@@ -1,0 +1,16 @@
+target/
+__pycache__/
+.pytest_cache/
+*.tar.gz
+*.bundle
+.venv/
+.cargo/
+.cache/
+logs/
+reports/
+# generated crates, except the typed backend's committed reference output
+generated/*
+!generated/app_axum/
+storage-test/
+dist/
+*.egg-info/

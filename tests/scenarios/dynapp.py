@@ -1,0 +1,535 @@
+"""Scenario of fixtures/dynapp: the dyn backend's own reference app (enums, computed defaults,
+annotated dependency aliases...). Tables are (re)created by SQLAlchemy from the fixture models."""
+import os
+
+# get_db commits after the response (FastAPI >= 0.121): pause after each write so that the reference has
+# committed before the next request reads (the binary commits before answering)
+SETTLE = 0.2
+
+
+def _cpython_pickles() -> tuple[str, str]:
+    """Pickles written by CPython itself (protocols 4 and 5) for /pk/load."""
+    import base64
+    import pickle
+
+    from fixtures.dynapp.pk import Entry, sample
+    e = Entry(sample(), 1.5, 2.0, 3.0)
+    return tuple(base64.b64encode(pickle.dumps(e, protocol=p)).decode() for p in (4, 5))
+
+
+def _unpickled(b64: str):
+    """A pickle written by either server, read back by CPython: compared by value, not by bytes."""
+    import base64
+    import pickle
+
+    from fixtures.dynapp.pk import Bag, Entry
+
+    def desc(o):
+        if isinstance(o, Entry):
+            return {"entry": [desc(getattr(o, s)) for s in Entry.__slots__]}
+        if isinstance(o, Bag):
+            return {"bag": sorted((k, desc(v)) for k, v in vars(o).items())}
+        if isinstance(o, dict):
+            return {k: desc(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [type(o).__name__, [desc(x) for x in o]]
+        return repr(o)
+    try:
+        return desc(pickle.loads(base64.b64decode(b64)))
+    except Exception as e:  # noqa: BLE001
+        return f"unreadable by CPython: {type(e).__name__}: {e}"
+
+
+def _jwt_cases() -> list:
+    """Tokens built by python-jose itself (fixed dates: same bytes for both servers)."""
+    import base64
+    import json as _json
+    from urllib.parse import quote
+
+    from jose import jwt
+
+    k = "s3cret"
+    far, past = 4102444800, 946684800  # 2100-01-01, 2000-01-01
+
+    def raw(header: dict, payload, key=k, alg="HS256"):
+        import hashlib
+        import hmac
+        enc = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()  # noqa: E731
+        h = enc(_json.dumps(header, separators=(",", ":")).encode())
+        p = enc(payload if isinstance(payload, bytes) else _json.dumps(payload, separators=(",", ":")).encode())
+        hm = {"HS256": hashlib.sha256, "HS384": hashlib.sha384}[alg]
+        sig = enc(hmac.new(key.encode(), f"{h}.{p}".encode(), hm).digest())
+        return f"{h}.{p}.{sig}"
+
+    good = jwt.encode({"sub": "ada", "exp": far, "n": 1.5, "l": [1, "é"]}, k)
+    tokens = [
+        good,
+        jwt.encode({"sub": "ada", "exp": past}, k),
+        jwt.encode({"nbf": far}, k),
+        jwt.encode({"aud": "x"}, k),
+        jwt.encode({"aud": ["x", 1]}, k),
+        jwt.encode({"sub": 5}, k),
+        jwt.encode({"jti": 5}, k),
+        jwt.encode({"iat": "abc"}, k),
+        jwt.encode({"iat": "12", "exp": "4102444800"}, k),
+        jwt.encode({"at_hash": "x"}, k),
+        jwt.encode({"sub": "ada"}, "other"),
+        jwt.encode({"sub": "ada"}, k, algorithm="HS384"),
+        good[:-3] + "AAA",
+        good + "!!",
+        "abc", "a.b", "a.b.c", "....", good.replace(".", "..", 1),
+        raw({"alg": "none"}, {"a": 1}),
+        raw({"typ": "JWT"}, {"a": 1}),
+        raw({"alg": "HS256"}, [1, 2]),
+        raw({"alg": "HS256"}, b"not json"),
+        raw({"alg": "RS256"}, {"a": 1}),
+        raw({"alg": "XX1"}, {"a": 1}),
+    ]
+    steps = [("GET", f"/jwt/check?token={quote(t)}", None) for t in tokens]
+    steps += [
+        ("GET", f"/jwt/check?token={quote(good)}&algs=HS384&algs=HS256", None),
+        ("GET", f"/jwt/check?token={quote(tokens[11])}&algs=HS384", None),
+        ("GET", f"/jwt/check?token={quote(good)}&key=%22s3cret%22", None),
+        ("GET", f"/jwt/check?token={quote(good)}&key=-----BEGIN%20PUBLIC%20KEY-----", None),
+        ("POST", "/jwt/issue", {"sub": "ada", "roles": ["a"], "é": "ü"}),
+        ("POST", "/jwt/issue?alg=HS512", {"sub": "ada"}),
+        ("POST", "/jwt/issue?alg=XX", {"sub": "ada"}),
+        ("GET", "/jwt/me", None, {"authorization": f"Bearer {good}"}),
+        ("GET", "/jwt/me", None, {"authorization": "Bearer nope"}),
+    ]
+    return steps
+
+
+def _its_cases() -> list:
+    """Tokens signed by itsdangerous itself with fixed timestamps."""
+    from urllib.parse import quote
+
+    from itsdangerous import TimestampSigner, URLSafeTimedSerializer
+
+    def ser(ts, key="s3cret", salt="itsdangerous"):
+        class Signer(TimestampSigner):
+            def get_timestamp(self):
+                return ts
+
+        class S(URLSafeTimedSerializer):
+            default_signer = Signer
+
+        return S(key, salt=salt)
+
+    old = 1_000_000_000
+    big = {"rows": [{"name": "same", "value": i % 3} for i in range(30)], "é": "ü"}
+    raw = TimestampSigner("s3cret", salt="itsdangerous")
+    tokens = [
+        (ser(old).dumps({"user_id": 7, "purpose": "2fa"}), ""),
+        (ser(old).dumps({"user_id": 7}), "&max_age=60"),
+        (ser(4102444800).dumps({"user_id": 7}), "&max_age=60"),
+        (ser(old).dumps(big), ""),
+        (ser(old).dumps([1, "x", None]), "&salt=other"),
+        (ser(old, key="old-key").dumps({"k": "old"}), "&old_key=true"),
+        (ser(old, key="old-key").dumps({"k": "old"}), ""),
+        (ser(old).dumps({"a": 1})[:-2] + "xx", ""),
+        (ser(old).dumps({"a": 1})[:-2] + "xx", "&max_age=60"),
+        ("nodot", ""),
+        ("a.b", ""),
+        (raw.sign(b"!!!").decode(), ""),
+        (raw.sign(b"bm90IGpzb24").decode(), ""),
+        (raw.sign(b".bm90IHpsaWI").decode(), ""),
+        (raw.sign(b"e30").decode().rsplit(".", 2)[0] + "..sig", ""),
+    ]
+    return [("GET", f"/its/check?token={quote(t)}{q}", None) for t, q in tokens] + [
+        ("POST", "/its/issue", {"user_id": 1, "purpose": "2fa", "é": "ü"}),
+        ("POST", "/its/issue?salt=magic", {"mandant_id": 3}),
+        ("POST", "/its/issue", big),
+    ]
+
+
+def _multipart(parts: list) -> tuple[bytes, dict]:
+    """(name, value) text fields and (name, filename, content_type, bytes) files -> body, headers."""
+    b = "py2axumBOUNDARY"
+    out = b""
+    for p in parts:
+        out += f"--{b}\r\n".encode()
+        if len(p) == 2:
+            out += f'Content-Disposition: form-data; name="{p[0]}"\r\n\r\n'.encode() + p[1].encode() + b"\r\n"
+        else:
+            ct = f"Content-Type: {p[2]}\r\n" if p[2] else ""
+            out += (f'Content-Disposition: form-data; name="{p[0]}"; filename="{p[1]}"\r\n{ct}\r\n').encode() + p[3] + b"\r\n"
+    out += f"--{b}--\r\n".encode()
+    return out, {"content-type": f"multipart/form-data; boundary={b}"}
+
+
+def _upload_cases() -> list:
+    cases = [
+        [("file", "a.txt", "text/plain", "héllo wörld".encode()), ("caption", "Cap"), ("order", "3"), ("primary", "true")],
+        [("file", "b.bin", None, b"\x00\x01\x02"), ("caption", ""), ("order", "")],
+        [("caption", "no file"), ("order", "x")],
+        [("file", "not a file"), ("primary", "maybe")],
+    ]
+    steps = []
+    for c in cases:
+        body, h = _multipart(c)
+        steps.append(("POST", "/upload", body, h))
+    body, h = _multipart([("files", "1.csv", "text/csv", b"a,b"), ("files", "2.csv", "text/csv", b"c,d,e"), ("note", "n.txt", "text/plain", b"x")])
+    steps.append(("POST", "/uploads", body, h))
+    body, h = _multipart([("files", "1.csv", "text/csv", b"a")])
+    steps.append(("POST", "/uploads", body, h))
+    body, h = _multipart([("other", "x")])
+    steps.append(("POST", "/uploads", body, h))
+    steps.append(("POST", "/upload", b"caption=url&order=2", {"content-type": "application/x-www-form-urlencoded"}))
+    steps.append(("POST", "/upload", {"file": "json"}))
+    steps.append(("POST", "/upload", b"--x\r\nbroken", {"content-type": "multipart/form-data; boundary=x"}))
+    return steps
+
+STEPS: list = [
+    ("POST", "/tasks", {"title": "Écrire", "priority": "high", "tags": ["a", "b"]}),
+    ("POST", "/tasks", {"title": "Relire"}),
+    ("POST", "/tasks", {"title": "Bas", "priority": "low"}),
+    ("POST", "/tasks", {"title": "x", "priority": "urgent"}),
+    ("POST", "/tasks", {"title": "x", "priority": 1}),
+    ("POST", "/tasks", {"title": "x", "level": 3}),
+    ("POST", "/tasks", {"title": "x", "channel": "fax"}),
+    ("GET", "/tasks", None),
+    ("GET", "/tasks?priority=high", None),
+    ("GET", "/tasks?priority=nope", None),
+    ("GET", "/tasks?status=open", None),
+    ("GET", "/tasks/1", None),
+    ("GET", "/tasks/99", None),
+    ("POST", "/tasks/1/status", {"status": "done"}),
+    ("POST", "/tasks/1/status", {"status": "done"}),
+    ("POST", "/tasks/1/status", {"status": "DONE"}),
+    ("GET", "/tasks?status=done", None),
+    ("POST", "/tasks/2/lower", None),
+    ("POST", "/tasks/99/lower", None),
+    ("POST", "/describe", {"title": "t", "priority": "high", "channel": "sms", "level": 2}),
+    ("POST", "/describe", {"title": "t"}),
+    ("POST", "/summary", {"title": "t", "priority": "low"}),
+    ("GET", "/stats", None),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'Ada@Example.COM'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": '@x.fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@localhost'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'a b@x.fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@x..fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@-x.fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ADA.Lovelace+tag@sub.Example.org'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": '  ada@x.fr '}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@[1.2.3.4]'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": '"a b"@x.fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@x.123'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'Ada <ada@x.fr>'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'Info@x.fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@x.test'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'ada@x.fr.'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 'x@a--b.fr'}),
+    ("POST", "/contacts", {"name": " Ada ", "email": 5}),
+    ("POST", "/contacts", {"name": "   ", "email": "a@x.fr"}),
+    ("POST", "/contacts/bad-assign", {"name": "Ada", "email": "a@x.fr"}),
+    ("POST", "/projects", {"name": "Alpha", "owner": "Ada", "tasks": ["a1", "a2", "a3"]}),
+    ("POST", "/projects", {"name": "Beta", "tasks": ["b1"]}),
+    ("POST", "/projects", {"name": "Gamma"}),
+    ("GET", "/projects", None),
+    ("GET", "/projects/1", None),
+    ("GET", "/projects/9", None),
+    ("GET", "/projects/1/lazy", None),
+    ("GET", "/owners/1", None),
+    ("GET", "/tasks/5/project", None),
+    ("GET", "/tasks/5/project?preload=discard", None),
+    ("GET", "/tasks/5/project?preload=keep", None),
+    ("GET", "/tasks/1/project", None),
+    ("POST", "/tasks/1/move/3", None),
+    ("POST", "/tasks/6/move/3", None),
+    ("GET", "/project-sizes", None),
+    ("POST", "/projects/1/drop-first", None),
+    ("DELETE", "/projects/3", None),
+    ("GET", "/tasks", None),
+    ("GET", "/projects", None),
+    ("POST", "/tasks", {"title": "p1", "price": 12.3}),
+    ("POST", "/tasks", {"title": "p2", "price": 0.1}),
+    ("POST", "/tasks", {"title": "p3", "price": 19.999}),
+    ("POST", "/tasks", {"title": "p4", "price": -5.555}),
+    ("GET", "/prices", None),
+    ("GET", "/prices?above=0.1", None),
+    ("POST", "/drafts", None),
+    ("POST", "/drafts?fail=true", None),
+    ("GET", "/drafts/count", None),
+    ("GET", "/drafts/count?pending=true", None),
+    ("POST", "/drafts", None),
+    ("GET", "/drafts/count", None),
+    ("POST", "/projects", {"name": "Delta", "tasks": ["d1", "d2"]}),
+    ("GET", "/sql-mix", None),
+    ("POST", "/tasks/2/retitle", None),
+    ("POST", "/tasks/3/retitle?sync=false", None),
+    ("GET", "/tasks/3", None),
+    ("GET", "/projects/1/via-get", None),
+    ("GET", "/projects/2/via-get?how=refresh", None),
+    ("GET", "/projects/9/via-get", None),
+    ("GET", "/items/special", None),
+    ("POST", "/items/special", None),
+    ("GET", "/items/caf%C3%A9%20au%20lait", None),
+    ("GET", "/tasks/%31", None),
+    ("HEAD", "/tasks", None),
+    ("DELETE", "/tasks", None),
+    ("PUT", "/items/x", None),
+    ("GET", "/tasks/?priority=high", None, {"host": "api.example:9000"}),
+    ("GET", "/items/x/", None, {"host": "api.example"}),
+    ("GET", "/nowhere/", None),
+    ("POST", "/people", {"fullName": "Ada Lovelace", "tags": ["math"]}),
+    ("POST", "/people", {"full_name": "Ada", "nick": "al"}),
+    ("POST", "/people", {"full_name": "A"}),
+    ("POST", "/people", {}),
+    ("GET", "/tasks/2/as-title?attrs=true", None),
+    ("GET", "/tasks/2/as-title", None),
+    ("POST", "/sum?scale=2", [1, 2, 3]),
+    ("POST", "/sum?values=1&values=2", None),
+    ("POST", "/sum", b"{not json"),
+    ("GET", "/stats", b"{not json"),
+    ("POST", "/tasks/2/price?value=42.424", None),
+    ("POST", "/tasks/2/price?value=1e12", None),
+    ("GET", "/lazy", None),
+    ("GET", "/lazy?n=2", None),
+    ("POST", "/bookings?n=1", {"slots": [{"start": 1, "label": "talk", "name": "ada lovelace", "room": "Big"}], "total": 1}),
+    ("POST", "/bookings?n=-1", {"slots": [
+        {"start": "x", "label": "admin", "name": "a1", "seats": 7},
+        {"start": 1, "label": "quiet", "name": "ok"},
+        {"start": 1, "label": "hush", "name": "b2"},
+        {"start": 2, "label": 3, "name": "c"},
+    ], "total": "many"}),
+    ("POST", "/bookings?n=1", {"slots": [{"start": 1, "label": "x", "name": "n", "room": "teapot"}], "total": 1}),
+    ("POST", "/bookings?n=1", {"slots": [{"start": 1, "label": "x", "name": "n", "room": "teapot"}], "total": "x"}),
+    ("POST", "/slots/check", {"start": 1, "label": "ok"}),
+    ("POST", "/slots/check", {"start": "z", "label": "admin", "seats": 7}),
+    ("POST", "/slots/check", {"label": "quiet", "room": "C"}),
+    ("GET", "/slots/fine", None),
+    ("GET", "/slots/admin", None),
+    ("POST", "/mixed", {"a": 1, "b": 1, "c": 1, "d": {"x": 1}, "e": [1], "f": "1", "g": 1, "h": "2020-01-02", "i": {"k": 1}}),
+    ("POST", "/mixed", {"a": "1", "b": 1.0, "c": True, "d": {"x": 1, "z": 2}, "e": ["1"], "f": 2, "g": "low", "h": "3", "j": "ab"}),
+    ("POST", "/mixed", {"a": 1.0, "b": "1", "c": "1", "d": {"x": "1"}, "e": [], "f": 2.0, "g": "nope", "h": 4, "i": [{"x": 1}], "j": 5}),
+    ("POST", "/mixed", {"a": True, "b": True, "c": 1.0, "d": {"x": "a"}, "f": "2", "g": 2, "j": "a"}),
+    ("POST", "/mixed", {"a": None, "b": "x", "c": "maybe", "d": {}, "e": [1, "a"], "f": [], "g": [], "h": "x", "i": 3, "j": None}),
+    ("POST", "/mixed", {"a": [], "d": 1, "e": "x", "i": [{"y": 1}], "k": "q"}),
+    ("POST", "/mixed", {"a": 1, "k": None}),
+    ("GET", '/auth/me', None),
+    ("GET", '/auth/me', None, {"authorization": 'Bearer good'}),
+    ("GET", '/auth/me', None, {"authorization": 'Bearer bad'}),
+    ("GET", '/auth/me?n=x', None),
+    ("GET", '/auth/me?n=x', None, {"authorization": 'Bearer good'}),
+    ("GET", '/auth/token', None, {"authorization": 'bearer  spaced'}),
+    ("GET", '/auth/token', None, {"authorization": 'Basic abc'}),
+    ("GET", '/auth/token', None, {"authorization": 'Bearer'}),
+    ("GET", '/auth/token', None, {"authorization": ''}),
+    ("GET", '/auth/optional', None),
+    ("GET", '/auth/optional', None, {"authorization": 'Token x'}),
+    ("GET", '/auth/optional', None, {"authorization": 'BEARER t'}),
+    ("GET", '/auth/creds', None),
+    ("GET", '/auth/creds', None, {"authorization": 'Bearer jwt.x'}),
+    ("GET", '/auth/creds', None, {"authorization": 'Bearer'}),
+    ("GET", '/auth/creds', None, {"authorization": 'Basic abc'}),
+    ("GET", '/auth/creds', None, {"authorization": 'Bearer a b'}),
+    ("GET", '/auth/maybe-creds', None),
+    ("GET", '/auth/maybe-creds', None, {"authorization": 'Basic x'}),
+    ("GET", '/auth/maybe-creds', None, {"authorization": 'bearer y'}),
+    *_jwt_cases(),
+    ("GET", "/env", None),
+    ("GET", "/env?name=HOME", None),
+    ("GET", "/env?name=", None),
+    ("POST", "/globals", None),
+    ("POST", "/globals", None),
+    ("GET", "/sentry?user_id=7", None),
+    ("GET", "/dataclass", None),
+    ("GET", "/dataclass?role=viewer&perm=read", None),
+    ("GET", "/dataclass?role=viewer", None),
+    ("GET", "/dataclass?role=admin", None),
+    *_its_cases(),
+    ("POST", "/secrets", {"label": "totp", "token": "JBSWY3DPEHPK3PXP"}),
+    ("POST", "/secrets", {"label": "empty", "token": ""}),
+    ("POST", "/secrets", {"label": "none"}),
+    ("GET", "/secrets/1", None),
+    ("GET", "/secrets/2", None),
+    ("GET", "/secrets/3", None),
+    ("PUT", "/secrets/1", {"token": "été ✓"}),
+    ("GET", "/secrets/1", None),
+    ("GET", "/gendep/events", None),
+    ("GET", "/gendep?tag=a", None),
+    ("GET", "/gendep/events", None),
+    ("GET", "/gendep?fail=true", None),
+    ("GET", "/gendep/events", None),
+    ("GET", "/gendep?fail=maybe", None),
+    ("GET", "/gendep/events", None),
+    ("GET", "/classes", None),
+    ("POST", "/trips", {"legs": [{"a": 1}, {"a": 11}, {"a": "z"}, {"a": 5}]}),
+    ("POST", "/trips", {"legs": [{"a": 2}], "swap": {"a": -1}}),
+    ("POST", "/trips", {"legs": [{"a": 3}], "swap": {"a": 4}}),
+    ("POST", "/invoices", {"lines": [{"value": "1 000€", "note": "  "}, "250", {"value": 3, "note": "x"}], "total": "1253"}),
+    ("POST", "/invoices", {"lines": [{"value": "bad"}, "X", {"value": "z€"}, {"value": 1, "unit": 2}], "total": {"value": "bad"}}),
+    ("GET", "/tasks/2/loose", None),
+    *_upload_cases(),
+    ("POST", "/files/note.txt", {"text": "héllo"}),
+    ("POST", "/files/archive.tar.gz", {"text": ""}),
+    ("GET", "/misc", None),
+    ("GET", "/misc?n=12&kind=bois", None),
+    ("GET", "/misc?kind=charbon", None),
+    ("GET", "/resp/cookies", None),
+    ("GET", "/resp/redirect", None),
+    ("GET", "/resp/plain", None),
+    ("GET", "/resp/json", None),
+    ("GET", "/resp/empty", None),
+    ("GET", "/resp/file", None),
+    ("GET", "/resp/file?name=Reçu 1.pdf", None),
+    ("GET", "/resp/file?name=plain.pdf", None),
+    ("POST", "/resp/background", None),
+    ("GET", "/gendep/events", None),
+    ("GET", "/mail/render", None),
+    ("GET", "/mail/build", None),
+    ("POST", "/mail/send?to=nobody@example.com", None),  # no SMTP server in the scenario: the error path
+    ("POST", "/stdlib", {"text": "<LOC> https://a.fr/x </loc><loc>b</loc> le 05/10/2026 et 31/12/1999"}),
+    ("POST", "/stdlib", {"text": "rien"}),
+    ("GET", "/sqlx", None),
+    ("GET", "/sqlx?prio=low", None),
+    ("POST", "/tasks/2/tag?tag=x", None),
+    ("POST", "/tasks/2/tag?tag=y", None),
+    ("POST", "/batch2", None),
+    ("POST", "/token", b"username=ada&password=secret&scope=read+write", {"content-type": "application/x-www-form-urlencoded"}),
+    ("POST", "/token", b"grant_type=password&username=ada&password=x", {"content-type": "application/x-www-form-urlencoded"}),
+    ("POST", "/token", b"grant_type=implicit&password=x", {"content-type": "application/x-www-form-urlencoded"}),
+    # last: a failed INSERT may or may not consume the id sequence (plan caching, on both sides)
+    ("POST", "/tasks", {"title": "p5", "price": 1e9}),
+    # dunder methods, hashability, frozen models (fixtures/dynapp/dunders.py)
+    ("GET", "/dunders/eq", None),
+    ("GET", "/dunders/hash", None),
+    ("GET", "/dunders/frozen", None),
+    ("POST", "/dunders/vdefault", {"bad": 1}),
+    ("POST", "/dunders/vdefault", {"bad": 1, "nickName": "z", "upper": "q"}),
+    ("POST", "/dunders/vdefault", {}),
+    ("GET", "/dunders/jsonresp", None),
+    ("GET", "/dunders/raise/unavailable", None),
+    ("GET", "/dunders/raise/limited", None),
+    ("GET", "/dunders/raise/provider", None),
+    ("GET", "/dunders/raise/base", None),
+    ("GET", "/dunders/raise/none", None),
+    ("GET", "/dunders/builtins", None),
+    ("GET", "/dunders/smallbatch", None),
+    # --python-side /dunders/proxied/{name}: relayed by the binary to PY2AXUM_PYTHON_URL
+    ("POST", "/dunders/proxied/abc?q=1", b"raw body", {"x-probe": "yes", "content-type": "text/plain"}),
+    ("GET", "/dunders/jsonresp?kind=model", None),
+    ("GET", "/dunders/jsonresp?kind=dt", None),
+    ("GET", "/dunders/jsonresp?kind=nan", None),
+    ("POST", "/dunders/vdefault", {"bad": 2, "nick": "ignored", "rank": "x"}),
+    # pickle in CPython's format (fixtures/dynapp/pk.py)
+    ("GET", "/pk/dump", None),
+    ("POST", "/pk/load", {"b64": _cpython_pickles()[0]}),
+    ("POST", "/pk/load", {"b64": _cpython_pickles()[1]}),
+    ("GET", "/pk/errors", None),
+    # redis.asyncio (fixtures/dynapp/rds.py; Redis database 13, emptied by reset)
+    ("POST", "/rds/basic", None),
+    ("POST", "/rds/pickled", None),
+    ("GET", "/rds/down", None),
+    # coroutine objects (fixtures/dynapp/aio.py)
+    ("GET", "/aio/gather", None),
+    ("GET", "/aio/coro", None),
+    ("GET", "/aio/acm", None),
+    ("GET", "/bg/run", None),
+    ("GET", "/bg/run", None),
+    ("GET", "/bg/misc", None),
+    # composite primary keys (fixtures/dynapp/composite.py)
+    ("POST", "/composite/run", None),
+    ("GET", "/composite/list", None),
+    ("POST", "/composite/tickets", None),
+    ("POST", "/composite/upsert", None),
+    ("GET", "/composite/adapter", None),
+    ("GET", "/composite/mappings", None),
+    # project decorators (fixtures/dynapp/decos.py)
+    ("GET", "/decos/fetch", None),
+    ("GET", "/decos/fetch?n=4&fail=true", None),
+    ("GET", "/decos/attrs", None),
+    ("GET", "/decos/compute", None),
+    ("GET", "/decos/bare", None),
+    ("GET", "/decos/step", None),
+    ("GET", "/decos/step?b=0", None),
+    ("GET", "/decos/nested", None),
+    ("GET", "/decos/types", None),
+    # third-party libraries (fixtures/dynapp/libs.py)
+    ("GET", "/libs/bcrypt", None),
+    ("GET", "/libs/bcrypt?pw=%C3%A9t%C3%A9%20%F0%9F%8C%9E", None),
+    ("GET", "/libs/totp", None),
+    ("POST", "/libs/thread", None),
+    ("GET", "/libs/sent", None),
+    ("POST", "/libs/alert/one", None),
+    ("POST", "/libs/alert/two", None),
+    ("GET", "/libs/http", None),
+    ("GET", "/libs/yarl", None),
+    # pywebpush: tests/push_sink.py on port 8299 (started by scripts_start_dyn.sh)
+    ("POST", "/libs/push?target=http://127.0.0.1:8299/sink", None),
+    ("POST", "/libs/push?target=http://127.0.0.1:8299/sink&der=true&size=9000", None),
+    ("POST", "/libs/push?target=http://127.0.0.1:8299/sink%3Fgone%3Dtrue", None),
+    ("POST", "/libs/push?target=http://127.0.0.1:8299/sink&sub=admin", None),
+    ("POST", "/libs/push-errors", None),
+    ("POST", "/libs/savepoint", None),
+    ("POST", "/libs/savepoint", None),
+    ("GET", "/libs/enum", None),
+    ("GET", "/libs/enum?rank=high", None),
+    ("GET", "/libs/enum?rank=Estar", None),
+    ("GET", "/libs/enum?rank=", None),
+    ("GET", "/libs/enum?rank=zz", None),
+    ("POST", "/libs/enum", {"rank": "ESTAR", "ranks": ["low", "", "estar"]}),
+    ("POST", "/libs/enum", {"rank": "bad", "ranks": ["low", "worse"]}),
+    ("GET", "/libs/urllib", None),
+    ("GET", "/libs/b64", None),
+    ("GET", "/libs/psutil", None),
+    ("GET", "/libs/sqlmisc", None),
+    ("GET", "/libs/google", None),
+    ("GET", "/libs/aliased", None),
+    ("GET", "/libs/decimal", None),
+    ("POST", "/libs/decimal-db", None),
+    ("GET", "/libs/sqlmore", None),
+    ("GET", "/libs/sets", None),
+    ("GET", "/libs/startup", None),
+    ("GET", "/libs/numtypes", None),
+    ("GET", "/libs/script-settings", None),
+    ("GET", "/libs/jose-options", None),
+    ("POST", "/libs/urls", {"site": "http://Example.COM/a b?x=1#frag", "any": "x:y", "redis": "redis://h"}),
+    ("POST", "/libs/urls", {"site": "https://a.b:443/"}),
+    ("POST", "/libs/urls", {"site": "ftp://x", "any": "http://", "redis": "http://x"}),
+    ("POST", "/libs/urls", {"site": 5, "any": "nope", "redis": "redis://"}),
+    ("POST", "/libs/urls", {"site": "http://" + "a" * 2100 + ".com"}),
+    ("GET", "/libs/urllib?s=%F0%9F%8C%9E%20x%3B%3A%40%26%3D%2B%24%2C", None),
+]
+
+
+def reset(db: str) -> None:
+    from sqlalchemy import create_engine
+
+    from fixtures.dynapp.models import Base
+
+    # FileResponse: a file both servers serve, with a fixed mtime (etag, last-modified)
+    os.makedirs("storage-test", exist_ok=True)
+    with open("storage-test/fixed.pdf", "wb") as f:
+        f.write(b"%PDF-1.4 fixed")
+    os.utime("storage-test/fixed.pdf", (1700000000.123456, 1700000000.123456))
+    import redis as _redis
+    _redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/13")).flushdb()
+    engine = create_engine(db.replace("postgresql://", "postgresql+psycopg://", 1))
+    Base.metadata.create_all(engine)  # once; afterwards only emptied (servers cache their plans)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"TRUNCATE {', '.join(t.name for t in Base.metadata.sorted_tables)} RESTART IDENTITY CASCADE")
+    engine.dispose()
+
+
+def normalize(body):
+    """MIME boundaries are random (email.generator): masked."""
+    import re as _re
+    if isinstance(body, dict) and set(body) == {"slots", "proto4"}:
+        body = {k: _unpickled(v) for k, v in body.items()}
+    if isinstance(body, dict) and isinstance(body.get("text"), str):
+        body["text"] = _re.sub(r"={15}\d{19}==", "<boundary>", body["text"])
+    return _normalize(body)
+
+
+def _normalize(body):
+    """Known, documented difference (README): the decoder message of a `json_invalid` error comes from
+    CPython's json module (and changes between Python versions); type, msg and loc are compared."""
+    if isinstance(body, dict) and isinstance(body.get("detail"), list):
+        for e in body["detail"]:
+            if isinstance(e, dict) and e.get("type") == "json_invalid" and "ctx" in e:
+                e["ctx"] = {"error": "<decoder message>"}
+    return body

@@ -1,0 +1,255 @@
+{
+  "per_row_bytes": 158.9217,
+  "results": [
+    {
+      "target_mb": 5,
+      "rows": 32990,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 5.048647880554199,
+          "wire_mb": 5.048647880554199,
+          "ttfb_ms": 467.64585299979444,
+          "latency_ms": 475.157482999748,
+          "rps": 3.7908337550227205,
+          "errors": 0,
+          "peak_rss_mb": 424.51171875
+        },
+        "axum (généré)": {
+          "size_mb": 5.048647880554199,
+          "wire_mb": 5.048647880554199,
+          "ttfb_ms": 4.70613500010586,
+          "latency_ms": 37.08226900016598,
+          "rps": 35.14536113070104,
+          "errors": 0,
+          "peak_rss_mb": 7.60546875
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 10,
+      "rows": 65980,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 10.118478775024414,
+          "wire_mb": 10.118478775024414,
+          "ttfb_ms": 990.540269000121,
+          "latency_ms": 1013.2295170001271,
+          "rps": 1.6001251689789162,
+          "errors": 0,
+          "peak_rss_mb": 622.19921875
+        },
+        "axum (généré)": {
+          "size_mb": 10.118478775024414,
+          "wire_mb": 10.118478775024414,
+          "ttfb_ms": 3.117140000085783,
+          "latency_ms": 74.03705400020044,
+          "rps": 17.712692383087003,
+          "errors": 0,
+          "peak_rss_mb": 8.81640625
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 15,
+      "rows": 98971,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 15.18846321105957,
+          "wire_mb": 15.18846321105957,
+          "ttfb_ms": 1651.0834599998816,
+          "latency_ms": 1670.9175539999706,
+          "rps": 1.0803534472670433,
+          "errors": 0,
+          "peak_rss_mb": 826.8203125
+        },
+        "axum (généré)": {
+          "size_mb": 15.18846321105957,
+          "wire_mb": 15.18846321105957,
+          "ttfb_ms": 4.672199000196997,
+          "latency_ms": 106.96316399980788,
+          "rps": 11.624715678767986,
+          "errors": 0,
+          "peak_rss_mb": 7.60546875
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 20,
+      "rows": 131961,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 20.31925678253174,
+          "wire_mb": 20.31925678253174,
+          "ttfb_ms": 2467.6842610001586,
+          "latency_ms": 2510.9507340002892,
+          "rps": 0.6089089861640653,
+          "errors": 0,
+          "peak_rss_mb": 1014.56640625
+        },
+        "axum (généré)": {
+          "size_mb": 20.31925678253174,
+          "wire_mb": 20.31925678253174,
+          "ttfb_ms": 3.6872399996354943,
+          "latency_ms": 129.83005199976105,
+          "rps": 8.555201163191567,
+          "errors": 0,
+          "peak_rss_mb": 8.2421875
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 25,
+      "rows": 164951,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 25.452011108398438,
+          "wire_mb": 25.452011108398438,
+          "ttfb_ms": 2842.8541789999144,
+          "latency_ms": 2889.0065360001245,
+          "rps": 0.6365894152711257,
+          "errors": 0,
+          "peak_rss_mb": 1162.65234375
+        },
+        "axum (généré)": {
+          "size_mb": 25.452011108398438,
+          "wire_mb": 25.452011108398438,
+          "ttfb_ms": 4.331819000071846,
+          "latency_ms": 216.47695299998304,
+          "rps": 7.254670788354071,
+          "errors": 0,
+          "peak_rss_mb": 7.67578125
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 30,
+      "rows": 197942,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 30.58492088317871,
+          "wire_mb": 30.58492088317871,
+          "ttfb_ms": 3671.4879620003558,
+          "latency_ms": 3733.4314150002683,
+          "rps": 0.490135746685295,
+          "errors": 0,
+          "peak_rss_mb": 1369.0234375
+        },
+        "axum (généré)": {
+          "size_mb": 30.58492088317871,
+          "wire_mb": 30.58492088317871,
+          "ttfb_ms": 4.110929000034957,
+          "latency_ms": 204.8368450000453,
+          "rps": 6.0255263386211455,
+          "errors": 0,
+          "peak_rss_mb": 8.046875
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 35,
+      "rows": 230932,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 35.71767520904541,
+          "wire_mb": 35.71767520904541,
+          "ttfb_ms": 4211.324406999665,
+          "latency_ms": 4281.510691999756,
+          "rps": 0.42606789320959276,
+          "errors": 0,
+          "peak_rss_mb": 1621.28125
+        },
+        "axum (généré)": {
+          "size_mb": 35.71767520904541,
+          "wire_mb": 35.71767520904541,
+          "ttfb_ms": 2.9637969996656466,
+          "latency_ms": 289.570170999923,
+          "rps": 4.970159815905381,
+          "errors": 0,
+          "peak_rss_mb": 8.2578125
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 40,
+      "rows": 263922,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 40.85042953491211,
+          "wire_mb": 40.85042953491211,
+          "ttfb_ms": 4929.129551000187,
+          "latency_ms": 5011.921831000109,
+          "rps": 0.289983692909604,
+          "errors": 0,
+          "peak_rss_mb": 1786.66796875
+        },
+        "axum (généré)": {
+          "size_mb": 40.85042953491211,
+          "wire_mb": 40.85042953491211,
+          "ttfb_ms": 3.187973000422062,
+          "latency_ms": 321.8091970002206,
+          "rps": 4.284044767458301,
+          "errors": 0,
+          "peak_rss_mb": 7.97265625
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 45,
+      "rows": 296913,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 45.98333930969238,
+          "wire_mb": 45.98333930969238,
+          "ttfb_ms": 5406.6450350001105,
+          "latency_ms": 5528.898047000439,
+          "rps": 0.31231931068838914,
+          "errors": 0,
+          "peak_rss_mb": 1931.859375
+        },
+        "axum (généré)": {
+          "size_mb": 45.98333930969238,
+          "wire_mb": 45.98333930969238,
+          "ttfb_ms": 6.737320999491203,
+          "latency_ms": 352.39231799914705,
+          "rps": 3.7756072879051854,
+          "errors": 0,
+          "peak_rss_mb": 8.015625
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 50,
+      "rows": 329903,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 51.11609363555908,
+          "wire_mb": 51.11609363555908,
+          "ttfb_ms": 6348.3914380003625,
+          "latency_ms": 6491.1735160003445,
+          "rps": 0.30124907355995945,
+          "errors": 0,
+          "peak_rss_mb": 2169.078125
+        },
+        "axum (généré)": {
+          "size_mb": 51.11609363555908,
+          "wire_mb": 51.11609363555908,
+          "ttfb_ms": 4.7512379996987875,
+          "latency_ms": 421.36250200019276,
+          "rps": 3.305633866808261,
+          "errors": 0,
+          "peak_rss_mb": 8.9296875
+        }
+      },
+      "identical": true
+    }
+  ]
+}

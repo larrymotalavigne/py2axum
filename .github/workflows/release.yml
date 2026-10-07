@@ -1,0 +1,36 @@
+name: Publish to PyPI
+
+# Run by hand (Actions → Publish to PyPI → Run workflow) on the commit tagged for the release.
+# Uses PyPI Trusted Publishing: no token; the project's trusted publisher must name this repository,
+# this workflow (release.yml) and the `pypi` environment.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install build && python -m build
+      - name: the wheel installs and runs
+        run: python -m venv /tmp/w && /tmp/w/bin/pip install dist/*.whl && /tmp/w/bin/py2axum --help
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

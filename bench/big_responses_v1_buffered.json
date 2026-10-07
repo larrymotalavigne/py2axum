@@ -1,0 +1,215 @@
+{
+  "per_row_bytes": 158.9217,
+  "results": [
+    {
+      "target_mb": 5,
+      "rows": 32990,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 5.048647880554199,
+          "latency_ms": 572.8478589999213,
+          "rps": 3.6135058265911786,
+          "errors": 0,
+          "peak_rss_mb": 423.91015625
+        },
+        "axum (généré)": {
+          "size_mb": 5.048647880554199,
+          "latency_ms": 59.64304000008269,
+          "rps": 36.915946908128056,
+          "errors": 0,
+          "peak_rss_mb": 66.5078125
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 10,
+      "rows": 65980,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 10.118478775024414,
+          "latency_ms": 1075.825087999874,
+          "rps": 1.5652405028394485,
+          "errors": 0,
+          "peak_rss_mb": 619.67578125
+        },
+        "axum (généré)": {
+          "size_mb": 10.118478775024414,
+          "latency_ms": 90.60294099981547,
+          "rps": 16.37591237787937,
+          "errors": 0,
+          "peak_rss_mb": 161.03515625
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 15,
+      "rows": 98971,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 15.18846321105957,
+          "latency_ms": 1879.6897549996174,
+          "rps": 1.0306742833337843,
+          "errors": 0,
+          "peak_rss_mb": 832.0546875
+        },
+        "axum (généré)": {
+          "size_mb": 15.18846321105957,
+          "latency_ms": 137.55340000034266,
+          "rps": 10.891436388100308,
+          "errors": 0,
+          "peak_rss_mb": 153.83984375
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 20,
+      "rows": 131961,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 20.31925678253174,
+          "latency_ms": 2552.563532000022,
+          "rps": 0.7133469339978187,
+          "errors": 0,
+          "peak_rss_mb": 1034.7734375
+        },
+        "axum (généré)": {
+          "size_mb": 20.31925678253174,
+          "latency_ms": 185.77374300002703,
+          "rps": 8.361911928173933,
+          "errors": 0,
+          "peak_rss_mb": 198.26953125
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 25,
+      "rows": 164951,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 25.452011108398438,
+          "latency_ms": 2949.4750200001363,
+          "rps": 0.46734264792812086,
+          "errors": 0,
+          "peak_rss_mb": 1239.55859375
+        },
+        "axum (généré)": {
+          "size_mb": 25.452011108398438,
+          "latency_ms": 232.65562599999612,
+          "rps": 6.303112903096674,
+          "errors": 0,
+          "peak_rss_mb": 231.79296875
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 30,
+      "rows": 197942,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 30.58492088317871,
+          "latency_ms": 3733.252646999972,
+          "rps": 0.4351001752226974,
+          "errors": 0,
+          "peak_rss_mb": 1368.44140625
+        },
+        "axum (généré)": {
+          "size_mb": 30.58492088317871,
+          "latency_ms": 292.37188700017214,
+          "rps": 5.252017424270019,
+          "errors": 0,
+          "peak_rss_mb": 254.06640625
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 35,
+      "rows": 230932,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 35.71767520904541,
+          "latency_ms": 4348.271906000264,
+          "rps": 0.4417281167054993,
+          "errors": 0,
+          "peak_rss_mb": 1555.61328125
+        },
+        "axum (généré)": {
+          "size_mb": 35.71767520904541,
+          "latency_ms": 303.2033690001299,
+          "rps": 4.40648552691309,
+          "errors": 0,
+          "peak_rss_mb": 321.25
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 40,
+      "rows": 263922,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 40.85042953491211,
+          "latency_ms": 4984.870688999763,
+          "rps": 0.3800621938524842,
+          "errors": 0,
+          "peak_rss_mb": 1703.5078125
+        },
+        "axum (généré)": {
+          "size_mb": 40.85042953491211,
+          "latency_ms": 384.3589439998141,
+          "rps": 4.010207756805496,
+          "errors": 0,
+          "peak_rss_mb": 312.578125
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 45,
+      "rows": 296913,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 45.98333930969238,
+          "latency_ms": 5452.846190999935,
+          "rps": 0.30354933119592925,
+          "errors": 0,
+          "peak_rss_mb": 1970.42578125
+        },
+        "axum (généré)": {
+          "size_mb": 45.98333930969238,
+          "latency_ms": 434.2865180001354,
+          "rps": 3.5876735550574104,
+          "errors": 0,
+          "peak_rss_mb": 366.28125
+        }
+      },
+      "identical": true
+    },
+    {
+      "target_mb": 50,
+      "rows": 329903,
+      "servers": {
+        "FastAPI + Uvicorn": {
+          "size_mb": 51.11609363555908,
+          "latency_ms": 6597.273792000124,
+          "rps": 0.20822214014025853,
+          "errors": 0,
+          "peak_rss_mb": 2174.09765625
+        },
+        "axum (généré)": {
+          "size_mb": 51.11609363555908,
+          "latency_ms": 487.57430800014845,
+          "rps": 3.0238283992892674,
+          "errors": 0,
+          "peak_rss_mb": 458.0234375
+        }
+      },
+      "identical": true
+    }
+  ]
+}

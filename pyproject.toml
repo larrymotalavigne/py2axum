@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "py2axum"
+version = "0.1.0"
+description = "Ahead-of-time compiler from FastAPI + SQLAlchemy + Pydantic applications to Rust (axum), with response-level conformance testing"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+authors = [{ name = "Larry Motalavigne" }]
+keywords = ["fastapi", "rust", "axum", "compiler", "transpiler", "sqlalchemy", "pydantic", "performance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+# the transpiler itself only needs the standard library; the extras run the conformance harness
+dependencies = []
+
+[project.optional-dependencies]
+conformance = ["httpx>=0.27", "fastapi>=0.115", "uvicorn[standard]>=0.30", "sqlalchemy[asyncio]>=2.0", "psycopg[binary]>=3.2", "pydantic[email]>=2.9"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+py2axum = "py2axum.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/larrymotalavigne/py2axum"
+Issues = "https://github.com/larrymotalavigne/py2axum/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["py2axum"]
+
+[tool.hatch.build.targets.sdist]
+include = ["py2axum", "tests", "fixtures", "examples", "docs", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md", "CONTRIBUTING.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+extend-exclude = ["generated", "fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "E731", "B008", "B904", "B905", "E741", "B023"]

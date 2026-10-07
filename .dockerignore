@@ -1,0 +1,9 @@
+.git
+.venv
+generated
+target
+logs
+reports
+storage-test
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,53 @@
+{
+  "config": {
+    "server_cpus": null,
+    "workers": 2,
+    "duration": "10s",
+    "conns": 64,
+    "cpus_available": 2
+  },
+  "servers": {
+    "axum (généré)": {
+      "endpoints": {
+        "GET /health (JSON)": {
+          "rps": 91421.94825287777,
+          "p50_ms": 0.423,
+          "p99_ms": 3.449948,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 914508
+          }
+        },
+        "GET /users/{id} (1 SELECT)": {
+          "rps": 10902.204992581284,
+          "p50_ms": 5.048384,
+          "p99_ms": 14.507012,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 109152
+          }
+        },
+        "GET /users?limit=20 (liste)": {
+          "rps": 4358.043510739196,
+          "p50_ms": 12.613335999999999,
+          "p99_ms": 33.891625000000005,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 43537
+          }
+        },
+        "PATCH /users/{id} (UPDATE)": {
+          "rps": 4495.031770717055,
+          "p50_ms": 13.794654,
+          "p99_ms": 23.791460999999998,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 44916
+          }
+        }
+      },
+      "rss_idle_mb": 5.55078125,
+      "rss_peak_mb": 10.04296875
+    }
+  }
+}

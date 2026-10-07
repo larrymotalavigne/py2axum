@@ -1,0 +1,3 @@
+- [ ] conformance case(s) added to a fixture app and its scenario (or a rejection test for a refused construct)
+- [ ] `docs/supported.md` updated (supported construct or documented difference)
+- [ ] `ruff check` and `pytest` pass; the generated crate builds with `RUSTFLAGS="-D warnings"`

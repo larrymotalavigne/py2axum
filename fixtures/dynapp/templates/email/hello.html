@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Bonjour {{ name }}{% endblock %}
+{% block content %}
+<p>Montant : {{ amount }} € — actif : {{ active }} — rien : {{ nothing }}</p>
+{% if items %}<ul>{% for it in items %}<li>{{ it.label }} = {{ it.value }}</li>{% endfor %}</ul>{% endif %}
+<p>{{ task.title }}</p>
+{% endblock %}
