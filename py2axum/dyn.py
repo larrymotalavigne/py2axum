@@ -11,6 +11,7 @@ Unsupported constructs raise `TranspileError` with file:line, as everywhere else
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import re
 import shutil
@@ -30,7 +31,7 @@ BUILTIN_FUNCS = {
     "len", "str", "repr", "int", "float", "bool", "list", "tuple", "set", "frozenset", "dict", "sorted",
     "reversed", "min", "max", "sum", "any", "all", "next", "round", "abs", "enumerate", "zip", "range",
     "print", "isinstance", "getattr", "setattr", "hasattr", "iter", "open", "type", "chr", "ord", "divmod", "callable",
-    "hash", "id", "filter", "map", "issubclass", "vars",
+    "hash", "id", "filter", "map", "issubclass", "vars", "anext",
 }
 BUILTIN_TYPES = {"str", "int", "float", "bool", "dict", "list", "tuple", "set", "frozenset", "bytes", "object"}
 
@@ -216,6 +217,8 @@ class SchemaInfo:
     extra: str
     settings: bool = False
     env_prefix: str = ""
+    case_sensitive: bool = False
+    env_none: str | None = None  # env_parse_none_str
     validators: list[tuple[list[str], Sym]] = field(default_factory=list)
     methods: list[tuple[str, bool, Sym]] = field(default_factory=list)
 
@@ -312,6 +315,17 @@ class Project:
                                 names |= {t.id for t in st.targets if isinstance(t, ast.Name)}
                     elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
                         names.add(n.attr)
+                    if isinstance(n, ast.ClassDef):
+                        names.add(n.name)  # a row's entity by class name (`row.User`)
+                    elif isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", None)) in ATTR_NAMING_CALLS:
+                        # attributes named by a string or a keyword: `.label("total")`, `setattr(o, "x", v)`,
+                        # `namedtuple("P", "a b")`, `SimpleNamespace(x=1)`, `getattr(o, "x")`
+                        names |= {k.arg for k in n.keywords if k.arg}
+                        for a in n.args:
+                            if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                                names |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", a.value))
+                            elif isinstance(a, (ast.List, ast.Tuple)):
+                                names |= {e.value for e in a.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)}
                     elif (isinstance(n, ast.Call) and len(n.args) == 1 and isinstance(n.args[0], ast.Constant)
                           and isinstance(n.args[0].value, str)
                           and (isinstance(n.func, ast.Name) and n.func.id == "import_module"
@@ -322,6 +336,23 @@ class Project:
                             names |= {*mod.defs, *mod.imports}
             self.__dict__["_attrs"] = names
         return self.__dict__["_attrs"]
+
+    def open_attrs(self) -> bool:
+        """Does the project give objects attributes that cannot be listed statically (`__getattr__`,
+        `setattr`/`__dict__` with a computed name)? Then no attribute read is refused."""
+        if self.__dict__.get("_open") is None:
+            def computed(n):
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
+                    return n.name in {"__getattr__", "__getattribute__"}
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "setattr":
+                    return len(n.args) < 2 or not (isinstance(n.args[1], ast.Constant) and isinstance(n.args[1].value, str))
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "update":
+                    v = n.func.value
+                    return (isinstance(v, ast.Attribute) and v.attr == "__dict__") or (
+                        isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "vars")
+                return False
+            self.__dict__["_open"] = any(computed(n) for m in list(self.ix.modules.values()) for n in ast.walk(m.tree))
+        return self.__dict__["_open"]
 
     def uid(self) -> int:
         self.counter += 1
@@ -364,10 +395,11 @@ class Project:
         self.session_cfg = cfg
 
     SESSION_SHAPE = ("only `async with maker() as s: yield s`, optionally inside `try:` with `await s.commit()` "
-                     "after the yield, `except ...: await s.rollback(); raise` and `finally: await s.close()`")
+                     "after the yield, `except ...: await s.rollback(); raise` and `finally: await s.close()`; "
+                     "synchronous: the same with `with`, or `s = maker()` then `try: yield s` ... `finally: s.close()`")
 
-    def session_config(self, sym: Sym) -> tuple[bool, bool, bool]:
-        """(commit after the endpoint, expire_on_commit, autoflush) of a session dependency."""
+    def session_config(self, sym: Sym) -> tuple[bool, bool, bool, bool]:
+        """(commit after the endpoint, expire_on_commit, autoflush, sync) of a session dependency."""
         fn = self.ix.definition(sym)
         for _ in range(5):  # `get_async_session = get_db`
             if not (isinstance(fn, ast.Assign) and isinstance(fn.value, (ast.Name, ast.Attribute))):
@@ -378,34 +410,49 @@ class Project:
             sym, fn = t, self.ix.definition(t)
         module = sym.module
         bad = lambda node: self.err(f"session dependency {sym.name}: {self.SESSION_SHAPE}", node, module)  # noqa: E731
-        if not isinstance(fn, ast.AsyncFunctionDef):
+        if not isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)):
             raise bad(fn)
+        sync = isinstance(fn, ast.FunctionDef)
+        with_t = ast.With if sync else ast.AsyncWith
         body = [b for b in fn.body if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))]
         outer_finally = []
         if (len(body) == 1 and isinstance(body[0], ast.Try) and not body[0].handlers and not body[0].orelse
-                and len(body[0].body) == 1 and isinstance(body[0].body[0], ast.AsyncWith)):
+                and len(body[0].body) == 1 and isinstance(body[0].body[0], with_t)):
             # try: async with maker() as s: yield s / finally: await s.aclose()
             outer_finally = body[0].finalbody
             body = body[0].body
-        if len(body) != 1 or not isinstance(body[0], ast.AsyncWith) or len(body[0].items) != 1:
+        if (sync and len(body) == 2 and isinstance(body[0], ast.Assign) and len(body[0].targets) == 1
+                and isinstance(body[0].targets[0], ast.Name) and isinstance(body[1], ast.Try)):
+            # s = maker() / try: yield s / finally: s.close()
+            maker_call, sname, inner = body[0].value, body[0].targets[0].id, [body[1]]
+            if not body[1].finalbody:
+                raise bad(body[1])
+        elif len(body) == 1 and isinstance(body[0], with_t) and len(body[0].items) == 1:
+            item = body[0].items[0]
+            if not isinstance(item.optional_vars, ast.Name):
+                raise bad(item.context_expr)
+            maker_call, sname, inner = item.context_expr, item.optional_vars.id, body[0].body
+        else:
             raise bad(fn)
-        item = body[0].items[0]
-        if not (isinstance(item.context_expr, ast.Call) and not item.context_expr.args and isinstance(item.optional_vars, ast.Name)):
-            raise bad(item.context_expr)
-        sname = item.optional_vars.id
+        if not (isinstance(maker_call, ast.Call) and not maker_call.args and not maker_call.keywords):
+            raise bad(maker_call)
 
         def is_call(stmt, meth):
             meths = {"close", "aclose"} if meth == "close" else {meth}
-            return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Await) and isinstance(stmt.value.value, ast.Call)
-                    and isinstance(stmt.value.value.func, ast.Attribute) and stmt.value.value.func.attr in meths
-                    and isinstance(stmt.value.value.func.value, ast.Name) and stmt.value.value.func.value.id == sname
-                    and not stmt.value.value.args)
+            if not isinstance(stmt, ast.Expr):
+                return False
+            call = stmt.value
+            if not sync:
+                if not isinstance(call, ast.Await):
+                    return False
+                call = call.value
+            return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr in meths
+                    and isinstance(call.func.value, ast.Name) and call.func.value.id == sname and not call.args)
 
         def is_yield(stmt):
             return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield)
                     and isinstance(stmt.value.value, ast.Name) and stmt.value.value.id == sname)
 
-        inner = body[0].body
         commit = False
         if len(inner) == 1 and is_yield(inner[0]):
             pass
@@ -420,13 +467,13 @@ class Project:
             if not all(is_call(x, "close") for x in t.finalbody):
                 raise bad(t)
         else:
-            raise bad(body[0])
+            raise bad(inner[0] if inner else fn)
         if not all(is_call(x, "close") for x in outer_finally):
             raise bad(fn)
         # the sessionmaker
         # the sessionmaker: a module constant, or a factory function creating it once (`get_factory()()`)
         makers = {"async_sessionmaker", "sessionmaker"}
-        f = item.context_expr.func
+        f = maker_call.func
         maker = None
         if isinstance(f, ast.Call) and not f.args and not f.keywords:
             fs = self.resolve(module, f.func)
@@ -444,10 +491,12 @@ class Project:
             elif isinstance(mdef, (ast.Assign, ast.AnnAssign)) and isinstance(mdef.value, ast.Call):
                 cls = self.resolve(mk.module, mdef.value.func)
                 if isinstance(cls, Sym) and isinstance(self.ix.definition(cls), ast.ClassDef):
-                    return (commit, *self.maker_class_options(cls, mdef.value, mk.module))
+                    if sync:
+                        raise self.err("session maker class: only async_sessionmaker wrappers are supported", mdef.value, mk.module)
+                    return (commit, *self.maker_class_options(cls, mdef.value, mk.module), False)
         if maker is None:
             raise self.err(f"session dependency {sym.name}: `{ast.unparse(f)}` must be a module-level "
-                           "async_sessionmaker(...) or a function creating one", item.context_expr, module)
+                           "(async_)sessionmaker(...) or a function creating one", maker_call, module)
         expire, autoflush = True, True
         for kw in maker.keywords:
             v = literal(kw.value, self.src(mk.module)) if kw.arg in {"expire_on_commit", "autoflush"} else None
@@ -455,13 +504,16 @@ class Project:
                 expire = bool(v)
             elif kw.arg == "autoflush":
                 autoflush = bool(v)
-            elif kw.arg == "class_" and (dotted(kw.value) or "").split(".")[-1] == "AsyncSession":
+            elif kw.arg == "class_" and (dotted(kw.value) or "").split(".")[-1] == ("Session" if sync else "AsyncSession"):
                 pass
             elif kw.arg == "autocommit" and literal(kw.value, self.src(mk.module)) is False:
                 pass  # SQLAlchemy 2.x: the only accepted value
             elif kw.arg != "bind":
-                raise self.err(f"async_sessionmaker({kw.arg}=) is not supported", kw, mk.module)
-        return commit, expire, autoflush
+                raise self.err(f"{(dotted(maker.func) or '').split('.')[-1]}({kw.arg}=) is not supported", kw, mk.module)
+        if sync != self._sync_maker(maker):
+            raise self.err(f"session dependency {sym.name}: a {'synchronous' if sync else 'coroutine'} dependency "
+                           f"needs {'sessionmaker' if sync else 'async_sessionmaker'}(...)", maker, mk.module)
+        return commit, expire, autoflush, sync
 
     def maker_class_options(self, cls: Sym, call: ast.Call, call_module: str) -> tuple[bool, bool]:
         """A project class wrapping `async_sessionmaker` (an instance per module, called for a session):
@@ -498,6 +550,13 @@ class Project:
         if opts.get("autocommit", False) is not False:
             raise self.err("autocommit=True is not supported", call, call_module)
         return bool(opts["expire_on_commit"]), bool(opts["autoflush"])
+
+    @staticmethod
+    def _sync_maker(maker: ast.Call) -> bool:
+        """`sessionmaker(...)` makes synchronous sessions unless `class_=AsyncSession`."""
+        if (dotted(maker.func) or "").split(".")[-1] != "sessionmaker":
+            return False
+        return not any(kw.arg == "class_" and (dotted(kw.value) or "").split(".")[-1] == "AsyncSession" for kw in maker.keywords)
 
     def _expire_on_commit(self) -> bool:
         for m in list(self.ix.modules.values()):
@@ -599,6 +658,20 @@ class Project:
             return f"Some({float(cons[k])!r}f64)" if k in cons else "None"
         return f"{RT}::pyd::NumC {{ ge: {o('ge')}, gt: {o('gt')}, le: {o('le')}, lt: {o('lt')} }}"
 
+    def _dec(self, cons: dict, node, module: str) -> str:
+        def bound(k):
+            if k not in cons:
+                return "None"
+            v = cons[k]
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise self.err(f"Decimal bound {k}={v!r}: only int and float literals are supported", node, module)
+            return f"Some({rs(repr(v))})"  # Decimal(str(v)), as pydantic converts it
+
+        def count(k):
+            return f"Some({int(cons[k])})" if k in cons else "None"
+        return (f"{RT}::pyd::DecC {{ ge: {bound('ge')}, gt: {bound('gt')}, le: {bound('le')}, lt: {bound('lt')}, "
+                f"max_digits: {count('max_digits')}, decimal_places: {count('decimal_places')} }}")
+
     def _str(self, cons: dict) -> str:
         mn = f"Some({cons['min_length']})" if "min_length" in cons else "None"
         mx = f"Some({cons['max_length']})" if "max_length" in cons else "None"
@@ -665,6 +738,9 @@ class Project:
             raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
         name = dotted(ann)
         if name in {"int", "float", "str", "bool", "dict", "list", "set", "tuple", "bytes", "Any", "object"} and not isinstance(self.resolve(module, ann, scope), Sym):
+            if bad := [k for k in ("max_digits", "decimal_places") if k in cons]:
+                # pydantic raises TypeError at validation time ("Unable to apply constraint")
+                raise self.err(f"{bad[0]}= applies to Decimal only, not to `{name}`", ann, module)
             return self._scalar(name, cons)
         t = self.resolve(module, ann, scope)
         if isinstance(t, Ext):
@@ -683,6 +759,8 @@ class Project:
             }
             if t.dotted in mapping:
                 return mapping[t.dotted]
+            if t.dotted == "decimal.Decimal":
+                return f"{RT}::pyd::TD::Decimal({self._dec(cons, ann, module)})"
             if t.package == "typing" and last in {"Dict", "List", "Set", "Tuple"}:
                 return self._scalar(last.lower(), cons)
             raise self.err(f"unsupported type annotation `{ast.unparse(ann)}` ({t.dotted})", ann, module)
@@ -729,6 +807,7 @@ class Project:
             return f"{RT}::pyd::TD::Optional(&{inner})" if none else self._td_init(rest[0], module, cons, scope)
         tds = ", ".join(f"&{self._static_td(self._td_init(p, module, cons, scope))}" for p in rest)
         u = f"{RT}::pyd::TD::Union(&[{tds}])"
+        self.__dict__.setdefault("union_src", {}).setdefault(u, (node, module))  # where a refusal points
         return f"{RT}::pyd::TD::Optional(&{self._static_td(u)})" if none else u
 
     def _scalar(self, name: str, cons: dict) -> str:
@@ -752,7 +831,7 @@ class Project:
             return f"{RT}::pyd::TD::Any"
         raise TranspileError(f"unsupported type {name}")
 
-    FIELD_KW = {"ge", "gt", "le", "lt", "min_length", "max_length", "pattern", "regex"}
+    FIELD_KW = {"ge", "gt", "le", "lt", "min_length", "max_length", "pattern", "regex", "max_digits", "decimal_places"}
     IGNORED_KW = {"description", "title", "examples", "example", "json_schema_extra", "deprecated", "include_in_schema"}
 
     def field_cons(self, call: ast.Call, module: str, scope=None) -> tuple[dict, dict]:
@@ -1157,7 +1236,27 @@ class Project:
             "immediate": "Selectin", "noload": "NoLoad", "None": "NoLoad", "raise": "Raise", "raise_on_sql": "Raise",
             "False": "Selectin"}
     REL_OPTIONS = {"back_populates", "backref", "foreign_keys", "lazy", "cascade", "uselist", "passive_deletes",
-                   "overlaps", "argument", "doc", "info"}
+                   "overlaps", "argument", "doc", "info", "order_by"}
+
+    def rel_order(self, v: ast.AST, tsym: Sym, tinfo, where: str, module: str) -> list[tuple[int, bool]]:
+        """`relationship(order_by=...)`: target columns (Target.col, `.desc()`/`.asc()`, a list), or a string
+        SQLAlchemy evaluates against the class registry ("Target.col", "[Target.a, Target.b.desc()]")."""
+        from_str = isinstance(v, ast.Constant) and isinstance(v.value, str)
+        node = ast.parse(v.value, mode="eval").body if from_str else v
+        out = []
+        for expr in node.elts if isinstance(node, (ast.List, ast.Tuple)) else [node]:
+            desc = False
+            if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and expr.func.attr in {"desc", "asc"}
+                    and not expr.args and not expr.keywords):
+                desc, expr = expr.func.attr == "desc", expr.func.value
+            target_ok = isinstance(expr, ast.Attribute) and (
+                (isinstance(expr.value, ast.Name) and expr.value.id == tsym.name) if from_str
+                else self.resolve(module, expr.value) == tsym)
+            idx = next((i for i, c in enumerate(tinfo.cols) if target_ok and c["name"] == expr.attr), None)
+            if idx is None:
+                raise self.err(f"relationship {where}: order_by= must name columns of {tsym.name}", v, module)
+            out.append((idx, desc))
+        return out
 
     def resolve_rels(self, info: ModelInfo) -> None:
         """Resolve `relationship()` declarations: target model, direction from the foreign keys, options.
@@ -1214,7 +1313,8 @@ class Project:
             if "all" in cascade:
                 cascade |= {"save-update", "merge", "refresh-expire", "expunge", "delete"}
             uselist = lit("uselist", not m2o)
-            rels.append({"name": name, "target": tsym, "m2o": m2o, "local": li, "remote": ri, "uselist": bool(uselist),
+            order = self.rel_order(opts["order_by"], tsym, tinfo, f"{info.sym.name}.{name}", module) if "order_by" in opts else []
+            rels.append({"name": name, "target": tsym, "m2o": m2o, "local": li, "remote": ri, "uselist": bool(uselist), "order": order,
                          "lazy": self.LAZY[lazy], "back": lit("back_populates"), "delete": "delete" in cascade,
                          "orphan": "delete-orphan" in cascade, "passive_deletes": bool(lit("passive_deletes", False))})
             if "backref" in opts:
@@ -1349,8 +1449,55 @@ class Project:
         "String": "Str", "VARCHAR": "Str", "Text": "Str", "TEXT": "Str", "Unicode": "Str", "UnicodeText": "Str",
         "Boolean": "Bool", "BOOLEAN": "Bool", "Float": "Float", "Double": "Float", "REAL": "Float",
         "Date": "Date", "DATE": "Date", "Time": "Time", "JSON": "Json", "JSONB": "Json", "Uuid": "Uuid", "UUID": "Uuid",
+        "LargeBinary": "Bytes", "BYTEA": "Bytes",
     }
-    PY_COL_TYPES = {"int": "Int", "str": "Str", "bool": "Bool", "float": "Float"}
+    PY_COL_TYPES = {"int": "Int", "str": "Str", "bool": "Bool", "float": "Float", "bytes": "Bytes"}
+
+    def inline_type_factory(self, fn: Sym, call: ast.Call, module: str, col: str):
+        """`_enum(Status, "status")` where `def _enum(c, n): return Enum(c, name=n, ...)`: the returned expression,
+        parameters replaced by the arguments (evaluated once at class creation, like SQLAlchemy sees it)."""
+        fd = self.ix.definition(fn)
+        body = [s for s in fd.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        if (isinstance(fd, ast.AsyncFunctionDef) or fd.decorator_list or len(body) != 1
+                or not isinstance(body[0], ast.Return) or body[0].value is None):
+            raise self.err(f"column {col}: type factory {fn.name}() must be a plain function whose body is "
+                           f"`return <column type>`", call, module)
+        fa = fd.args
+        if fa.vararg or fa.kwarg or fa.posonlyargs or fa.kwonlyargs:
+            raise self.err(f"column {col}: type factory {fn.name}(): only plain parameters are supported", fd, fn.module)
+        names = [p.arg for p in fa.args]
+        bound: dict[str, ast.AST] = dict(zip(names[len(names) - len(fa.defaults):], fa.defaults))
+        given = list(call.args) + [k.value for k in call.keywords]
+        if len(call.args) > len(names):
+            raise self.err(f"column {col}: too many arguments to {fn.name}()", call, module)
+        bound.update(zip(names, call.args))
+        for k in call.keywords:
+            if k.arg not in names:
+                raise self.err(f"column {col}: {fn.name}() has no parameter `{k.arg}`", k, module)
+            bound[k.arg] = k.value
+        if missing := [n for n in names if n not in bound]:
+            raise self.err(f"column {col}: {fn.name}() missing argument `{missing[0]}`", call, module)
+        for g in given:
+            if not isinstance(g, (ast.Constant, ast.Name, ast.Attribute)):
+                raise self.err(f"column {col}: argument `{ast.unparse(g)}` of {fn.name}() must be a literal or a name",
+                               g, module)
+        ret = body[0].value
+        local = {n.arg for n in ast.walk(ret) if isinstance(n, ast.arg)} | {
+            n.id for n in ast.walk(ret) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        for n in ast.walk(ret):
+            # the expression is read where the column is declared: its other names must mean the same there
+            if (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound and n.id not in local
+                    and self.resolve(module, n) != self.resolve(fn.module, n)):
+                raise self.err(f"column {col}: `{n.id}` in {fn.name}() does not mean the same in {module}", n, fn.module)
+        if any(isinstance(n, ast.arg) and n.arg in bound for n in ast.walk(ret)) or any(
+                isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id in bound for n in ast.walk(ret)):
+            raise self.err(f"column {col}: type factory {fn.name}() rebinds one of its parameters", ret, fn.module)
+
+        class Subst(ast.NodeTransformer):
+            def visit_Name(self, n):
+                return copy.deepcopy(bound[n.id]) if n.id in bound and isinstance(n.ctx, ast.Load) else n
+
+        return ast.fix_missing_locations(Subst().visit(copy.deepcopy(ret))), module
 
     def column(self, name: str, ann, call, module: str, stmt) -> dict:
         col = {"name": name, "ty": None, "nullable": None, "pk": False, "default": None, "server_default": False,
@@ -1392,6 +1539,17 @@ class Project:
                     dn = self.ix.definition(t0)
                     if isinstance(dn, (ast.Assign, ast.AnnAssign)) and isinstance(dn.value, ast.Call):
                         a, amod = dn.value, t0.module
+                # `T.with_variant(V, "postgresql")` is V on PostgreSQL; a variant for another dialect is T
+                while (isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute) and a.func.attr == "with_variant"
+                       and len(a.args) == 2 and not a.keywords):
+                    dialects = literal(a.args[1], self.src(amod))
+                    dialects = (dialects,) if isinstance(dialects, str) else tuple(dialects)
+                    a = a.args[0] if "postgresql" in dialects else a.func.value
+                if isinstance(a, ast.Call):
+                    # a project function that only returns a type (`def _enum(cls, name): return Enum(cls, name=name)`)
+                    f0 = self.resolve(amod, a.func)
+                    if isinstance(f0, Sym) and isinstance(self.ix.definition(f0), (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        a, amod = self.inline_type_factory(f0, a, amod, name)
                 d = dotted(a.func) if isinstance(a, ast.Call) else dotted(a)
                 last = (d or "").split(".")[-1]
                 fn_t = self.resolve(amod, a.func if isinstance(a, ast.Call) else a)
@@ -1420,6 +1578,16 @@ class Project:
                                 raise self.err(f"column {name}: {fn_t.name}(...) arguments must be literals", x, amod)
                     col["ty"] = f"Decorated(&{self.type_dec(fn_t)})"
                     continue
+                if isinstance(fn_t, Ext) and fn_t.dotted in {"sqlalchemy.ARRAY", "sqlalchemy.types.ARRAY", "sqlalchemy.dialects.postgresql.ARRAY"}:
+                    item = a.args[0] if isinstance(a, ast.Call) and len(a.args) == 1 else None
+                    item_t = (dotted(item.func) if isinstance(item, ast.Call) else dotted(item)) if item is not None else None
+                    if (item_t or "").split(".")[-1] not in {"String", "VARCHAR", "Text", "TEXT", "Unicode", "UnicodeText"}:
+                        raise self.err(f"column {name}: only ARRAY(String) is supported", a, amod)
+                    for k in a.keywords:
+                        if k.arg != "dimensions" or literal(k.value, self.src(amod)) != 1:
+                            raise self.err(f"column {name}: ARRAY({k.arg}=) is not supported", k, amod)
+                    col["ty"] = "StrArray"
+                    continue
                 if last in {"Numeric", "NUMERIC", "DECIMAL"}:
                     asdecimal = True
                     if isinstance(a, ast.Call):
@@ -1442,7 +1610,7 @@ class Project:
                                 continue
                             if k.arg not in ok:
                                 raise self.err(f"column {name}: {last}({k.arg}=) is not supported", k, amod)
-                        if len(a.args) > 1 or (a.args and last not in {"String", "VARCHAR", "Unicode", "CHAR"}):
+                        if len(a.args) > 1 or (a.args and last not in {"String", "VARCHAR", "Unicode", "CHAR", "LargeBinary"}):
                             raise self.err(f"column {name}: {ast.unparse(a)} is not supported", a, amod)
                     if last in {"DateTime", "TIMESTAMP"}:
                         pass
@@ -1795,10 +1963,15 @@ class Project:
                 info.extra = parent.extra
                 info.settings = parent.settings
                 info.env_prefix = parent.env_prefix
+                info.case_sensitive = parent.case_sensitive
+                info.env_none = parent.env_none
                 info.validators = list(parent.validators)
                 info.methods = list(parent.methods)
-                for k in ("model_after", "model_before", "before"):
+                for k in ("model_after", "model_before", "before", "computed"):
                     info.__dict__[k] = list(parent.__dict__.get(k, []))
+                info.__dict__["vinfo"] = dict(parent.__dict__.get("vinfo", {}))
+                if parent.__dict__.get("init") is not None:
+                    info.__dict__["init"] = parent.__dict__["init"]
                 for k in ("strip", "lower", "upper", "enum_values", "validate_assignment", "populate_by_name"):
                     if k in parent.__dict__:
                         info.__dict__[k] = parent.__dict__[k]
@@ -1836,7 +2009,7 @@ class Project:
                             f["alias"] = self.const(opts["alias"], module)
                     f["cons"] = cons
                     f["ann"] = (ann, module)
-                    fields = [x for x in fields if x["name"] != n] + [f]
+                    fields = self.put_field(fields, f)
                     continue
                 cons, opts = {}, self.annotated_opts(ann, module)
                 if stmt.value is not None:
@@ -1862,7 +2035,7 @@ class Project:
                     f["validate_default"] = True
                 f["cons"] = cons
                 f["ann"] = (ann, module)
-                fields = [x for x in fields if x["name"] != n] + [f]
+                fields = self.put_field(fields, f)
             elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                 n = stmt.targets[0].id
                 v = stmt.value
@@ -1875,6 +2048,9 @@ class Project:
                     mode = next((self.const(k.value, module) for k in dec.keywords if k.arg == "mode"), "after")
                     if mode not in {"after", "before"} or any(k.arg != "mode" for k in dec.keywords):
                         raise self.err(f"schema {sym.name}: field_validator(...) options not supported here", dec, module)
+                    lam_args = v.args[0].args
+                    if len(lam_args.posonlyargs + lam_args.args) - len(lam_args.defaults) != 1:
+                        raise self.err(f"schema {sym.name}: a lambda validator taking `info` is not supported", v.args[0], module)
                     lam = Sym(module, f"{node.name}.<{n}>")
                     self.__dict__.setdefault("lambda_validators", {})[lam] = v.args[0]
                     entry = ([self.const(a, module) for a in dec.args], lam)
@@ -1908,6 +2084,9 @@ class Project:
                             raise self.err(f"@validator({kw.arg}=True) is not supported", kw, module)
                         elif kw.arg not in {"mode", "pre", "each_item", "always", "allow_reuse", "check_fields"}:
                             raise self.err(f"@{last[0]}({kw.arg}=) is not supported", kw, module)
+                    kind = self.validator_info(stmt, "field_validator" not in last, before, sym, module)
+                    if kind:
+                        info.__dict__.setdefault("vinfo", {})[msym] = kind
                     if before:
                         info.__dict__.setdefault("before", []).append((names, msym))
                     else:
@@ -1918,7 +2097,29 @@ class Project:
                     if mode not in {"after", "before"}:
                         raise self.err(f"schema {sym.name}: @model_validator(mode={mode!r}) is not supported (after/before)", dec, module)
                     info.__dict__.setdefault("model_after" if mode == "after" else "model_before", []).append(msym)
-                elif "computed_field" in last or "field_serializer" in last or "model_serializer" in last:
+                elif "computed_field" in last:
+                    # `@computed_field` over `@property` (or alone): a property also serialized after the fields
+                    dec = stmt.decorator_list[last.index("computed_field")]
+                    if isinstance(dec, ast.Call) and (dec.args or dec.keywords):
+                        raise self.err(f"schema {sym.name}.{stmt.name}: @computed_field(...) options are not supported", dec, module)
+                    for d, ln in zip(stmt.decorator_list, last):
+                        if ln not in {"property", "computed_field"}:
+                            raise self.err(f"schema {sym.name}.{stmt.name}: decorator @{ast.unparse(d)} is not supported "
+                                           "with @computed_field", d, module)
+                    if isinstance(stmt, ast.AsyncFunctionDef):
+                        raise self.err(f"schema {sym.name}.{stmt.name}: an async @computed_field is not supported", stmt, module)
+                    info.methods.append((stmt.name, True, msym))
+                    comp = info.__dict__.setdefault("computed", [])
+                    if stmt.name not in comp:
+                        comp.append(stmt.name)
+                elif stmt.name == "__init__":
+                    # `def __init__(self, **data)`: run by `Model(...)` only (model_validate and FastAPI skip it)
+                    a = stmt.args
+                    if (isinstance(stmt, ast.AsyncFunctionDef) or stmt.decorator_list or len(a.args) != 1 or a.vararg
+                            or a.kwonlyargs or a.posonlyargs or a.kwarg is None):
+                        raise self.err(f"schema {sym.name}: only `def __init__(self, **data)` is supported", stmt, module)
+                    info.__dict__["init"] = msym
+                elif "field_serializer" in last or "model_serializer" in last:
                     raise self.err(f"schema {sym.name}: @{last[0]} is not supported", stmt, module)
                 elif is_dunder(stmt.name) and stmt.name not in DISPATCHED_DUNDERS:
                     raise self.err(f"schema {sym.name}: method {stmt.name} is not supported", stmt, module)
@@ -1942,6 +2143,45 @@ class Project:
                            "(the validators would not run on assignment)", node, module)
         info.fields = fields
         return info
+
+    @staticmethod
+    def put_field(fields: list[dict], f: dict) -> list[dict]:
+        """A field (re)declared: a redefinition (in a subclass, or again in the class) keeps the inherited
+        position, like Pydantic's field order (the annotations' dict order)."""
+        out = [f if x["name"] == f["name"] else x for x in fields]
+        return out if any(x["name"] == f["name"] for x in fields) else out + [f]
+
+    VALIDATION_INFO_ATTRS = {"data", "field_name"}
+
+    def validator_info(self, fn, v1: bool, before: bool, sym, module) -> int:
+        """What a field validator receives besides the value, by pydantic's own rules (`inspect_validator`,
+        `make_generic_v1_field_validator`): 0 nothing, 1 `info` (positional), 2 `values=info.data`."""
+        a = fn.args
+        pos = (a.posonlyargs + a.args)[1:]  # after cls
+        required = [x.arg for x in pos[:len(pos) - len(a.defaults)]] if len(a.defaults) <= len(pos) else []
+        if v1:
+            names = {x.arg for x in pos + a.kwonlyargs}
+            if names & {"field", "config"}:
+                raise self.err(f"schema {sym.name}.{fn.name}: the `field` and `config` validator parameters do not "
+                               "exist in Pydantic v2 (use `info`)", fn, module)
+            if [x for x in required[1:] if x != "values"]:
+                raise self.err(f"schema {sym.name}.{fn.name}: unsupported signature for a v1 @validator", fn, module)
+            kind = 2 if "values" in names or a.kwarg is not None else 0
+        elif len(required) in (1, 2):
+            kind = len(required) - 1
+        else:
+            raise self.err(f"schema {sym.name}.{fn.name}: unrecognized field validator signature", fn, module)
+        if kind and before:
+            raise self.err(f"schema {sym.name}.{fn.name}: `info`/`values` in a mode='before' validator is not supported",
+                           fn, module)
+        if kind == 1:
+            name = required[1]
+            for n in ast.walk(fn):
+                if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == name
+                        and n.attr not in self.VALIDATION_INFO_ATTRS):
+                    raise self.err(f"ValidationInfo.{n.attr} is not supported (only "
+                                   f"{', '.join(sorted(self.VALIDATION_INFO_ATTRS))})", n, module)
+        return kind
 
     def model_config(self, info: SchemaInfo, value: ast.AST, module: str) -> None:
         if isinstance(value, ast.Dict):
@@ -1992,7 +2232,13 @@ class Project:
                 info.__dict__["enum_values"] = bool(v)
             elif kw.arg in {"populate_by_name", "validate_by_name"}:
                 info.__dict__["populate_by_name"] = bool(v)
-            elif kw.arg in {"env_file", "env_file_encoding", "case_sensitive",
+            elif kw.arg == "case_sensitive":
+                info.case_sensitive = bool(v)
+            elif kw.arg == "env_parse_none_str":
+                if v is not None and not isinstance(v, str):
+                    raise self.err("model_config env_parse_none_str= must be a string or None", kw, module)
+                info.env_none = v
+            elif kw.arg in {"env_file", "env_file_encoding",
                             "arbitrary_types_allowed", "protected_namespaces", "json_schema_extra", "title"}:
                 pass
             elif kw.arg == "str_strip_whitespace":
@@ -2147,7 +2393,7 @@ class Project:
             node = self.fn_node(sym)
             fc = FnCompiler(self, sym.module, None, name)
             try:
-                decos = [fc.expr(d) for d in node.decorator_list]
+                decos = [mcp_tool_decorator(self, fc, sym, node, d) or fc.expr(d) for d in node.decorator_list]
                 val = raw_fn_value(self, sym)
                 # decorators introspect the function (typing.get_type_hints): its annotations as type values
                 anns = [(a.arg, a.annotation) for a in [*node.args.posonlyargs, *node.args.args, *([node.args.vararg] if node.args.vararg else []),
@@ -2586,7 +2832,7 @@ class FnCompiler:
         lbl = f"'l{self.p.uid()}"
         var = self.tmp("it")
         flag = self.loop_else_start(node, lbl)
-        self.emit(f"{lbl}: for {var} in {self.q(f'{RT}::ops::iter(&{it})')} {{")
+        self.emit(f"{lbl}: for {var} in {self.q(f'{RT}::orm::iter(&{it}).await')} {{")
         self.ind += 1
         self.assign(node.target, var)
         self.loops.append(lbl)
@@ -3125,8 +3371,9 @@ class FnCompiler:
         if "." not in sym.name and vdecos:
             return self.q(f"{self.p.decorated_value(sym)}(cx).await")
         params = fn_params(d)
-        if not has_yield(d):
-            # a function object bound at each call like CPython (keywords, defaults, *args/**kwargs, TypeErrors)
+        if not has_yield(d) or "." not in sym.name:
+            # a function object bound at each call like CPython (keywords, defaults, *args/**kwargs, TypeErrors);
+            # calling an async generator function gives the generator
             if "." in sym.name:
                 return f"V::native({RT}::Native::Bound({function_wrapper(self.p, sym)}, V::None))"
             return raw_fn_value(self.p, sym)
@@ -3152,7 +3399,17 @@ class FnCompiler:
                             return f"V::Col(&{info.rust}, {i})"
             return self.ref_value(ref, node)
         obj = self.expr(node.value)
+        self.check_attr(node)
         return self.q(f"{RT}::methods::getattr(cx, &{obj}, {rs(node.attr)}).await")
+
+    def check_attr(self, node: ast.Attribute) -> None:
+        """An attribute read at run time that no runtime type provides (and the project never defines nor
+        names) is a certain AttributeError on that path: refused here, so that --report counts it."""
+        name = node.attr
+        if name in self.p.project_attrs() or name in runtime_attr_names() or self.p.open_attrs():
+            return
+        raise self.err(f"attribute .{name} is not provided by the runtime for any type "
+                       "(it would raise AttributeError at run time)", node)
 
     GENERIC_BUILTINS = {"list", "dict", "set", "tuple", "frozenset", "type"}
     TYPING_GENERICS = {"List", "Dict", "Set", "Tuple", "FrozenSet", "Optional", "Union", "Literal", "Annotated",
@@ -3355,7 +3612,7 @@ class FnCompiler:
             self.comp_scopes.append(scope)
             pushed += 1
             var = self.tmp("c")
-            out_lines.append(f"for {var} in {self.q(f'{RT}::ops::iter(&{it})')} {{")
+            out_lines.append(f"for {var} in {self.q(f'{RT}::orm::iter(&{it}).await')} {{")
             depth += 1
             out_lines.append(self.bind_comp_target(g.target, var))
             for cond in g.ifs:
@@ -3526,6 +3783,14 @@ class FnCompiler:
                 raise self.err("only `super().__init__(app)` is supported in a BaseHTTPMiddleware", node)
             self.expr(node.args[0])
             return "V::None"
+        if csym in self.p.fe.schema_syms:
+            # a model's own __init__: the parent's __init__, or BaseModel's validation into `self`
+            pinit = self.p.schema(t).__dict__.get("init") if isinstance(t, Sym) and t in self.p.fe.schema_syms else None
+            if pinit is not None:
+                return self.q(f"{method_wrapper(self.p, pinit)}(cx, {me}.clone(), {RT}::pack({args}, {kwargs})).await")
+            if node.args:
+                raise self.err("BaseModel.__init__() takes keyword arguments only", node)
+            return self.q(f"{RT}::pyd::init_in_place(cx, &{me}, {RT}::kwargs_dict({kwargs})?).await")
         if isinstance(t, Sym):
             init = self.p.exc_init(t)
             if init is not None:
@@ -3838,7 +4103,17 @@ class FnCompiler:
             if node.args:
                 raise self.err(f"{sym.name}(): Pydantic models take keyword arguments only", node)
             if info.settings:
-                return self.q(f"{RT}::settings(cx, &{info.rust}, {rs(info.env_prefix)}, {kwargs}).await")
+                for kw in node.keywords:
+                    if kw.arg and kw.arg.startswith("_"):
+                        raise self.err(f"{sym.name}({kw.arg}=): pydantic-settings init options are not supported "
+                                       "(set them in model_config)", kw)
+                none = f"Some({rs(info.env_none)})" if info.env_none is not None else "None"
+                return self.q(f"{RT}::settings(cx, &{info.rust}, {rs(info.env_prefix)}, "
+                              f"{'true' if info.case_sensitive else 'false'}, {none}, {kwargs}).await")
+            if info.__dict__.get("init") is not None:
+                mw = method_wrapper(self.p, info.__dict__["init"])
+                return self.q(f"{{ let __o = {RT}::pyd::object_new_blank(&{info.rust}); "
+                              f"{mw}(cx, __o.clone(), {RT}::pack(vec![], {kwargs})).await.map(|_| __o) }}")
             return self.q(f"{RT}::pyd::construct(cx, &{info.rust}, {RT}::kwargs_dict({kwargs})?).await")
         if sym in self.p.fe.dataclass_syms:
             info = self.p.dataclass(sym)
@@ -3942,6 +4217,10 @@ class FnCompiler:
             obj = self.object_value(recv, values=False)
             args, kwargs = self.dyn_args(node)
             return self.q(f"{RT}::methods::call_method(cx, &{obj}, {rs(meth)}, {args}, {kwargs}).await")
+        if tmpl is None and recv in libmap.VALUES and not libmap.VALUES[recv].startswith("V::Enum("):
+            # a method of a library constant (`datetime.min.time()`)
+            args, kwargs = self.dyn_args(node)
+            return self.q(f"{RT}::methods::call_method(cx, &{libmap.VALUES[recv]}, {rs(meth)}, {args}, {kwargs}).await")
         if tmpl is None:
             raise self.err(f"library call `{name}()` is not supported (not in the py2axum library map)", node)
         for k in node.keywords:
@@ -4050,6 +4329,7 @@ class FnCompiler:
             "type": f"{RT}::methods::b_type(&{args})",
             "chr": f"{RT}::methods::b_chr(&{args})", "ord": f"{RT}::methods::b_ord(&{args})",
             "divmod": f"{RT}::methods::b_divmod(&{args})",
+            "bytes": f"{RT}::methods::b_bytes(&{args}, &{kwargs})",
             "open": f"{RT}::pathio::open(&{args}, &{kwargs})",
             "sorted": f"{RT}::methods::b_sorted(cx, &{args}[0], &{kwargs}).await",
             "id": f"{RT}::methods::b_id(&{args})", "callable": f"{RT}::methods::b_callable(&{args})",
@@ -4057,6 +4337,8 @@ class FnCompiler:
             "filter": f"{RT}::methods::b_filter(cx, &{args}).await", "map": f"{RT}::methods::b_map(cx, &{args}).await",
             "min": f"{RT}::methods::b_minmax(cx, false, &{args}, &{kwargs}).await",
             "max": f"{RT}::methods::b_minmax(cx, true, &{args}, &{kwargs}).await",
+            # an awaitable, like CPython: the generator advances when it is awaited
+            "anext": f"{{ let __it = {args}[0].clone(); Ok::<V, Exc>({RT}::aio::coro(Box::pin(async move {{ {RT}::agen::anext(&__it).await }}))) }}",
         }
         if name in simple:
             return self.q(simple[name])
@@ -4189,7 +4471,10 @@ class RouteBuilder:
             dep_call, dmod, dscope = find({"Depends", "Security"})
             pcall, pmod, pscope = find({"Query", "Path", "Body", "Header", "Cookie", "Form", "File"})
             name = arg.arg
-            if self.is_ext(amod, ann, ascope, "sqlalchemy.ext.asyncio.AsyncSession", "sqlalchemy.ext.asyncio.session.AsyncSession"):
+            sync_sess = self.is_ext(amod, ann, ascope, "sqlalchemy.orm.Session", "sqlalchemy.orm.session.Session")
+            if sync_sess and not (dep_call is not None and dep_call.args):
+                raise TranspileError(f"{name}: a synchronous Session parameter needs Depends(<session dependency>)", arg, src)
+            if sync_sess or self.is_ext(amod, ann, ascope, "sqlalchemy.ext.asyncio.AsyncSession", "sqlalchemy.ext.asyncio.session.AsyncSession"):
                 if dep_call is not None and dep_call.args:
                     t = self.p.resolve(dmod, dep_call.args[0], dscope)
                     if isinstance(t, Sym):
@@ -4588,19 +4873,31 @@ def emit_descriptors(p: Project) -> list[str]:
             if not f.get("any"):
                 ann, module = f["ann"]
                 field_tds[info.rust] |= refs(p.td(ann, module, dict(f.get("cons", {}))))
+    def closure(base: set) -> set:
+        changed = True
+        while changed:
+            changed = False
+            for r, deps in field_tds.items():
+                if r not in base and deps & base:
+                    base.add(r)
+                    changed = True
+        return base
+
     has_before = {i.rust for i in p.schemas.values() if i.__dict__.get("before") or i.__dict__.get("model_before")}
     has_before |= {rust for sym, (rust, _, _) in p.enums.items() if p.__dict__.get("enum_missing", {}).get(sym)}
-    changed = True
-    while changed:
-        changed = False
-        for r, deps in field_tds.items():
-            if r not in has_before and deps & has_before:
-                has_before.add(r)
-                changed = True
+    has_before = closure(has_before)
+    # after validators run once the member is chosen: a raising one would make Pydantic try the next member
+    has_after = closure({i.rust for i in p.schemas.values() if i.validators or i.__dict__.get("model_after")})
+    names = {i.rust: i.sym.name for i in p.schemas.values()}
     for init, td in p.tds.items():
-        if "TD::Union(" in init and refs(td) & has_before:
-            raise TranspileError(f"a Union containing {sorted(refs(td) & has_before)[0]} (mode='before' validators) "
-                                 "is not supported")
+        if "TD::Union(" not in init:
+            continue
+        node, module = p.__dict__.get("union_src", {}).get(init, (None, None))
+        for bad, what in ((refs(td) & has_before, "mode='before' validators"),
+                          (refs(td) & has_after, "validators, which would make Pydantic try the next member when they raise")):
+            if bad:
+                msg = f"a Union containing {names.get(sorted(bad)[0], sorted(bad)[0])} ({what}) is not supported"
+                raise p.err(msg, node, module) if node is not None else TranspileError(msg)
     for info in list(p.schemas.values()):
         fields = []
         for f in info.fields:
@@ -4621,7 +4918,8 @@ def emit_descriptors(p: Project) -> list[str]:
                 f"default: {RT}::pyd::Dflt::{f['default']}, env: None, validate_default: {str(bool(f.get('validate_default'))).lower()} }}"
             )
         validators = ", ".join(
-            f"{RT}::pyd::ValidatorDesc {{ fields: &[{', '.join(rs(n) for n in names)}], f: {method_wrapper(p, s)} }}"
+            f"{RT}::pyd::ValidatorDesc {{ fields: &[{', '.join(rs(n) for n in names)}], f: {method_wrapper(p, s)}, "
+            f"info: {info.__dict__.get('vinfo', {}).get(s, 0)} }}"
             for names, s in info.validators
         )
         methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
@@ -4638,14 +4936,17 @@ def emit_descriptors(p: Project) -> list[str]:
             f"populate_by_name: {str(bool(info.__dict__.get('populate_by_name'))).lower()}, methods: &[{methods}], "
             f"open: {str(bool(info.__dict__.get('open'))).lower()}, "
             f"model_after: &[{', '.join(f'{method_wrapper(p, m)} as {RT}::pyd::MethodFn' for m in info.__dict__.get('model_after', []))}], "
-            f"before: &[{', '.join(f'{RT}::pyd::ValidatorDesc {{ fields: &[{chr(44).join(rs(n) for n in names)}], f: {method_wrapper(p, s_)} }}' for names, s_ in info.__dict__.get('before', []))}], "
+            f"before: &[{', '.join(f'{RT}::pyd::ValidatorDesc {{ fields: &[{chr(44).join(rs(n) for n in names)}], f: {method_wrapper(p, s_)}, info: 0 }}' for names, s_ in info.__dict__.get('before', []))}], "
             f"model_before: &[{', '.join(f'{method_wrapper(p, m)} as {RT}::pyd::MethodFn' for m in info.__dict__.get('model_before', []))}], "
             f"has_before: {str(info.rust in has_before).lower()}, "
             f"frozen: {str(bool(info.__dict__.get('frozen'))).lower()}, "
             f"post_init: {('Some(' + method_wrapper(p, info.__dict__['post_init']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('post_init') else 'None'}, "
             f"hash: {RT}::pyd::HashKind::{hash_kind(info)}, dataclass: {str(bool(info.__dict__.get('dataclass'))).lower()}, "
             f"async_methods: {async_names(p, info.methods)}, "
-            f"slots: &[{', '.join(rs(x) for x in info.__dict__.get('slots', []))}] }};"
+            f"slots: &[{', '.join(rs(x) for x in info.__dict__.get('slots', []))}], "
+            f"settings: {settings_desc(info)}, "
+            f"computed: &[{', '.join(computed_entry(p, info, n) for n in info.__dict__.get('computed', []))}], "
+            f"init: {('Some(' + method_wrapper(p, info.__dict__['init']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('init') else 'None'} }};"
         )
     # INSERT order: rank = 1 + the highest rank of the tables a model references (cycles cut)
     by_table = {m.table: m for m in p.models.values()}
@@ -4675,7 +4976,8 @@ def emit_descriptors(p: Project) -> list[str]:
             f"{RT}::orm::RelDesc {{ name: {rs(r['name'])}, target: &{p.models[r['target']].rust}, m2o: {b(r['m2o'])}, "
             f"local: {r['local']}, remote: {r['remote']}, uselist: {b(r['uselist'])}, lazy: {RT}::orm::Lazy::{r['lazy']}, "
             f"back: {'Some(' + rs(r['back']) + ')' if r['back'] else 'None'}, delete: {b(r['delete'])}, "
-            f"orphan: {b(r['orphan'])}, passive_deletes: {b(r['passive_deletes'])} }}"
+            f"orphan: {b(r['orphan'])}, passive_deletes: {b(r['passive_deletes'])}, "
+            f"order: &[{', '.join(f'({i}, {b(d)})' for i, d in r.get('order', []))}] }}"
             for r in (info.rels or [])
         )
         fks = ", ".join(f"({i}, {rs(c['fk'])}, {rs(c.get('fk_col') or 'id')})" for i, c in enumerate(info.cols) if c.get("fk"))
@@ -4712,11 +5014,20 @@ def async_names(p: "Project", methods) -> str:
     return "&[" + ", ".join(out) + "]"
 
 # dunder methods the runtime dispatches to (str(), repr(), ==/!= and the containers' comparisons)
-DISPATCHED_DUNDERS = {"__str__", "__repr__", "__eq__", "__aenter__", "__aexit__", "__enter__", "__exit__"}
+DISPATCHED_DUNDERS = {"__str__", "__repr__", "__eq__", "__aenter__", "__aexit__", "__enter__", "__exit__", "__call__"}
 
 
 def is_dunder(name: str) -> bool:
     return name.startswith("__") and name.endswith("__")
+
+
+def settings_desc(info) -> str:
+    """A BaseSettings class's environment options, for calling the class held as a value (`type(s)()`)."""
+    if not info.settings:
+        return "None"
+    none = f"Some({rs(info.env_none)})" if info.env_none is not None else "None"
+    return (f"Some({RT}::pyd::SettingsDesc {{ prefix: {rs(info.env_prefix)}, "
+            f"case_sensitive: {'true' if info.case_sensitive else 'false'}, none_str: {none} }})")
 
 
 def hash_kind(info) -> str:
@@ -4803,14 +5114,27 @@ def function_wrapper(p: Project, sym: Sym) -> str:
             else:
                 vals.append(f"__s[{i}].take().unwrap_or(V::None)")
         qual = sym.name.split(".")[-1] + "()" if "." not in sym.name else sym.name + "()"
+        if has_yield(node):
+            # an async generator: the call binds its arguments, the body waits for the first __anext__
+            binds = "".join(f"    let __a{i} = {v};\n" for i, v in enumerate(vals))
+            call = (f"{binds}    let cx2 = cx.clone();\n    Ok({RT}::web::spawn_gen(move |y| Box::pin(async move {{ "
+                    f"{rust}(&cx2{''.join(f', __a{i}' for i in range(len(vals)))}, &y).await }})))")
+        else:
+            call = f"    {rust}(cx, {', '.join(vals)}).await"
         p.items.append(
             f"fn {name}<'a>(cx: &'a Cx, _slf: V, args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{\n"
             f"    let (args, kwargs) = {RT}::unpack(args);\n"
             f"    let mut __s = {RT}::bind_params({rs(qual)}, 0, args, kwargs, &[{spec}])?;\n"
             f"    let _ = &mut __s;\n"
-            f"    {rust}(cx, {', '.join(vals)}).await\n}}) }}"
+            f"{call}\n}}) }}"
         )
     return name
+
+
+def computed_entry(p, info, name: str) -> str:
+    """A `@computed_field` of a schema: its most derived property."""
+    sym = [s for n, _, s in info.methods if n == name][-1]
+    return f"({rs(name)}, {method_wrapper(p, sym)} as {RT}::pyd::MethodFn)"
 
 
 def method_wrapper(p: Project, sym: Sym) -> str:
@@ -4870,7 +5194,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.8"
-tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }}
+tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }}
 futures-util = "0.3"
 sqlx = {{ version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "json", "uuid"] }}
 serde = {{ version = "1", features = ["derive"] }}
@@ -4952,7 +5276,7 @@ async fn main() {{
             Ok(())
         }}))
         .connect_lazy_with(opts);
-    let app = Arc::new(dynrt::AppState {{ pool, expire_on_commit: {expire}, autoflush: {autoflush}, commit_after: {commit} }});
+    let app = Arc::new(dynrt::AppState {{ pool, expire_on_commit: {expire}, autoflush: {autoflush}, commit_after: {commit}, sync_session: {sync} }});
     dynrt::set_root(app.clone());
     dynrt::set_python({pymajor}, {pyminor});
     dynrt::set_pydantic("{pydantic}");
@@ -4965,12 +5289,41 @@ async fn main() {{
         std::process::exit(1);
     }}
     let router = gen::router(app.clone()){layers};
+    // FastAPI(lifespan=...): its code before `yield` runs before the server listens, the rest after it stops
+    let lcx = dynrt::root_cx();
+    let lifespan = match gen::lifespan(&lcx).await {{
+        Ok(None) => None,
+        Ok(Some(f)) => match dynrt::web::lifespan_start(&lcx, f).await {{
+            Ok(cm) => Some(cm),
+            Err(e) => {{
+                eprintln!("ERROR:    {{:?}}\nERROR:    Application startup failed. Exiting.", e);
+                std::process::exit(3);
+            }}
+        }},
+        Err(e) => {{
+            eprintln!("ERROR:    {{:?}}\nERROR:    Application startup failed. Exiting.", e);
+            std::process::exit(3);
+        }}
+    }};
     let addr = format!("{{}}:{{}}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     eprintln!("listening on http://{{addr}}");
-    axum::serve(listener, router.with_state(app).into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .await
-        .expect("server");
+    let serve = axum::serve(listener, router.with_state(app).into_make_service_with_connect_info::<std::net::SocketAddr>());
+    match lifespan {{
+        None => serve.await.expect("server"),
+        Some(cm) => {{
+            // in-flight requests finish (bounded: an endless stream would hold the shutdown forever)
+            tokio::select! {{
+                r = serve.with_graceful_shutdown(dynrt::web::shutdown_signal()) => r.expect("server"),
+                _ = dynrt::web::shutdown_deadline() => {{}}
+            }}
+            if let Err(e) = dynrt::web::lifespan_end(&lcx, cm).await {{
+                eprintln!("ERROR:    {{:?}}\nERROR:    Application shutdown failed. Exiting.", e);
+            }}
+            // like the interpreter: the process ends here (threads still using the runtime included)
+            std::process::exit(0);
+        }}
+    }}
 }}
 """
 
@@ -5039,9 +5392,10 @@ def prepare(fe: Frontend, python_side: set[str]):
     fe.collect = collect
     kept = []
     for e in fe.global_errors:
-        if e.node is not None and e.file and stack_node(fe, fe.index.module_of(e.file).name, e.node):
-            continue  # compiled into the middleware stack (generate_project)
         txt = e.render()
+        if (e.node is not None and e.file and stack_node(fe, fe.index.module_of(e.file).name, e.node)
+                and not ("add_route" in txt and (_route_path(fe, e) in python_side or fe.__dict__.get("auto_side") is not None))):
+            continue  # compiled into the middleware stack (generate_project)
         if "add_route" in txt and isinstance(e.node, ast.Call) and e.node.args:
             mod = fe.index.module_of(e.file).name
             try:
@@ -5065,9 +5419,8 @@ def prepare(fe: Frontend, python_side: set[str]):
             if isinstance(node, ast.Call) and dotted(node.func) in {"FastAPI", "fastapi.FastAPI"}:
                 for kw in node.keywords:
                     if kw.arg == "lifespan" and "lifespan" not in python_side:
-                        kept.append(TranspileError(
-                            "FastAPI(lifespan=...) is not translated: declare it Python-side with --python-side lifespan",
-                            kw, str(m.path)))
+                        if not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
+                            fe.lifespan = (m.name, kw.value)  # compiled natively (generate_project)
                     elif kw.arg in FASTAPI_DOC_OPTIONS or kw.arg == "lifespan":
                         pass  # OpenAPI/docs metadata: no effect on the translated routes (/docs is not served)
                     elif kw.arg == "debug" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
@@ -5084,6 +5437,16 @@ def prepare(fe: Frontend, python_side: set[str]):
 MW_CORS = {"starlette.middleware.cors.CORSMiddleware", "fastapi.middleware.cors.CORSMiddleware"}
 MW_BASE = {"starlette.middleware.base.BaseHTTPMiddleware", "fastapi.middleware.base.BaseHTTPMiddleware"}
 MW_GZIP = {"starlette.middleware.gzip.GZipMiddleware", "fastapi.middleware.gzip.GZipMiddleware"}
+
+
+def _route_path(fe: Frontend, e: TranspileError):
+    """The literal path of an `add_route(...)` global error, else None."""
+    if not (isinstance(e.node, ast.Call) and e.node.args):
+        return None
+    try:
+        return Project(fe).const(e.node.args[0], fe.index.module_of(e.file).name)
+    except TranspileError:
+        return None
 
 
 def mw_kind(fe: Frontend, module: str, call: ast.Call) -> str | None:
@@ -5112,11 +5475,22 @@ def stack_deco(fe: Frontend, module: str, d: ast.AST) -> str | None:
     return None
 
 
+def is_add_route(fe: Frontend, module: str, node: ast.AST) -> bool:
+    """`app.add_route(...)` / `app.router.add_route(...)`."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add_route"):
+        return False
+    owner = node.func.value
+    return fe._is_app(module, owner) or (isinstance(owner, ast.Attribute) and owner.attr == "router"
+                                         and fe._is_app(module, owner.value))
+
+
 def stack_node(fe: Frontend, module: str, node: ast.AST) -> bool:
     """A registration the middleware stack compiles (so not a global error)."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr == "add_middleware" and fe._is_app(module, node.func.value):
             return mw_kind(fe, module, node) in {"cors", "base", "user"}
+        if is_add_route(fe, module, node):
+            return True  # run while the stack is built, like Starlette registering the route
         return stack_deco(fe, module, node) is not None
     return False
 
@@ -5230,6 +5604,244 @@ FRAMEWORK_CALLS = {"include_router", "add_middleware", "mount", "add_api_route",
                    "add_websocket_route", "add_event_handler"}
 
 
+MCP_SERVER = "mcp.server.mcpserver.MCPServer"
+MCP_TOOL_KW = {"name", "title", "description"}
+# BaseModel attributes FastMCP renames a parameter after (alias + `field_` prefix): refused
+BASEMODEL_CALLABLES = {"copy", "dict", "json", "schema", "schema_json", "validate", "construct", "parse_obj", "parse_raw",
+                       "parse_file", "from_orm", "update_forward_refs"}
+
+
+def mcp_servers(p: "Project") -> dict:
+    """Module globals `X = MCPServer(...)`: {Sym: call}."""
+    found = p.__dict__.get("_mcp_servers")
+    if found is None:
+        found = {}
+        for m in p.fe.index.package_modules():
+            for st in m.tree.body:
+                target = st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else (
+                    st.target if isinstance(st, ast.AnnAssign) else None)
+                value = getattr(st, "value", None)
+                if isinstance(target, ast.Name) and isinstance(value, ast.Call):
+                    t = p.resolve(m.name, value.func)
+                    if isinstance(t, Ext) and t.dotted == MCP_SERVER:
+                        found[Sym(m.name, target.id)] = value
+        p.__dict__["_mcp_servers"] = found
+    return found
+
+
+def mcp_deco_server(p: "Project", module: str, d: ast.AST):
+    """The server of a `@server.tool(...)` decorator, else None."""
+    f = d.func if isinstance(d, ast.Call) else d
+    if isinstance(f, ast.Attribute) and f.attr == "tool" and isinstance(f.value, (ast.Name, ast.Attribute)):
+        t = p.resolve(module, f.value)
+        if isinstance(t, Sym) and t in mcp_servers(p):
+            return t
+    return None
+
+
+def mcp_tool_decorator(p: "Project", fc: "FnCompiler", sym: Sym, node, d) -> str | None:
+    """`@server.tool(name=, title=, description=)` on a project function: the runtime decorator with the
+    tool's spec computed here (FastMCP's argument model, its JSON schema), else None."""
+    if mcp_deco_server(p, sym.module, d) is None:
+        return None
+    spec = mcp_tool_spec(p, sym, node, d)
+    return fc.q(f"{RT}::mcp::tool_decorator(&{fc.expr(d.func.value)}, &{spec})")
+
+
+def mcp_tool_spec(p: "Project", sym: Sym, node, d) -> str:
+    from .jsonschema import SchemaGen
+
+    module = sym.module
+    err = lambda msg, n: TranspileError(msg, n, p.src(module))  # noqa: E731
+    if not isinstance(d, ast.Call):
+        raise err("@server.tool without parentheses is not supported (FastMCP requires @server.tool())", d)
+    if not isinstance(node, ast.AsyncFunctionDef) or has_yield(node):
+        raise err(f"MCP tool {node.name}: only `async def` functions are supported (a sync tool runs in a thread)", node)
+    opts = {}
+    if d.args:
+        if len(d.args) > 1:
+            raise err("@server.tool(): only the name may be positional", d)
+        opts["name"] = d.args[0]
+    for k in d.keywords:
+        if k.arg not in MCP_TOOL_KW:
+            raise err(f"@server.tool({k.arg}=...) is not supported (name, title, description)", k)
+        opts[k.arg] = k.value
+    vals = {}
+    for k, v in opts.items():
+        if not (isinstance(v, ast.Constant) and isinstance(v.value, str)):
+            try:
+                vals[k] = p.const(v, module)
+            except TranspileError:
+                raise err(f"@server.tool({k}=...) must be a constant string", v) from None
+            if not isinstance(vals[k], str):
+                raise err(f"@server.tool({k}=...) must be a constant string", v)
+        else:
+            vals[k] = v.value
+    ret = node.returns
+    ok_ret = (isinstance(ret, ast.Subscript) and p.resolve(module, ret.value) in (None,) and isinstance(ret.value, ast.Name)
+              and ret.value.id == "dict" and isinstance(ret.slice, ast.Tuple) and len(ret.slice.elts) == 2
+              and isinstance(ret.slice.elts[0], ast.Name) and ret.slice.elts[0].id == "str"
+              and p.resolve(module, ret.slice.elts[1]) == Ext("typing.Any"))
+    if not ok_ret:
+        raise err(f"MCP tool {node.name}: only the return annotation dict[str, Any] is supported (structured output)",
+                  ret or node)
+    a = node.args
+    for q in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
+        if q.arg.startswith("_"):
+            raise err(f"MCP tool {node.name}: parameter {q.arg} cannot start with '_' (FastMCP refuses it)", q)
+        if q.arg in BASEMODEL_CALLABLES or q.arg.startswith("model_"):
+            raise err(f"MCP tool {node.name}: parameter {q.arg} shadows a BaseModel attribute (FastMCP aliases it)", q)
+    schema = SchemaGen(p).arguments(node, module)
+    # FastMCP's `<function>Arguments` model, as a project schema compiled like any other
+    asym = Sym(module, f"{node.name}Arguments")
+    if asym not in p.fe.schema_syms:
+        body = []
+        defaults = [None] * (len(a.args) - len(a.defaults)) + list(a.defaults) + list(a.kw_defaults)
+        for q, dflt in zip([*a.args, *a.kwonlyargs], defaults):
+            st = ast.AnnAssign(target=ast.Name(q.arg, ast.Store()), annotation=q.annotation, value=dflt, simple=1)
+            body.append(ast.copy_location(st, q))
+        cls = ast.copy_location(ast.ClassDef(name=asym.name, bases=[], keywords=[], body=body, decorator_list=[],
+                                             type_params=[]), node)
+        p.fe.schema_syms[asym] = cls
+    info = p.schema(asym)
+    params = []
+    for q in [*a.args, *a.kwonlyargs]:
+        inner = q.annotation
+        if isinstance(inner, ast.Subscript) and (dotted(inner.value) or "").split(".")[-1] == "Annotated":
+            inner = inner.slice.elts[0] if isinstance(inner.slice, ast.Tuple) else inner.slice
+        params.append((q.arg, isinstance(inner, ast.Name) and inner.id == "str"))
+    name = vals.get("name", node.name)
+    desc = vals.get("description", fn_doc(p, node) or "")
+    out = json.dumps({"type": "object", "additionalProperties": True, "title": f"{node.name}DictOutput"},
+                     separators=(",", ":"))
+    static = f"MCP_TOOL_{mod_ident(module)}__{ident(node.name)}"
+    if static not in p.__dict__.setdefault("_mcp_specs", set()):
+        p._mcp_specs.add(static)
+        title = f"Some({rs(vals['title'])})" if "title" in vals else "None"
+        plist = ", ".join(f"({rs(n)}, {str(b).lower()})" for n, b in params)
+        p.items.append(
+            f"/// @tool {name} ({p.rel_file(module)}:{node.lineno})\n"
+            f"pub static {static}: {RT}::mcp::ToolSpec = {RT}::mcp::ToolSpec {{ name: {rs(name)}, title: {title}, "
+            f"description: {rs(desc)}, input_schema: {rs(json.dumps(schema, separators=(',', ':'), ensure_ascii=False))}, "
+            f"output_schema: {rs(out)}, args: &{info.rust}, params: &[{plist}] }};")
+    return static
+
+
+MCP_SERVER_ATTRS = {"tool", "streamable_http_app", "session_manager"}
+
+
+def mcp_check(p: "Project", fe: Frontend) -> None:
+    """The MCP servers' use in the project stays within what dynrt/mcp.rs implements (refused otherwise)."""
+    servers = mcp_servers(p)
+    if not servers:
+        return
+    for m in fe.index.package_modules():
+        file = str(m.path)
+        parents = {}
+        for n in ast.walk(m.tree):
+            for c in ast.iter_child_nodes(n):
+                parents[c] = n
+        for n in ast.walk(m.tree):
+            if not (isinstance(n, ast.Attribute) and isinstance(n.value, (ast.Name, ast.Attribute))):
+                continue
+            t = p.resolve(m.name, n.value)
+            if not (isinstance(t, Sym) and t in servers):
+                continue
+            if n.attr not in MCP_SERVER_ATTRS:
+                raise TranspileError(f"MCPServer.{n.attr} is not supported (tools only: @server.tool, "
+                                     "streamable_http_app, session_manager)", n, file)
+            up = parents.get(n)
+            if n.attr == "tool":
+                deco = up if isinstance(up, ast.Call) and up.func is n else n
+                owner = parents.get(deco)
+                if not (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)) and deco in owner.decorator_list):
+                    raise TranspileError("server.tool(...) is only supported as a decorator", n, file)
+            elif n.attr == "session_manager":
+                if not (isinstance(up, ast.Attribute) and up.attr in {"run", "handle_request"}):
+                    raise TranspileError("server.session_manager: only .run() and .handle_request(scope, receive, send) "
+                                         "are supported", n, file)
+            elif n.attr == "streamable_http_app":
+                call = up if isinstance(up, ast.Call) and up.func is n else None
+                kw = {k.arg: k.value for k in call.keywords} if call else None
+                if call is None or call.args or kw is None or set(kw) - {"stateless_http", "json_response", "transport_security"}:
+                    raise TranspileError("streamable_http_app(): only stateless_http=True, json_response=True, "
+                                         "transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)",
+                                         n, file)
+                for k in ("stateless_http", "json_response"):
+                    if not (isinstance(kw.get(k), ast.Constant) and kw[k].value is True):
+                        raise TranspileError(f"streamable_http_app({k}=True) is required: sessions and SSE responses "
+                                             "are not supported", call, file)
+                ts = kw.get("transport_security")
+                if not (isinstance(ts, ast.Call)
+                        and p.resolve(m.name, ts.func) == Ext("mcp.server.transport_security.TransportSecuritySettings")):
+                    raise TranspileError("streamable_http_app(): transport_security=TransportSecuritySettings("
+                                         "enable_dns_rebinding_protection=False) is required (Host/Origin checks are "
+                                         "not supported)", call, file)
+
+
+def mcp_register(p: "Project", fe: Frontend) -> None:
+    """The `@server.tool(...)` functions are registered at import in Python: built at startup here too."""
+    servers = mcp_servers(p)
+    if not servers:
+        return
+    p.cur = ("mcp", 0)
+    try:
+        mcp_check(p, fe)
+        for m in fe.index.package_modules():
+            for st in m.tree.body:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                        mcp_deco_server(p, m.name, d) for d in st.decorator_list):
+                    p.decorated_value(Sym(m.name, st.name))
+        p.drain()
+    except TranspileError as e:
+        if not p.collect:
+            raise
+        fe.global_errors.append(e)
+    finally:
+        p.cur = None
+
+
+def lifespan_fn(p: "Project", fe: Frontend) -> str:
+    """`pub async fn lifespan`: the value of `FastAPI(lifespan=...)` (an `@asynccontextmanager` function or an
+    async generator function, called with the app before the server listens), None without one."""
+    spec = fe.__dict__.get("lifespan")
+    if spec is None:
+        return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
+    module, value = spec
+    t = p.resolve(module, value) if isinstance(value, (ast.Name, ast.Attribute)) else None
+    d = p.ix.definition(t) if isinstance(t, Sym) else None
+    if not isinstance(d, ast.AsyncFunctionDef) or not has_yield(d):
+        e = TranspileError("FastAPI(lifespan=...): only an `async def` generator of the project (decorated with "
+                           "@asynccontextmanager or not) is supported", value, p.src(module))
+        if not p.collect:
+            raise e
+        fe.global_errors.append(e)
+        return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
+    for n in walk_scope(d):
+        if isinstance(n, ast.Yield) and n.value is not None and not (isinstance(n.value, ast.Constant) and n.value.value is None):
+            e = TranspileError("lifespan state (`yield <value>` in the lifespan) is not supported: use module globals",
+                               n, p.src(t.module))
+            if not p.collect:
+                raise e
+            fe.global_errors.append(e)
+            return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
+    p.cur = ("lifespan", 0)
+    fc = FnCompiler(p, module, None, "lifespan")
+    try:
+        code = fc.expr(value)
+        p.drain()
+    except TranspileError as e:
+        if not p.collect:
+            raise
+        fe.global_errors.append(e)
+        return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
+    finally:
+        p.cur = None
+    body = "\n".join("    " + l for l in fc.lines)
+    return (f"/// FastAPI(lifespan={ast.unparse(value)}) ({p.rel_file(module)}:{value.lineno})\n"
+            f"pub async fn lifespan(cx: &Cx) -> R<Option<V>> {{\n{body}\n    Ok(Some({code}))\n}}")
+
+
 def module_statements(p: "Project", fe: Frontend) -> None:
     """Module-level call statements (`INI.set_main_option(...)`, `logger.setLevel(...)`) of the modules the
     translation uses, compiled to run at startup in their place among the module's globals."""
@@ -5325,6 +5937,22 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                                      n, p.src(module))
 
     def middleware(fc: "FnCompiler", module: str, call: ast.Call) -> None:
+        if is_add_route(fe, module, call):
+            path = _route_path(fe, TranspileError("", call, p.src(module)))
+            if path in fe.python_side:
+                return  # proxied to the Python side
+            ep = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == "route"), None)
+            t = p.resolve(module, ep) if isinstance(ep, (ast.Name, ast.Attribute)) else None
+            if isinstance(t, Sym) and isinstance(p.ix.definition(t), ast.ClassDef):
+                raise TranspileError("add_route() with a class endpoint (HTTPEndpoint, raw ASGI class) is not supported: "
+                                     "pass an instance or a function", ep, p.src(module))
+            names = {n.id for n in ast.walk(call.func) if isinstance(n, ast.Name)}
+            fc.__dict__["app_alias"] = names
+            try:
+                fc.emit(f"let _ = {fc.expr(call)};")
+            finally:
+                fc.__dict__.pop("app_alias")
+            return
         kind = mw_kind(fe, module, call)
         if any(k.arg is None for k in call.keywords) or any(isinstance(a, ast.Starred) for a in call.args):
             raise TranspileError("add_middleware(*args/**kwargs) is not supported", call, p.src(module))
@@ -5601,10 +6229,12 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         fe.global_errors.append(e)
         stack = ""
     proj.cur = None
+    mcp_register(proj, fe)
+    lifespan = lifespan_fn(proj, fe)
     finalize(proj)
     if collect:
         # a middleware that cannot be compiled blocks every route
-        keys = {("stack", 0)} | {k for k in proj.fn_errors
+        keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
                                  if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
                                         for c in proj.__dict__.get("stack_classes", []))}
         seen = set()
@@ -5617,13 +6247,14 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     for info, err in proj.__dict__.get("route_infos", []):
         for e in ([err] if err else []) + closure_errors(proj, info["id"]):
             raise e
-    stack_keys = {("stack", 0)} | {k for k in proj.fn_errors
+    stack_keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
                                    if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
                                           for c in proj.__dict__.get("stack_classes", []))}
     for k in stack_keys:
         for e in closure_errors(proj, k):
             raise e
     proj.items.append(stack)
+    proj.items.append(lifespan)
     # module globals (and the app factory's locals) evaluated at startup, as importing the app does
     order = {name: i for i, name in enumerate(import_order(fe))}
     keep = set(proj.globals.values()) | proj.__dict__.get("modst", set())
@@ -5690,10 +6321,10 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     lock = Path(__file__).parent / "runtime" / "Cargo.lock"
     if lock.exists() and not (out_dir / "Cargo.lock").exists():
         (out_dir / "Cargo.lock").write_text(lock.read_text().replace('name = "dynapp_axum"', f'name = "{crate_name}"'))
-    commit, expire, autoflush = getattr(proj, "session_cfg", (False, proj.expire_on_commit, True))
+    commit, expire, autoflush, sync = getattr(proj, "session_cfg", (False, proj.expire_on_commit, True, False))
     b = lambda x: str(x).lower()  # noqa: E731
     pyver = target_python(fe.index.root)
-    (out_dir / "src" / "main.rs").write_text(MAIN.format(expire=b(expire), autoflush=b(autoflush), commit=b(commit), layers=layers,
+    (out_dir / "src" / "main.rs").write_text(MAIN.format(expire=b(expire), autoflush=b(autoflush), commit=b(commit), sync=b(sync), layers=layers,
                                                          pymajor=pyver[0], pyminor=pyver[1],
                                                          pydantic=".".join((locked_version(fe.index.root, "pydantic") or "2.13").split(".")[:2]),
                                                          python_side=", ".join(rs(x) for x in sorted(fe.__dict__.get("python_side", ())) if x.startswith("/"))))
@@ -5711,7 +6342,29 @@ METHOD_KWARGS = {
     "model_copy": {"update", "deep"},
 }
 
+# calls whose string arguments or keywords name attributes of the objects they make or change
+ATTR_NAMING_CALLS = {"label", "setattr", "getattr", "hasattr", "namedtuple", "NamedTuple", "make_dataclass",
+                     "SimpleNamespace", "column", "literal_column", "alias", "type"}
+
 _RUNTIME_NAMES: set[str] | None = None
+_RUNTIME_ATTRS: set[str] | None = None
+
+
+def runtime_attr_names() -> set[str]:
+    """The names the runtime dispatches on (`runtime_names`), compares to (`name == "x"`), keeps in a table
+    (`("x", value)`, `&["x", "y"]`) or declares as a field (`name: "x"`): over-approximates the attributes
+    some runtime value provides, so a name outside it is certainly missing."""
+    global _RUNTIME_ATTRS
+    if _RUNTIME_ATTRS is None:
+        names, ident = set(runtime_names()), r'"([A-Za-z_][A-Za-z0-9_]*)"'
+        for f in (Path(__file__).parent / "runtime" / "dynrt").glob("*.rs"):
+            src = f.read_text()
+            for pat in (rf"==\s*{ident}", rf"{ident}\s*==", rf"\(\s*{ident}\s*,", rf"\bname:\s*{ident}"):
+                names |= set(re.findall(pat, src))
+            for table in re.findall(r'&\[((?:\s*"[A-Za-z_][A-Za-z0-9_]*"\s*,?)+)\s*\]', src):
+                names |= set(re.findall(ident, table))
+        _RUNTIME_ATTRS = names
+    return _RUNTIME_ATTRS
 
 
 def runtime_names() -> set[str]:

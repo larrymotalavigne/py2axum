@@ -509,6 +509,9 @@ pub static NAMESPACE: pyd::SchemaDesc = pyd::SchemaDesc {
     dataclass: false,
     async_methods: &[],
     slots: &[],
+    settings: None,
+    init: None,
+    computed: &[],
 };
 
 /// `types.SimpleNamespace(**kwargs)`

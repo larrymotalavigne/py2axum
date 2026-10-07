@@ -166,6 +166,8 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
         V::Native(n) => match &**n {
             Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) => Ok(v.clone()),
             Native::Sem(s) => sem_method(s, "__aenter__").await,
+            Native::Acm(g) => super::agen::acm_enter(g).await,
+            Native::McpRun => Ok(V::None),
             _ => Err(no_acm(v)),
         },
         V::Session(_) => Ok(v.clone()),
@@ -191,6 +193,11 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
             let Native::Sem(s) = &**n else { unreachable!() };
             sem_method(s, "__aexit__").await
         }
+        V::Native(n) if matches!(&**n, Native::McpRun) => Ok(V::Bool(false)),
+        V::Native(n) if matches!(&**n, Native::Acm(_)) => {
+            let Native::Acm(g) = &**n else { unreachable!() };
+            super::agen::acm_exit(g, exc).await
+        }
         V::Native(n) if matches!(&**n, Native::AmqpConn(_)) => {
             let Native::AmqpConn(c) = &**n else { unreachable!() };
             super::rmq::conn_method(c, "close", &[]).await?;
@@ -211,13 +218,14 @@ pub async fn collect(cx: &Cx, it: V) -> R {
             return Ok(V::list(items.lock().take().unwrap_or_default()));
         }
         if let Native::Gen(g) = &**n {
-            let rx = g.lock().take();
-            let Some(mut rx) = rx else { return Ok(V::list(vec![])) };
             let mut out = Vec::new();
-            while let Some(v) = rx.recv().await {
-                out.push(v);
+            loop {
+                match g.asend(V::None).await {
+                    Ok(v) => out.push(v),
+                    Err(e) if e.isinstance(&STOP_ASYNC_ITERATION) => return Ok(V::list(out)),
+                    Err(e) => return Err(e),
+                }
             }
-            return Ok(V::list(out));
         }
     }
     Err(Exc::type_error(format!("'async for' requires an object with __aiter__ method, got {}", it.type_name())))

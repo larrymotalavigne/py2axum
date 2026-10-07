@@ -38,8 +38,7 @@ FILES = {
             label: Mapped[str] = mapped_column(String(50))
     ''',
     "proj/schemas.py": '''
-        from decimal import Decimal
-        from pydantic import BaseModel, ConfigDict, Field
+        from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
         class ItemOut(BaseModel):
             model_config = ConfigDict(from_attributes=True)
@@ -47,7 +46,7 @@ FILES = {
             label: str = Field(..., min_length=1)
 
         class Stamped(BaseModel):
-            at: Decimal
+            at: SecretStr
     ''',
     "proj/deps.py": '''
         import jwt
@@ -119,15 +118,15 @@ def test_report(tmp_path):
     # imports: absolute, relative, __init__ re-export, factory app, router prefixes
     assert routes["/api/items/{item_id}"]["status"] == "traduite"
     assert routes["/users/count"]["status"] == "traduite"
-    # dyn backend: the Decimal field blocks the schema, the unmapped lib blocks the dependency; one
+    # dyn backend: the SecretStr field blocks the schema, the unmapped lib blocks the dependency; one
     # blocker per route (compilation of a route's closure stops at its first error)
-    assert set(routes["/api/items/stamp/now"]["blockers"]) == {"type Decimal"}
+    assert set(routes["/api/items/stamp/now"]["blockers"]) == {"type SecretStr"}
     assert set(routes["/api/items/me/info"]["blockers"]) == {"lib jwt"}
     # the second route using the same refused dependency is blocked too (no stale dependency cache)
     assert set(routes["/api/items/me/again"]["blockers"]) == {"lib jwt"}
     assert len(routes["/api/items/me/stamp"]["blockers"]) == 1
     alone = {c["construction"]: c["débloquées_seule"] for c in data["constructions"]}
-    assert alone == {"type Decimal": 2, "lib jwt": 2}
+    assert alone == {"type SecretStr": 2, "lib jwt": 2}
     assert data["glouton"][-1]["cumul"] == 6
     assert data["résumé"] == {"total": 6, "traduites": 2, "bloquées": 4}
 
@@ -168,10 +167,10 @@ def test_python_side_auto_global_error(tmp_path, capsys):
     """An error about the whole application cannot be avoided by moving routes: refused, with file:line."""
     pkg = write_project(tmp_path)
     main_py = pkg / "main.py"
-    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(lifespan=None)"))
+    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(dependencies=[])"))
     assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "main.py" in err and "--python-side lifespan" in err
+    assert "main.py" in err and "FastAPI(dependencies=...) is not supported" in err
     assert "only moves routes" in err
 
 

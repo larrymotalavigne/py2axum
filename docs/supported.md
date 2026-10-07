@@ -2,7 +2,9 @@
 
 py2axum translates a closed subset of Python and of a list of libraries. Anything outside it is refused at
 compile time with `file:line` (and counted by `--report`), so a construct is either translated with the
-behaviour described here or not translated at all. Each item below is covered by conformance cases that
+behaviour described here or not translated at all. Method calls and attribute reads on values only known at run
+time are checked by name: a name that no runtime type implements and that the project never defines is
+refused (a name that exists on another type than the actual receiver is not detected). Each item below is covered by conformance cases that
 compare the binary with the Python application, response by response.
 
 "Differences" are the places where the binary is knowingly not identical to CPython; they are listed so you
@@ -38,6 +40,18 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - An invalid JSON body gives the same 422 `json_invalid` (type, message, position) but `ctx.error` is
   serde_json's message rather than CPython's `json` module message (which itself varies across versions).
 - `Cookie()` parameters are not supported yet.
+
+- Raw ASGI routes: `app.add_route(path, obj, methods=...)` / `app.router.add_route(...)` at module level, with
+  an instance of a project class defining `async def __call__(self, scope, receive, send)` (Starlette runs
+  anything that is not a function or a method as an ASGI app). The app gets an ASGI 3 `scope` dict (the keys
+  uvicorn and Starlette's router set, `scope["app"]` with an empty `dependency_overrides`), `receive` (the
+  body in one `http.request` message, then nothing until the client leaves) and `send`
+  (`http.response.start`/`http.response.body`, streamed when `more_body` is true). `Request(scope, receive)`
+  (the request being served only), a response object called as an ASGI app
+  (`await JSONResponse(...)(scope, receive, send)`), a generator dependency called by hand
+  (`gen = get_session(); s = await anext(gen); ...; await gen.aclose()`). Refused: a class as endpoint
+  (`HTTPEndpoint`). Differences: `allow` of a 405 lists the methods in declaration order (Starlette
+  iterates a set, so its order varies between processes); mutations of `dependency_overrides` are lost.
 
 ## Dependencies and security
 
@@ -109,14 +123,18 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   `use_enum_values`, `model_config` as a dict or `ConfigDict`, v1 `class Config` (v1-only keys ignored like
   Pydantic v2 does).
 - `@field_validator` / `@validator` (after and before, including `_x = field_validator(...)(lambda v: ...)`),
+  `info: ValidationInfo` in after validators (`info.data`: the earlier fields that passed, after their own
+  validators, defaults included; `info.field_name`; other attributes, and `info` in before validators, are
+  refused), v1 `values` (pydantic's own signature rules: `field`/`config` parameters are refused),
   `@model_validator` (before/after); validators that raise produce the 422 at their place. Before
-  validators run on the raw input in reverse definition order, like pydantic-core; a union containing such a
-  model is refused. A union whose branch has a `@field_validator` picks the branch on types only, then runs
-  its validators (Pydantic would try the next branch if they raise).
+  validators run on the raw input in reverse definition order, like pydantic-core. A union with a member
+  that has validators (directly or in a nested model) is refused: Pydantic would try the next member when one
+  raises.
 - `model_dump(mode=, by_alias=, exclude_none=, exclude_unset=, exclude=, include=)` (top-level field names
   for `exclude`/`include`), `model_dump_json`, `model_validate(_json)`, `model_copy(update=, deep=)`,
-  `model_fields_set`, `model_fields`, `ValidationError.errors()` (URL with the locked pydantic version,
-  `include_*` options) and `error_count()`.
+  `model_fields_set`, `model_fields`, `ValidationError.errors()` (URL with the major.minor of the pydantic the
+  project locks, else the one installed next to py2axum; `ctx.error` is the exception raised by the validator,
+  rendered as its attributes by `jsonable_encoder`; `include_*` options) and `error_count()`.
 - `model_config frozen=True` (assignment raises `frozen_instance`; frozen models hash by value),
   `Field(validate_default=True)`, field options given in `Annotated[T, Field(...)]`.
 - `TypeAdapter(T)`: `validate_python` (ORM objects with `from_attributes`, iterables), `validate_json`,
@@ -124,9 +142,25 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - `EmailStr` (rule-by-rule port of email-validator, same messages, except IDNA encoding and NFC normalization
   of internationalized domains, which are accepted and lowercased), `AnyUrl`/`AnyHttpUrl`/`HttpUrl`/`RedisDsn`
   (parsed with the `url` crate like pydantic-core, type defaults, attributes, same errors).
-- pydantic-settings `BaseSettings`: environment variables (not `.env` files), `validate_default=True`;
+- pydantic-settings `BaseSettings`: environment variables (not `.env` files), `validate_default=True`,
+  `env_prefix`, `case_sensitive` (names compared case-insensitively by default, the last of two names that
+  differ only in case wins), `env_parse_none_str` (an environment value equal to it, case included, is
+  `None`; init keywords are not parsed), JSON values for container/model fields (a union with such a
+  member keeps the raw string when the JSON does not parse); other `env_*` options and `_env_*` init keywords are refused;
   a class body run like a script (class-level `if`, attributes reading earlier ones) is evaluated once.
-- Not supported: `@computed_field`, `@field_serializer`/`@model_serializer`, `PrivateAttr`, nested
+- `decimal.Decimal` fields: lax validation like pydantic-core (a float through its `repr`, a string through
+  `Decimal(str)`, finite values only), `max_digits`/`decimal_places` on the normalized value, then
+  `le`/`lt`/`ge`/`gt` (int or float literals); dumped as a string in JSON mode.
+- `@computed_field` (bare, over `@property` or alone): serialized after the fields and the extras,
+  `exclude_none` applies, `exclude_unset` does not. The property must not await. Differences: `repr()` of the
+  model does not show computed fields; with `extra="allow"`, an extra key named like a computed field shadows
+  it on attribute access and in `model_dump_json` (Pydantic writes both keys).
+  `jsonable_encoder` of an integral `Decimal` beyond 64 bits gives a float (Python: an int).
+- A model's own `def __init__(self, **data)` calling `super().__init__(**data)`: run by `Model(...)`;
+  validation from attributes (`from_attributes`, ORM objects) or of an existing instance skips it, as in
+  pydantic-core. Validating such a model from a dict (request body, `model_validate(dict)`, nested), where
+  pydantic-core calls the `__init__`, raises a py2axum RuntimeError (500) instead.
+- Not supported: `@computed_field(...)` options, `@field_serializer`/`@model_serializer`, `PrivateAttr`, nested
   `exclude`/`include` dicts, strict mode.
 
 ## SQLAlchemy 2.0 (async, PostgreSQL)
@@ -134,7 +168,11 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - Declarative models (`Mapped[...]`, `mapped_column`, types, `default=`/`server_default=`/`onupdate=`
   (value, callable or SQL), `unique`, `nullable`, `ForeignKey` (a foreign key without a type takes the
   referenced column's), composite primary keys, `Identity()`, `JSON`/`JSONB` (`none_as_null=`),
-  `Numeric` (`Decimal`, or float with `asdecimal=False`), `Enum` columns, project `TypeDecorator`s
+  `Numeric` (`Decimal`, or float with `asdecimal=False`), `Enum` columns, `LargeBinary` (bytes), `ARRAY(String)`
+  (lists; `contains`/`contained_by`/`overlap`/`any`), `T.with_variant(V, "postgresql")` (V; other dialects' variants
+  are ignored), `col.op("...")(value)` (the value typed like the column, as SQLAlchemy does), a column type returned by a project function
+  (`def _enum(cls, name): return Enum(cls, name=name, ...)`, inlined; its arguments must be literals or names),
+  project `TypeDecorator`s
   (`process_bind_param`/`process_result_value` without `self`/`dialect`). Methods of mapped classes:
   plain, `@property`, `@staticmethod` and `@classmethod` (`cls(...)` builds an instance); other decorators
   (`@hybrid_property`, `@validates`...) are refused.
@@ -144,7 +182,8 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   `get_bind()`. Server-generated values (identity, `server_default`, SQL defaults) are fetched with
   `RETURNING` at insert, like `eager_defaults="auto"`.
 - Relationships (many-to-one, one-to-many), `lazy=` select/selectin/joined/noload/raise, `selectinload()`
-  chains, `back_populates`/`backref`, cascades (save-update, delete, delete-orphan), `passive_deletes`.
+  chains, `back_populates`/`backref`, cascades (save-update, delete, delete-orphan), `passive_deletes`,
+  `order_by=` (target columns, `.desc()`, or a string SQLAlchemy evaluates such as `"[Child.a, Child.b.desc()]"`).
   Difference: `parent.children.append(x)` sets the foreign key at flush but not `x.parent` before it
   (SQLAlchemy does it immediately through the backref event).
 - Core: `select` (entities, columns, labels, `*cols`), `where`/`filter_by`, joins (explicit, inferred from
@@ -162,6 +201,13 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - `obj.__dict__` of a mapped object: `_sa_instance_state` then the loaded attributes (a snapshot).
 - `create_async_engine(...)` is the binary's pool (one database, `DATABASE_URL`; its options are ignored);
   `async with engine.connect() as conn` (rolled back on exit).
+- Synchronous sessions (`create_engine`, `sessionmaker`, `Session` parameters of `def` endpoints, a
+  generator dependency `s = maker()` / `try: yield s` / `finally: s.close()` or `with maker() as s:
+  yield s`): the same session semantics, run on the async pool (FastAPI's threadpool is not modelled:
+  only the observable behaviour is). Reading an expired column or a relationship that is not loaded emits
+  the SQL like SQLAlchemy's lazy loader (autoflush first; `ObjectDeletedError` when the row is gone),
+  including while a `response_model` reads the attributes. An application uses one kind of session
+  dependency (sync or async), not both.
 
 ## Python semantics
 
@@ -184,6 +230,14 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - Types as values: `list[X]`, `X | None`, library classes (`BaseModel`, `AsyncSession`...),
   `isinstance`/`issubclass` with run-time types, `inspect.isclass`, `typing.get_args/get_origin/
   get_type_hints` (annotations kept on decorated functions).
+- `type(x)`: compared with `==`/`is`/`in`, called (`type(x)(...)` for builtin types), `__name__`/`__qualname__`
+  (CPython's names: `Pattern`, `UUID`, `builtin_function_or_method`; a Pydantic model class is a
+  `ModelMetaclass`, an Enum class an `EnumType`). Differences: values the runtime does not tell apart report
+  the type they are stored as (`frozenset` → `set`, iterators and `range` → `list`), a mapped class reports
+  `type`. A project class obtained as a value (`cls(**data)` in a classmethod, `type(m)(a=1)`, a class passed as
+  an argument) is called like the class named in the source: Pydantic model, settings (environment read again),
+  dataclass, plain class, Enum, `SimpleNamespace`, with CPython's `TypeError`s. Difference: pydantic-settings
+  init options (positional arguments, `_env_prefix=`…) on a settings class held as a value raise a `TypeError`.
 - Module globals are evaluated at startup in import order, like importing the app; module-level calls too, and
   module-level `try`, `if`, `for`, `while` and `with` statements, whose bindings are module variables
   (`except E as e` names are deleted as in CPython). A `try` whose body only imports and assigns constants is an
@@ -227,6 +281,52 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   on their own OS threads. Locks block like CPython's.
 - `asyncio.run()` raises CPython's `RuntimeError` (always inside a running loop). Library calls that are not
   awaited (a bare `asyncio.sleep(1)`) run immediately.
+- `FastAPI(lifespan=...)` with an `async def` generator of the project (decorated with
+  `@contextlib.asynccontextmanager` or not, like Starlette): the code before `yield` runs before the server
+  listens (a failure prints `Application startup failed. Exiting.` and exits with code 3, like uvicorn),
+  the code after it once the server has stopped on SIGTERM/SIGINT. Differences: in-flight requests get
+  `PY2AXUM_SHUTDOWN_TIMEOUT` seconds (default 25) to finish, then their connections are dropped (uvicorn
+  waits without a limit); lifespan state (`yield {...}`) is refused.
+- Async generators run in lockstep with their consumer like CPython: the body starts at the first
+  `__anext__`, `anext()`, `asend`, `athrow`, `aclose` (`GeneratorExit` at the `yield`, `finally` blocks run).
+  `@asynccontextmanager` follows `contextlib` (exception thrown in at the `yield`, `generator didn't yield`,
+  `generator didn't stop`). `contextlib.suppress(*excs)`.
+- `task.cancel()`, `task.cancelled()`: `await task` then raises `CancelledError`. Difference: the task's
+  coroutine is stopped at its current `await` without `CancelledError` being raised inside it (its own
+  `except CancelledError` / `finally` blocks do not run).
+- `contextvars.ContextVar` (`get` with or without default, `set`, `reset(token)`): values belong to the request
+  being served (or to the lifespan). Difference: a task created with `create_task` shares its creator's
+  values instead of a copy (a value it sets is seen by the creator).
+
+## MCP servers (`mcp` 2.2)
+
+A FastMCP-style server served from a raw ASGI route: `MCPServer(name, title=,
+instructions=, version=)`, `@server.tool(name=, title=, description=)` on `async def` tools returning
+`dict[str, Any]`, `ToolError`, `server.streamable_http_app(stateless_http=True, json_response=True,
+transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))`, `async with
+server.session_manager.run()`, `await server.session_manager.handle_request(scope, receive, send)`.
+
+- Transport like `mcp/server/streamable_http.py` without sessions: 413 above 4 MiB, `Invalid Content-Type
+  header`, 406 (Accept), 415 (strict content type), `Parse error` (-32700), the JSON-RPC envelope validated
+  like pydantic's union of the four message models (same `Validation error: ...` text), 202 for
+  notifications and posted responses, GET = an SSE stream that never sends anything, DELETE/HEAD 405.
+- `initialize` (version negotiation, capabilities, `serverInfo`, `instructions`), `ping`, `tools/list`,
+  `tools/call`, empty `resources/list`, `resources/templates/list`, `prompts/list`, `resources/read` and
+  `prompts/get` errors, -32601 for the rest; -32602 `Invalid request parameters` for malformed params.
+- Tools: the `<function>Arguments` model and its `inputSchema` are computed at compile time (pydantic 2.13's
+  JSON schema, a closed subset of types: `str/int/float/bool/date/datetime/time/timedelta/UUID`, `Literal`,
+  `Optional`/unions, `list`, `dict[str, T]`, `Any`, project `BaseModel`s; `Field(description=, title=,
+  default=, examples=)` and constraints), FastMCP's JSON pre-parsing of string arguments, validation errors
+  as `Error executing tool <name>: <pydantic message>`, `ToolError` text, other exceptions as
+  `Error executing tool <name>`, structured output (`structuredContent` + indented JSON text).
+- Refused at compile time: sync tools, other return annotations, other `tool()` options, parameters
+  starting with `_` or shadowing a `BaseModel` attribute, resources, prompts, any other `MCPServer`
+  attribute, sessions (`stateless_http=False`), SSE responses (`json_response=False`), Host/Origin checks.
+- Differences: the 2026-07-28 transport (a `mcp-protocol-version` outside the handshake list) answers its
+  envelope and header errors like the SDK, but a well-formed request of that protocol gets -32022
+  `Unsupported protocol version`; `capabilities` of `initialize` is only checked to be an object; JSON
+  parse-error messages come from serde_json (the same wording as pydantic-core's jiter for the usual
+  cases); floats in tool results use Python's repr rather than pydantic-core's formatting.
 
 ## Standard library
 
@@ -239,7 +339,7 @@ Python 3.7+), `csv` (simplified `Sniffer`), `io.StringIO/BytesIO`, `pathlib`/`op
 `hmac`, `base64`, `urllib.parse`, `string` constants, `time.time/monotonic/perf_counter`,
 `statistics.median`, `logging` (stderr, `LEVEL:logger:message`, level from `PY2AXUM_LOG_LEVEL`; level constants,
 `Logger.log` with a standard level),
-`email.mime`/`email.utils`, `pickle` (see below), `functools.wraps`, `inspect.iscoroutinefunction`,
+`email.mime`/`email.utils` (`formataddr`, `formatdate`, `make_msgid`), `html.escape`, `bytes()`, `pickle` (see below), `functools.wraps`, `inspect.iscoroutinefunction`,
 `typing.get_args/get_origin/get_type_hints`, `collections.defaultdict` with a builtin type factory (`int`, `list`, `str`...; `type()` of it reports `dict`), `string.Formatter().vformat/format`. `str.format` and `Formatter` support `{}`/`{0}`/`{name}`, `!r`/`!s` and format specs; attribute/index fields (`{a.b}`, `{a[0]}`), nested specs and `!a` raise. Not yet: `collections.Counter`, other `Formatter` methods.
 
 `pickle.dumps/loads` use CPython's format (protocol 5 when the project targets Python ≥ 3.14, else 4):
@@ -253,7 +353,7 @@ read back as integral `Decimal`s.
 
 | Library | Scope |
 |---|---|
-| httpx (0.28) | `AsyncClient`, requests, timeouts, `raise_for_status`, exceptions; no redirects followed, no `files=`, cookies or custom transports |
+| httpx (0.28) | `AsyncClient` (`auth=` a `BasicAuth` or a `(user, password)` tuple), requests, timeouts, `raise_for_status`, exceptions; no redirects followed, no `files=`, cookies or custom transports |
 | aiohttp (3.14) | `ClientSession` (`timeout=None` = default timeouts), `async with session.post(...) as resp`, `ssl=False`, `proxy=None`, `status/reason/text()/json()`, `ClientTimeout`; `reason` is the standard phrase; a per-request `timeout=None` keeps the session's timeout Replacing the request method (`aiohttp.ClientSession._request = wrap(aiohttp.ClientSession._request)`, `httpx.AsyncClient.request = ...`, e.g. to time outgoing calls) is supported: the clients call the replacement with the session, the method, the URL and the keyword arguments aiohttp passes (`allow_redirects=` for get/options/head, `data=` for post/put/patch); httpx's replacement receives only the keyword arguments given by the caller (httpx passes all its defaults). Other assignments to library attributes are refused. |
 | yarl | `URL(str)`: `host`, `port` (scheme default), `scheme`, `path`, `query_string`, `fragment`, `user`, `password`, `str()` |
 | redis.asyncio (redis-py 5+) | `from_url`/`Redis(...)`, get/set (ex, px, nx, xx, get)/setex/delete/exists/incr/decr/mget/expire/ttl/keys/scan_iter/hash commands/ping, `Retry(backoff, n)` (retries without the backoff delay), redis-py's encoding and exceptions |
@@ -273,7 +373,7 @@ read back as integral `Decimal`s.
 
 ## Not supported
 
-WebSockets, `lifespan` and raw ASGI apps (declare them `--python-side`), libraries not listed, C extensions,
+WebSockets, raw ASGI middlewares and mounted ASGI apps (declare routes `--python-side`), libraries not listed, C extensions,
 `eval`/`exec`, metaclasses, multiple inheritance of project classes, OpenAPI `/docs` in the binary.
 
 ## The typed backend

@@ -58,6 +58,8 @@ async def team(team_id: int, s: AsyncSession = Depends(db)):
         ('parent: Mapped["Team"] = relationship(remote_side=[id])', "option remote_side= is not supported"),
         ('owner: Mapped["User"] = relationship()', "cannot pick the foreign key between teams and users"),
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], lazy="dynamic")', "lazy='dynamic' is not supported"),
+        ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], order_by="User.nope")', "order_by= must name columns of User"),
+        ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], order_by=["User.id"])', "order_by= must name columns of User"),
         ('members: Mapped[list["User"]] = relationship(secondary="team_users")', "option secondary= is not supported"),
         ('ghost: Mapped["Nope"] = relationship("Nope")', "relationship target 'Nope': unknown mapped class"),
     ],
@@ -118,6 +120,57 @@ def test_session_dependency_rejected(tmp_path, capsys, opts, body, message):
     assert "main.py:" in err
 
 
+SYNC_MAIN = '''
+from fastapi import Depends, FastAPI
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
+
+from .models import Team
+
+engine = create_engine("postgresql+psycopg://x/y")
+Maker = {maker}
+app = FastAPI()
+
+
+{dep}
+
+
+@app.get("/teams/{{team_id}}")
+def team(team_id: int, {param}):
+    return {{"name": s.get(Team, team_id).name}}
+'''
+
+
+@pytest.mark.parametrize(
+    "maker, dep, param, message",
+    [
+        ("sessionmaker(bind=engine)", "def db():\n    s = Maker()\n    yield s", "s: Session = Depends(db)",
+         "session dependency db: only"),
+        ("sessionmaker(bind=engine)", "def db():\n    s = Maker()\n    try:\n        yield s\n    finally:\n        s.expunge_all()",
+         "s: Session = Depends(db)", "session dependency db: only"),
+        ("async_sessionmaker(engine)", "def db():\n    with Maker() as s:\n        yield s", "s: Session = Depends(db)",
+         "a synchronous dependency needs sessionmaker(...)"),
+        ("sessionmaker(bind=engine)", "async def db():\n    async with Maker() as s:\n        yield s", "s: Session = Depends(db)",
+         "a coroutine dependency needs async_sessionmaker(...)"),
+        ("sessionmaker(bind=engine, info={})", "def db():\n    with Maker() as s:\n        yield s", "s: Session = Depends(db)",
+         "sessionmaker(info=) is not supported"),
+        ("sessionmaker(bind=engine)", "def db():\n    with Maker() as s:\n        yield s", "s: Session",
+         "s: a synchronous Session parameter needs Depends(<session dependency>)"),
+    ],
+)
+def test_sync_session_dependency_rejected(tmp_path, capsys, maker, dep, param, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    (pkg / "main.py").write_text(SYNC_MAIN.format(maker=maker, dep=dep, param=param))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
 @pytest.mark.parametrize(
     "decl, message",
     [
@@ -125,6 +178,9 @@ def test_session_dependency_rejected(tmp_path, capsys, opts, body, message):
         ('__mapper_args__ = {"version_id_col": id}', "__mapper_args__ is not supported"),
         ('label: Mapped[str] = mapped_column("lbl", String(20))', "a SQL column name different from the attribute"),
         ("data: Mapped[dict] = mapped_column(JSON(astext_type=None, foo=1))", "JSON(foo=) is not supported"),
+        ("codes: Mapped[list] = mapped_column(ARRAY(Integer))", "only ARRAY(String) is supported"),
+        ("codes: Mapped[list] = mapped_column(ARRAY(String, as_tuple=True))", "ARRAY(as_tuple=) is not supported"),
+        ("codes: Mapped[list] = mapped_column(JSON().with_variant(ARRAY(Integer), 'postgresql'))", "only ARRAY(String) is supported"),
         ("@hybrid_property\n    def double(self):\n        return self.id * 2", "decorator @hybrid_property is not supported"),
         ("@validates('name')\n    def check(self, key, value):\n        return value", "decorator @validates('name') is not supported"),
     ],
@@ -135,7 +191,8 @@ def test_model_declaration_rejected(tmp_path, capsys, decl, message):
     (pkg / "__init__.py").write_text("")
     models = textwrap.dedent(MODELS).replace("{rel}", decl).replace(
         "from sqlalchemy import ForeignKey, String",
-        "from sqlalchemy import JSON, ForeignKey, String\nfrom sqlalchemy.orm import column_property, validates\n"
+        "from sqlalchemy import JSON, ForeignKey, Integer, String\nfrom sqlalchemy.dialects.postgresql import ARRAY\n"
+        "from sqlalchemy.orm import column_property, validates\n"
         "from sqlalchemy.ext.hybrid import hybrid_property")
     (pkg / "models.py").write_text(models)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
@@ -146,11 +203,53 @@ def test_model_declaration_rejected(tmp_path, capsys, decl, message):
 
 
 @pytest.mark.parametrize(
+    "factory, use, message",
+    [
+        ("def kind(n):\n    if n:\n        return String(n)\n    return String(5)", "kind(3)", "body is `return <column type>`"),
+        ("def kind(*a):\n    return String(*a)", "kind(3)", "only plain parameters are supported"),
+        ("def kind(n):\n    return String(n)", "kind(3, 4)", "too many arguments to kind()"),
+        ("def kind(n):\n    return String(n)", "kind(m=3)", "kind() has no parameter `m`"),
+        ("def kind(n):\n    return String(n)", "kind()", "kind() missing argument `n`"),
+        ("def kind(n):\n    return String(n)", "kind(len('ab'))", "must be a literal or a name"),
+        ("def kind(n):\n    return String(len([n for n in 'ab']))", "kind(2)", "rebinds one of its parameters"),
+    ],
+)
+def test_column_type_factory_rejected(tmp_path, capsys, factory, use, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    models = textwrap.dedent(MODELS).replace("{rel}", f"code: Mapped[str] = mapped_column({use})")
+    (pkg / "models.py").write_text(models + "\n\n" + factory + "\n")
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "models.py:" in err
+
+
+def test_column_type_factory_other_module(tmp_path, capsys):
+    """the factory's body is read where the column is declared: a name it uses must mean the same there"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "kinds.py").write_text("from sqlalchemy import Text as String\n\n\ndef kind(n):\n    return String(n)\n")
+    models = textwrap.dedent(MODELS).replace("{rel}", "code: Mapped[str] = mapped_column(kind(3))")
+    (pkg / "models.py").write_text(models.replace("from sqlalchemy import ForeignKey, String",
+                                                  "from sqlalchemy import ForeignKey, String\nfrom .kinds import kind"))
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "`String` in kind() does not mean the same" in err
+    assert "kinds.py:5" in err
+
+
+@pytest.mark.parametrize(
     "body, message",
     [
         ("    it = iter([1, 2])\n    return {'a': next(it)}", "iter() stored in a variable is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicate()}", "method .frobnicate() is not implemented by the runtime"),
         ("    d = {}\n    return {'a': d.model_dump(context={'x'})}", ".model_dump(context=) is not supported"),
+        ("    xs = [3, 1]\n    return {'a': xs.frobnicated}", "attribute .frobnicated is not provided by the runtime"),
         ("    import os\n    os.environ['X'] = '1'\n    return {}", "writing into os.environ is not supported"),
     ],
 )
@@ -194,6 +293,32 @@ def test_validate_assignment_with_validators_rejected(tmp_path, capsys):
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "validate_assignment=True with @field_validator is not supported" in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ("    n: int = Field(max_digits=3)", "max_digits= applies to Decimal only"),
+        ("    d: Decimal = Field(gt=Decimal('1'))", "`Decimal('1')` is not a constant"),
+        ("    n: int\n\n    @computed_field(alias='N')\n    @property\n    def m(self) -> int:\n        return 1",
+         "@computed_field(...) options are not supported"),
+        ("    n: int\n\n    @computed_field\n    @cached_property\n    def m(self) -> int:\n        return 1",
+         "is not supported with @computed_field"),
+        ("    n: int\n\n    def __init__(self, n):\n        super().__init__(n=n)", "only `def __init__(self, **data)` is supported"),
+    ],
+)
+def test_schema_declaration_rejected(tmp_path, capsys, body, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from decimal import Decimal\nfrom functools import cached_property\n"
+        "from fastapi import FastAPI\nfrom pydantic import BaseModel, Field, computed_field\n\napp = FastAPI()\n\n\n"
+        f"class In(BaseModel):\n{body}\n\n\n@app.post('/x')\nasync def x(b: In):\n    return b\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
     assert "main.py:" in err
 
 
@@ -597,3 +722,229 @@ def test_model_method_decorator_rejected(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "decorator @functools.cache is not supported (only @property, @staticmethod and @classmethod)" in err
     assert "models.py:" in err
+
+
+def test_attribute_read_allowed_when_project_computes_attributes(tmp_path):
+    """setattr with a computed name in the project: no attribute read is refused."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\n\napp = FastAPI()\n\n\nclass Bag:\n    def __init__(self, **kw):\n"
+        "        for k, v in kw.items():\n            setattr(self, k, v)\n\n\n@app.get('/x')\nasync def x():\n"
+        "    return {'a': Bag(frobnicated=1).frobnicated}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+
+
+@pytest.mark.parametrize(
+    "config, call, message",
+    [
+        ('env_nested_delimiter="__"', "S()", "model_config env_nested_delimiter= is not supported"),
+        ('env_ignore_empty=True', "S()", "model_config env_ignore_empty= is not supported"),
+        ('env_parse_none_str=5', "S()", "env_parse_none_str= must be a string or None"),
+        ('env_parse_none_str="null"', 'S(_env_parse_none_str="none")',
+         "S(_env_parse_none_str=): pydantic-settings init options are not supported"),
+    ],
+)
+def test_settings_options_rejected(tmp_path, capsys, config, call, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent(f'''
+        from fastapi import FastAPI
+        from pydantic_settings import BaseSettings, SettingsConfigDict
+
+        app = FastAPI()
+
+
+        class S(BaseSettings):
+            model_config = SettingsConfigDict({config})
+            A: int | None = 1
+
+
+        @app.get("/x")
+        async def x():
+            return {{"a": {call}.A}}
+    '''))
+
+
+@pytest.mark.parametrize(
+    "decl, message",
+    [
+        ("lifespan = None\n\n\ndef make():\n    return None\n\n\napp = FastAPI(lifespan=make())",
+         "FastAPI(lifespan=...): only an `async def` generator of the project"),
+        ("async def lifespan(app):\n    return None\n\n\napp = FastAPI(lifespan=lifespan)",
+         "FastAPI(lifespan=...): only an `async def` generator of the project"),
+        ("from contextlib import asynccontextmanager\n\n\n@asynccontextmanager\nasync def lifespan(app):\n"
+         "    yield {'pool': 1}\n\n\napp = FastAPI(lifespan=lifespan)",
+         "lifespan state (`yield <value>` in the lifespan) is not supported"),
+    ],
+)
+def test_lifespan_rejected(tmp_path, capsys, decl, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(f"from fastapi import FastAPI\n\n{decl}\n\n\n@app.get('/x')\nasync def x():\n    return {{}}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "validator, message",
+    [
+        ('@field_validator("name")\n    @classmethod\n    def v(cls, v, info):\n        return info.context',
+         "ValidationInfo.context is not supported"),
+        ('@field_validator("name", mode="before")\n    @classmethod\n    def v(cls, v, info):\n        return v',
+         "`info`/`values` in a mode='before' validator is not supported"),
+        ('@validator("name")\n    def v(cls, v, values, field):\n        return v',
+         "the `field` and `config` validator parameters do not exist in Pydantic v2"),
+        ('@field_validator("name")\n    @classmethod\n    def v(cls, v, info, extra):\n        return v',
+         "unrecognized field validator signature"),
+        ('_v = field_validator("name")(lambda v, info: v)', "a lambda validator taking `info` is not supported"),
+    ],
+)
+def test_validator_info_rejected(tmp_path, capsys, validator, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\nfrom pydantic import BaseModel, field_validator, validator\n\napp = FastAPI()\n\n\n"
+        "class In(BaseModel):\n    name: str\n\n    " + validator + "\n\n\n"
+        "@app.post('/x')\nasync def x(body: In):\n    return body\n")
+
+
+MCP_APP = '''
+from typing import Annotated, Any
+
+from fastapi import FastAPI
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
+
+server = MCPServer(name="t"{server_kw})
+{tool}
+
+
+async def lifespan_like():
+    server.streamable_http_app({app_kw})
+    async with server.session_manager.run():
+        pass
+
+
+class Endpoint:
+    async def __call__(self, scope, receive, send):
+        await server.session_manager.handle_request(scope, receive, send)
+
+
+app = FastAPI()
+app.router.add_route("/mcp", Endpoint(), methods=["GET", "POST", "DELETE"])
+
+
+@app.get("/x")
+async def x():
+    await lifespan_like()
+    return {{}}
+'''
+TOOL = '''
+
+@server.tool(name="t1", description="d")
+async def t1(n: Annotated[int, Field(ge=0)] = 1) -> dict[str, Any]:
+    return {"n": n}
+'''
+OK_APP_KW = "stateless_http=True, json_response=True, transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)"
+
+
+@pytest.mark.parametrize(
+    "server_kw, tool, app_kw, message",
+    [
+        (", website_url='x'", TOOL, OK_APP_KW, "MCPServer(website_url=...) is not supported"),
+        ("", TOOL.replace("async def t1", "def t1"), OK_APP_KW, "only `async def` functions are supported"),
+        ("", TOOL.replace("-> dict[str, Any]", "-> str"), OK_APP_KW, "only the return annotation dict[str, Any]"),
+        ("", TOOL.replace('description="d"', 'description="d", annotations=None'), OK_APP_KW,
+         "@server.tool(annotations=...) is not supported"),
+        ("", TOOL.replace("@server.tool(name=\"t1\", description=\"d\")", "@server.tool"), OK_APP_KW,
+         "@server.tool without parentheses"),
+        ("", TOOL.replace("n: Annotated[int, Field(ge=0)] = 1", "_n: int = 1"), OK_APP_KW, "cannot start with '_'"),
+        ("", TOOL.replace("n: Annotated[int, Field(ge=0)] = 1", "n: tuple[int, int]"), OK_APP_KW,
+         "type `tuple[int, int]` is not supported"),
+        ("", TOOL + "\n\n@server.resource('x://y')\nasync def r():\n    return 'x'\n", OK_APP_KW, "MCPServer.resource is not supported"),
+        ("", TOOL, OK_APP_KW.replace("stateless_http=True", "stateless_http=False"), "streamable_http_app(stateless_http=True) is required"),
+        ("", TOOL, OK_APP_KW.replace("json_response=True, ", ""), "streamable_http_app(json_response=True) is required"),
+        ("", TOOL, "stateless_http=True, json_response=True", "transport_security=TransportSecuritySettings"),
+        ("", TOOL, OK_APP_KW.replace("False", "True"), "only enable_dns_rebinding_protection=False is supported"),
+    ],
+)
+def test_mcp_rejected(tmp_path, capsys, server_kw, tool, app_kw, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(MCP_APP.format(server_kw=server_kw, tool=tool, app_kw=app_kw))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+def test_union_member_with_validators_rejected(tmp_path, capsys):
+    """Pydantic tries the next member when a member's validator raises: not emulated, refused."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        from fastapi import FastAPI
+        from pydantic import BaseModel, field_validator
+
+        app = FastAPI()
+
+
+        class A(BaseModel):
+            x: int
+
+            @field_validator("x")
+            @classmethod
+            def small(cls, v):
+                if v > 9:
+                    raise ValueError("big")
+                return v
+
+
+        class B(BaseModel):
+            x: int
+
+
+        class In(BaseModel):
+            item: A | B
+
+
+        @app.post("/x")
+        async def x(body: In):
+            return body
+    '''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "a Union containing A (validators, which would make Pydantic try the next member" in err
+    assert "main.py:24" in err
+
+
+def test_mcp_accepted(tmp_path):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(MCP_APP.format(server_kw=", title='T', instructions='i'", tool=TOOL, app_kw=OK_APP_KW))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "MCP_TOOL_" in gen and '\\"title\\":\\"t1Arguments\\"' in gen
+
+
+def test_raw_asgi_class_endpoint_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\n\n\nclass Ep:\n    async def __call__(self, scope, receive, send):\n        pass\n\n\n"
+        "app = FastAPI()\napp.add_route('/raw', Ep)\n\n\n@app.get('/x')\nasync def x():\n    return {}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "add_route() with a class endpoint" in err and "main.py:10" in err

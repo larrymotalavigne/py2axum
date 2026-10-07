@@ -23,6 +23,20 @@ def _argv(args: list[str]) -> str:
     return "vec![" + ", ".join(args) + "]"
 
 
+def _mcp_server(a, kw):
+    bad = sorted(set(kw) - {"name", "title", "instructions", "version"})
+    if bad or len(a) > 2:
+        raise ValueError(f"MCPServer({bad[0] if bad else '*args'}=...) is not supported (name, title, instructions, version)")
+    return f"{RT}::mcp::server(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _mcp_security(a, kw):
+    if a or set(kw) != {"enable_dns_rebinding_protection"} or kw["enable_dns_rebinding_protection"] != "V::Bool(false)":
+        raise ValueError("TransportSecuritySettings: only enable_dns_rebinding_protection=False is supported "
+                         "(the binary does not check Host/Origin)")
+    return "Ok::<V, Exc>(V::None)"
+
+
 def _one(name):
     def f(a, kw):
         if len(a) != 1 or kw:
@@ -64,6 +78,8 @@ VALUES: dict[str, str] = {
     "aio_pika.DeliveryMode.NOT_PERSISTENT": "V::Int(1)",
     "datetime.time.min": "V::Time(chrono::NaiveTime::MIN)",
     "datetime.time.max": "V::Time(chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).unwrap())",
+    "datetime.datetime.min": f"V::DateTime({RT}::dt::DateTime::naive(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap()))",
+    "datetime.datetime.max": f"V::DateTime({RT}::dt::DateTime::naive(chrono::NaiveDate::from_ymd_opt(9999, 12, 31).unwrap().and_hms_micro_opt(23, 59, 59, 999_999).unwrap()))",
     "datetime.date.min": "V::Date(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap())",
     "datetime.date.max": "V::Date(chrono::NaiveDate::from_ymd_opt(9999, 12, 31).unwrap())",
     # library classes used as values (isinstance targets, issubclass, `X is not None`)
@@ -74,7 +90,10 @@ VALUES: dict[str, str] = {
         ("sqlalchemy.ext.asyncio.AsyncSession", "sqlalchemy.ext.asyncio.AsyncSession"),
         ("sqlalchemy.ext.asyncio.AsyncEngine", "sqlalchemy.ext.asyncio.AsyncEngine"),
         ("sqlalchemy.ext.asyncio.AsyncConnection", "sqlalchemy.ext.asyncio.AsyncConnection"),
-        ("sqlalchemy.orm.Session", "sqlalchemy.orm.Session"))},
+        ("sqlalchemy.orm.Session", "sqlalchemy.orm.Session"),
+        # pool classes: create_engine(poolclass=...) options are ignored (the binary's pool)
+        ("sqlalchemy.pool.StaticPool", "sqlalchemy.pool.StaticPool"), ("sqlalchemy.pool.NullPool", "sqlalchemy.pool.NullPool"),
+        ("sqlalchemy.pool.QueuePool", "sqlalchemy.pool.QueuePool"))},
     **{f"re.{n}": f"V::Int({v})" for n, v in (("I", 2), ("IGNORECASE", 2), ("M", 8), ("MULTILINE", 8), ("S", 16),
                                              ("DOTALL", 16), ("X", 64), ("VERBOSE", 64), ("UNICODE", 32), ("U", 32))},
     **{f"csv.QUOTE_{n}": f"V::Int({v})" for n, v in (("MINIMAL", 0), ("ALL", 1), ("NONNUMERIC", 2), ("NONE", 3))},
@@ -165,6 +184,7 @@ EXCEPTIONS: dict[str, str] = {
         ("ServerTimeoutError", "SERVER_TIMEOUT"), ("ConnectionTimeoutError", "CONNECTION_TIMEOUT"), ("InvalidURL", "INVALID_URL"))},
     "asyncio.TimeoutError": "TIMEOUT_ERROR",
     "asyncio.CancelledError": "CANCELLED_ERROR",
+    "mcp.server.mcpserver.exceptions.ToolError": "MCP_TOOL_ERROR",
     "asyncio.QueueFull": "QUEUE_FULL",
     "asyncio.QueueEmpty": "QUEUE_EMPTY",
     "fastapi.HTTPException": "HTTP_EXCEPTION",
@@ -325,6 +345,7 @@ CALLS = {
     # outgoing HTTP: httpx 0.28, aiohttp 3.14 (the version goes in the User-Agent)
     "httpx.AsyncClient": lambda a, kw: f"{RT}::http::client(\"httpx\", \"{LIB_VERSIONS.get('httpx', '0.28.1')}\", &{_argv(a)}, &{_kwvec(kw)})",
     "aiohttp.ClientSession": lambda a, kw: f"{RT}::http::client(\"aiohttp\", \"{LIB_VERSIONS.get('aiohttp', '3.14.3')}\", &{_argv(a)}, &{_kwvec(kw)})",
+    "httpx.BasicAuth": lambda a, kw: f"{RT}::http::basic_auth(&{_argv(a)}, &{_kwvec(kw)})",
     "httpx.Timeout": lambda a, kw: f"{RT}::http::timeout(\"httpx\", &{_argv(a)}, &{_kwvec(kw)})",
     "aiohttp.ClientTimeout": lambda a, kw: f"{RT}::http::timeout(\"aiohttp\", &{_argv(a)}, &{_kwvec(kw)})",
     "httpx.URL": lambda a, kw: f"{RT}::http::url(&{_argv(a)})",
@@ -451,7 +472,9 @@ CALLS = {
     "jinja2.select_autoescape": lambda a, kw: f"{RT}::mail::select_autoescape({('Some(&' + _bind('select_autoescape', a, kw, ['enabled_extensions'], {'enabled_extensions'})['enabled_extensions'] + ')') if (a or kw) else 'None'})",
     **{f"email.mime.{m}.{c}": (lambda c: lambda a, kw: f"{RT}::mail::mime_new(\"{c}\", &{_argv(a)}, &{_kwvec(kw)})")(c)
        for m, c in (("multipart", "MIMEMultipart"), ("text", "MIMEText"), ("application", "MIMEApplication"))},
+    "html.escape": lambda a, kw: f"{RT}::stdlib::html_escape(&{_argv(a)}, &{_kwvec(kw)})",
     "email.utils.formataddr": lambda a, kw: f"{RT}::mail::formataddr(&{a[0]})",
+    "email.utils.formatdate": lambda a, kw: f"{RT}::mail::formatdate(&{_argv(a)}, &{_kwvec(kw)})",
     "email.utils.make_msgid": lambda a, kw: f"{RT}::mail::make_msgid({('Some(&' + _bind('make_msgid', a, kw, ['idstring', 'domain'], {'domain'})['domain'] + ')') if kw.get('domain') else 'None'})",
     "aiosmtplib.send": lambda a, kw: f"{RT}::mail::smtp_send({_argv(a)}, {_kwvec(kw)}).await",
     # Starlette responses returned by an endpoint
@@ -521,6 +544,16 @@ CALLS = {
     "logging.getLogger": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::Logger(std::sync::Arc::from({RT}::ops::str_(&{a[0] if a else 'V::str(\"root\")'})?.as_str()))))",
     "asyncio.Queue": lambda a, kw: f"Ok::<V, Exc>({RT}::web::AQueue::new(match &{a[0] if a else kw.get('maxsize', 'V::Int(0)')} {{ V::Int(i) => *i as usize, _ => 0 }}))",
     "asyncio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0]}).await",
+    "contextlib.asynccontextmanager": lambda a, kw: f"{RT}::agen::asynccontextmanager(&{a[0]})",
+    # mcp 2.2 (dynrt/mcp.rs): the server object; its tools, transport options and attributes are checked
+    # by the transpiler (dyn.mcp_tools)
+    "mcp.server.mcpserver.MCPServer": lambda a, kw: _mcp_server(a, kw),
+    # `Request(scope, receive)` inside a raw ASGI app (dynrt/rawasgi.rs): the request being served
+    "starlette.requests.Request": lambda a, kw: f"{{ let _ = {a[1]}; {RT}::rawasgi::request_from_scope(cx, &{a[0]}) }}",
+    "fastapi.Request": lambda a, kw: f"{{ let _ = {a[1]}; {RT}::rawasgi::request_from_scope(cx, &{a[0]}) }}",
+    "mcp.server.transport_security.TransportSecuritySettings": lambda a, kw: _mcp_security(a, kw),
+    "contextvars.ContextVar": lambda a, kw: f"{RT}::agen::context_var(&{_argv(a)}, &{_kwvec(kw)})",
+    "contextlib.suppress": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::Suppress({_argv(a)})))",
     # FastAPI / Starlette
     "fastapi.HTTPException": _http_exc,
     "fastapi.exceptions.HTTPException": _http_exc,
@@ -530,7 +563,9 @@ CALLS = {
     # SQLAlchemy core
     "sqlalchemy.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
     "sqlalchemy.future.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
-    "sqlalchemy.ext.asyncio.async_sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)})",
+    "sqlalchemy.ext.asyncio.async_sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, false)",
+    "sqlalchemy.orm.sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, true)",
+    "sqlalchemy.create_engine": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}",
     "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}",
     "sqlalchemy.text": lambda a, kw: f"{RT}::orm::text(&{a[0]})",
     "sqlalchemy.orm.aliased": lambda a, kw: f"{RT}::orm::aliased(&{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("aliased(Model) only")),

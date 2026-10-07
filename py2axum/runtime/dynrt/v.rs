@@ -86,6 +86,8 @@ pub enum Native {
     HttpClient(Arc<super::http::Client>),
     HttpResp(Arc<super::http::Resp>),
     HttpTimeout(super::http::Timeout),
+    /// `httpx.BasicAuth(user, password)`: its `Authorization` header value
+    HttpBasicAuth(String),
     HttpUrl(String),
     /// a result row (`execute(select(...)).all()`): a tuple whose columns are also attributes
     Row(Arc<Vec<Arc<str>>>, Arc<Vec<V>>),
@@ -131,9 +133,25 @@ pub enum Native {
     Kwargs(Vec<(String, V)>),
     /// a `mode="before"` validator failed on this input: (type, msg, input), reported in place by the
     /// synchronous validation
-    ValErr(&'static str, String, V),
+    ValErr(&'static str, String, V, V),
     Streaming(Mutex<Option<web::Streaming>>),
-    Gen(Mutex<Option<web::GenRx>>),
+    Gen(Arc<super::agen::AGen>),
+    /// `@asynccontextmanager` called: `_AsyncGeneratorContextManager`
+    Acm(Arc<super::agen::AGen>),
+    /// `contextlib.suppress(*excs)`
+    Suppress(Vec<V>),
+    /// `contextvars.ContextVar(name, default=...)`
+    CtxVar(Arc<super::agen::CtxVar>),
+    /// the `Token` of `var.set(v)`: (variable, previous value)
+    CtxToken(Arc<super::agen::CtxVar>, Option<V>),
+    /// the `receive` / `send` callables given to a raw ASGI app
+    AsgiReceive(Arc<super::rawasgi::Chan>),
+    AsgiSend(Arc<super::rawasgi::Chan>),
+    /// `mcp.server.mcpserver.MCPServer`, its `@tool(...)` decorator, `session_manager`, `session_manager.run()`
+    McpServer(Arc<super::mcp::Server>),
+    McpToolDeco(Arc<super::mcp::Server>, &'static super::mcp::ToolSpec),
+    McpManager(Arc<super::mcp::Server>),
+    McpRun,
     /// `func` of sqlalchemy, `status` of fastapi...: a namespace of attributes.
     Namespace(&'static str),
     /// Bound builtin type used as a value (`dict`, `str`) e.g. in isinstance.
@@ -154,8 +172,10 @@ pub enum Native {
     TEvent(Arc<super::thread::TEvent>),
     TThread(Arc<super::thread::TThread>),
     ELoop(Arc<super::thread::ELoop>),
-    /// `async_sessionmaker(...)` built at run time: (expire_on_commit, autoflush)
-    Maker(bool, bool),
+    /// `async_sessionmaker(...)`/`sessionmaker(...)` built at run time: (expire_on_commit, autoflush, sync: `sessionmaker` rather than `async_sessionmaker`)
+    Maker(bool, bool, bool),
+    /// `session.query(...)`: the session and the `select()` it runs
+    Query(super::orm::Session, V),
     /// a `redis.asyncio` client (see `rds`), a `Retry` policy (its number of retries)
     Redis(Arc<super::rds::RClient>),
     RRetry(usize),
@@ -273,6 +293,7 @@ impl V {
                 Native::HttpClient(_) => "AsyncClient",
                 Native::HttpResp(_) => "Response",
                 Native::HttpTimeout(_) => "Timeout",
+                Native::HttpBasicAuth(_) => "BasicAuth",
                 Native::HttpUrl(_) => "URL",
                 Native::Savepoint(..) => "AsyncSessionTransaction",
                 Native::Row(..) => "Row",
@@ -306,6 +327,15 @@ impl V {
                 Native::ValErr(..) => "ValErr",
                 Native::Streaming(_) => "StreamingResponse",
                 Native::Gen(_) => "async_generator",
+                Native::Acm(_) => "_AsyncGeneratorContextManager",
+                Native::Suppress(_) => "suppress",
+                Native::CtxVar(_) => "ContextVar",
+                Native::CtxToken(..) => "Token",
+                Native::AsgiReceive(_) | Native::AsgiSend(_) => "function",
+                Native::McpServer(_) => "MCPServer",
+                Native::McpToolDeco(..) => "function",
+                Native::McpManager(_) => "StreamableHTTPSessionManager",
+                Native::McpRun => "_AsyncGeneratorContextManager",
                 Native::Namespace(_) => "module",
                 Native::Type(_) => "type",
                 Native::FieldInfo => "FieldInfo",
@@ -329,7 +359,9 @@ impl V {
                 Native::Redis(_) => "Redis",
                 Native::RRetry(_) => "Retry",
                 Native::AsyncItems(_) => "async_generator",
-                Native::Maker(..) => "async_sessionmaker",
+                Native::Maker(_, _, false) => "async_sessionmaker",
+                Native::Maker(_, _, true) => "sessionmaker",
+                Native::Query(..) => "Query",
                 Native::TLock(l) => if l.reentrant { "RLock" } else { "lock" },
                 Native::TEvent(_) => "Event",
                 Native::TThread(_) => "Thread",
@@ -588,6 +620,7 @@ macro_rules! builtin_exc {
 builtin_exc!(BASE_EXCEPTION, "BaseException", []);
 builtin_exc!(GENERATOR_EXIT, "GeneratorExit", [BASE_EXCEPTION]);
 builtin_exc!(CANCELLED_ERROR, "CancelledError", [BASE_EXCEPTION]);
+builtin_exc!(MCP_TOOL_ERROR, "ToolError", [EXCEPTION]);
 builtin_exc!(EXCEPTION, "Exception", [BASE_EXCEPTION]);
 builtin_exc!(VALUE_ERROR, "ValueError", [EXCEPTION]);
 builtin_exc!(TYPE_ERROR, "TypeError", [EXCEPTION]);
@@ -645,6 +678,7 @@ builtin_exc!(NO_RESULT_FOUND, "NoResultFound", [SQLALCHEMY_ERROR]);
 builtin_exc!(MULTIPLE_RESULTS_FOUND, "MultipleResultsFound", [SQLALCHEMY_ERROR]);
 builtin_exc!(MISSING_GREENLET, "MissingGreenlet", [SQLALCHEMY_ERROR]);
 builtin_exc!(INVALID_REQUEST_ERROR, "InvalidRequestError", [SQLALCHEMY_ERROR]);
+builtin_exc!(OBJECT_DELETED_ERROR, "ObjectDeletedError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(ARGUMENT_ERROR, "ArgumentError", [SQLALCHEMY_ERROR]);
 builtin_exc!(JOSE_ERROR, "JOSEError", [EXCEPTION]);
 builtin_exc!(JWS_ERROR, "JWSError", [JOSE_ERROR]);
@@ -766,6 +800,10 @@ impl Exc {
     /// `str(exc)`: the single argument, or the tuple of arguments, like CPython.
     pub fn message(&self) -> String {
         if let Some(errs) = &self.0.errors {
+            // the model's name, when the raiser knew it (pydantic's `ValidationError.title`)
+            if let Some(V::Str(t)) = self.0.attrs.lock().get("title") {
+                return super::pyd::error_str(t, errs);
+            }
             return format!("{} validation errors", errs.len());
         }
         if let Some((code, detail, _)) = &self.http_info() {

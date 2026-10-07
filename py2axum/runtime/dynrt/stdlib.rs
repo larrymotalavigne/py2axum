@@ -1524,3 +1524,20 @@ pub fn abspath(p: &str) -> String {
         normpath(&format!("{cwd}/{p}"))
     }
 }
+
+/// `html.escape(s, quote=True)`
+pub fn html_escape(args: &[V], kwargs: &[(String, V)]) -> R {
+    let s = args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "s").map(|(_, v)| v)).ok_or_else(|| Exc::type_error("escape() missing 1 required positional argument: 's'"))?;
+    let quote = match args.get(1).or_else(|| kwargs.iter().find(|(k, _)| k == "quote").map(|(_, v)| v)) {
+        Some(q) => super::ops::truthy(q)?,
+        None => true,
+    };
+    let V::Str(s) = s else {
+        return Err(Exc::attr_error(format!("'{}' object has no attribute 'replace'", s.type_name())));
+    };
+    let mut out = s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    if quote {
+        out = out.replace('"', "&quot;").replace('\'', "&#x27;");
+    }
+    Ok(V::str(out))
+}

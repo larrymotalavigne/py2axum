@@ -29,6 +29,7 @@ ERROR_CLASSES: list[tuple[str, str]] = [
     (r"middleware (\S+) is not supported", "middleware \\1"),
     (r"method \.(\w+)\(\) is not implemented by the runtime", "méthode .\\1() absente du runtime (500 exécution)"),
     (r"\.(\w+)\((\w+)=\) is not supported \(only", ".\\1(\\2=) (500 exécution)"),
+    (r"attribute \.(\w+) is not provided by the runtime", "attribut .\\1 absent du runtime (500 exécution)"),
     (r"@app\.(\w+)\(\.\.\.\) is not supported", "@app.\\1"),
     (r"app\.(\w+)\(\.\.\.\) is not supported", "app.\\1()"),
     (r"FastAPI\(lifespan=", "lifespan (à déclarer --python-side)"),

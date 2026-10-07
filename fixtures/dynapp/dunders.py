@@ -6,6 +6,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from .enums import Level
+
 router = APIRouter(prefix="/dunders")
 
 
@@ -266,3 +268,106 @@ class Item0(BaseModel):
 async def proxied(name: str, request: Request, q: str = ""):
     """Declared --python-side in the conformance build: the binary relays it to the Python app."""
     return {"name": name, "q": q, "body": (await request.body()).decode(), "ua": request.headers.get("x-probe")}
+
+
+class Oops(Exception):
+    pass
+
+
+@router.get("/types")
+async def types_route():
+    """type(x): its __name__, compared with == / is / in, called, for each kind of runtime value."""
+    import re
+    import uuid
+    from datetime import date, datetime, time, timedelta, timezone
+    from decimal import Decimal
+
+    values = [1, 1.5, "s", b"b", [1], (1,), {"k": 1}, {1}, None, True, datetime(2026, 1, 2),
+              date(2026, 1, 2), time(1, 2), timedelta(1), timezone.utc, Decimal("1.5"), re.compile("a"),
+              re.match("a", "a"), uuid.UUID(int=1), Plain(), Oops("x"), ValueError("v"), KeyError("k"),
+              len, Plain, Level, int, lambda: 1]
+    def each(f):
+        out = []
+        for v in values:
+            try:
+                out.append(f(v))
+            except Exception as e:
+                out.append(f"{type(e).__name__}: {e}")
+        return out
+
+    names = each(lambda v: type(v).__name__)
+    eq = each(lambda v: [type(v) == str, type(v) is list, type(v) in (dict, tuple), type(v) != int, type(v) is Plain])
+    errs = []
+    for f in (lambda: 1 / 0, lambda: {}["k"], lambda: [][1], lambda: int("x"), lambda: None.x):
+        try:
+            f()
+        except Exception as e:
+            errs.append([type(e).__name__, type(e) is ZeroDivisionError, type(e).__qualname__])
+    made = [type(1)("7"), type("")(5), type([])((1, 2))]
+    return {"names": names, "eq": eq, "errs": errs, "made": made, "type": type(type(1)).__name__}
+
+
+# ---- a class called as a value: `cls(**data)` in a classmethod, `type(x)(...)`, a class passed as an argument
+from types import SimpleNamespace  # noqa: E402
+
+from pydantic_settings import BaseSettings, SettingsConfigDict  # noqa: E402
+
+
+class Made(BaseModel):
+    a: int = 1
+    b: str = "x"
+
+    @field_validator("b")
+    @classmethod
+    def no_bang(cls, v):
+        if "!" in v:
+            raise ValueError("no bang")
+        return v
+
+    @classmethod
+    def make(cls, **data):
+        return cls(**data)
+
+    def copy_with(self, **changes):
+        return type(self)(**{**self.model_dump(), **changes})
+
+
+class MadeSettings(BaseSettings):
+    # env set in scripts_start_dyn.sh: DYNAPP_NONE_INT=none
+    model_config = SettingsConfigDict(case_sensitive=True, env_parse_none_str="none", env_prefix="DYNAPP_")
+    NONE_INT: int | None = 5
+    other: str = "o"
+
+
+class Empty:
+    pass
+
+
+def _build(c, *args, **kwargs):
+    return c(*args, **kwargs)
+
+
+def _invalid(f):
+    try:
+        return f()
+    except ValidationError as e:
+        return e.errors(include_url=False)
+
+
+@router.get("/classvalue")
+async def class_value():
+    m = Made(a=2)
+    s = MadeSettings()
+    d, p, ns = Pair(1), Point(1, 2), SimpleNamespace(a=1)
+    return {
+        "model": [Made.make(a="3"), type(m)(b="y"), m.copy_with(a=7), _build(Made, a=4), _build(Plain),
+                  _try(lambda: type(m)(1)), _try(lambda: _build(Made, 1, 2)),
+                  _invalid(lambda: Made.make(a="z")), _invalid(lambda: type(m)(b="hi!"))],
+        "settings": [type(s)().NONE_INT, type(s)(NONE_INT=7).NONE_INT, _build(MadeSettings, other="p").other],
+        "dataclass": [str(type(d)(4, 5)), str(_build(Pair, a=3)), _try(lambda: type(d)()),
+                      _try(lambda: type(d)(a=1, c=2)), _try(lambda: _build(Key, 1, 2))],
+        "plain": [repr(type(p)(9, 8)), _build(Bag, n=3).n, _try(lambda: type(p)(1)), _try(lambda: type(Empty())(1)),
+                  type(_build(Empty)).__name__],
+        "namespace": type(ns)(b=2).b,
+        "enum": [type(Level.ONE)(2), _build(Level, 1), _try(lambda: type(Level.ONE)(3))],
+    }

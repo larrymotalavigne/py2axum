@@ -1,12 +1,14 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import JSON, BigInteger, DateTime, Enum as SQLEnum, ForeignKey, Identity, Integer, Numeric, String, func
+from sqlalchemy import (
+    JSON, BigInteger, DateTime, Enum as SQLEnum, ForeignKey, Identity, Integer, LargeBinary, Numeric, String, func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from .coltypes import EncryptedString, Money
-from .enums import Priority, Status
+from .coltypes import EncryptedString, Money, enum_type
+from .enums import Channel, Priority, Status
 
 
 def utcnow() -> datetime:
@@ -76,6 +78,16 @@ class Secret(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     label: Mapped[str] = mapped_column(String(50))
     token: Mapped[str | None] = mapped_column(EncryptedString(300))
+
+
+class Asset(Base):
+    """Column types from a project factory function."""
+    __tablename__ = "assets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel: Mapped[Channel] = mapped_column(enum_type(Channel, "asset_channel"), default=Channel.MAIL, index=True)
+    data: Mapped[bytes | None] = mapped_column(LargeBinary)
+    thumb: Mapped[bytes | None] = mapped_column(nullable=True)
 
 
 class Membership(Base):

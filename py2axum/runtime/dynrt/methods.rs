@@ -80,7 +80,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
     match v {
         V::Obj(o) => {
             if o.desc.col_index(name).is_some() || o.desc.rel_index(name).is_some() {
-                return o.get_attr_sync(name);
+                return o.get_attr(name).await;
             }
             if let Some((prop, f)) = find_method(o.desc.methods, name) {
                 return if prop { f(cx, v.clone(), vec![]).await } else { Ok(bound(f, v.clone())) };
@@ -191,6 +191,10 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             "key" | "name" => Ok(V::str(m.cols[*i].name)),
             _ => Err(no_attr(v, name)),
         },
+        V::Native(n) if matches!(&**n, Native::McpServer(_)) => match &**n {
+            Native::McpServer(s) => super::mcp::attr(s, name),
+            _ => unreachable!(),
+        },
         V::Native(n) if matches!(&**n, Native::Upload(_) | Native::Path(_) | Native::Uuid(_) | Native::RespObj(_) | Native::Pattern(_) | Native::Match(_) | Native::CsvRows(..) | Native::Sniffed(_)) => match &**n {
             Native::Pattern(p) => super::stdlib::pattern_attr(p, name),
             Native::Match(m) => super::stdlib::match_attr(m, name),
@@ -230,7 +234,8 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::HttpResp(r) => super::http::resp_attr(r, name),
             Native::HttpClient(c) => super::http::client_attr(c, name),
             Native::HttpUrl(u) => super::http::url_attr(u, name),
-            Native::Type(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t)),
+            // `re.Pattern` -> Pattern (type names carry their module where CPython's repr does)
+            Native::Type(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t.rsplit('.').next().unwrap_or(t))),
             Native::TThread(t) => super::thread::thread_attr(t, name),
             Native::YarlUrl(u) => super::http::yarl_attr(u, name),
             Native::AmqpConn(c) => super::rmq::conn_attr(c, name),
@@ -574,7 +579,9 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                     }
                     let names: Vec<String> = ops::iter(sel)?.iter().map(ops::str_).collect::<R<_>>()?;
                     let keys: Vec<&str> = i.desc.fields.iter().filter(|f| names.iter().any(|n| n == f.name))
-                        .map(|f| if by_alias { f.alias.unwrap_or(f.name) } else { f.name }).collect();
+                        .map(|f| if by_alias { f.alias.unwrap_or(f.name) } else { f.name })
+                        .chain(i.desc.computed.iter().map(|(n, _)| *n).filter(|c| names.iter().any(|n| n == c)))
+                        .collect();
                     if let V::Dict(m) = &d {
                         let kept: Vec<(V, V)> = m.lock().values().filter(|(k, _)| matches!(k, V::Str(s) if keys.contains(&&**s) == keep)).cloned().collect();
                         d = V::dict_from(kept)?;
@@ -665,6 +672,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 "refresh" => (2, &["attribute_names"]),
                 "execute" => (2, &["params"]),
                 "add" | "add_all" | "scalar" | "scalars" | "delete" => (1, &[]),
+                "query" => (usize::MAX, &[]),
                 _ => (0, &[]),
             };
             if args.len() > max_pos.max(if matches!(name, "commit" | "flush" | "rollback" | "close") { 0 } else { 1 }) {
@@ -704,6 +712,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             },
             "delete" => s.delete(&args[0]).await.map(|_| V::None),
             "begin_nested" => s.begin_nested().await,
+            "query" => orm::query(s, args),
             "close" | "aclose" => Ok(V::None),
             // the engine the session is bound to (sync side for get_bind(), but the same process pool)
             "get_bind" => Ok(V::native(Native::Engine)),
@@ -712,6 +721,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         }
         V::Result(r) => orm::result_method(r, name),
         V::Col(..) | V::Sql(_) => orm::sql_method(recv, name, args, kwargs),
+        V::Native(n) if matches!(&**n, Native::Query(..)) => match &**n {
+            Native::Query(sess, sel) => orm::query_method(sess, sel, name, args, kwargs).await,
+            _ => unreachable!(),
+        },
         V::Native(n) => match &**n {
             Native::Headers(r) => match name {
                 "get" => {
@@ -750,11 +763,15 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::Row(_, vals) if name == "_tuple" => Ok(V::tuple(vals.to_vec())),
             Native::UrlParts(u) if name == "geturl" => Ok(V::str(super::stdlib::url_parts_geturl(u))),
             Native::Task(t) => web::task_method(cx, t, recv, name, &args).await,
+            Native::Gen(g) => super::agen::method(g, recv, name, &args).await,
+            Native::CtxVar(var) => super::agen::ctxvar_method(cx, var, name, &args),
+            Native::McpServer(s) => super::mcp::server_method(s, name),
+            Native::McpManager(s) => super::mcp::manager_method(cx, s, name, &args).await,
             Native::IniConfig(c) => super::ini::method(c, name, &args, &kwargs),
             Native::PydUrl(_, u) if name == "unicode_string" => Ok(V::str(u.as_str())),
             Native::Engine => match name {
                 // a connection: its own transaction, rolled back when the `async with` ends
-                "connect" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, Arc::downgrade(cx)))),
+                "connect" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, false, Arc::downgrade(cx)))),
                 "dispose" => Ok(V::None),
                 _ => Err(no_attr(recv, name)),
             },
@@ -791,6 +808,16 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
 }
 
 /// Calling a first-class function value (lambda, bound method, function passed as an argument).
+/// `call_value` behind a declared `Send` future: for runtime code that a `call_value` can itself reach
+/// (ASGI send/receive, MCP tools), whose auto traits would otherwise be computed in a cycle
+pub fn call_value_boxed<'a>(cx: &'a Cx, f: &'a V, args: Vec<V>) -> super::BoxFut<'a> {
+    Box::pin(call_value(cx, f, args, vec![]))
+}
+
+pub fn call_value_kw_boxed<'a>(cx: &'a Cx, f: &'a V, kwargs: Vec<(String, V)>) -> super::BoxFut<'a> {
+    Box::pin(call_value(cx, f, vec![], kwargs))
+}
+
 pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     if let V::Native(n) = f {
         if let Native::Bound(m, recv) = &**n {
@@ -815,11 +842,11 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
             return super::tenacity::decorate(t, &args);
         }
         // `async_sessionmaker(...)()`: a new session on the process pool
-        if let Native::Maker(expire, autoflush) = &**n {
+        if let Native::Maker(expire, autoflush, sync) = &**n {
             if !args.is_empty() || !kwargs.is_empty() {
                 return Err(Exc::type_error("py2axum: calling a sessionmaker with arguments is not supported"));
             }
-            return Ok(V::Session(orm::Session::new(cx.app.pool.clone(), *expire, *autoflush, Arc::downgrade(cx))));
+            return Ok(V::Session(orm::Session::new(cx.app.pool.clone(), *expire, *autoflush, *sync, Arc::downgrade(cx))));
         }
         // a builtin type used as a function value (`map(str, xs)`, `defaultdict(list)`)
         if let Native::Type(t) = &**n {
@@ -841,6 +868,31 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
         if let Native::MethodOf(recv, name) = &**n {
             return Box::pin(call_method(cx, recv, name, args, kwargs)).await;
         }
+        if let Native::McpToolDeco(s, spec) = &**n {
+            return super::mcp::decorate(s, spec, &args);
+        }
+        // raw ASGI: `await receive()`, `await send(message)`, `await response(scope, receive, send)`
+        if let Native::AsgiReceive(c) = &**n {
+            let c = c.clone();
+            return Ok(super::aio::coro(Box::pin(async move { super::rawasgi::receive(&c).await })));
+        }
+        if let Native::AsgiSend(c) = &**n {
+            let (c, msg) = (c.clone(), args.into_iter().next().unwrap_or(V::None));
+            return Ok(super::aio::coro(Box::pin(async move { super::rawasgi::send(&c, &msg).await })));
+        }
+        if let Native::RespObj(_) = &**n {
+            let (cx2, resp) = (cx.clone(), f.clone());
+            return Ok(super::aio::coro(Box::pin(async move { super::rawasgi::send_response(&cx2, &resp, &args).await })));
+        }
+    }
+    // an instance of a project class with `__call__`
+    let call_dunder = match f {
+        V::Inst(i) => find_method(i.desc.methods, "__call__"),
+        V::Obj(o) => find_method(o.desc.methods, "__call__"),
+        _ => None,
+    };
+    if let Some((_, m)) = call_dunder {
+        return m(cx, f.clone(), super::pack(args, kwargs)).await;
     }
     // a builtin exception class held as a value: `(ValueError if c else TypeError)(msg)`
     if let V::Class(c) = f {
@@ -857,6 +909,16 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
             }
             return orm::construct(m, kwargs);
         }
+        // a project class held as a value (`cls(**data)`, `type(m)(a=1)`): what calling it by name does
+        if let ClassKind::Schema(s) = c.kind {
+            return Box::pin(schema_new(cx, s, args, kwargs)).await;
+        }
+        if let ClassKind::Enum(e) = c.kind {
+            if args.len() != 1 || !kwargs.is_empty() {
+                return Err(Exc::type_error(format!("py2axum: {}() held as a value takes exactly one value", c.name)));
+            }
+            return enum_call(cx, e, &args[0]).await;
+        }
     }
     if !kwargs.is_empty() {
         return Err(Exc::type_error("keyword arguments to a function value are not supported by py2axum"));
@@ -868,6 +930,42 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
         },
         _ => Err(Exc::type_error(format!("'{}' object is not callable", f.type_name()))),
     }
+}
+
+/// Calling a Pydantic model, settings, dataclass or plain class known only at run time: the same
+/// paths as a call by name (`dyn.py` `construct`), with the errors CPython raises.
+async fn schema_new(cx: &Cx, s: &'static pyd::SchemaDesc, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if std::ptr::eq(s, &super::libs::NAMESPACE) {
+        return super::libs::namespace(&args, &kwargs);
+    }
+    if s.dataclass {
+        return pyd::dataclass_new(cx, s, args, kwargs).await;
+    }
+    if s.open {
+        let o = pyd::object_new(s);
+        return match s.init {
+            Some(init) => init(cx, o.clone(), super::pack(args, kwargs)).await.map(|_| o),
+            None if args.is_empty() && kwargs.is_empty() => Ok(o),
+            None => Err(Exc::type_error(format!("{}() takes no arguments", s.name))),
+        };
+    }
+    if let Some(st) = s.settings {
+        // positional arguments and `_env_prefix=`-style keywords are BaseSettings init options
+        if !args.is_empty() || kwargs.iter().any(|(k, _)| k.starts_with('_')) {
+            return Err(Exc::type_error(format!(
+                "py2axum: {}(): pydantic-settings init options are not supported (set them in model_config)", s.name)));
+        }
+        return super::settings(cx, s, st.prefix, st.case_sensitive, st.none_str, kwargs).await;
+    }
+    if !args.is_empty() {
+        return Err(Exc::type_error(format!("BaseModel.__init__() takes 1 positional argument but {} were given", args.len() + 1)));
+    }
+    if let Some(init) = s.init {
+        // the model's own `__init__(self, **data)`
+        let o = pyd::object_new_blank(s);
+        return init(cx, o.clone(), super::pack(vec![], kwargs)).await.map(|_| o);
+    }
+    pyd::construct(cx, s, super::kwargs_dict(kwargs)?).await
 }
 
 // ---------------------------------------------------------------- str
@@ -1372,6 +1470,7 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
         "utcoffset" => d.offset().map(|o| V::Delta(Duration::seconds(o as i64))).unwrap_or(V::None),
         "weekday" => V::Int(d.wall.weekday().num_days_from_monday() as i64),
         "isoweekday" => V::Int(d.wall.weekday().number_from_monday() as i64),
+        "toordinal" => V::Int(d.wall.date().num_days_from_ce() as i64),
         "strftime" => V::str(libs::strftime(&d.wall, d.offset(), d.tz.map(|t| t.name()), &strs(&args[0])?)),
         _ => return Err(Exc::attr_error(format!("'datetime.datetime' object has no attribute '{name}'"))),
     })
@@ -1384,6 +1483,7 @@ fn date_method(d: &chrono::NaiveDate, name: &str, args: &[V], kwargs: &[(String,
         "isoformat" => V::str(dt::date_iso(d)),
         "weekday" => V::Int(d.weekday().num_days_from_monday() as i64),
         "isoweekday" => V::Int(d.weekday().number_from_monday() as i64),
+        "toordinal" => V::Int(d.num_days_from_ce() as i64),
         "strftime" => V::str(libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, &strs(&args[0])?)),
         "replace" => {
             let mut x = *d;
@@ -1833,6 +1933,11 @@ pub fn b_print(args: &[V]) -> R {
 
 /// `isinstance(x, <builtin type name>)`
 /// `type(x)` (one argument): the class of a project/library instance, else the builtin type by name
+/// builtins that are functions, not types (`type(len)` is builtin_function_or_method)
+const BUILTIN_FUNCTIONS: &[&str] = &["len", "repr", "sorted", "min", "max", "sum", "any", "all", "next", "round", "abs",
+    "print", "isinstance", "getattr", "setattr", "hasattr", "iter", "open", "chr", "ord", "divmod", "callable", "hash", "id",
+    "issubclass", "vars"];
+
 pub fn b_type(args: &[V]) -> R {
     if args.len() != 1 {
         return Err(Exc::type_error("py2axum: type() takes exactly one argument here"));
@@ -1844,8 +1949,15 @@ pub fn b_type(args: &[V]) -> R {
         V::Enum(e, _) => V::Class(e.class),
         V::Decimal(_) => V::native(Native::Type("Decimal")),
         V::Native(n) if matches!(&**n, Native::TypeExpr(..)) => V::native(Native::ExtType("types.GenericAlias")),
+        // builtins held as values are `Native::Type(name)`: the functions among them are not types
+        V::Native(n) if matches!(&**n, Native::Type(t) if BUILTIN_FUNCTIONS.contains(t)) => V::native(Native::Type("builtin_function_or_method")),
         V::Native(n) if matches!(&**n, Native::ExtType(_) | Native::Type(_)) => V::native(Native::Type("type")),
-        V::Class(_) => V::native(Native::Type("type")),
+        // the metaclass (Python ≥ 3.11 names Enum's `EnumType`)
+        V::Class(c) => V::native(Native::Type(match c.kind {
+            ClassKind::Schema(s) if !s.dataclass => "ModelMetaclass",
+            ClassKind::Enum(_) => "EnumType",
+            _ => "type",
+        })),
         v => V::native(Native::Type(v.type_name())),
     })
 }
@@ -1891,6 +2003,51 @@ pub fn b_chr(args: &[V]) -> R {
         [o] => Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
         _ => Err(Exc::type_error(format!("chr() takes exactly one argument ({} given)", args.len()))),
     }
+}
+
+/// `bytes(...)`: empty, a copy, n zero bytes, an iterable of ints, or a str with its encoding
+pub fn b_bytes(args: &[V], kwargs: &[(String, V)]) -> R {
+    let mut enc = None;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "encoding" => enc = Some(v.clone()),
+            "errors" => {}
+            _ => return Err(Exc::type_error(format!("'{k}' is an invalid keyword argument for bytes()"))),
+        }
+    }
+    let enc = enc.or_else(|| args.get(1).cloned());
+    let out: Vec<u8> = match (args.first(), enc) {
+        (None, None) => Vec::new(),
+        (Some(V::Str(s)), Some(V::Str(e))) => match e.to_ascii_lowercase().replace('_', "-").as_str() {
+            "utf-8" | "utf8" => s.as_bytes().to_vec(),
+            _ => return Err(Exc::runtime(format!("py2axum: bytes(str, {e:?}): only utf-8 is supported"))),
+        },
+        (Some(V::Str(_)), None) => return Err(Exc::type_error("string argument without an encoding")),
+        (_, Some(_)) => return Err(Exc::type_error("encoding without a string argument")),
+        (Some(V::Bytes(b)), None) => b.to_vec(),
+        (Some(V::Bool(b)), None) => vec![0; *b as usize],
+        (Some(V::Int(n)), None) => {
+            if *n < 0 {
+                return Err(Exc::value_error("negative count"));
+            }
+            vec![0; *n as usize]
+        }
+        (Some(V::None), None) => return Err(Exc::type_error("cannot convert 'NoneType' object to bytes")),
+        (Some(it @ (V::List(_) | V::Tuple(_) | V::Set(_) | V::Dict(_))), None) => {
+            let mut out = Vec::new();
+            for x in ops::iter(it)? {
+                match x {
+                    V::Int(i) if (0..256).contains(&i) => out.push(i as u8),
+                    V::Bool(b) => out.push(b as u8),
+                    V::Int(_) => return Err(Exc::value_error("bytes must be in range(0, 256)")),
+                    o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+                }
+            }
+            out
+        }
+        (Some(o), None) => return Err(Exc::type_error(format!("cannot convert '{}' object to bytes", o.type_name()))),
+    };
+    Ok(V::Bytes(Arc::from(out)))
 }
 
 pub fn b_ord(args: &[V]) -> R {

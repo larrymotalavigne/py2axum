@@ -175,6 +175,23 @@ async def echo(request: Request):
             "body": body.decode(), "x": request.headers.get("x-test")}
 
 
+@router.get("/whoami")
+async def whoami(request: Request):
+    return {"auth": request.headers.get("authorization")}
+
+
+@router.get("/http-auth")
+async def http_auth(request: Request):
+    """AsyncClient(auth=...): BasicAuth or a (user, password) tuple, replacing the request's own header."""
+    url = f"http://{request.headers['host']}/libs/whoami"
+    out = []
+    for auth in (httpx.BasicAuth("é", "p:w"), ("bob", b"secret"), httpx.BasicAuth(username="u", password=""), None):
+        async with httpx.AsyncClient(timeout=_TIMEOUT, auth=auth) as client:
+            out.append((await client.get(url)).json())
+            out.append((await client.get(url, headers={"Authorization": "Bearer x"})).json())
+    return out
+
+
 @router.get("/status/{code}")
 async def status_code(code: int):
     return PlainTextResponse("nope é", status_code=code)
@@ -571,6 +588,144 @@ async def decimal_db(db: DbDep):
             "avg": str(avg), "ratio": str(ratio), "big": big, "doubled": str(p.budget), "raw": [total, avg]}
 
 
+# ---- html.escape, datetime.min/max, toordinal
+import html  # noqa: E402
+from datetime import date as _date  # noqa: E402
+
+
+SKIPPED, STUCK, LIMITS = "sautée", "figée", (1, 2)
+
+
+@router.get("/smalllibs")
+async def small_libs():
+    out = [SKIPPED, STUCK, LIMITS, html.escape("<a href='x'>&\"</a>"), html.escape("<'\">", quote=False), html.escape("plain", False),
+           str(datetime.combine(_date(2024, 5, 6), datetime.min.time(), tzinfo=UTC)), str(datetime.min), str(datetime.max),
+           _date(2024, 5, 6).toordinal(), datetime(2024, 5, 6, 7).toordinal(), _date.min.toordinal(),
+           (_date(2024, 5, 6).toordinal() - 1) // 7]
+    try:
+        html.escape(5)
+    except AttributeError as e:
+        out.append(str(e))
+    return out
+
+
+# ---- email.utils.formatdate (RFC 2822 dates)
+from email.utils import formatdate  # noqa: E402
+
+
+@router.get("/formatdate")
+async def format_date():
+    return [formatdate(0), formatdate(0, usegmt=True), formatdate(1700000000.5), formatdate(1e9, localtime=True),
+            formatdate(timeval=86399.9999999), formatdate(1e9, True, True), len(formatdate()),
+            formatdate(localtime=True)[-5:], formatdate(None, usegmt=True)[-4:], formatdate(-1)]
+
+
+# ---- Decimal fields of Pydantic models (lax validation, digits, bounds, JSON as strings)
+from pydantic import BaseModel as _BaseModel, Field, computed_field  # noqa: E402
+
+
+class Price(_BaseModel):
+    amount: Decimal
+    fee: Decimal | None = None
+    capped: Decimal | None = Field(None, gt=0, le=500.5, max_digits=5, decimal_places=2)
+    small: Decimal | None = Field(None, ge=0.1, lt=10, decimal_places=1)
+    digits: Decimal | None = Field(None, max_digits=1)
+
+
+class Bill(_BaseModel):
+    model_config = {"extra": "allow"}
+
+    qty: int
+    unit: Decimal
+    note: str | None = None
+
+    @computed_field
+    @property
+    def total(self) -> Decimal:
+        return self.qty * self.unit
+
+    @computed_field
+    @property
+    def label(self) -> str | None:
+        return self.note.upper() if self.note else None
+
+
+class BigBill(Bill):
+    @computed_field
+    def big(self) -> bool:
+        return self.total > 100
+
+
+@router.post("/bill")
+async def bill(b: BigBill):
+    return {"dump": b.model_dump(), "json": b.model_dump(mode="json"), "nn": b.model_dump(exclude_none=True),
+            "unset": b.model_dump(exclude_unset=True), "attr": str(b.total), "exc": b.model_dump(exclude={"total"}),
+            "inc": b.model_dump(include={"qty", "big"}), "mj": b.model_dump_json(), "big": b.big}
+
+
+@router.post("/bill-echo", response_model=BigBill)
+async def bill_echo(b: BigBill):
+    b.qty = b.qty + 1
+    return b
+
+
+class Tagged(_BaseModel):
+    """A model's own __init__: run by Tagged(...), skipped by validation from attributes."""
+    model_config = {"from_attributes": True}
+
+    name: str
+    mode: str = "a"
+    tags: list[str] = []
+    full: str | None = None
+
+    def __init__(self, **data):
+        val = data.get("mode")
+        if val and hasattr(val, "value"):
+            data["mode"] = val.value
+        if data.get("tags") is None:
+            data["tags"] = []
+        super().__init__(**data)
+        if self.name:
+            self.full = f"{self.name}:{self.mode}"
+
+
+class SubTagged(Tagged):
+    n: int = 0
+
+
+@router.post("/tagged")
+async def tagged(body: dict):
+    from pydantic import ValidationError
+    from .enums import Channel
+    from types import SimpleNamespace
+    obj = SimpleNamespace(name=body.get("name"), mode=body.get("mode", "a"), tags=body.get("tags") or [])
+    out = {"v": Tagged.model_validate(obj).model_dump(),
+           "e": Tagged(name="x", mode=Channel.SMS, tags=None).model_dump(), "s": SubTagged(name="y", n=2).model_dump(),
+           "fs": sorted(Tagged(name="z").model_fields_set)}
+    try:
+        out["t"] = Tagged(**body).model_dump()
+    except ValidationError as e:
+        out["t"] = [x["type"] for x in e.errors()]
+    return out
+
+
+@router.post("/decimal-in")
+async def decimal_in(p: Price):
+    return {"amount": str(p.amount), "dump": p.model_dump(mode="json"), "raw": p.model_dump(),
+            "is_dec": isinstance(p.amount, Decimal), "plus": str(p.amount + 1)}
+
+
+@router.post("/decimal-echo", response_model=Price)
+async def decimal_echo(p: Price):
+    return p
+
+
+@router.post("/decimal-out", response_model=Price)
+async def decimal_out(body: dict):
+    """response_model validation of plain values (floats through their repr)."""
+    return body
+
+
 # ---- is_(True), join without ON, in_(select), injected Response headers, recursion
 from fastapi import Response  # noqa: E402
 
@@ -731,6 +886,57 @@ async def url_cases(body: UrlIn):
             "site": [body.site.host, body.site.port, body.site.path, body.site.query, body.site.fragment],
             "dump": body.model_dump(mode="json"), "settings": f"{UrlSettings().REDIS_DSN}",
             "env": str(UrlSettings(REDIS_DSN="rediss://u:p@cache").REDIS_DSN)}
+
+
+# ---- pydantic-settings env_parse_none_str and case_sensitive (env set in scripts_start_dyn.sh)
+from pydantic import ValidationError as _SettingsError  # noqa: E402
+from pydantic_settings import SettingsConfigDict  # noqa: E402
+
+
+class NoneSettings(BaseSettings):
+    model_config = SettingsConfigDict(case_sensitive=True, env_parse_none_str="none", env_prefix="DYNAPP_")
+    NONE_INT: int | None = 5
+    NONE_STR: str | None = "x"
+    NONE_LIST: list[int] | None = [1]
+    NONE_CASE: str | None = "c"
+    NONE_DICT: dict[str, int | None] | None = None
+    lower: str = "dflt"
+    NONE_REQ: int = 3
+    RAW: list[int] | str | None = None
+    JSON: list[int] | None = None
+
+
+class LooseNoneSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_parse_none_str="none", env_prefix="dynapp_")
+    none_int: int | None = 5
+    lower: str = "dflt"
+    none_req: int = 1
+
+
+class ChildNoneSettings(LooseNoneSettings):
+    model_config = SettingsConfigDict(env_parse_none_str="None")
+    none_int: str | None = "i"
+    none_case: str | None = "c"
+
+
+@router.get("/none-settings")
+async def none_settings():
+    out = [NoneSettings(NONE_REQ=1).model_dump(), LooseNoneSettings(none_req=2).model_dump(),
+           ChildNoneSettings(none_req=2).model_dump()]
+    # missing required value from the env -> None; an init keyword is not parsed
+    try:
+        NoneSettings()
+    except _SettingsError as e:
+        out.append(e.errors(include_url=False))
+    try:
+        LooseNoneSettings()
+    except _SettingsError as e:
+        out.append(e.errors(include_url=False))
+    try:
+        NoneSettings(NONE_REQ=1, NONE_INT="none")
+    except _SettingsError as e:
+        out.append(e.errors(include_url=False))
+    return out
 
 
 # ---- python-jose decode options (tokens of an identity provider read unverified)

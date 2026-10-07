@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import Annotated, Literal, Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationInfo, field_validator, model_validator, validator
 
 from .enums import Channel, Level, Priority, Status
 
@@ -142,6 +142,43 @@ class NamedSlot(Slot):
         if any(c.isdigit() for c in v):
             raise ValueError("digits")
         return v.title()
+
+
+class Span(BaseModel):
+    """`info.data` / v1 `values`: the earlier fields that passed (after their validators), defaults included."""
+    start: int
+    kind: str = "day"
+    end: int
+    seen: str = ""
+    note: str | None = None
+
+    @field_validator("start")
+    @classmethod
+    def start_positive(cls, v):
+        if v < 0:
+            raise ValueError("negative start")
+        return v * 10
+
+    @field_validator("end")
+    @classmethod
+    def after_start(cls, v, info: ValidationInfo):
+        start = info.data.get("start")
+        if start is not None and v * 10 < start:
+            raise ValueError(f"{info.field_name} before start")
+        return v
+
+    @validator("seen")
+    def seen_values(cls, v, values):
+        return v + ":" + ",".join(f"{k}={values[k]}" for k in values)
+
+    @field_validator("note")
+    def note_info(cls, v, info):
+        return f"{v}|{sorted(info.data)}|{info.field_name}|{type(info.data).__name__}"
+
+
+class Agenda(BaseModel):
+    spans: list[Span]
+    title: str
 
 
 class Booking(BaseModel):

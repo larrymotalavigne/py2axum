@@ -58,3 +58,12 @@ class EncryptedString(TypeDecorator[str]):
 
     def process_result_value(self, value, dialect):  # noqa: ANN001
         return decrypt_value(value)
+
+
+# a column type built by a project function (marketing's `_enum`): inlined at transpile time
+from sqlalchemy import Enum as SQLEnum  # noqa: E402
+
+
+def enum_type(enum_cls, name: str):
+    """Postgres ENUM named `name` storing the member values."""
+    return SQLEnum(enum_cls, name=name, values_callable=lambda e: [m.value for m in e])

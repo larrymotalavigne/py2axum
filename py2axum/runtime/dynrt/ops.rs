@@ -533,7 +533,7 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y) || x.equals(y),
-        (V::Native(x), V::Native(y)) => Arc::ptr_eq(x, y),
+        (V::Native(x), V::Native(y)) => Arc::ptr_eq(x, y) || matches!((&**x, &**y), (Native::Type(p), Native::Type(q)) if p == q),
         (V::Exc(x), V::Exc(y)) => Arc::ptr_eq(&x.0, &y.0),
         _ => match (num(a), num(b)) {
             (Some(x), Some(y)) => x == y,
@@ -644,7 +644,8 @@ pub fn is(a: &V, b: &V) -> bool {
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y),
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),
-        (V::Native(x), V::Native(y)) => Arc::ptr_eq(x, y),
+        // a builtin type is one object: `type(x) is str`
+        (V::Native(x), V::Native(y)) => Arc::ptr_eq(x, y) || matches!((&**x, &**y), (Native::Type(p), Native::Type(q)) if p == q),
         _ => false,
     }
 }
@@ -1501,6 +1502,7 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         V::Dict(d) => d.lock().values().map(|(k, _)| k.clone()).collect(),
         V::Set(s) => s.lock().values().cloned().collect(),
         V::Str(s) => s.chars().map(|c| V::str(c.to_string())).collect(),
+        V::Bytes(b) => b.iter().map(|x| V::Int(*x as i64)).collect(),
         V::Result(r) => r.lock().take_rows()?,
         V::Native(n) if matches!(&**n, Native::CsvRows(..) | Native::StringIO(_) | Native::Iter(_)) => match &**n {
             Native::CsvRows(_, rows) => iter(rows)?,

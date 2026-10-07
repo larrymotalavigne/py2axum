@@ -312,6 +312,8 @@ fn no_attr(o: &RObj, name: &str) -> Exc {
 pub fn attr(o: &Arc<RObj>, name: &str) -> R {
     match (&**o, name) {
         (RObj::App, "router") => Ok(obj(RObj::AppRouter)),
+        // the binary has no overrides (tests set them, a server does not): always empty
+        (RObj::App, "dependency_overrides") => V::dict_from(vec![]),
         (RObj::App | RObj::AppRouter, "routes") => routes_of(app_def(), true),
         (RObj::AppRouter, "prefix") => Ok(V::str("")),
         (RObj::Router(r), "routes") => routes_of(r, false),
@@ -340,6 +342,10 @@ fn add_route(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     }
     let path = args.first().or_else(|| kw(&kwargs, "path")).cloned().ok_or_else(|| Exc::type_error("Starlette.add_route() missing 2 required positional arguments: 'path' and 'route'"))?;
     let endpoint = args.get(1).or_else(|| kw(&kwargs, "route")).cloned().ok_or_else(|| Exc::type_error("Starlette.add_route() missing 1 required positional argument: 'route'"))?;
+    if matches!(endpoint, V::Class(_)) {
+        // Starlette runs a class as an ASGI app (`HTTPEndpoint`): not supported
+        return Err(Exc::type_error("py2axum: add_route() with a class endpoint (HTTPEndpoint) is not supported"));
+    }
     let path = match path {
         V::Str(s) => s.to_string(),
         o => return Err(Exc::type_error(format!("py2axum: a route path must be a str, not {}", o.type_name()))),

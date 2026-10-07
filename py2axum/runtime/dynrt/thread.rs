@@ -461,6 +461,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         if let Native::Prom(p) = &**n {
             return super::prom::enter(v, p);
         }
+        if let Native::Suppress(_) = &**n {
+            return Ok(V::None);
+        }
     }
     super::pathio::ctx_enter(v)
 }
@@ -480,6 +483,11 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         }
         if let Native::Prom(p) = &**n {
             return super::prom::exit(p, exc.as_ref());
+        }
+        if let Native::Suppress(classes) = &**n {
+            // contextlib.suppress: true when the exception is an instance of one of its classes
+            let hit = exc.is_some_and(|e| classes.iter().any(|c| matches!(c, V::Class(k) if e.isinstance(k))));
+            return Ok(V::Bool(hit));
         }
     }
     super::pathio::ctx_exit(v)?;

@@ -1,6 +1,7 @@
 //! py2axum dynamic runtime: compiled Python operates on `V` values with CPython semantics.
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 
+pub mod agen;
 pub mod aio;
 pub mod asgi;
 pub mod auth;
@@ -29,10 +30,12 @@ pub mod google;
 pub mod itsd;
 pub mod jose;
 pub mod libs;
+pub mod mcp;
 pub mod methods;
 pub mod ops;
 pub mod orm;
 pub mod pyd;
+pub mod rawasgi;
 pub mod v;
 pub mod web;
 pub mod webpush;
@@ -55,6 +58,8 @@ pub struct AppState {
     pub autoflush: bool,
     /// the session dependency commits after the endpoint (`yield s; await s.commit()`)
     pub commit_after: bool,
+    /// the session dependency is a synchronous `Session` (lazy loads emit SQL)
+    pub sync_session: bool,
 }
 
 /// Per-request state (or the process-level context of module globals).
@@ -70,6 +75,10 @@ pub struct CxInner {
     pub background: std::sync::OnceLock<V>,
     /// a `sys.settrace` function is running (its own calls are not traced)
     pub in_trace: std::sync::atomic::AtomicBool,
+    /// `contextvars` values set in this request (or task tree), by variable id
+    pub ctxvars: parking_lot::Mutex<std::collections::HashMap<usize, V>>,
+    /// the scope given to a raw ASGI app serving this request (`Request(scope, receive)`)
+    pub asgi_scope: parking_lot::Mutex<Option<V>>,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -85,6 +94,8 @@ impl CxInner {
             teardowns: parking_lot::Mutex::new(Vec::new()),
             background: std::sync::OnceLock::new(),
             in_trace: std::sync::atomic::AtomicBool::new(false),
+            ctxvars: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            asgi_scope: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -93,7 +104,7 @@ impl CxInner {
 pub async fn session(cx: &Cx) -> R {
     Ok(cx
         .session
-        .get_or_init(|| async { V::Session(orm::Session::new(cx.app.pool.clone(), cx.app.expire_on_commit, cx.app.autoflush, Arc::downgrade(cx))) })
+        .get_or_init(|| async { V::Session(orm::Session::new(cx.app.pool.clone(), cx.app.expire_on_commit, cx.app.autoflush, cx.app.sync_session, Arc::downgrade(cx))) })
         .await
         .clone())
 }
@@ -370,19 +381,31 @@ pub fn kwargs_dict(kw: Vec<(String, V)>) -> R {
     V::dict_from(kw.into_iter().map(|(k, v)| (V::str(k), v)).collect())
 }
 
-/// pydantic-settings `BaseSettings()`: fields read from the environment (case-insensitive).
-pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, kw: Vec<(String, V)>) -> R {
-    let env: Vec<(String, String)> = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
+/// pydantic-settings `BaseSettings()`: fields read from the environment (case-insensitive unless
+/// `case_sensitive=True`; `env_parse_none_str`: a value equal to it, case included, is `None`).
+pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, case_sensitive: bool,
+                      none_str: Option<&str>, kw: Vec<(String, V)>) -> R {
+    let fold = |k: &str| if case_sensitive { k.to_string() } else { k.to_lowercase() };
+    let env: Vec<(String, String)> = std::env::vars().map(|(k, v)| (fold(&k), v)).collect();
     let mut items = Vec::new();
     for f in desc.fields {
         if let Some((_, v)) = kw.iter().find(|(k, _)| k == f.name) {
             items.push((V::str(f.name), v.clone()));
             continue;
         }
-        let key = format!("{}{}", prefix.to_ascii_lowercase(), f.env.unwrap_or(f.name).to_ascii_lowercase());
-        if let Some((_, raw)) = env.iter().find(|(k, _)| *k == key) {
-            let complex = matches!(f.td, pyd::TD::Dict(_) | pyd::TD::List(_) | pyd::TD::Set(_) | pyd::TD::Tuple(_) | pyd::TD::Schema(_));
-            let v = if complex { pyd::loads(raw)? } else { V::str(raw) };
+        let key = fold(&format!("{}{}", prefix, f.env.unwrap_or(f.name)));
+        // a dict built from os.environ: when case folding merges two names, the last one wins
+        if let Some((_, raw)) = env.iter().rev().find(|(k, _)| *k == key) {
+            let v = if none_str == Some(raw.as_str()) {
+                V::None
+            } else {
+                match settings_complex(f.td) {
+                    // a union with a complex member: JSON when it parses, else the raw string
+                    Some(true) => pyd::loads(raw).unwrap_or_else(|_| V::str(raw)),
+                    Some(false) => pyd::loads(raw)?,
+                    None => V::str(raw),
+                }
+            };
             items.push((V::str(f.name), v));
             continue;
         }
@@ -394,6 +417,17 @@ pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, kw:
         }
     }
     pyd::construct(cx, desc, V::dict_from(items)?).await
+}
+
+/// pydantic-settings' complex fields (decoded as JSON): containers and models; `Some(true)` for a union
+/// with such a member, whose JSON errors are tolerated.
+fn settings_complex(td: &pyd::TD) -> Option<bool> {
+    match td {
+        pyd::TD::Dict(_) | pyd::TD::List(_) | pyd::TD::Set(_) | pyd::TD::Tuple(_) | pyd::TD::Schema(_) => Some(false),
+        pyd::TD::Optional(t) => settings_complex(t).map(|_| true),
+        pyd::TD::Union(ts) => ts.iter().any(|t| settings_complex(t).is_some()).then_some(true),
+        _ => None,
+    }
 }
 
 /// `x += y`: lists are extended in place (aliases see it), everything else is `x = x + y`.

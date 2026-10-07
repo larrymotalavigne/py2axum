@@ -31,6 +31,8 @@ pub struct Client {
     http_insecure: reqwest::Client,
     headers: Vec<(String, String)>,
     base_url: Option<String>,
+    /// `auth=`: the `Authorization` header httpx's BasicAuth flow sets on every request
+    auth: Option<String>,
     closed: AtomicBool,
 }
 
@@ -100,6 +102,31 @@ fn header_pairs(v: Option<&V>) -> R<Vec<(String, String)>> {
     }
 }
 
+fn bytes_of(v: &V) -> R<Vec<u8>> {
+    match v {
+        V::Str(s) => Ok(s.as_bytes().to_vec()),
+        V::Bytes(b) => Ok(b.to_vec()),
+        o => Err(Exc::type_error(format!("Expected str or bytes, got {}", o.type_name()))),
+    }
+}
+
+fn basic_header(user: &V, password: &V) -> R<String> {
+    use base64::Engine;
+    let mut up = bytes_of(user)?;
+    up.push(b':');
+    up.extend(bytes_of(password)?);
+    Ok(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(up)))
+}
+
+/// `httpx.BasicAuth(username, password)` (UTF-8, like httpx)
+pub fn basic_auth(args: &[V], kwargs: &[(String, V)]) -> R {
+    let get = |i: usize, n: &str| args.get(i).or_else(|| kw(kwargs, n)).cloned().ok_or_else(|| Exc::type_error(format!("BasicAuth.__init__() missing 1 required positional argument: '{n}'")));
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "username" && k != "password") {
+        return Err(Exc::type_error(format!("BasicAuth.__init__() got an unexpected keyword argument '{k}'")));
+    }
+    Ok(V::native(Native::HttpBasicAuth(basic_header(&get(0, "username")?, &get(1, "password")?)?)))
+}
+
 /// `httpx.AsyncClient(...)` / `aiohttp.ClientSession(...)`
 pub fn client(kind: &str, version: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let k = if kind == "httpx" { Kind::Httpx } else { Kind::Aiohttp };
@@ -124,6 +151,7 @@ pub fn client(kind: &str, version: &str, args: &[V], kwargs: &[(String, V)]) -> 
         ],
     };
     let mut base_url = None;
+    let mut auth = None;
     let mut follow = k == Kind::Aiohttp;
     for (name, v) in kwargs {
         match (k, name.as_str()) {
@@ -149,6 +177,20 @@ pub fn client(kind: &str, version: &str, args: &[V], kwargs: &[(String, V)]) -> 
             }
             (Kind::Httpx, "base_url") => base_url = Some(ops::str_(v)?.trim_end_matches('/').to_string()),
             (Kind::Httpx, "follow_redirects") => follow = ops::truthy(v)?,
+            (Kind::Httpx, "auth") => {
+                auth = match v {
+                    V::None => None,
+                    V::Native(n) if matches!(&**n, Native::HttpBasicAuth(_)) => match &**n {
+                        Native::HttpBasicAuth(h) => Some(h.clone()),
+                        _ => None,
+                    },
+                    V::Tuple(_) | V::List(_) => match ops::iter(v)?.as_slice() {
+                        [u, p] => Some(basic_header(u, p)?),
+                        _ => return Err(Exc::type_error("py2axum: auth=(username, password) expected")),
+                    },
+                    o => return Err(Exc::type_error(format!("py2axum: AsyncClient(auth=) of type {} is not supported", o.type_name()))),
+                }
+            }
             // an injected transport (tests): None is the default one
             (Kind::Httpx, "transport") if v.is_none() => {}
             _ => return Err(Exc::type_error(format!("py2axum: {}({name}=) is not supported", if k == Kind::Httpx { "AsyncClient" } else { "ClientSession" }))),
@@ -174,7 +216,7 @@ pub fn client(kind: &str, version: &str, args: &[V], kwargs: &[(String, V)]) -> 
     };
     let http = make().build().map_err(|e| Exc::runtime(format!("py2axum: HTTP client: {e}")))?;
     let http_insecure = make().danger_accept_invalid_certs(true).build().map_err(|e| Exc::runtime(format!("py2axum: HTTP client: {e}")))?;
-    Ok(V::native(Native::HttpClient(Arc::new(Client { kind: k, http, http_insecure, headers, base_url, closed: AtomicBool::new(false) }))))
+    Ok(V::native(Native::HttpClient(Arc::new(Client { kind: k, http, http_insecure, headers, base_url, auth, closed: AtomicBool::new(false) }))))
 }
 
 /// `yarl.URL(url)`: yarl's parts (default port of the scheme, `host` None without a host)
@@ -359,6 +401,10 @@ pub async fn send(c: &Client, method: &str, args: &[V], kwargs: &[(String, V)]) 
     let m = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| Exc::value_error(format!("invalid method {method}")))?;
     let final_url = parsed.to_string();
     let mut rb = if insecure { c.http_insecure.request(m, parsed) } else { c.http.request(m, parsed) };
+    if c.auth.is_some() {
+        // the auth flow replaces any Authorization header of the request
+        headers.retain(|(x, _)| !x.eq_ignore_ascii_case("authorization"));
+    }
     for (k, v) in &headers {
         rb = rb.header(k.as_str(), v.as_str());
     }
@@ -367,6 +413,9 @@ pub async fn send(c: &Client, method: &str, args: &[V], kwargs: &[(String, V)]) 
             rb = rb.header("content-type", ct);
         }
         rb = rb.body(b);
+    }
+    if let Some(h) = &c.auth {
+        rb = rb.header("authorization", h.as_str());
     }
     if let Some(Some(s)) = per_request_timeout {
         rb = rb.timeout(Duration::from_secs_f64(s));

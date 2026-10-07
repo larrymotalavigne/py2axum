@@ -230,6 +230,9 @@ pub static CREDENTIALS: pyd::SchemaDesc = pyd::SchemaDesc {
     dataclass: false,
     async_methods: &[],
     slots: &[],
+    settings: None,
+    init: None,
+    computed: &[],
 };
 
 pub enum Security {
@@ -626,36 +629,12 @@ impl Drop for TeardownGuard {
 
 // ---------------------------------------------------------------- async generators
 
-pub struct Yielder(pub tokio::sync::mpsc::Sender<V>);
-
-impl Yielder {
-    pub async fn send(&self, v: V) -> R<V> {
-        self.0.send(v).await.map_err(|_| Exc::new(&GENERATOR_EXIT, vec![]))?;
-        Ok(V::None)
-    }
-}
-
-/// Calling an `async def` generator: its body runs as a task feeding a bounded channel.
-pub fn spawn_gen<F>(f: F) -> V
-where
-    F: FnOnce(Yielder) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send + 'static>>,
-{
-    let (tx, rx) = tokio::sync::mpsc::channel::<V>(1);
-    let fut = f(Yielder(tx));
-    tokio::spawn(async move {
-        if let Err(e) = fut.await {
-            if !e.isinstance(&GENERATOR_EXIT) {
-                eprintln!("ERROR:py2axum:exception in async generator: {:?}", e);
-            }
-        }
-    });
-    V::native(Native::Gen(Mutex::new(Some(rx))))
-}
+pub use super::agen::{spawn_gen, Yielder};
 
 pub fn streaming_response(content: V, media_type: Option<String>, status: u16, headers: Vec<(String, String)>) -> R {
     let rx = match &content {
         V::Native(n) => match &**n {
-            Native::Gen(g) => g.lock().take().ok_or_else(|| Exc::runtime("generator already consumed"))?,
+            Native::Gen(g) => super::agen::into_channel(g.clone()),
             _ => return Err(Exc::type_error("StreamingResponse needs an async generator")),
         },
         _ => {
@@ -959,6 +938,9 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
             None => vec![],
         };
         *cx.req.path_params.lock() = pp;
+        if super::rawasgi::is_asgi_app(&a.endpoint) {
+            return super::rawasgi::serve(cx, &a.endpoint).await;
+        }
         let ret = super::methods::call_value(cx, &a.endpoint, vec![super::request(cx)], vec![]).await?;
         return super::asgi::to_response(&ret);
     }
@@ -1002,6 +984,9 @@ pub struct Task {
     state: Mutex<(bool, Vec<V>)>,
     result: Mutex<Option<R>>,
     finished: tokio::sync::Notify,
+    /// `task.cancel()`: the coroutine stops at its current await (its future is dropped)
+    cancel: tokio::sync::Notify,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 /// `await task`: its result (or exception) once it has finished
@@ -1023,21 +1008,33 @@ pub fn spawn_task(cx: &Cx, f: V, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
 
 /// A task running `fut` on its own: result kept for `await task`, done callbacks called after.
 pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
-    let task = Arc::new(Task { state: Mutex::new((false, Vec::new())), result: Mutex::new(None), finished: tokio::sync::Notify::new() });
+    let task = Arc::new(Task {
+        state: Mutex::new((false, Vec::new())),
+        result: Mutex::new(None),
+        finished: tokio::sync::Notify::new(),
+        cancel: tokio::sync::Notify::new(),
+        cancelled: std::sync::atomic::AtomicBool::new(false),
+    });
     let tv = V::native(Native::Task(task.clone()));
     let (cx2, tv2) = (cx.clone(), tv.clone());
     tokio::spawn(async move {
-        let r = fut.await;
+        let r = tokio::select! {
+            r = fut => r,
+            _ = task.cancel.notified() => Err(Exc::new(&CANCELLED_ERROR, vec![])),
+        };
         if let Err(e) = &r {
-            eprintln!("ERROR:asyncio:Task exception was never retrieved: {:?}", e);
+            if !e.isinstance(&CANCELLED_ERROR) {
+                eprintln!("ERROR:asyncio:Task exception was never retrieved: {:?}", e);
+            }
         }
         *task.result.lock() = Some(r);
-        task.finished.notify_waiters();
+        // done before anyone waiting on the result runs again
         let callbacks = {
             let mut st = task.state.lock();
             st.0 = true;
             std::mem::take(&mut st.1)
         };
+        task.finished.notify_waiters();
         for cb in callbacks {
             if let Err(e) = super::methods::call_value(&cx2, &cb, vec![tv2.clone()], vec![]).await {
                 eprintln!("ERROR:asyncio:Exception in callback: {:?}", e);
@@ -1045,6 +1042,69 @@ pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
         }
     });
     Ok(tv)
+}
+
+// ---------------------------------------------------------------- lifespan
+
+/// `FastAPI(lifespan=f)` at startup: `f(app)` entered (an async generator function is wrapped like
+/// Starlette does); the context manager is kept for the shutdown
+pub async fn lifespan_start(cx: &Cx, f: V) -> R {
+    let cm = super::methods::call_value(cx, &f, vec![super::routing::app()], vec![]).await?;
+    let cm = match super::agen::as_gen(&cm) {
+        Some(g) => V::native(Native::Acm(g)),
+        None => cm,
+    };
+    super::aio::aenter(cx, &cm).await?;
+    Ok(cm)
+}
+
+/// after the server stopped: the lifespan's code after `yield`
+pub async fn lifespan_end(cx: &Cx, cm: V) -> R<()> {
+    super::aio::aexit(cx, &cm, None).await?;
+    Ok(())
+}
+
+static SHUTDOWN: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
+
+fn shutdown_tx() -> &'static tokio::sync::watch::Sender<bool> {
+    SHUTDOWN.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// SIGINT or SIGTERM (what uvicorn handles): the server stops accepting and drains
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
+    eprintln!("INFO:     Shutting down");
+    let _ = shutdown_tx().send(true);
+}
+
+/// resolves PY2AXUM_SHUTDOWN_TIMEOUT seconds (default 25) after the shutdown signal
+pub async fn shutdown_deadline() {
+    let mut rx = shutdown_tx().subscribe();
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+    let secs: f64 = std::env::var("PY2AXUM_SHUTDOWN_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(25.0);
+    tokio::time::sleep(std::time::Duration::from_secs_f64(secs.max(0.0))).await;
+    eprintln!("WARNING:  py2axum: shutdown timeout, open connections dropped");
 }
 
 pub async fn task_method(cx: &Cx, t: &Arc<Task>, recv: &V, name: &str, args: &[V]) -> R {
@@ -1067,6 +1127,15 @@ pub async fn task_method(cx: &Cx, t: &Arc<Task>, recv: &V, name: &str, args: &[V
             Ok(V::None)
         }
         "done" => Ok(V::Bool(t.state.lock().0)),
+        "cancel" => {
+            if t.state.lock().0 {
+                return Ok(V::Bool(false));
+            }
+            t.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            t.cancel.notify_one();
+            Ok(V::Bool(true))
+        }
+        "cancelled" => Ok(V::Bool(t.state.lock().0 && t.cancelled.load(std::sync::atomic::Ordering::SeqCst))),
         _ => Err(Exc::attr_error(format!("'_asyncio.Task' object has no attribute '{name}'"))),
     }
 }

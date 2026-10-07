@@ -1,3 +1,4 @@
+import base64
 import csv
 import hashlib
 import hmac
@@ -27,27 +28,28 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import ExpiredSignatureError, JWTError, jwt
 from jose.exceptions import JWTClaimsError
-from sqlalchemy import String, and_, cast, extract, func, select, update
+from sqlalchemy import String, and_, cast, extract, func, select, text, update
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
-from . import aio, amqp, apiv, bgloop, colls, composite, decos, dunders, lazyimp, libs, outbound, pk, prom, rds, retrying, tracing
+from . import aio, amqp, apiv, bgloop, colls, composite, decos, dunders, lazyimp, libs, life, outbound, pk, prom, rds, retrying, tracing
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
-from .models import Owner, Project, Secret, Task
+from .models import Asset, Owner, Project, Secret, Task
 from pydantic import ValidationError
 
 from .schemas import (
-    Booking, Contact, Invoice, TaskLoose, Trip, Label, Mixed, Point, Point3, ContactV1, OwnerOut, Person, TaskTitle, ProjectIn, ProjectOut, StatusChange, TaskBrief, TaskIn, TaskOut, TaskSummary, Slot,
+    Agenda, Booking, Contact, Span, Invoice, TaskLoose, Trip, Label, Mixed, Point, Point3, ContactV1, OwnerOut, Person, TaskTitle, ProjectIn, ProjectOut, StatusChange, TaskBrief, TaskIn, TaskOut, TaskSummary, Slot,
 )
 
-app = FastAPI()
+app = FastAPI(lifespan=life.lifespan)
 app.include_router(libs.router)
 app.include_router(decos.router)
 app.include_router(composite.router)
 app.include_router(dunders.router)
 app.include_router(aio.router)
+app.include_router(life.router)
 app.include_router(bgloop.router)
 app.include_router(pk.router)
 app.include_router(rds.router)
@@ -462,6 +464,25 @@ async def lazy(n: int = 4):
             "checked": checked, "head": next(iter([7, 8]))}
 
 
+@app.post("/agenda")
+async def agenda(agenda: Agenda):
+    """Field validators taking `info` / v1 `values`."""
+    return agenda
+
+
+@app.post("/agenda/errors")
+async def agenda_errors(payload: dict):
+    """ValidationError.errors() of a model built in the endpoint: ctx holds the exception object."""
+    try:
+        Span(**payload)
+    except ValidationError as e:
+        errs = e.errors()
+        return {"n": e.error_count(), "url": [d.get("url") for d in errs], "repr": [repr(d.get("ctx")) for d in errs],
+                "types": [type(d["ctx"]["error"]).__name__ for d in errs if "error" in d.get("ctx", {})],
+                "short": e.errors(include_url=False, include_context=False)}
+    return {"ok": True}
+
+
 @app.post("/bookings")
 async def book(booking: Booking, n: int = Query(ge=0)):
     """Validators run in field order, nested ones first; their errors interleave with type errors."""
@@ -697,6 +718,46 @@ async def set_secret(secret_id: int, body: dict, db: DbDep):
     await db.commit()
     await db.refresh(sec)
     return {"token": sec.token}
+
+
+@app.post("/assets")
+async def add_asset(body: dict, db: DbDep):
+    asset = Asset(**({"channel": Channel(body["channel"])} if "channel" in body else {}))
+    if "b64" in body:
+        asset.data = base64.b64decode(body["b64"])
+    if "text" in body:
+        asset.thumb = body["text"].encode()
+    db.add(asset)
+    await db.commit()
+    return {"id": asset.id, "channel": asset.channel, "name": asset.channel.name, "size": len(asset.data or b"")}
+
+
+@app.get("/assets/{asset_id}/data")
+async def asset_data(asset_id: int, db: DbDep):
+    """LargeBinary: bytea read back as bytes, served raw."""
+    asset = await db.get(Asset, asset_id)
+    if asset is None or not asset.data:
+        raise HTTPException(status_code=404, detail="no data")
+    return Response(content=bytes(asset.data), media_type="application/octet-stream")
+
+
+@app.get("/assets/{asset_id}/meta")
+async def asset_meta(asset_id: int, db: DbDep):
+    asset = await db.get(Asset, asset_id)
+    same = (await db.execute(select(Asset.id).where(Asset.data == asset.data))).scalars().all()
+    thumbs = (await db.execute(select(Asset.thumb).where(Asset.thumb.is_not(None)).order_by(Asset.id))).scalars().all()
+    return {"data": asset.data, "thumb": asset.thumb, "is_bytes": isinstance(asset.data, bytes),
+            "head": base64.b64encode((asset.data or b"")[:4]).decode(), "same": same, "thumbs": thumbs}
+
+
+@app.get("/assets")
+async def list_assets(db: DbDep, channel: Channel | None = None):
+    q = select(Asset).order_by(Asset.id)
+    if channel is not None:
+        q = q.where(Asset.channel == channel)
+    rows = (await db.execute(q)).scalars().all()
+    raw = (await db.execute(text("SELECT channel::text FROM assets ORDER BY id"))).scalars().all()
+    return {"ids": [a.id for a in rows], "channels": [a.channel for a in rows], "stored": raw}
 
 
 EVENTS: list = []

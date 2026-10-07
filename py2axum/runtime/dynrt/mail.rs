@@ -436,6 +436,44 @@ pub fn formataddr(pair: &V) -> R {
     Ok(V::str(format!("{name} <{addr}>")))
 }
 
+/// `email.utils.formatdate(timeval=None, localtime=False, usegmt=False)`: RFC 2822 date, seconds truncated,
+/// `-0000` for UTC unless `usegmt` (then `GMT`), the machine's offset with `localtime`
+pub fn formatdate(args: &[V], kwargs: &[(String, V)]) -> R {
+    use chrono::{Offset, TimeZone};
+    let mut p = [args.first().cloned(), args.get(1).cloned(), args.get(2).cloned()];
+    if args.len() > 3 {
+        return Err(Exc::type_error(format!("formatdate() takes from 0 to 3 positional arguments but {} were given", args.len())));
+    }
+    for (k, v) in kwargs {
+        let i = match k.as_str() {
+            "timeval" => 0,
+            "localtime" => 1,
+            "usegmt" => 2,
+            _ => return Err(Exc::type_error(format!("formatdate() got an unexpected keyword argument '{k}'"))),
+        };
+        p[i] = Some(v.clone());
+    }
+    let flag = |v: &Option<V>| -> R<bool> { v.as_ref().map(ops::truthy).transpose().map(|b| b.unwrap_or(false)) };
+    let (local, gmt) = (flag(&p[1])?, flag(&p[2])?);
+    let micros: i64 = match &p[0] {
+        None | Some(V::None) => chrono::Utc::now().timestamp_micros(),
+        Some(V::Int(i)) => i.checked_mul(1_000_000).ok_or_else(|| Exc::new(&OVERFLOW_ERROR, vec![V::str("timestamp out of range for platform time_t")]))?,
+        // datetime.fromtimestamp rounds to the microsecond, half to even
+        Some(V::Float(f)) => (f * 1e6).round_ties_even() as i64,
+        Some(o) => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+    };
+    let utc = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| Exc::value_error("year is out of range"))?;
+    let (wall, zone) = if local {
+        let off = chrono::Local.offset_from_utc_datetime(&utc.naive_utc()).fix();
+        let secs = off.local_minus_utc();
+        let (sign, a) = if secs < 0 { ('-', -secs) } else { ('+', secs) };
+        (utc.naive_utc() + chrono::TimeDelta::seconds(secs as i64), format!("{sign}{:02}{:02}", a / 3600, a % 3600 / 60))
+    } else {
+        (utc.naive_utc(), if gmt { "GMT".to_string() } else { "-0000".to_string() })
+    };
+    Ok(V::str(format!("{} {zone}", wall.format("%a, %d %b %Y %H:%M:%S"))))
+}
+
 /// `email.utils.make_msgid(domain=...)`
 pub fn make_msgid(domain: Option<&V>) -> R {
     let d = match domain {

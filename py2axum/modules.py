@@ -240,6 +240,16 @@ class ModuleIndex:
                         m.defs[st.target.id] = st
             elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 m.defs[node.name] = node
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                  and isinstance(node.value, (ast.Tuple, ast.List)) and len(node.targets[0].elts) == len(node.value.elts)
+                  and all(isinstance(t, ast.Name) for t in node.targets[0].elts)
+                  and not any(isinstance(v, ast.Starred) for v in node.value.elts)):
+                # `A, B = "a", "b"`: one plain assignment per name (literal tuple of the same length)
+                for t, v in zip(node.targets[0].elts, node.value.elts):
+                    one = ast.copy_location(ast.Assign(targets=[ast.Name(t.id, ast.Store())], value=v), node)
+                    m.defs[t.id] = ast.fix_missing_locations(one)
+                    m.binders.setdefault(t.id, []).append(one)
+                continue
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name):

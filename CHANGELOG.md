@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-07
+
+- `FastAPI(lifespan=...)` is translated: the code before `yield` runs before the server listens, the rest after a
+  graceful shutdown on SIGTERM/SIGINT (`PY2AXUM_SHUTDOWN_TIMEOUT`). Async generators run in lockstep with their
+  consumer (`anext`, `asend`, `athrow`, `aclose`), `@asynccontextmanager`, `contextlib.suppress`,
+  `contextvars.ContextVar`, `Task.cancel()`.
+- Raw ASGI routes: `app.add_route(path, obj)` with an object whose class defines `async __call__(scope, receive,
+  send)`; `Request(scope, receive)`, response objects called as ASGI apps.
+- MCP servers (`mcp` 2.2): `MCPServer`, `@server.tool` (async, structured `dict[str, Any]` output), `ToolError`,
+  streamable HTTP without state and with JSON responses, the JSON-RPC envelope validated like the SDK. Tool
+  argument schemas are computed at compile time (pydantic 2.13 JSON schema, `py2axum/jsonschema.py`).
+- `str(ValidationError)` in pydantic-core's format where the model is known.
+
 - Replacing `aiohttp.ClientSession._request` / `httpx.AsyncClient.request` with a wrapper (timing outgoing calls):
   the clients call it; other assignments to library attributes are refused.
 

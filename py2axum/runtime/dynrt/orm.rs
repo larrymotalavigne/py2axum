@@ -71,6 +71,10 @@ pub enum ColTy {
     /// `JSON(none_as_null=True)`: Python None is SQL NULL instead of JSON `null`
     JsonNull,
     Uuid,
+    /// `LargeBinary`: BYTEA, bytes in Python
+    Bytes,
+    /// `ARRAY(String)`: TEXT[]/VARCHAR[], a list of str in Python
+    StrArray,
     Enum(&'static EnumCol),
     /// a project `TypeDecorator`: its `impl` type, plus the compiled process_* methods
     Decorated(&'static TypeDec),
@@ -122,6 +126,8 @@ impl std::fmt::Debug for ColTy {
             ColTy::Json => "Json",
             ColTy::JsonNull => "JsonNull",
             ColTy::Uuid => "Uuid",
+            ColTy::Bytes => "Bytes",
+            ColTy::StrArray => "StrArray",
             ColTy::Enum(e) => return write!(f, "Enum({})", e.desc.name),
             ColTy::Decorated(d) => d.name,
         };
@@ -277,6 +283,8 @@ pub struct RelDesc {
     pub delete: bool,
     pub orphan: bool,
     pub passive_deletes: bool,
+    /// `order_by=`: (target column, descending) — the collection's order when loaded
+    pub order: &'static [(usize, bool)],
 }
 
 /// One loader option path: `selectinload(A.b).selectinload(B.c)` = [(Selectin, A, b), (Selectin, B, c)].
@@ -513,6 +521,22 @@ impl ObjCell {
             return Ok(v.clone());
         }
         Err(Exc::attr_error(format!("'{}' object has no attribute '{}'", self.desc.name, name)))
+    }
+
+    /// Reading an attribute: in a synchronous `Session`, what needs SQL (an expired column, a
+    /// relationship not loaded yet) is loaded like SQLAlchemy's lazy loader instead of MissingGreenlet.
+    pub async fn get_attr(self: &Arc<Self>, name: &str) -> R {
+        match self.get_attr_sync(name) {
+            Err(e) if e.isinstance(&MISSING_GREENLET) => {
+                let Some(sess) = self.sess.lock().upgrade() else { return Err(e) };
+                if !sess.lock().await.sync {
+                    return Err(e);
+                }
+                Session(sess).lazy_load(self, name).await?;
+                self.get_attr_sync(name)
+            }
+            r => r,
+        }
     }
 
     /// A modified persistent object is held strongly by its session until the next flush.
@@ -758,7 +782,8 @@ pub enum Sql {
     ExCol(&'static ModelDesc, usize),
     /// `case((cond, value), ..., else_=value)`
     Case(Vec<(Sql, Sql)>, Option<Box<Sql>>),
-    Delete(&'static ModelDesc, Vec<Sql>),
+    /// (model, WHERE, synchronize_session: objects matched in the session are marked deleted)
+    Delete(&'static ModelDesc, Vec<Sql>, bool),
     Text(String),
     /// `Model.relationship` (class attribute): loader options and `join()` only
     Rel(&'static ModelDesc, usize),
@@ -833,6 +858,10 @@ fn to_sql(v: &V, hint: Option<ColTy>) -> Sql {
     match v {
         V::Col(m, i) => Sql::Col(m, *i),
         V::Sql(s) => (**s).clone(),
+        V::Native(n) if matches!(&**n, Native::Query(..)) => match &**n {
+            Native::Query(_, sel) => to_sql(sel, hint),
+            _ => unreachable!(),
+        },
         // a value for a JSON column: None is JSON null (SQLAlchemy's JSON type, none_as_null=False)
         V::None if hint == Some(ColTy::Json) => Sql::Param(V::None, hint),
         V::None => Sql::Null,
@@ -959,6 +988,7 @@ pub fn sql_text(v: &V) -> R<String> {
 fn expect_sql(v: &V) -> R<Sql> {
     match v {
         V::Col(..) | V::Sql(_) => Ok(to_sql(v, None)),
+        V::Native(n) if matches!(&**n, Native::Query(..)) => Ok(to_sql(v, None)),
         other => Err(Exc::type_error(format!("expected a SQL expression, got {}", other.type_name()))),
     }
 }
@@ -1012,7 +1042,7 @@ fn model_of(v: &V) -> R<&'static ModelDesc> {
 
 /// `async_sessionmaker(bind=engine, expire_on_commit=, autoflush=, autocommit=False, class_=AsyncSession)`
 /// called at run time (the process pool: one database per binary)
-pub fn sessionmaker(args: &[V], kwargs: &[(String, V)]) -> R {
+pub fn sessionmaker(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
     let (mut expire, mut autoflush) = (true, true);
     if args.len() > 1 {
         return Err(Exc::type_error("py2axum: async_sessionmaker() takes the engine and keyword options"));
@@ -1027,7 +1057,7 @@ pub fn sessionmaker(args: &[V], kwargs: &[(String, V)]) -> R {
             other => return Err(Exc::type_error(format!("py2axum: async_sessionmaker({other}=) is not supported"))),
         }
     }
-    Ok(V::native(Native::Maker(expire, autoflush)))
+    Ok(V::native(Native::Maker(expire, autoflush, sync)))
 }
 
 /// `insert(Model)`; `pg`: the postgresql dialect's (on_conflict_do_update/nothing)
@@ -1076,7 +1106,7 @@ pub fn update(m: &V) -> R {
 }
 
 pub fn delete(m: &V) -> R {
-    Ok(sql(Sql::Delete(model_of(m)?, vec![])))
+    Ok(sql(Sql::Delete(model_of(m)?, vec![], true)))
 }
 
 pub fn exists(v: &V) -> R {
@@ -1092,6 +1122,17 @@ pub fn exists(v: &V) -> R {
 /// Methods on columns, expressions and statements.
 pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     let base = expect_sql(recv)?;
+    // a Query given as an argument (`col.in_(session.query(...))`) is its select()
+    let args: Vec<V> = args
+        .into_iter()
+        .map(|a| match &a {
+            V::Native(n) => match &**n {
+                Native::Query(_, sel) => sel.clone(),
+                _ => a,
+            },
+            _ => a,
+        })
+        .collect();
     if let Sql::Load(c) = &base {
         let a = args.first().cloned().ok_or_else(|| Exc::type_error(format!("{name}() takes one argument")))?;
         return loader_chain(c.clone(), name, &a);
@@ -1403,17 +1444,18 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
         return Ok(sql(Sql::Update(m, w, sets, sync)));
     }
-    if let Sql::Delete(m, w) = &base {
-        let mut w = w.clone();
+    if let Sql::Delete(m, w, sync) = &base {
+        let (mut w, mut sync) = (w.clone(), *sync);
         match name {
             "where" | "filter" => w.extend(args.iter().map(|a| to_sql(a, None))),
             "execution_options" => match kw("synchronize_session") {
+                Some(V::Bool(false)) => sync = false,
                 Some(V::Str(x)) if matches!(&*x, "auto" | "evaluate" | "fetch") => {}
-                _ => return Err(Exc::type_error("py2axum: execution_options() on a DELETE supports synchronize_session='auto'/'evaluate'/'fetch' only")),
+                _ => return Err(Exc::type_error("py2axum: execution_options() on a DELETE supports synchronize_session=False/'auto'/'evaluate'/'fetch' only")),
             },
             _ => return Err(Exc::attr_error(format!("'Delete' object has no attribute '{name}'"))),
         }
-        return Ok(sql(Sql::Delete(m, w)));
+        return Ok(sql(Sql::Delete(m, w, sync)));
     }
     let hint = hint_of(&base);
     let b = Box::new(base.clone());
@@ -1462,6 +1504,31 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         "like" | "ilike" | "not_like" | "not_ilike" => {
             let op = if name.contains("ilike") { "ILIKE" } else { "LIKE" };
             Sql::Like(b, op, Box::new(to_sql(&one(&args)?, Some(ColTy::Str))), name.starts_with("not"))
+        }
+        // ARRAY operators (PostgreSQL)
+        "contains" | "contained_by" | "overlap" if hint == Some(ColTy::StrArray) => {
+            let op = match name {
+                "contains" => "@>",
+                "contained_by" => "<@",
+                _ => "&&",
+            };
+            Sql::Bin(op, b, Box::new(to_sql(&one(&args)?, hint)))
+        }
+        "any" if hint == Some(ColTy::StrArray) => {
+            Sql::Bin("=", Box::new(to_sql(&one(&args)?, Some(ColTy::Str))), Box::new(Sql::Func("ANY".into(), vec![*b])))
+        }
+        // `col.op("?|")(value)`: a custom binary operator, the value typed like the column (SQLAlchemy)
+        "op" => {
+            let op = ops::str_(&one(&args)?)?;
+            let op: &'static str = Box::leak(op.to_string().into_boxed_str());
+            let left = *b;
+            return Ok(V::native(Native::Func(Arc::new(move |_cx, a: Vec<V>| {
+                let left = left.clone();
+                Box::pin(async move {
+                    let [x] = a.as_slice() else { return Err(Exc::type_error("op(...)() takes one argument")) };
+                    Ok(sql(Sql::Bin(op, Box::new(left.clone()), Box::new(to_sql(x, hint_of(&left))))))
+                })
+            }))));
         }
         "startswith" | "endswith" | "contains" => {
             if !matches!(hint, None | Some(ColTy::Str) | Some(ColTy::Enum(_))) {
@@ -1596,6 +1663,8 @@ impl Rend {
             (V::Int(i), None) if i32::try_from(*i).is_ok() => Some("int4"),
             (V::Int(_), _) => Some("int8"),
             (V::Float(_), _) => Some("float8"),
+            // psycopg sends a list as text[]: SQLAlchemy casts it to the column's array type
+            (V::List(_) | V::Tuple(_), Some(ColTy::StrArray)) => Some("VARCHAR[]"),
             _ => None,
         };
         self.binds.push(Bind::V(v, ty.map(|t| if let ColTy::Enum(_) = t { ColTy::Str } else { t })));
@@ -1751,7 +1820,7 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
             }
             render_where(r, w)?;
         }
-        Sql::Delete(m, w) => {
+        Sql::Delete(m, w, _) => {
             r.sql += &format!("DELETE FROM {}", m.table);
             render_where(r, w)?;
         }
@@ -2101,7 +2170,21 @@ fn push_bind(args: &mut PgArguments, b: &Bind) -> R<()> {
             ColTy::Json => args.add(Some(sqlx::types::Json(serde_json::Value::Null))),
             ColTy::JsonNull => args.add(None::<sqlx::types::Json<serde_json::Value>>),
             ColTy::Uuid | ColTy::Str | ColTy::Enum(_) | ColTy::Decorated(_) => args.add(None::<String>),
+            ColTy::Bytes => args.add(None::<Vec<u8>>),
+            ColTy::StrArray => args.add(None::<Vec<String>>),
         },
+        V::Bytes(b) => args.add(b.to_vec()),
+        V::List(_) | V::Tuple(_) if matches!(ty, Some(ColTy::StrArray)) => {
+            let mut items: Vec<Option<String>> = Vec::new();
+            for x in ops::iter(v)? {
+                items.push(match x {
+                    V::Str(s) => Some(s.to_string()),
+                    V::None => None,
+                    other => return Err(Exc::type_error(format!("py2axum: an ARRAY(String) element must be a str, got {}", other.type_name()))),
+                });
+            }
+            args.add(items)
+        }
         V::Bool(x) => args.add(*x),
         V::Int(i) => match ty {
             // same wire type as a Decimal for `$n::numeric` (sqlx caches the parameter types by SQL text)
@@ -2211,6 +2294,11 @@ fn decode(row: &PgRow, i: usize, tz: Tz) -> R<V> {
             .unwrap_or(V::None),
         "JSON" | "JSONB" => match row.try_get::<Option<sqlx::types::JsonValue>, _>(i).map_err(e)? {
             Some(v) => pyd::from_serde(&v),
+            None => V::None,
+        },
+        "BYTEA" => row.try_get::<Option<Vec<u8>>, _>(i).map_err(e)?.map(|b| V::Bytes(Arc::from(b))).unwrap_or(V::None),
+        "TEXT[]" | "VARCHAR[]" | "BPCHAR[]" => match row.try_get::<Option<Vec<Option<String>>>, _>(i).map_err(e)? {
+            Some(items) => V::list(items.into_iter().map(|x| x.map(V::str).unwrap_or(V::None)).collect()),
             None => V::None,
         },
         "UUID" => row.try_get::<Option<sqlx::types::Uuid>, _>(i).map_err(e)?.map(|u| V::str(u.to_string())).unwrap_or(V::None),
@@ -2440,6 +2528,8 @@ struct SessInner {
     new: Vec<Arc<ObjCell>>,
     deleted: Vec<Arc<ObjCell>>,
     expire_on_commit: bool,
+    /// a synchronous `Session`: reading an unloaded attribute loads it (SQL) instead of MissingGreenlet
+    sync: bool,
     autoflush: bool,
     me: Weak<tokio::sync::Mutex<SessInner>>,
     /// the request (TypeDecorator methods are compiled Python: they run with it)
@@ -2509,7 +2599,7 @@ fn ident(m: &'static ModelDesc, pk: &V) -> R<(usize, Key)> {
 }
 
 impl Session {
-    pub fn new(pool: sqlx::PgPool, expire_on_commit: bool, autoflush: bool, cx: std::sync::Weak<super::CxInner>) -> Session {
+    pub fn new(pool: sqlx::PgPool, expire_on_commit: bool, autoflush: bool, sync: bool, cx: std::sync::Weak<super::CxInner>) -> Session {
         Session(Arc::new_cyclic(|me| {
             tokio::sync::Mutex::new(SessInner {
                 pool,
@@ -2519,6 +2609,7 @@ impl Session {
                 new: Vec::new(),
                 deleted: Vec::new(),
                 expire_on_commit,
+                sync,
                 autoflush,
                 me: me.clone(),
                 cx,
@@ -2692,6 +2783,7 @@ impl Session {
             let sel = Select {
                 cols: vec![SelCol::Entity(t)],
                 wheres: vec![Sql::In(Box::new(Sql::Col(t, rel.remote)), query.into_iter().map(|k| Sql::Param(k, Some(ty))).collect(), false)],
+                order: rel.order.iter().map(|&(i, desc)| Sql::Order(Box::new(Sql::Col(t, i)), desc, None)).collect(),
                 ..Default::default()
             };
             let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
@@ -3276,6 +3368,58 @@ impl Session {
         Session::decode_pending(&mut s).await
     }
 
+    /// A synchronous session's lazy loader (autoflush first, as SQLAlchemy's loaders do): the expired
+    /// columns in one SELECT by primary key (ObjectDeletedError when the row is gone), then the
+    /// relationship `name` if that is what was read.
+    async fn lazy_load(&self, o: &Arc<ObjCell>, name: &str) -> R<()> {
+        let mut s = self.0.lock().await;
+        if s.autoflush {
+            Session::flush_inner(&mut s).await?;
+        }
+        let desc = o.desc;
+        let expired: Vec<usize> = {
+            let st = o.st.lock();
+            if st.status != Status::Persistent {
+                vec![]
+            } else {
+                (0..desc.cols.len()).filter(|&i| matches!(st.vals[i], V::Unbound)).collect()
+            }
+        };
+        if !expired.is_empty() {
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+            render_select(&mut r, &Select { cols: vec![SelCol::Entity(desc)], ..Default::default() })?;
+            desc.where_pk(&mut r, &o.pk());
+            let rows = Session::run(&mut s, &r).await?;
+            let Some(row) = rows.first() else {
+                return Err(Exc::msg(
+                    &OBJECT_DELETED_ERROR,
+                    format!("Instance '<{} at 0x{:x}>' has been deleted, or its row is otherwise not present.", desc.name, Arc::as_ptr(o) as usize),
+                ));
+            };
+            let mut decoded = Vec::new();
+            for &i in &expired {
+                let mut v = map_col(&desc.cols[i], decode(row, i, db_tz())?);
+                if let ColTy::Decorated(TypeDec { result: Some(f), .. }) = desc.cols[i].ty {
+                    v = f(&Session::cx(&s)?, V::None, vec![v, V::None]).await?;
+                }
+                decoded.push(v);
+            }
+            let mut st = o.st.lock();
+            for (i, v) in expired.into_iter().zip(decoded) {
+                st.vals[i] = v.clone();
+                st.committed[i] = v;
+                st.modified[i] = false;
+            }
+            st.expired = false;
+        }
+        if let Some(ri) = desc.rel_index(name) {
+            if o.st.lock().rels[ri].is_none() {
+                Session::load_rel(&mut s, &[o.clone()], desc, ri).await?;
+            }
+        }
+        Session::decode_pending(&mut s).await
+    }
+
     pub async fn refresh(&self, obj: &V) -> R<()> {
         let o = match obj {
             V::Obj(o) => o.clone(),
@@ -3584,14 +3728,14 @@ impl Session {
                 }
                 Ok(V::Result(Arc::new(Mutex::new(QResult { rows: None, width: 0, scalars: false, rowcount: n, names: None }))))
             }
-            Sql::Delete(m, w) => {
+            Sql::Delete(m, w, sync) => {
                 render(&mut r, &st)?;
                 let n = Session::run_exec(&mut s, &r).await? as i64;
                 let gone: Vec<(usize, Key)> = s
                     .identity
                     .entries()
                     .into_iter()
-                    .filter(|(_, o)| std::ptr::eq(o.desc, *m) && evaluates_true(o, w))
+                    .filter(|(_, o)| *sync && std::ptr::eq(o.desc, *m) && evaluates_true(o, w))
                     .map(|(k, _)| k)
                     .collect();
                 for k in gone {
@@ -3746,4 +3890,161 @@ pub fn flag_modified(obj: &V, name: &V) -> R {
     o.set_attr(&n, v)?;
     o.st.lock().committed[i] = V::Unbound; // differs from anything: the flush writes it
     Ok(V::None)
+}
+
+// ---------------------------------------------------------------- legacy Query (session.query)
+
+/// `session.query(*entities)`: a `select()` bound to its session. Building methods return a new Query;
+/// the others execute it like SQLAlchemy 2.0's `Query._iter()` (a single entity gives the objects,
+/// anything else rows), with autoflush as any execution.
+pub fn query(sess: &Session, ents: Vec<V>) -> R {
+    Ok(V::native(Native::Query(sess.clone(), select(ents)?)))
+}
+
+fn query_sel(sel: &V) -> R<&Select> {
+    match sel {
+        V::Sql(s) => match &**s {
+            Sql::Select(x) => Ok(x),
+            _ => Err(Exc::type_error("py2axum: a Query needs a select()")),
+        },
+        _ => Err(Exc::type_error("py2axum: a Query needs a select()")),
+    }
+}
+
+/// the mapped class of `query(Model)` (one entity selected)
+fn query_entity(sel: &V) -> R<Option<&'static ModelDesc>> {
+    Ok(match query_sel(sel)?.cols.as_slice() {
+        [SelCol::Entity(m)] => Some(*m),
+        _ => None,
+    })
+}
+
+async fn query_rows(sess: &Session, sel: &V) -> R<Vec<V>> {
+    let single = query_entity(sel)?.is_some();
+    let V::Result(res) = sess.execute(sel).await? else { return Err(Exc::type_error("py2axum: a Query returned no rows")) };
+    let res = if single {
+        match result_method(&res, "scalars")? {
+            V::Result(r) => r,
+            _ => unreachable!(),
+        }
+    } else {
+        res
+    };
+    let rows = res.lock().take_rows()?;
+    Ok(rows)
+}
+
+/// The Query's own target for `delete()`/`update()`: one entity, no joins, ordering or limits.
+fn query_bulk_target(sel: &V, name: &str) -> R<(&'static ModelDesc, Vec<Sql>)> {
+    let s = query_sel(sel)?;
+    let m = query_entity(sel)?.ok_or_else(|| Exc::type_error(format!("py2axum: Query.{name}() needs query(Model)")))?;
+    if !s.joins.is_empty() || !s.order.is_empty() || !s.group.is_empty() || s.limit.is_some() || s.offset.is_some() || s.distinct || !s.from_subs.is_empty() {
+        return Err(Exc::type_error(format!("py2axum: Query.{name}() is supported on query(Model).filter(...) only")));
+    }
+    Ok((m, s.wheres.clone()))
+}
+
+fn sync_option(name: &str, args: &[V], kwargs: &[(String, V)], pos: usize) -> R<Option<V>> {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "synchronize_session") {
+        return Err(Exc::type_error(format!("py2axum: Query.{name}({k}=) is not supported")));
+    }
+    if args.len() > pos + 1 {
+        return Err(Exc::type_error(format!("py2axum: Query.{name}() takes at most {} positional arguments", pos + 1)));
+    }
+    Ok(kwargs.first().map(|(_, v)| v.clone()).or_else(|| args.get(pos).cloned()))
+}
+
+pub async fn query_method(sess: &Session, sel: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    let wrap = |v: V| V::native(Native::Query(sess.clone(), v));
+    let no_args = |args: &Vec<V>, kwargs: &Vec<(String, V)>| -> R<()> {
+        if args.is_empty() && kwargs.is_empty() {
+            Ok(())
+        } else {
+            Err(Exc::type_error(format!("py2axum: Query.{name}() takes no arguments")))
+        }
+    };
+    match name {
+        "filter" | "where" | "filter_by" | "order_by" | "group_by" | "having" | "join" | "outerjoin" | "options" | "limit" | "offset"
+        | "distinct" | "select_from" | "with_for_update" => Ok(wrap(sql_method(sel, name, args, kwargs)?)),
+        "with_entities" => Ok(wrap(sql_method(sel, "with_only_columns", args, kwargs)?)),
+        "subquery" | "scalar_subquery" | "exists" | "label" => sql_method(sel, name, args, kwargs),
+        "all" => {
+            no_args(&args, &kwargs)?;
+            Ok(V::list(query_rows(sess, sel).await?))
+        }
+        "first" => {
+            no_args(&args, &kwargs)?;
+            let one = sql_method(sel, "limit", vec![V::Int(1)], vec![])?;
+            Ok(query_rows(sess, &one).await?.into_iter().next().unwrap_or(V::None))
+        }
+        "one" | "one_or_none" | "scalar" => {
+            no_args(&args, &kwargs)?;
+            let rows = query_rows(sess, sel).await?;
+            match rows.len() {
+                0 if name == "one" => Err(Exc::msg(&NO_RESULT_FOUND, "No row was found when one was required")),
+                0 => Ok(V::None),
+                1 => {
+                    let r = rows.into_iter().next().unwrap();
+                    // Query.scalar(): one(), then the first element of a row
+                    if name == "scalar" && query_entity(sel)?.is_none() {
+                        ops::getitem(&r, &V::Int(0))
+                    } else {
+                        Ok(r)
+                    }
+                }
+                _ => Err(Exc::msg(&MULTIPLE_RESULTS_FOUND, "Multiple rows were found when exactly one was required")),
+            }
+        }
+        "count" => {
+            // SELECT count(*) FROM (<query>) AS anon_1
+            no_args(&args, &kwargs)?;
+            let sub = sql_method(sel, "subquery", vec![], vec![])?;
+            let c = sql_method(&select(vec![func("count", vec![])?])?, "select_from", vec![sub], vec![])?;
+            sess.scalar(&c).await
+        }
+        "get" => {
+            let m = query_entity(sel)?.ok_or_else(|| Exc::type_error("py2axum: Query.get() needs query(Model)"))?;
+            if args.len() != 1 || !kwargs.is_empty() {
+                return Err(Exc::type_error("py2axum: Query.get() takes the primary key"));
+            }
+            sess.get(&V::Class(m.class), &args[0]).await
+        }
+        "delete" => {
+            let (m, w) = query_bulk_target(sel, name)?;
+            let sync = match sync_option(name, &args, &kwargs, 0)? {
+                None => true,
+                Some(V::Bool(false)) => false,
+                Some(V::Str(x)) if matches!(&*x, "auto" | "evaluate" | "fetch") => true,
+                Some(_) => return Err(Exc::type_error("py2axum: Query.delete(synchronize_session=) must be False, 'auto', 'evaluate' or 'fetch'")),
+            };
+            match sess.execute(&sql(Sql::Delete(m, w, sync))).await? {
+                V::Result(r) => result_attr(&r, "rowcount"),
+                other => Ok(other),
+            }
+        }
+        "update" => {
+            let (m, w) = query_bulk_target(sel, name)?;
+            let values = args.first().cloned().ok_or_else(|| Exc::type_error("py2axum: Query.update() takes a dict of values"))?;
+            let mut u = sql(Sql::Update(m, w, vec![], true));
+            if let Some(opt) = sync_option(name, &args, &kwargs, 1)? {
+                u = sql_method(&u, "execution_options", vec![], vec![("synchronize_session".into(), opt)])?;
+            }
+            u = sql_method(&u, "values", vec![values], vec![])?;
+            match sess.execute(&u).await? {
+                V::Result(r) => result_attr(&r, "rowcount"),
+                other => Ok(other),
+            }
+        }
+        _ => Err(Exc::attr_error(format!("'Query' object has no attribute '{name}' (not supported by py2axum)"))),
+    }
+}
+
+/// `for x in <iterable>`: a Query is executed (`Query.__iter__`), anything else iterated as usual.
+pub async fn iter(v: &V) -> R<Vec<V>> {
+    if let V::Native(n) = v {
+        if let Native::Query(sess, sel) = &**n {
+            return query_rows(sess, sel).await;
+        }
+    }
+    ops::iter(v)
 }

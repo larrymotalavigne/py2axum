@@ -35,6 +35,16 @@ impl Pat {
     }
 }
 
+/// `decimal.Decimal` constraints: bounds as decimal text (pydantic converts them to Decimal)
+pub struct DecC {
+    pub ge: Option<&'static str>,
+    pub gt: Option<&'static str>,
+    pub le: Option<&'static str>,
+    pub lt: Option<&'static str>,
+    pub max_digits: Option<u64>,
+    pub decimal_places: Option<u64>,
+}
+
 pub struct StrC {
     pub min: Option<usize>,
     pub max: Option<usize>,
@@ -76,6 +86,8 @@ pub enum TD {
     Enum(&'static EnumDesc, bool),
     /// pydantic.EmailStr
     Email,
+    /// decimal.Decimal
+    Decimal(DecC),
     /// pydantic's URL types (AnyUrl, HttpUrl, AnyHttpUrl, RedisDsn)
     Url(&'static UrlSpec),
 }
@@ -200,7 +212,43 @@ pub type MethodFn = for<'a> fn(&'a super::Cx, V, Vec<V>) -> super::BoxFut<'a>;
 pub struct ValidatorDesc {
     pub fields: &'static [&'static str],
     pub f: MethodFn,
+    /// what the validator receives besides the value: 0 nothing, 1 a `ValidationInfo` (positional),
+    /// 2 `values=info.data` (v1 `@validator`)
+    pub info: u8,
 }
+
+static ANY_TD: TD = TD::Any;
+static STR_TD: TD = TD::Str(NO_STR);
+static VALINFO_CLASS: Class = Class { name: "ValidationInfo", qualname: "ValidationInfo", bases: &[], kind: ClassKind::Schema(&VALINFO) };
+/// pydantic-core's `ValidationInfo` as a field validator sees it (the transpiler refuses other attributes)
+static VALINFO: SchemaDesc = SchemaDesc {
+    name: "ValidationInfo",
+    class: &VALINFO_CLASS,
+    fields: &[
+        FieldDesc { name: "data", alias: None, td: &ANY_TD, default: Dflt::Required, env: None, validate_default: false },
+        FieldDesc { name: "field_name", alias: None, td: &STR_TD, default: Dflt::Required, env: None, validate_default: false },
+    ],
+    from_attributes: false,
+    extra: Extra::Ignore,
+    validators: &[],
+    validate_assignment: false,
+    populate_by_name: false,
+    methods: &[],
+    open: false,
+    model_after: &[],
+    before: &[],
+    model_before: &[],
+    has_before: false,
+    frozen: false,
+    post_init: None,
+    hash: HashKind::Unhashable,
+    dataclass: false,
+    async_methods: &[],
+    slots: &[],
+    settings: None,
+    init: None,
+    computed: &[],
+};
 
 pub struct SchemaDesc {
     pub name: &'static str,
@@ -237,6 +285,21 @@ pub struct SchemaDesc {
     pub async_methods: &'static [&'static str],
     /// a plain class's `__slots__` (its pickled state is `(None, {slot: value})`)
     pub slots: &'static [&'static str],
+    /// a pydantic-settings class: how calling it reads the environment
+    pub settings: Option<SettingsDesc>,
+    /// a plain class's `__init__`, or a model's own (pydantic-core calls it for a dict input)
+    pub init: Option<MethodFn>,
+    /// `@computed_field` properties, serialized after the fields and the extras
+    pub computed: &'static [(&'static str, MethodFn)],
+}
+
+/// pydantic-settings' `model_config` as `BaseSettings()` uses it
+#[derive(Clone, Copy)]
+pub struct SettingsDesc {
+    pub prefix: &'static str,
+    pub case_sensitive: bool,
+    /// `env_parse_none_str`
+    pub none_str: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -281,13 +344,50 @@ impl ErrDetail {
     }
 }
 
+/// pydantic-core's `str(ValidationError)`: the title line, then per error its loc, message,
+/// `[type=..., input_value=..., input_type=...]` (the repr cut to 25 + 24 bytes around `...` past
+/// 50) and the documentation link.
+pub fn error_str(title: &str, errs: &[ErrDetail]) -> String {
+    let n = errs.len();
+    let mut out = format!("{n} validation error{} for {title}", if n == 1 { "" } else { "s" });
+    for e in errs {
+        let loc = e.loc.iter().map(|l| match l {
+            V::Str(s) => s.to_string(),
+            o => ops::repr(o).unwrap_or_default(),
+        }).collect::<Vec<_>>().join(".");
+        if !loc.is_empty() {
+            out += "\n";
+            out += &loc;
+        }
+        let r = ops::repr(&e.input).unwrap_or_default();
+        let r = if r.len() > 50 {
+            let mut a = 25;
+            while !r.is_char_boundary(a) {
+                a -= 1;
+            }
+            let mut b = r.len() - 24;
+            while !r.is_char_boundary(b) {
+                b += 1;
+            }
+            format!("{}...{}", &r[..a], &r[b..])
+        } else {
+            r
+        };
+        out += &format!("\n  {} [type={}, input_value={}, input_type={}]", e.msg, e.kind, r, e.input.type_name());
+        out += &format!("\n    For further information visit https://errors.pydantic.dev/{}/v/{}", super::pydantic(), e.kind);
+    }
+    out
+}
+
 /// One step of a validation, in pydantic-core's order. The type checks are synchronous; the
 /// `@field_validator`s and computed defaults are compiled Python (async), so they are recorded
 /// here and replayed by `settle`, which slots their errors exactly where Pydantic raises them.
 enum Step {
     Err(ErrDetail),
-    /// field `field` of the instance in `slot` passed its type check: run its validators on `value`
-    Validators { slot: usize, field: usize, desc: &'static SchemaDesc, value: V, loc: Vec<V> },
+    /// field `field` of the instance in `slot` passed its type check: run its validators on `value`;
+    /// `prior` = the earlier fields that passed theirs (`info.data`, once their own validators ran),
+    /// filled only when a validator takes `info`
+    Validators { slot: usize, field: usize, desc: &'static SchemaDesc, value: V, loc: Vec<V>, prior: Vec<(usize, V)> },
     /// field `field` of the instance in `slot` was omitted and has a computed default
     Default { slot: usize, field: usize, f: MethodFn },
     /// start of a model that has `@model_validator(mode="after")`: errors counted from here
@@ -377,6 +477,7 @@ pub struct Inst {
 /// Exceptions other than ValueError/AssertionError raised by a validator propagate.
 pub async fn validate(cx: &super::Cx, input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDetail>) -> R<Option<V>> {
     let input = if td_has_before(td) { prepare(cx, input.clone(), td).await? } else { input.clone() };
+    prefetch(td, &input).await?;
     run(cx, errs, |e| val(&input, td, loc, e)).await
 }
 
@@ -400,7 +501,8 @@ fn before_error(x: Exc, input: V) -> R {
     } else {
         return Err(x);
     };
-    Ok(V::native(Native::ValErr(kind, format!("{word}, {}", x.message()), input)))
+    let msg = format!("{word}, {}", x.message());
+    Ok(V::native(Native::ValErr(kind, msg, input, V::Exc(x))))
 }
 
 /// The asynchronous pre-pass: `mode="before"` validators applied to the raw input, model first,
@@ -525,6 +627,8 @@ pub fn validate_sync(input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDe
 
 async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>, errs: &mut Vec<ErrDetail>) -> R<()> {
     let mut starts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // (slot, field) -> the value after its validators, None if one raised (read back by `info.data`)
+    let mut outcomes: std::collections::HashMap<(usize, usize), Option<V>> = std::collections::HashMap::new();
     for st in steps {
         match st {
             Step::Err(d) => errs.push(d),
@@ -553,7 +657,8 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
                             } else {
                                 return Err(x);
                             };
-                            errs.push(ErrDetail { kind, loc: loc.clone(), msg: format!("{word}, {}", x.message()), input: input.clone(), ctx: Some(vec![("error", V::empty_dict())]) });
+                            let msg = format!("{word}, {}", x.message());
+                            errs.push(ErrDetail { kind, loc: loc.clone(), msg, input: input.clone(), ctx: Some(vec![("error", V::Exc(x))]) });
                             break;
                         }
                     }
@@ -562,15 +667,39 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
             Step::Default { slot, field, f } => {
                 if let Some(inst) = &slots[slot] {
                     let d = f(cx, V::None, vec![]).await?;
+                    outcomes.insert((slot, field), Some(d.clone()));
                     inst.vals.lock()[field] = d;
                 }
             }
-            Step::Validators { slot, field, desc, value, loc } => {
+            Step::Validators { slot, field, desc, value, loc, prior } => {
                 let name = desc.fields[field].name;
                 let mut cur = value;
                 let mut failed = false;
                 for vd in desc.validators.iter().filter(|vd| vd.fields.contains(&name)) {
-                    match (vd.f)(cx, V::Class(desc.class), vec![cur.clone()]).await {
+                    let mut args = vec![cur.clone()];
+                    if vd.info != 0 {
+                        let mut data = Vec::new();
+                        for (i, v) in &prior {
+                            match outcomes.get(&(slot, *i)) {
+                                Some(Some(x)) => data.push((V::str(desc.fields[*i].name), x.clone())),
+                                Some(None) => {}
+                                None if matches!(v, V::Unbound) => {}
+                                None => data.push((V::str(desc.fields[*i].name), v.clone())),
+                            }
+                        }
+                        let data = V::dict_from(data)?;
+                        args.push(if vd.info == 1 {
+                            V::Inst(Arc::new(Inst {
+                                desc: &VALINFO,
+                                vals: Mutex::new(vec![data, V::str(name)]),
+                                set: Mutex::new(vec![true, true]),
+                                extra: Mutex::new(IndexMap::new()),
+                            }))
+                        } else {
+                            V::native(Native::Kwargs(vec![("values".to_string(), data)]))
+                        });
+                    }
+                    match (vd.f)(cx, V::Class(desc.class), args).await {
                         Ok(v) => cur = v,
                         Err(x) => {
                             let (kind, word) = if x.isinstance(&ASSERTION_ERROR) {
@@ -580,14 +709,15 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
                             } else {
                                 return Err(x);
                             };
-                            // ctx.error is the exception object: FastAPI's jsonable_encoder renders it {}
-                            let ctx = Some(vec![("error", V::empty_dict())]);
-                            errs.push(ErrDetail { kind, loc: loc.clone(), msg: format!("{word}, {}", x.message()), input: cur.clone(), ctx });
+                            // ctx.error is the exception object (FastAPI's jsonable_encoder renders its vars)
+                            let msg = format!("{word}, {}", x.message());
+                            errs.push(ErrDetail { kind, loc: loc.clone(), msg, input: cur.clone(), ctx: Some(vec![("error", V::Exc(x))]) });
                             failed = true;
                             break;
                         }
                     }
                 }
+                outcomes.insert((slot, field), if failed { None } else { Some(cur.clone()) });
                 if !failed {
                     if let Some(inst) = &slots[slot] {
                         inst.vals.lock()[field] = cur;
@@ -601,8 +731,8 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
 
 fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
     if let V::Native(n) = input {
-        if let Native::ValErr(kind, msg, raw) = &**n {
-            e.push(kind, loc, msg.clone(), raw, Some(vec![("error", V::empty_dict())]));
+        if let Native::ValErr(kind, msg, raw, exc) = &**n {
+            e.push(kind, loc, msg.clone(), raw, Some(vec![("error", exc.clone())]));
             return None;
         }
     }
@@ -994,6 +1124,7 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
             None
         }
         TD::Schema(desc) => schema_val(input, desc, loc, e),
+        TD::Decimal(c) => decimal_val(input, c, loc, e),
         TD::Url(spec) => url_val(input, spec, loc, e),
         TD::Email => match input {
             V::Str(s) => match super::email::validate(s) {
@@ -1077,8 +1208,97 @@ fn label(td: &TD) -> String {
             EnumKind::Plain => format!("enum[{}]", d.name),
         },
         TD::Email => "function-after[_validate(), str]".into(),
+        TD::Decimal(_) => "decimal".into(),
         TD::Url(s) => format!("url[{}]", s.name),
     }
+}
+
+/// pydantic-core's decimal validator (lax mode): a float through its repr, a string through
+/// `Decimal(str)`, finite only, then digits, then bounds (le, lt, ge, gt)
+fn decimal_val(input: &V, c: &DecC, loc: &[V], e: &mut Errs) -> Option<V> {
+    use super::decimal::Dec;
+    e.floor(if matches!(input, V::Decimal(_)) { EXACT } else { LAX });
+    let finite = |e: &mut Errs| {
+        e.push("finite_number", loc, "Input should be a finite number", input, None);
+        None
+    };
+    let d = match input {
+        V::Decimal(d) => (**d).clone(),
+        V::Int(i) => Dec::from_i64(*i),
+        V::Float(f) if !f.is_finite() => return finite(e),
+        V::Float(f) => Dec::parse(&ops::float_repr(*f)).ok()?,
+        V::Str(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            let t = t.trim_start_matches(['+', '-']);
+            let special = ["nan", "snan"].iter().any(|p| t.strip_prefix(p).is_some_and(|r| r.chars().all(|c| c.is_ascii_digit())))
+                || t == "inf" || t == "infinity";
+            if special {
+                return finite(e);
+            }
+            match Dec::parse(s) {
+                Ok(d) => d,
+                Err(_) => {
+                    e.push("decimal_parsing", loc, "Input should be a valid decimal", input, None);
+                    return None;
+                }
+            }
+        }
+        _ => {
+            e.push("decimal_type", loc, "Decimal input should be an integer, float, string or Decimal object", input, None);
+            return None;
+        }
+    };
+    if c.max_digits.is_some() || c.decimal_places.is_some() {
+        // digits of the normalized value (trailing zeros dropped)
+        let (mut coeff, mut exp) = (d.coeff.clone(), d.exp);
+        let ten = num_bigint::BigUint::from(10u32);
+        if num_traits::Zero::is_zero(&coeff) {
+            exp = 0;
+        } else {
+            while num_traits::Zero::is_zero(&(&coeff % &ten)) {
+                coeff /= &ten;
+                exp += 1;
+            }
+        }
+        let nd = coeff.to_str_radix(10).len() as i64;
+        let (digits, decimals) = if exp >= 0 { (nd + exp, 0) } else { (nd.max(-exp), -exp) };
+        let pl = |n: u64| if n == 1 { "" } else { "s" };
+        if let Some(m) = c.max_digits {
+            if digits > m as i64 {
+                e.push("decimal_max_digits", loc, format!("Decimal input should have no more than {m} digit{} in total", pl(m)), input, Some(vec![("max_digits", V::Int(m as i64))]));
+                return None;
+            }
+        }
+        if let Some(p) = c.decimal_places {
+            if decimals > p as i64 {
+                e.push("decimal_max_places", loc, format!("Decimal input should have no more than {p} decimal place{}", pl(p)), input, Some(vec![("decimal_places", V::Int(p as i64))]));
+                return None;
+            }
+            if let Some(m) = c.max_digits {
+                let whole = m.saturating_sub(p);
+                if digits - decimals > whole as i64 {
+                    e.push("decimal_whole_digits", loc, format!("Decimal input should have no more than {whole} digit{} before the decimal point", pl(whole)), input, Some(vec![("whole_digits", V::Int(whole as i64))]));
+                    return None;
+                }
+            }
+        }
+    }
+    let checks = [
+        (c.le, [std::cmp::Ordering::Less, std::cmp::Ordering::Equal].as_slice(), "less_than_equal", "less than or equal to", "le"),
+        (c.lt, [std::cmp::Ordering::Less].as_slice(), "less_than", "less than", "lt"),
+        (c.ge, [std::cmp::Ordering::Greater, std::cmp::Ordering::Equal].as_slice(), "greater_than_equal", "greater than or equal to", "ge"),
+        (c.gt, [std::cmp::Ordering::Greater].as_slice(), "greater_than", "greater than", "gt"),
+    ];
+    for (bound, ok, kind, word, key) in checks {
+        if let Some(b) = bound {
+            let bd = Dec::parse(b).ok()?;
+            if !ok.contains(&d.cmp(&bd)) {
+                e.push(kind, loc, format!("Input should be {word} {bd}"), input, Some(vec![(key, super::decimal::v(bd))]));
+                return None;
+            }
+        }
+    }
+    Some(super::decimal::v(d))
 }
 
 fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> Option<V> {
@@ -1086,6 +1306,14 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
         if std::ptr::eq(i.desc, desc) {
             return Some(input.clone()); // exact, no fields count: wins a union at once
         }
+    }
+    if desc.init.is_some() && !desc.open && matches!(input, V::Dict(_)) && !SKIP_INIT.with(|s| s.replace(0) == desc as *const _ as usize) {
+        // pydantic-core would call the model's own __init__(**input) here (validation is synchronous here)
+        FATAL.with(|f| {
+            f.borrow_mut().get_or_insert(Exc::runtime(format!(
+                "py2axum: validating {} from a dict would run its own __init__, which is not supported here", desc.name)));
+        });
+        return None;
     }
     enum Src<'a> {
         Map(&'a IndexMap<Key, (V, V)>),
@@ -1116,7 +1344,17 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
     }
     let mut vals = Vec::with_capacity(desc.fields.len());
     let mut set = Vec::with_capacity(desc.fields.len());
+    // fields that passed their type check (`info.data` holds those before the validated field)
+    let mut ok: Vec<bool> = Vec::with_capacity(desc.fields.len());
+    let prior = |fi: usize, vals: &Vec<V>, ok: &Vec<bool>| -> Vec<(usize, V)> {
+        let name = desc.fields[fi].name;
+        if !desc.validators.iter().any(|vd| vd.info != 0 && vd.fields.contains(&name)) {
+            return Vec::new();
+        }
+        (0..fi).filter(|&i| ok[i]).map(|i| (i, vals[i].clone())).collect()
+    };
     for (fi, f) in desc.fields.iter().enumerate() {
+        let n_before = e.n;
         let key = f.alias.unwrap_or(f.name);
         let by_name = desc.populate_by_name && f.alias.is_some();
         // (value, the key it was found under: Pydantic reports errors at that key)
@@ -1139,7 +1377,8 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
                     Some(v) => {
                         if let Some(slot) = slot {
                             if desc.validators.iter().any(|vd| vd.fields.contains(&f.name)) {
-                                e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), loc: floc });
+                                let prior = prior(fi, &vals, &ok);
+                                e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), loc: floc, prior });
                             }
                         }
                         vals.push(v)
@@ -1160,7 +1399,8 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
                             Some(v) => {
                                 if let Some(slot) = slot {
                                     if desc.validators.iter().any(|vd| vd.fields.contains(&f.name)) {
-                                        e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), loc: floc });
+                                        let prior = prior(fi, &vals, &ok);
+                                        e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), loc: floc, prior });
                                     }
                                 }
                                 vals.push(v)
@@ -1178,6 +1418,7 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
                 }
             }
         }
+        ok.push(e.n == n_before);
     }
     let mut extra = IndexMap::new();
     if let Src::Map(m) = &src {
@@ -1214,6 +1455,11 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
 }
 
 thread_local! {
+    /// `super().__init__(**data)` validating `data` into the model whose own `__init__` is running
+    static SKIP_INIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
     /// An exception other than AttributeError raised while reading an attribute during validation
     /// (`from_attributes`): pydantic-core lets it propagate (e.g. MissingGreenlet on an unloaded
     /// relationship) instead of reporting the field as missing.
@@ -1223,6 +1469,58 @@ thread_local! {
 /// The exception that interrupted the last validation, if any (validation itself is synchronous).
 pub fn take_fatal() -> Option<Exc> {
     FATAL.with(|f| f.borrow_mut().take())
+}
+
+type Fut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = R<()>> + Send + 'a>>;
+
+/// Validation reads ORM attributes synchronously (`from_attributes`); in a synchronous `Session` some
+/// of them need SQL (lazy loads): those the validation will read are loaded first, in its order.
+/// MissingGreenlet (an async session) is left for the validation to raise where pydantic-core does.
+fn prefetch<'a>(td: &'static TD, v: &'a V) -> Fut<'a> {
+    Box::pin(async move {
+        match (td, v) {
+            (TD::Optional(t), _) => prefetch(t, v).await,
+            (TD::Union(ts), _) => {
+                for t in ts.iter() {
+                    prefetch(t, v).await?;
+                }
+                Ok(())
+            }
+            (TD::List(Some(t)) | TD::Set(Some(t)) | TD::Tuple(Some(t)), V::List(_) | V::Tuple(_)) => {
+                let items = match v {
+                    V::List(l) => l.lock().clone(),
+                    V::Tuple(t) => t.to_vec(),
+                    _ => vec![],
+                };
+                for x in &items {
+                    prefetch(t, x).await?;
+                }
+                Ok(())
+            }
+            (TD::Schema(s), V::Obj(_)) => prefetch_schema(s, v).await,
+            _ => Ok(()),
+        }
+    })
+}
+
+fn prefetch_schema<'a>(s: &'static SchemaDesc, v: &'a V) -> Fut<'a> {
+    Box::pin(async move {
+        let V::Obj(o) = v else { return Ok(()) };
+        for f in s.fields {
+            for key in [f.alias, Some(f.name)].into_iter().flatten() {
+                if o.desc.col_index(key).is_none() && o.desc.rel_index(key).is_none() {
+                    continue;
+                }
+                match o.get_attr(key).await {
+                    Ok(x) => prefetch(f.td, &x).await?,
+                    Err(e) if e.isinstance(&super::v::MISSING_GREENLET) => {}
+                    Err(e) => return Err(e),
+                }
+                break;
+            }
+        }
+        Ok(())
+    })
 }
 
 fn attr_value(o: &V, name: &str) -> Option<V> {
@@ -1246,10 +1544,39 @@ fn attr_value(o: &V, name: &str) -> Option<V> {
 pub async fn construct(cx: &super::Cx, desc: &'static SchemaDesc, input: V) -> R {
     let mut errs = Vec::new();
     let input = if desc.has_before { prepare_schema(cx, input, desc).await? } else { input };
+    if let V::Obj(_) = &input {
+        prefetch_schema(desc, &input).await?;
+    }
     match run(cx, &mut errs, |e| schema_val(&input, desc, &[], e)).await? {
         Some(v) => Ok(v),
         None => Err(Exc::validation(&VALIDATION_ERROR, errs)),
     }
+}
+
+/// `super().__init__(**data)` in a model's own `__init__`: validated into the instance being built
+pub async fn init_in_place(cx: &super::Cx, me: &V, input: V) -> R {
+    let V::Inst(inst) = me else {
+        return Err(Exc::type_error("py2axum: BaseModel.__init__ outside a model"));
+    };
+    let desc = inst.desc;
+    let mut errs = Vec::new();
+    let input = if desc.has_before { prepare_schema(cx, input, desc).await? } else { input };
+    let got = run(cx, &mut errs, |e| {
+        SKIP_INIT.with(|s| s.set(desc as *const _ as usize));
+        let v = schema_val(&input, desc, &[], e);
+        SKIP_INIT.with(|s| s.set(0));
+        v
+    })
+    .await?;
+    let Some(built) = got else {
+        return Err(Exc::validation(&VALIDATION_ERROR, errs));
+    };
+    if let V::Inst(built) = built {
+        *inst.vals.lock() = built.vals.lock().clone();
+        *inst.set.lock() = built.set.lock().clone();
+        *inst.extra.lock() = built.extra.lock().clone();
+    }
+    Ok(V::None)
 }
 
 /// `SomeDataclass(*args, **kwargs)`: the generated `__init__` (no validation, CPython's TypeErrors).
@@ -1376,6 +1703,23 @@ impl Inst {
 
 // ---------------------------------------------------------------- dump
 
+/// The `@computed_field` values of an instance. Serialization is synchronous: the property must not
+/// await (it would need the event loop in the middle of a dump).
+pub fn computed_values(inst: &Arc<Inst>) -> R<Vec<(&'static str, V)>> {
+    if inst.desc.computed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cx = super::root_cx();
+    let mut out = Vec::with_capacity(inst.desc.computed.len());
+    for (name, f) in inst.desc.computed {
+        match futures_util::FutureExt::now_or_never(f(&cx, V::Inst(inst.clone()), vec![])) {
+            Some(v) => out.push((*name, v?)),
+            None => return Err(Exc::runtime(format!("py2axum: @computed_field {}.{name} awaited while being serialized", inst.desc.name))),
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct DumpOpts {
     pub json: bool,
@@ -1406,6 +1750,11 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
             }
             for (k, ev) in inst.extra.lock().clone() {
                 items.push((V::str(k), dump(&ev, o)?));
+            }
+            for (k, cv) in computed_values(inst)? {
+                if !(o.exclude_none && cv.is_none()) {
+                    items.push((V::str(k), dump(&cv, o)?));
+                }
             }
             V::dict_from(items)?
         }
@@ -1504,7 +1853,16 @@ pub fn jsonable(v: &V) -> R {
         V::Delta(d) => V::Float(dt::micros(d) as f64 / 1e6),
         V::Decimal(d) => super::decimal::jsonable(d),
         V::Native(n) if matches!(&**n, Native::PydUrl(..)) => V::str(ops::str_(v)?),
-        V::Exc(e) => V::str(e.message()),
+        // `vars(exc)` (dict(exc) fails): HTTPException's fields, then the attributes its `__init__` set
+        V::Exc(e) => {
+            let mut items = Vec::new();
+            if let Some((code, detail, headers)) = e.http_info() {
+                let h = if headers.is_empty() { V::None } else { V::dict_from(headers.into_iter().map(|(k, x)| (V::str(k), V::str(x))).collect())? };
+                items.extend([(V::str("status_code"), V::Int(code as i64)), (V::str("detail"), detail), (V::str("headers"), h)]);
+            }
+            items.extend(e.0.attrs.lock().iter().map(|(k, x)| (V::str(k), x.clone())));
+            jsonable(&V::dict_from(items)?)?
+        }
         V::Enum(e, i) => jsonable(&e.value(*i))?,
         _ => v.clone(),
     })
