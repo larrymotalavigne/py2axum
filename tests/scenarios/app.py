@@ -56,6 +56,8 @@ STEPS += [("POST", "/users", {"email": f"bulk{i}@example.com", "name": f"Bulk {i
 STEPS += [("GET", "/users?limit=100", None), ("GET", "/users?limit=3", None),
              ("GET", "/users/export", None), ("GET", "/users/export?limit=5", None),
              ("GET", "/users/export?limit=0", None)]
+# a body above axum's 2 MB default limit (Starlette has none): unknown field, ignored by the model
+STEPS += [("POST", "/users", {"email": "big@example.com", "name": "Big", "pad": "x" * 5_000_000})]
 
 
 

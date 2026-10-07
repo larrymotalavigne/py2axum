@@ -56,6 +56,9 @@ binary relay them:
 py2axum app --root . --backend dyn --python-side lifespan --python-side '/admin/{path:path}' -o /crate
 ```
 
+Or let py2axum choose: `--python-side lifespan --python-side auto` leaves every route that does not translate
+to Python and prints each one with its reason ([details](how-it-works.md#4-hybrid-deployments)).
+
 ```yaml
 services:
   api:                       # the binary: public entry point

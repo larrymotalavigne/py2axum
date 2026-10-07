@@ -20,6 +20,9 @@ pub mod pickle;
 pub mod rds;
 pub mod rmq;
 pub mod tenacity;
+pub mod prom;
+pub mod routing;
+pub mod trace;
 pub mod files;
 pub mod fernet;
 pub mod google;
@@ -65,6 +68,8 @@ pub struct CxInner {
     pub teardowns: parking_lot::Mutex<Vec<web::DepTeardown>>,
     /// the request's BackgroundTasks, created on first use
     pub background: std::sync::OnceLock<V>,
+    /// a `sys.settrace` function is running (its own calls are not traced)
+    pub in_trace: std::sync::atomic::AtomicBool,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -79,6 +84,7 @@ impl CxInner {
             deps: parking_lot::Mutex::new(std::collections::HashMap::new()),
             teardowns: parking_lot::Mutex::new(Vec::new()),
             background: std::sync::OnceLock::new(),
+            in_trace: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

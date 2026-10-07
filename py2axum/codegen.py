@@ -461,6 +461,8 @@ async fn main() {{
     ]);
     let app = Router::new()
         .fallback(move |req: axum::extract::Request| rt::dispatch(table.clone(), req))
+        // Starlette reads bodies of any size: lift axum's 2 MB default (413 otherwise)
+        .layer(axum::extract::DefaultBodyLimit::disable())
 {layers}        ;
 
     let addr = format!("{{}}:{{}}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));

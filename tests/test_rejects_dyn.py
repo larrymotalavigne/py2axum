@@ -432,3 +432,168 @@ def test_tenacity_options_rejected(tmp_path, capsys, opt):
     err = capsys.readouterr().err
     assert f"tenacity.retry({opt.split('=')[0]}=) is not supported" in err
     assert "main.py:10" in err
+
+
+PROM_MAIN = """
+from fastapi import FastAPI, Response
+from prometheus_client import Counter, generate_latest, make_asgi_app, push_to_gateway
+
+app = FastAPI()
+C = Counter("c", "doc")
+
+
+@app.get("/m")
+async def m():
+    {stmt}
+    return Response(b"")
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("push_to_gateway('g', job='j', registry=None)", "library call `prometheus_client.push_to_gateway()` is not supported"),
+    ("make_asgi_app()", "library call `prometheus_client.make_asgi_app()` is not supported"),
+    ("Counter('d', 'doc', _labelvalues=('x',))", "prometheus_client.Counter(_labelvalues=) is not supported"),
+])
+def test_prometheus_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PROM_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:11" in err
+
+
+def test_module_variable_bound_twice_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+from fastapi import FastAPI
+
+app = FastAPI()
+LIMIT = 10
+try:
+    LIMIT = int("20")
+except ValueError:
+    pass
+
+
+@app.get("/l")
+async def l():
+    return {"limit": LIMIT}
+""")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "the module variable `LIMIT` is bound by several module-level statements (lines 5, 6): not supported" in err
+    assert "main.py:6" in err
+
+
+CONFIGURE_MAIN = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from .router import r
+
+
+def configure(app):
+    {stmt}
+
+
+def create_app():
+    app = FastAPI()
+    configure(app)
+    return app
+
+
+app = create_app()
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("app.include_router(r)", "configure(): `app.include_router(...)` on the application passed to a function is not supported"),
+    ("app.add_middleware(CORSMiddleware, allow_origins=['*'])",
+     "add_middleware(CORSMiddleware) outside the app factory is not supported"),
+])
+def test_configure_function_registrations_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "router.py").write_text("from fastapi import APIRouter\n\nr = APIRouter()\n\n\n@r.get('/x')\nasync def x():\n    return {}\n")
+    (pkg / "main.py").write_text(CONFIGURE_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:9" in err
+
+
+def test_library_attribute_assignment_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+import aiohttp
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+def patch():
+    aiohttp.ClientSession.get = None
+
+
+@app.get("/p")
+async def p():
+    patch()
+    return {}
+""")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "assigning `aiohttp.ClientSession.get` (a library attribute) is not supported" in err
+    assert "main.py:9" in err
+
+
+def test_runtime_prefix_in_factory_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+import os
+
+from fastapi import APIRouter, FastAPI
+
+router = APIRouter()
+
+
+@router.get("/x")
+async def x():
+    return {}
+
+
+def create_app() -> FastAPI:
+    app = FastAPI()
+    app.include_router(router, prefix=os.environ.get("PREFIX", "/api"))
+    return app
+
+
+app = create_app()
+""")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "include_router(prefix=<non-literal>) inside a function (app factory) is not supported" in err
+    assert "main.py:16" in err
+
+
+def test_model_method_decorator_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    models = textwrap.dedent(MODELS).replace("{rel}", "@staticmethod\n    def ok() -> int:\n        return 1\n\n"
+                                             "    @functools.cache\n    def cached(self):\n        return 2")
+    (pkg / "models.py").write_text("import functools\n" + models)
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "decorator @functools.cache is not supported (only @property, @staticmethod and @classmethod)" in err
+    assert "models.py:" in err

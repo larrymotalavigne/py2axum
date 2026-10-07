@@ -46,7 +46,7 @@ masked automatically.
 
 | Scenario | Application | Requests |
 |---|---|---:|
-| `dynapp` | `fixtures/dynapp`: the dyn backend's reference app (every supported construct) | 418 |
+| `dynapp` | `fixtures/dynapp`: the dyn backend's reference app (every supported construct) | 449 |
 | `factoryapp` | `fixtures/factoryapp`: app factory, middleware stack, exception handlers | 25 |
 | `notes` | `examples/notes` | 24 |
 | `app` | `app/`: the typed backend's reference app | 40 |

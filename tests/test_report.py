@@ -145,3 +145,45 @@ def test_required_field_with_ellipsis(tmp_path):
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     schemas = (tmp_path / "out" / "src" / "schemas.rs").read_text()
     assert 'rt::missing(errs, rt::loc(prefix, "label"), v)' in schemas
+
+
+def test_python_side_auto(tmp_path, capsys):
+    """`--python-side auto`: the routes that do not translate are left to Python, the others are generated."""
+    pkg = write_project(tmp_path)
+    out = tmp_path / "out"
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(out)]) == 1
+    capsys.readouterr()
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(out)]) == 0
+    err = capsys.readouterr().err
+    moved = {"/api/items/stamp/now", "/api/items/me/info", "/api/items/me/again", "/api/items/me/stamp"}
+    for path in moved:
+        assert f"python-side (auto): {path} " in err
+    assert "python-side (auto): /users/count" not in err
+    main_rs = (out / "src" / "main.rs").read_text()
+    for path in moved:
+        assert f'"{path}"' in main_rs
+
+
+def test_python_side_auto_global_error(tmp_path, capsys):
+    """An error about the whole application cannot be avoided by moving routes: refused, with file:line."""
+    pkg = write_project(tmp_path)
+    main_py = pkg / "main.py"
+    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(lifespan=None)"))
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "main.py" in err and "--python-side lifespan" in err
+    assert "only moves routes" in err
+
+
+def test_python_side_auto_raw_route(tmp_path, capsys):
+    """A raw `add_route` with a literal path is moved too (without auto, it stops the generation)."""
+    pkg = write_project(tmp_path)
+    main_py = pkg / "main.py"
+    main_py.write_text(main_py.read_text().replace(
+        "    return app\n",
+        "    app.router.add_route(\"/raw\", raw, methods=[\"GET\"])\n    return app\n",
+    ).replace("def create_app", "async def raw(request):\n    return None\n\n\ndef create_app"))
+    out = tmp_path / "out"
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(out)]) == 0
+    assert "python-side (auto): /raw (raw route)" in capsys.readouterr().err
+    assert '"/raw"' in (out / "src" / "main.rs").read_text()

@@ -112,8 +112,16 @@ pub fn client(kind: &str, version: &str, args: &[V], kwargs: &[(String, V)]) -> 
         Kind::Aiohttp => Timeout { total: Some(300.0), connect: Some(30.0), read: None },
     };
     let mut headers: Vec<(String, String)> = match k {
-        Kind::Httpx | Kind::Requests => vec![("Accept".into(), "*/*".into()), ("User-Agent".into(), format!("python-httpx/{version}"))],
-        Kind::Aiohttp => vec![("Accept".into(), "*/*".into()), ("User-Agent".into(), format!("Python/3 aiohttp/{version}"))],
+        Kind::Httpx | Kind::Requests => vec![
+            ("Accept".into(), "*/*".into()),
+            ("Accept-Encoding".into(), "gzip, deflate".into()),
+            ("User-Agent".into(), format!("python-httpx/{version}")),
+        ],
+        Kind::Aiohttp => vec![
+            ("Accept".into(), "*/*".into()),
+            ("Accept-Encoding".into(), "gzip, deflate".into()),
+            ("User-Agent".into(), format!("Python/3 aiohttp/{version}")),
+        ],
     };
     let mut base_url = None;
     let mut follow = k == Kind::Aiohttp;
@@ -147,7 +155,8 @@ pub fn client(kind: &str, version: &str, args: &[V], kwargs: &[(String, V)]) -> 
         }
     }
     let make = || {
-        let mut b = reqwest::Client::builder().redirect(if follow {
+        // bodies are decoded here, not by reqwest, so that `Content-Encoding` stays visible like in httpx/aiohttp
+        let mut b = reqwest::Client::builder().no_gzip().no_deflate().redirect(if follow {
             reqwest::redirect::Policy::limited(if k == Kind::Httpx { 20 } else { 10 })
         } else {
             reqwest::redirect::Policy::none()
@@ -375,11 +384,117 @@ pub async fn send(c: &Client, method: &str, args: &[V], kwargs: &[(String, V)]) 
         .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().iter().map(|&b| b as char).collect()))
         .collect();
     let body = resp.bytes().await.map_err(|e| request_error(c.kind, &e, &final_url))?.to_vec();
+    let body = decode_body(&headers, body).map_err(|e| match c.kind {
+        Kind::Aiohttp => exc(&AIO_CLIENT_ERROR, format!("400, message='Can not decode content-encoding: {e}'")),
+        _ => exc(&HTTPX_DECODING_ERROR, e),
+    })?;
     let reason = super::status_phrase(status).unwrap_or("").to_string();
     Ok(V::native(Native::HttpResp(Arc::new(Resp { kind: c.kind, status, reason, headers, body, url: url_out, method: method.to_string() }))))
 }
 
-pub async fn client_method(c: &Client, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+// ---------------------------------------------------------------- patched request methods
+
+/// `aiohttp.ClientSession._request` / `httpx.AsyncClient.request` replaced by the project (a wrapper
+/// timing the calls...): the clients call it instead of sending directly
+static HOOKS: parking_lot::RwLock<[Option<V>; 2]> = parking_lot::RwLock::new([None, None]);
+
+fn hook_slot(kind: &str) -> usize {
+    if kind == "aiohttp" {
+        0
+    } else {
+        1
+    }
+}
+
+/// `aiohttp.ClientSession._request = f` / `httpx.AsyncClient.request = f`
+pub fn set_hook(kind: &str, f: V) -> R {
+    HOOKS.write()[hook_slot(kind)] = Some(f);
+    Ok(V::None)
+}
+
+/// reading `aiohttp.ClientSession._request` / `httpx.AsyncClient.request`: the replacement if any, else
+/// the library's method (an `async def` taking the client, the method and the URL)
+pub fn request_fn(kind: &'static str) -> V {
+    if let Some(f) = HOOKS.read()[hook_slot(kind)].clone() {
+        return f;
+    }
+    let call: super::KwFn = Arc::new(move |_cx: &super::Cx, args: Vec<V>, kwargs: Vec<(String, V)>| {
+        Box::pin(async move {
+            if args.len() < 3 {
+                return Err(Exc::type_error(format!("py2axum: {kind} request method called with {} positional arguments", args.len())));
+            }
+            let mut args = args.into_iter();
+            let (client, method, url) = (args.next().unwrap(), args.next().unwrap(), args.next().unwrap());
+            let V::Native(n) = &client else { return Err(Exc::type_error("py2axum: the request method needs its client")) };
+            let Native::HttpClient(c) = &**n else { return Err(Exc::type_error("py2axum: the request method needs its client")) };
+            let method = ops::str_(&method)?.to_ascii_uppercase();
+            // the defaults aiohttp's get()/head()/post() pass along are the client's own behaviour here
+            let kwargs: Vec<(String, V)> = kwargs
+                .into_iter()
+                .filter(|(k, v)| !(k == "data" && v.is_none()) && !(k == "allow_redirects" && matches!(v, V::Bool(b) if *b == (method != "HEAD"))))
+                .collect();
+            let mut rest = vec![url];
+            rest.extend(args);
+            send(c, &method, &rest, &kwargs).await
+        })
+    });
+    let (name, qual, module) = if kind == "aiohttp" { ("_request", "ClientSession._request", "aiohttp.client") } else { ("request", "AsyncClient.request", "httpx._client") };
+    let attrs = vec![
+        ("__name__".to_string(), V::str(name)),
+        ("__qualname__".to_string(), V::str(qual)),
+        ("__module__".to_string(), V::str(module)),
+        ("__doc__".to_string(), V::None),
+    ];
+    V::native(Native::PyFn(PyFn { call, is_async: true, attrs: parking_lot::Mutex::new(attrs) }))
+}
+
+/// a client method through the project's replacement of the request method: aiohttp's `get(url)` calls
+/// `self._request("GET", url, allow_redirects=True, **kwargs)`, `post` passes `data=None`...; httpx's
+/// `get(url)` calls `self.request("GET", url, **kwargs)` (only the keywords given)
+async fn hooked(cx: &super::Cx, hook: &V, recv: &V, c: &Client, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    let (method, mut rest) = if name == "request" {
+        let mut it = args.into_iter();
+        (it.next().ok_or_else(|| Exc::type_error("request() missing 'method'"))?, it.collect::<Vec<_>>())
+    } else {
+        (V::str(name.to_ascii_uppercase()), args)
+    };
+    if rest.is_empty() {
+        return Err(Exc::type_error(format!("{name}() missing 1 required positional argument: 'url'")));
+    }
+    let url = rest.remove(0);
+    let mut kw: Vec<(String, V)> = Vec::new();
+    if c.kind == Kind::Aiohttp {
+        let take = |kwargs: &mut Vec<(String, V)>, k: &str| kwargs.iter().position(|(x, _)| x == k).map(|i| kwargs.remove(i).1);
+        let mut kwargs = kwargs.clone();
+        match name {
+            "get" | "options" | "head" => {
+                let v = take(&mut kwargs, "allow_redirects").unwrap_or(V::Bool(name != "head"));
+                kw.push(("allow_redirects".into(), v));
+            }
+            "post" | "put" | "patch" => {
+                let v = take(&mut kwargs, "data").unwrap_or(V::None);
+                kw.push(("data".into(), v));
+            }
+            _ => {}
+        }
+        kw.extend(kwargs);
+    } else {
+        kw = kwargs;
+    }
+    let mut a = vec![recv.clone(), method, url];
+    a.extend(rest);
+    let r = super::methods::call_value(cx, hook, a, kw).await?;
+    super::aio::await_value(r).await
+}
+
+pub async fn client_method(cx: &super::Cx, recv: &V, c: &Client, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if matches!(name, "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "request") {
+        let hook = HOOKS.read()[if c.kind == Kind::Aiohttp { 0 } else { 1 }].clone();
+        if let Some(h) = hook.filter(|_| c.kind != Kind::Requests) {
+            return hooked(cx, &h, recv, c, name, args, kwargs).await;
+        }
+    }
+    let (args, kwargs) = (&args[..], &kwargs[..]);
     match name {
         "get" | "post" | "put" | "patch" | "delete" | "head" | "options" => send(c, &name.to_ascii_uppercase(), args, kwargs).await,
         "request" => {
@@ -453,6 +568,25 @@ pub fn resp_attr(r: &Resp, name: &str) -> R {
 }
 
 /// A response read in full, as `requests` gives it.
+/// the body decoded per `Content-Encoding` (gzip; deflate as zlib, else raw like httpx), headers untouched
+fn decode_body(headers: &[(String, String)], body: Vec<u8>) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let enc = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-encoding")).map(|(_, v)| v.trim().to_ascii_lowercase());
+    let mut out = Vec::new();
+    match enc.as_deref() {
+        Some("gzip") | Some("x-gzip") => flate2::read::MultiGzDecoder::new(&body[..]).read_to_end(&mut out).map_err(|e| e.to_string())?,
+        Some("deflate") => match flate2::read::ZlibDecoder::new(&body[..]).read_to_end(&mut out) {
+            Ok(n) => n,
+            Err(_) => {
+                out.clear();
+                flate2::read::DeflateDecoder::new(&body[..]).read_to_end(&mut out).map_err(|e| e.to_string())?
+            }
+        },
+        _ => return Ok(body),
+    };
+    Ok(out)
+}
+
 pub async fn from_reqwest(resp: reqwest::Response) -> R {
     let status = resp.status().as_u16();
     let url = resp.url().to_string();

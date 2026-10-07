@@ -39,6 +39,25 @@ VALUES: dict[str, str] = {
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean")},
     "os.environ": f"{RT}::libs::environ()",
     "aio_pika.DeliveryMode.PERSISTENT": "V::Int(2)",
+    # the HTTP client modules as values (`if aiohttp is not None`) and their patchable request methods
+    "aiohttp": f'V::native({RT}::Native::Namespace("aiohttp"))',
+    "httpx": f'V::native({RT}::Native::Namespace("httpx"))',
+    "aiohttp.ClientSession._request": f'{RT}::http::request_fn("aiohttp")',
+    "httpx.AsyncClient.request": f'{RT}::http::request_fn("httpx")',
+    # starlette.routing.Match and the routing classes (dynrt/routing.rs)
+    "starlette.routing.Match": f"V::Class(&{RT}::routing::CLS_MATCH)",
+    **{f"starlette.routing.Match.{n}": f"V::Enum(&{RT}::routing::ENUM_MATCH, {i})" for i, n in enumerate(("NONE", "PARTIAL", "FULL"))},
+    **{n: f'V::native({RT}::Native::ExtType("{c}"))' for n, c in (
+        ("starlette.routing.Route", "starlette.routing.Route"), ("starlette.routing.BaseRoute", "starlette.routing.BaseRoute"),
+        ("fastapi.routing.APIRoute", "fastapi.routing.APIRoute"), ("fastapi.APIRoute", "fastapi.routing.APIRoute"))},
+    # prometheus_client 0.26 (dynrt/prom.rs)
+    **{f"prometheus_client.{n}": f'{RT}::prom::value("{n}")' for n in ("REGISTRY", "GC_COLLECTOR", "PLATFORM_COLLECTOR", "PROCESS_COLLECTOR")},
+    "prometheus_client.CONTENT_TYPE_LATEST": 'V::str("text/plain; version=1.0.0; charset=utf-8")',
+    "prometheus_client.CONTENT_TYPE_PLAIN_1_0_0": 'V::str("text/plain; version=1.0.0; charset=utf-8")',
+    "prometheus_client.CONTENT_TYPE_PLAIN_0_0_4": 'V::str("text/plain; version=0.0.4; charset=utf-8")',
+    "prometheus_client.openmetrics.exposition.CONTENT_TYPE_LATEST": 'V::str("application/openmetrics-text; version=1.0.0; charset=utf-8")',
+    **{f"prometheus_client.{n}": f'V::native({RT}::Native::ExtType("prometheus_client.{n}"))'
+       for n in ("Counter", "Gauge", "Summary", "Histogram", "Info", "Enum", "CollectorRegistry")},
     **{f"tenacity.{n}": f'{RT}::tenacity::value("{n}")' for n in ("stop_never", "retry_always", "retry_never")},
     **{f"logging.{n}": f"V::Int({v})" for n, v in (("NOTSET", 0), ("DEBUG", 10), ("INFO", 20), ("WARNING", 30), ("WARN", 30),
                                                     ("ERROR", 40), ("CRITICAL", 50), ("FATAL", 50))},
@@ -74,6 +93,14 @@ VALUES: dict[str, str] = {
 
 # values above that are snapshots: writing into them would be lost, so it is refused
 READ_ONLY_VALUES = {"os.environ"}
+# library attributes a project may replace (monkeypatching the HTTP clients' request method to wrap it):
+# the runtime's clients then call the replacement
+HOOKS = {
+    "aiohttp.ClientSession._request": f'{RT}::http::set_hook("aiohttp", {{val}})',
+    "httpx.AsyncClient.request": f'{RT}::http::set_hook("httpx", {{val}})',
+}
+# library values that are run-time objects: their methods are called on the value
+OBJECT_VALUES = {"prometheus_client.REGISTRY", "aiohttp.ClientSession._request", "httpx.AsyncClient.request"}
 
 # --- exception classes usable in `except` / `isinstance` / `raise` -------------------------
 EXCEPTIONS: dict[str, str] = {
@@ -99,6 +126,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.ConnectionAbortedError": "CONNECTION_ABORTED_ERROR",
     "builtins.BrokenPipeError": "BROKEN_PIPE_ERROR",
     "builtins.StopIteration": "STOP_ITERATION",
+    "builtins.StopAsyncIteration": "STOP_ASYNC_ITERATION",
     "builtins.NameError": "NAME_ERROR",
     "builtins.FileNotFoundError": "FILE_NOT_FOUND_ERROR",
     "builtins.UnicodeDecodeError": "UNICODE_DECODE_ERROR",
@@ -129,7 +157,7 @@ EXCEPTIONS: dict[str, str] = {
         ("HTTPError", "HTTP_ERROR"), ("RequestError", "REQUEST_ERROR"), ("TransportError", "TRANSPORT_ERROR"),
         ("TimeoutException", "TIMEOUT_EXCEPTION"), ("ConnectTimeout", "CONNECT_TIMEOUT"), ("ReadTimeout", "READ_TIMEOUT"),
         ("NetworkError", "NETWORK_ERROR"), ("ConnectError", "CONNECT_ERROR"), ("UnsupportedProtocol", "UNSUPPORTED_PROTOCOL"),
-        ("TooManyRedirects", "TOO_MANY_REDIRECTS"), ("HTTPStatusError", "STATUS_ERROR"), ("InvalidURL", "INVALID_URL"))},
+        ("TooManyRedirects", "TOO_MANY_REDIRECTS"), ("DecodingError", "DECODING_ERROR"), ("HTTPStatusError", "STATUS_ERROR"), ("InvalidURL", "INVALID_URL"))},
     **{f"aiohttp.{n}": f"AIO_{c}" for n, c in (
         ("ClientError", "CLIENT_ERROR"), ("ClientResponseError", "RESPONSE_ERROR"), ("ContentTypeError", "CONTENT_TYPE_ERROR"),
         ("TooManyRedirects", "TOO_MANY_REDIRECTS"), ("ClientConnectionError", "CONNECTION_ERROR"), ("ClientOSError", "OS_ERROR"),
@@ -157,6 +185,7 @@ EXCEPTIONS: dict[str, str] = {
     "pickle.PickleError": "PICKLE_ERROR",
     "aio_pika.exceptions.AMQPError": "AMQP_ERROR",
     "tenacity.RetryError": "TENACITY_RETRY_ERROR",
+    "prometheus_client.registry.DuplicateTimeseries": "DUPLICATE_TIMESERIES",
     "aio_pika.exceptions.AMQPConnectionError": "AMQP_CONNECTION_ERROR",
     "aio_pika.exceptions.QueueEmpty": "AMQP_QUEUE_EMPTY",
     **{f"redis.exceptions.{n}": c for n, c in (("RedisError", "REDIS_ERROR"), ("ConnectionError", "REDIS_CONNECTION_ERROR"),
@@ -206,6 +235,7 @@ EXCEPTIONS: dict[str, str] = {
 REFUSED_KWARGS = {
     "tenacity.retry": {"sleep", "retry_error_cls"},
     "tenacity.before_sleep_log": {"exc_info"},
+    **{f"prometheus_client.{n}": {"_labelvalues"} for n in ("Counter", "Gauge", "Summary", "Histogram", "Info", "Enum")},
 }
 
 BUILTIN_EXC_NAMES = {k.split(".", 1)[1]: v for k, v in EXCEPTIONS.items() if k.startswith("builtins.")}
@@ -317,6 +347,19 @@ CALLS = {
                  "wait_exponential", "wait_exponential_jitter", "wait_incrementing", "wait_combine", "wait_chain",
                  "retry_if_exception_type", "retry_if_not_exception_type", "retry_if_exception", "retry_if_result",
                  "retry_any", "retry_all", "before_sleep_log")},
+    # prometheus_client 0.26 (dynrt/prom.rs)
+    **{f"prometheus_client.{n}": (lambda n: lambda a, kw: f'{RT}::prom::new_metric("{n}", {_argv(a)}, {_kwvec(kw)})')(n)
+       for n in ("Counter", "Gauge", "Summary", "Histogram", "Info", "Enum")},
+    "prometheus_client.CollectorRegistry": lambda a, kw: f"{RT}::prom::registry_new({_argv(a)}, {_kwvec(kw)})",
+    "prometheus_client.generate_latest": lambda a, kw: f"{RT}::prom::generate_latest(cx, {_argv(a)}, {_kwvec(kw)}).await",
+    **{f"prometheus_client.{n}": (lambda a, kw: f"{RT}::prom::start_http_server({_argv(a)}, {_kwvec(kw)})")
+       for n in ("start_http_server", "start_wsgi_server")},
+    "prometheus_client.openmetrics.exposition.generate_latest":
+        lambda a, kw: f"{RT}::prom::generate_openmetrics(cx, {_argv(a)}, {_kwvec(kw)}).await",
+    "prometheus_client.multiprocess.MultiProcessCollector": lambda a, kw: f"{RT}::prom::multiproc_new({_argv(a)}, {_kwvec(kw)})",
+    "prometheus_client.multiprocess.mark_process_dead": lambda a, kw: f"{RT}::prom::mark_process_dead({_argv(a)}, {_kwvec(kw)})",
+    "prometheus_client.disable_created_metrics": lambda a, kw: f"{RT}::prom::set_created(false)",
+    "prometheus_client.enable_created_metrics": lambda a, kw: f"{RT}::prom::set_created(true)",
     # aio_pika 10 (dynrt/rmq.rs)
     **{n: (lambda a, kw: f"{RT}::rmq::connect(&{_argv(a)}, &{_kwvec(kw)}).await") for n in ("aio_pika.connect_robust", "aio_pika.connect")},
     "aio_pika.Message": lambda a, kw: f"{RT}::rmq::message(&{_argv(a)}, &{_kwvec(kw)})",
@@ -444,6 +487,11 @@ CALLS = {
                  "radians", "degrees", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "hypot", "log2", "isfinite",
                  "copysign", "fmod")},
     **{f"time.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::time_now(\"{n}\")")(n) for n in ("time", "monotonic", "perf_counter")},
+    # sys.settrace and the threading variants (dynrt/trace.rs; the project's functions report events)
+    **{n: (lambda a, kw: f"{RT}::trace::settrace(&{_argv(a)})") for n in ("sys.settrace", "threading.settrace", "threading.settrace_all_threads")},
+    "sys.gettrace": lambda a, kw: f"{RT}::trace::gettrace()",
+    "traceback.extract_tb": lambda a, kw: f"{RT}::trace::extract_tb(&{_argv(a)}, &{_kwvec(kw)})",
+    "timeit.default_timer": lambda a, kw: f"{RT}::stdlib::time_now(\"perf_counter\")",
     **{f"os.path.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::os_path(\"{n}\", &{_argv(a)})")(n)
        for n in ("exists", "isfile", "isdir", "join", "basename", "dirname", "splitext", "normpath", "abspath", "realpath")},
     "hmac.new": lambda a, kw: f"{RT}::stdlib::hmac_new(&{_argv(a)}, &{_kwvec(kw)})",
@@ -542,6 +590,18 @@ for _n in DYN_ARGS:
     CALLS.setdefault(_n, DYN_ARGS[_n])
 
 
+# prometheus_client's submodules re-exported by the package
+PROM_SUBMODULES = {
+    "metrics": ("Counter", "Gauge", "Summary", "Histogram", "Info", "Enum", "disable_created_metrics", "enable_created_metrics"),
+    "registry": ("CollectorRegistry", "REGISTRY"),
+    "exposition": ("generate_latest", "CONTENT_TYPE_LATEST", "CONTENT_TYPE_PLAIN_0_0_4", "CONTENT_TYPE_PLAIN_1_0_0",
+                   "start_http_server", "start_wsgi_server"),
+    "gc_collector": ("GC_COLLECTOR",),
+    "platform_collector": ("PLATFORM_COLLECTOR",),
+    "process_collector": ("PROCESS_COLLECTOR",),
+}
+
+
 def canonical(dotted: str) -> str:
     """Aliases of the same API (`sqlalchemy.sql.expression.select` -> `sqlalchemy.select`)."""
     for prefix, repl in (
@@ -553,6 +613,7 @@ def canonical(dotted: str) -> str:
         ("starlette.status", "fastapi.status"),
         ("sqlalchemy.dialects.postgresql.dml.insert", "sqlalchemy.dialects.postgresql.insert"),
         ("sqlalchemy.sql.dml.insert", "sqlalchemy.insert"),
+        *((f"prometheus_client.{m}.{n}", f"prometheus_client.{n}") for m, ns in PROM_SUBMODULES.items() for n in ns),
     ):
         if dotted.startswith(prefix):
             return repl + dotted[len(prefix):]

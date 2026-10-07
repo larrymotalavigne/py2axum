@@ -24,7 +24,7 @@ The binary used 19 MB of RSS under load. Gains depend on how much of your reques
 
 - **Equivalence you can check.** Every supported behaviour is verified by differential testing: the same requests are sent to FastAPI and to the binary, and status, headers, content type and bodies must match **byte for byte** (JSON key order, Pydantic 422 error details and messages included). The project's own suites run 350+ such requests.
 - **No rewrite, no fork.** The Python app stays the source of truth: unit tests, debugging, local development and the OpenAPI docs keep working as before.
-- **Incremental.** Routes or ASGI apps that cannot be translated can stay in Python (`--python-side`): the binary relays them to a Python process, so one deployment serves both.
+- **Incremental.** Routes or ASGI apps that cannot be translated can stay in Python (`--python-side PATH`, or `--python-side auto` to move every route that does not translate): the binary relays them to a Python process, so one deployment serves both.
 
 ## Quick start
 
@@ -95,6 +95,8 @@ Not translated (stay in Python with `--python-side`, or refused): WebSockets, `l
 3. **Runtime** — `py2axum/runtime/dynrt/` (Rust, copied into each generated crate): values and operators, Pydantic validation and serialization, the SQLAlchemy session and SQL compiler (on sqlx/PostgreSQL), Starlette's middleware and routing, and the supported libraries.
 
 Details: [docs/how-it-works.md](docs/how-it-works.md).
+
+**How is this different from RustPython?** RustPython is a Python interpreter written in Rust; py2axum is a compiler for one framework stack, with no interpreter at run time. A FastAPI app cannot run on RustPython today (pydantic-core is a compiled extension) and would not be faster there. See [the comparison](docs/how-it-works.md#6-how-it-differs-from-rustpython).
 
 ## Project layout
 

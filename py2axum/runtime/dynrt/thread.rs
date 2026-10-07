@@ -458,6 +458,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
             lock_method(l, "__enter__", &[], &[])?;
             return Ok(V::Bool(true));
         }
+        if let Native::Prom(p) = &**n {
+            return super::prom::enter(v, p);
+        }
     }
     super::pathio::ctx_enter(v)
 }
@@ -474,6 +477,9 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
     if let V::Native(n) = v {
         if let Native::TLock(l) = &**n {
             return lock_method(l, "__exit__", &[], &[]);
+        }
+        if let Native::Prom(p) = &**n {
+            return super::prom::exit(p, exc.as_ref());
         }
     }
     super::pathio::ctx_exit(v)?;

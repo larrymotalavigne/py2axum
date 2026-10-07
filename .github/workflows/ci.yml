@@ -107,7 +107,7 @@ jobs:
           pip install fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" "psycopg[binary]" "pydantic[email]"
           aiohttp==3.14.3 httpx==0.28.1 pytest python-jose==3.5.0 bcrypt==5.0.0 pyotp==2.9.0 pywebpush==2.3.0
           py-vapid==1.9.4 http-ece==1.2.1 google-auth==2.49.0 requests psutil==7.2.2 alembic pydantic-settings
-          sentry-sdk itsdangerous==2.2.0 cryptography python-multipart==0.0.32 jinja2 aiosmtplib redis==8.1.0 aio-pika==10.0.1 tenacity==9.1.4
+          sentry-sdk itsdangerous==2.2.0 cryptography python-multipart==0.0.32 jinja2 aiosmtplib redis==8.1.0 aio-pika==10.0.1 tenacity==9.1.4 prometheus-client==0.26.0
       - run: |
           for db in py2axum_dyn py2axum_notes; do psql -h 127.0.0.1 -U postgres -qc "CREATE DATABASE $db"; done
       - name: dynapp (reference app of the dyn backend)
@@ -123,9 +123,7 @@ jobs:
         run: |
           python -m py2axum fixtures/factoryapp --root . --backend dyn -o generated/factoryapp_axum --name factoryapp_axum
           (cd generated/factoryapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
-          (nohup uvicorn fixtures.factoryapp.main:app --port 8300 --log-level warning > /tmp/fac-py.log 2>&1 &)
-          (PORT=8380 nohup generated/dynapp_axum/target/release/factoryapp_axum > /tmp/fac-rs.log 2>&1 &)
-          for i in $(seq 60); do curl -s -o /dev/null 127.0.0.1:8300/health && curl -s -o /dev/null 127.0.0.1:8380/health && break; sleep 0.5; done
+          ./scripts_start_factory.sh
           python tests/conformance.py http://127.0.0.1:8300 http://127.0.0.1:8380 --scenario factoryapp
       - name: examples/notes
         env:

@@ -177,6 +177,8 @@ pub struct ModelDesc {
     /// topological rank over the foreign keys (INSERT order: referenced tables first)
     pub rank: usize,
     pub methods: &'static [(&'static str, bool, pyd::MethodFn)],
+    /// the `@staticmethod`/`@classmethod`s, also read on the class (`Model.make()`, `cls.slug(x)`)
+    pub class_methods: &'static [&'static str],
     pub rels: &'static [RelDesc],
     /// the methods that are `async def`s (a call not awaited is a coroutine)
     pub async_methods: &'static [&'static str],

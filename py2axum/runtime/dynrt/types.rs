@@ -32,6 +32,8 @@ pub fn isinstance(v: &V, t: &V) -> R<bool> {
                 "sqlalchemy.orm.Session" | "sqlalchemy.ext.asyncio.AsyncConnection" => false,
                 "sqlalchemy.ext.asyncio.AsyncEngine" => matches!(v, V::Native(m) if matches!(&**m, Native::Engine)),
                 "types.GenericAlias" => matches!(v, V::Native(m) if matches!(&**m, Native::TypeExpr(..))),
+                p if p.starts_with("prometheus_client.") => super::prom::isinstance(v, &p["prometheus_client.".len()..]),
+                p if p.starts_with("starlette.") || p.starts_with("fastapi.") => super::routing::isinstance(v, p),
                 other => return Err(Exc::type_error(format!("py2axum: isinstance(x, {other}) is not supported"))),
             }),
             Native::TypeExpr(..) => Err(Exc::type_error("isinstance() argument 2 cannot be a parameterized generic")),

@@ -24,6 +24,21 @@ class Owner(Base):
     name: Mapped[str] = mapped_column(String(50))
     projects: Mapped[list["Project"]] = relationship(lazy="noload", overlaps="owner")
 
+    @staticmethod
+    def slug(name: str) -> str:
+        return "-".join(name.strip().lower().split())
+
+    @classmethod
+    def named(cls, name: str, shout: bool = False) -> "Owner":
+        return cls(name=cls.slug(name).upper() if shout else cls.slug(name))
+
+    @classmethod
+    def label(cls) -> str:
+        return f"{cls.__name__}s"
+
+    def describe(self) -> str:
+        return f"{self.label()}:{self.slug(self.name)}"
+
 
 class Project(Base):
     __tablename__ = "projects"

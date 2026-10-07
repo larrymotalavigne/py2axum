@@ -57,6 +57,7 @@ class Module:
     defs: dict[str, ast.AST] = field(default_factory=dict)  # top-level class/def/assign targets
     imports: dict[str, tuple] = field(default_factory=dict)  # local name -> import spec
     stars: list[str] = field(default_factory=list)  # modules imported with `*`
+    binders: dict[str, list[ast.stmt]] = field(default_factory=dict)  # name -> top-level statements binding it
 
     @property
     def package(self) -> str:
@@ -104,6 +105,91 @@ def _import_specs(stmts, package: str) -> tuple[dict[str, tuple], list[str]]:
     return out, stars
 
 
+def _static_value(e: ast.expr) -> bool:
+    """An expression that cannot raise: constants, names, attributes of names, tuples of them."""
+    if isinstance(e, ast.Constant):
+        return True
+    if isinstance(e, ast.Name):
+        return True
+    if isinstance(e, ast.Attribute):
+        return _static_value(e.value)
+    if isinstance(e, (ast.Tuple, ast.List)):
+        return all(_static_value(x) for x in e.elts)
+    return False
+
+
+def stmt_bindings(st: ast.stmt, handlers: bool = False) -> list[str]:
+    """Names a module-level statement binds (assignments, loop and `as` targets), in order; nested functions,
+    classes, lambdas and comprehensions have their own scopes. `except E as e` names only with `handlers`:
+    CPython deletes them when the handler ends."""
+    out: list[str] = []
+
+    def target(t):
+        if isinstance(t, ast.Name):
+            out.append(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                target(e)
+        elif isinstance(t, ast.Starred):
+            target(t.value)
+
+    def visit(n):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.append(n.name)
+            return
+        if isinstance(n, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            return
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                target(t)
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+            if not isinstance(n, ast.AnnAssign) or n.value is not None:
+                target(n.target)
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            target(n.target)
+        elif isinstance(n, ast.ExceptHandler) and n.name and handlers:
+            out.append(n.name)
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for it in n.items:
+                if it.optional_vars is not None:
+                    target(it.optional_vars)
+        elif isinstance(n, ast.NamedExpr):
+            target(n.target)
+        for c in ast.iter_child_nodes(n):
+            visit(c)
+
+    visit(st)
+    return list(dict.fromkeys(out))
+
+
+def startup_skipped(st: ast.stmt) -> bool:
+    """`if __name__ == "__main__":` (never true in the binary) and `if TYPE_CHECKING:` (imports only)."""
+    if not isinstance(st, ast.If):
+        return False
+    t = st.test
+    if isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id == "__name__":
+        return True
+    return (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (isinstance(t, ast.Attribute) and t.attr == "TYPE_CHECKING")
+
+
+def import_guard(node: ast.stmt) -> bool:
+    """A module-level `try` whose body only imports and binds static values (an import fallback): only a
+    failed import could reach its handlers."""
+    if not isinstance(node, ast.Try) or node.finalbody or not node.handlers:
+        return False
+    for st in [*node.body, *node.orelse]:
+        if isinstance(st, (ast.Import, ast.ImportFrom, ast.Pass)):
+            continue
+        if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+            continue
+        if isinstance(st, ast.Assign) and all(isinstance(t, ast.Name) for t in st.targets) and _static_value(st.value):
+            continue
+        if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None and _static_value(st.value):
+            continue
+        return False
+    return True
+
+
 def function_imports(fn: ast.AST, package: str) -> dict[str, tuple]:
     """Imports made inside a function body (lazy imports), anywhere in it."""
     stmts = [n for n in ast.walk(fn) if isinstance(n, (ast.Import, ast.ImportFrom))]
@@ -142,7 +228,17 @@ class ModuleIndex:
             return None
         m = Module(name, path, tree, path.name == "__init__.py", in_package)
         for node in tree.body:
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if import_guard(node):
+                # `try: import x; FLAG = True / except ImportError: FLAG = False`: the imports were resolved at
+                # compile time, so the body's bindings are the module's (its handlers never run)
+                for st in [*node.body, *node.orelse]:
+                    if isinstance(st, ast.Assign):
+                        for t in st.targets:
+                            if isinstance(t, ast.Name):
+                                m.defs[t.id] = st
+                    elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                        m.defs[st.target.id] = st
+            elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 m.defs[node.name] = node
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
@@ -150,6 +246,15 @@ class ModuleIndex:
                         m.defs[t.id] = node
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 m.defs[node.target.id] = node
+            elif isinstance(node, (ast.Try, ast.If, ast.For, ast.While, ast.With)) and not startup_skipped(node):
+                # a compound statement run at startup: the names it binds are module variables
+                for n in stmt_bindings(node):
+                    m.defs[n] = node
+            else:
+                continue
+            for n in ({node.name} if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                      else stmt_bindings(node)):
+                m.binders.setdefault(n, []).append(node)
         m.imports, m.stars = _import_specs(tree.body, m.package)
         self.modules[name] = m
         return m

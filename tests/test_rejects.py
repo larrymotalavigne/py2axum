@@ -55,6 +55,19 @@ def transpile(tmp_path: Path, handler: str) -> None:
         ),
         (
             '''
+            from fastapi import APIRouter
+            PREFIX = "/api"
+            router = APIRouter()
+            app.include_router(router, prefix=PREFIX)
+
+            @router.get("/x")
+            async def x():
+                return {}
+            ''',
+            "include_router(prefix=...) from a runtime value (settings, env) is only supported by the dyn backend",
+        ),
+        (
+            '''
             @app.exception_handler(ValueError)
             async def on_value_error(request, exc):
                 return None

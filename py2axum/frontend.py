@@ -131,6 +131,9 @@ class Frontend:
         self.keys: dict[Sym, str] = {}  # model/schema/const -> Rust name
         self.app_vars: dict[str, set[str]] = {}  # module -> names bound to FastAPI()
         self.routers: dict[Sym, Router] = {}
+        # non-literal `include_router(prefix=...)` of module-level calls, read at startup by the dyn backend:
+        # the route paths hold the marker `\x01<index>\x01` in their place
+        self.dyn_prefixes: list[tuple[ast.expr, str, str]] = []  # (value, file, module)
         self._schemas_done: dict[Sym, Schema] = {}
         self._parents_cache: dict[str, dict] = {}
 
@@ -586,9 +589,20 @@ class Frontend:
                             r.unsupported.append(kw)
                     self.routers[r.sym] = r
 
+    def _dyn_prefix(self, value: ast.expr, file: str, module: str) -> str:
+        for i, (v, _, _) in enumerate(self.dyn_prefixes):
+            if v is value:
+                return f"\x01{i}\x01"
+        self.dyn_prefixes.append((value, file, module))
+        return f"\x01{len(self.dyn_prefixes) - 1}\x01"
+
+    def shown_path(self, path: str) -> str:
+        """A route path for messages: runtime prefixes shown as `<expression>`."""
+        return re.sub("\x01(\\d+)\x01", lambda m: f"<{ast.unparse(self.dyn_prefixes[int(m.group(1))][0])}>", path)
+
     def _mounts(self) -> dict[Sym, list[Mount]]:
         """Every `include_router` chain from the app to each router, with its full prefix."""
-        edges: list[tuple[object, Sym, ast.Call, str, bool]] = []  # (owner, child, call, file, cond)
+        edges: list[tuple[object, Sym, ast.Call, str, bool, str, bool]] = []  # (owner, child, call, file, cond, module, top)
         for m in self.index.package_modules():
             file = str(m.path)
             parents = self._parents(m.name)
@@ -610,14 +624,15 @@ class Frontend:
                     owner = self.index.resolve_expr(m.name, owner_node, scope)
                     if owner not in self.routers:
                         continue
-                edges.append((owner, child, node, file, _under_if(node, parents)))
+                edges.append((owner, child, node, file, _under_if(node, parents), m.name, scope is None))
+        self.include_edges = edges
         memo: dict[object, list[Mount]] = {"app": [Mount("")]}
 
         def mounts_of(target, stack=()) -> list[Mount]:
             if target in memo:
                 return memo[target]
             out: list[Mount] = []
-            for owner, child, call, file, cond in edges:
+            for owner, child, call, file, cond, module, top in edges:
                 if child != target or owner in stack:
                     continue
                 for base in mounts_of(owner, (*stack, target)):
@@ -629,7 +644,10 @@ class Frontend:
                             try:
                                 mt.prefix += literal(kw.value, file)
                             except TranspileError:
-                                mt.unsupported.append((kw, file))
+                                if top:
+                                    mt.prefix += self._dyn_prefix(kw.value, file, module)
+                                else:
+                                    mt.unsupported.append((kw, file))
                         elif kw.arg == "dependencies":
                             mt.deps.append((kw, file))
                         elif kw.arg in {"tags", "responses", "deprecated", "include_in_schema"}:
@@ -720,6 +738,10 @@ class Frontend:
         if mount.unsupported:
             node, f = mount.unsupported[0]
             raise TranspileError(f"unsupported include_router option {getattr(node, 'arg', '?')}=", node, f)
+        if "\x01" in mount.prefix:
+            value, f, _ = self.dyn_prefixes[int(mount.prefix.split("\x01")[1])]
+            raise TranspileError("include_router(prefix=...) from a runtime value (settings, env) is only supported "
+                                 "by the dyn backend (--backend dyn)", value, f)
         path = mount.prefix + (r.prefix if r else "") + literal(deco.args[0], file)
         response_model = None
         status_code = 200

@@ -101,6 +101,8 @@ async fn main() {
         ]);
     let app = Router::new()
         .fallback(move |req: axum::extract::Request| rt::dispatch(table.clone(), req))
+        // Starlette reads bodies of any size: lift axum's 2 MB default (413 otherwise)
+        .layer(axum::extract::DefaultBodyLimit::disable())
         // app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
         .layer(
             CompressionLayer::new()

@@ -21,7 +21,7 @@ from pathlib import Path
 from . import libmap
 from .frontend import Frontend, Mount, dotted, literal
 from .ir import TranspileError
-from .modules import Ext, ModRef, Sym, is_ext
+from .modules import Ext, ModRef, Sym, import_guard, is_ext, startup_skipped, stmt_bindings
 
 RT = "crate::dynrt"
 RUNTIME_DIR = Path(__file__).parent / "runtime" / "dynrt"
@@ -38,6 +38,11 @@ BUILTIN_TYPES = {"str", "int", "float", "bool", "dict", "list", "tuple", "set", 
 def rs(s: str) -> str:
     """A Rust string literal."""
     return json.dumps(s, ensure_ascii=False)
+
+
+def rs_marked(s: str) -> str:
+    """A Rust string literal that may hold runtime prefix markers (`\\x01<index>\\x01`)."""
+    return rs(s).replace("\\u0001", "\\u{1}")
 
 
 def ident(s: str) -> str:
@@ -244,6 +249,24 @@ class Project:
         self.expire_on_commit = self._expire_on_commit()
 
     # ---------------------------------------------------------------- utils
+
+    TRACE_CALLS = {"sys.settrace", "threading.settrace", "threading.settrace_all_threads"}
+
+    def traced(self) -> bool:
+        """The project installs a trace function (`sys.settrace`): its functions report their events."""
+        if self.__dict__.get("_traced") is None:
+            self.__dict__["_traced"] = any(
+                isinstance(n, ast.Call) and is_ext(self.ix.resolve_expr(m.name, n.func), *self.TRACE_CALLS)
+                for m in list(self.ix.modules.values()) for n in ast.walk(m.tree))
+        return self.__dict__["_traced"]
+
+    def rel_file(self, module: str) -> str:
+        """A module's path relative to --root (what the binary reports as its file)."""
+        path = Path(self.src(module)).resolve()
+        try:
+            return str(path.relative_to(self.ix.root))
+        except ValueError:
+            return str(path)
 
     def rebound_globals(self) -> set[Sym]:
         """Module variables some module-level function rebinds with `global`."""
@@ -1111,9 +1134,9 @@ class Project:
                     if is_dunder(stmt.name) and stmt.name not in {"__str__", "__repr__"}:
                         raise self.err(f"model {sym.name}: method {stmt.name} is not supported", stmt, csym.module)
                     for d in stmt.decorator_list:
-                        if dotted(d) != "property":
+                        if dotted(d) not in {"property", "staticmethod", "classmethod"}:
                             raise self.err(f"model {sym.name}.{stmt.name}: decorator @{ast.unparse(d)} is not supported "
-                                           "(only @property)", d, csym.module)
+                                           "(only @property, @staticmethod and @classmethod)", d, csym.module)
                     prop = any(dotted(d) == "property" for d in stmt.decorator_list)
                     info.methods.append((stmt.name, prop, Sym(csym.module, f"{cnode.name}.{stmt.name}")))
         if not table:
@@ -2010,11 +2033,65 @@ class Project:
             raise TranspileError(f"no method {sym.name}")
         return self.ix.definition(sym)
 
+    def stmt_runner(self, module: str, st: ast.stmt) -> str:
+        """A module-level compound statement (`try`, `if`, `for`, `while`, `with`), run once at startup in its
+        place: a global holding the values of the names it binds (its locals), in `stmt_bindings` order."""
+        runners = self.__dict__.setdefault("stmt_runners", {})
+        key = (module, st.lineno)
+        if key not in runners:
+            name = f"ms_{mod_ident(module)}__{st.lineno}"
+            runners[key] = name
+            fc = FnCompiler(self, module, None, name)
+            prev, self.cur = self.cur, ("modst", name)
+            try:
+                bound = stmt_bindings(st)
+                m = self.ix.module(module)
+                for n in bound:
+                    if len(m.binders.get(n, [])) > 1:
+                        raise fc.err(f"the module variable `{n}` is bound by several module-level statements "
+                                     f"(lines {', '.join(str(b.lineno) for b in m.binders[n])}): not supported", st)
+                fc.locals = set(stmt_bindings(st, handlers=True))
+                for n in sorted(fc.locals):
+                    fc.emit(f"let mut v_{ident(n)}: V = V::Unbound;")
+                fc.block([st])
+            except TranspileError:
+                del runners[key]
+                raise
+            finally:
+                self.cur = prev
+            body = "\n".join("    " + l for l in fc.lines)
+            out = ", ".join(f"v_{ident(n)}" for n in bound)
+            self.items.append(
+                f"static G_{name}: {RT}::Global = {RT}::Global::new();\n"
+                f"/// {module}:{st.lineno} (module level, run at startup)\n"
+                f"pub async fn {name}(cx: &Cx) -> R {{\n"
+                f"    G_{name}.get(cx, |cx| Box::pin(async move {{\n{body}\n        #[allow(unreachable_code)]\n"
+                f"        Ok(V::tuple(vec![{out}]))\n    }})).await\n}}"
+            )
+            self.__dict__.setdefault("eager", []).append((module, st.lineno, name))
+            self.__dict__.setdefault("modst", set()).add(name)
+        return runners[key]
+
     def global_value(self, sym: Sym) -> str:
         if sym not in self.globals:
             name = f"g_{mod_ident(sym.module)}__{ident(sym.name)}"
-            self.globals[sym] = name
             node = self.ix.definition(sym)
+            if isinstance(node, (ast.Try, ast.If, ast.For, ast.While, ast.With)) and not import_guard(node):
+                runner = self.stmt_runner(sym.module, node)
+                self.globals[sym] = name
+                i = stmt_bindings(node).index(sym.name)
+                self.items.append(
+                    f"static G_{name}: {RT}::Global = {RT}::Global::new();\n"
+                    f"pub async fn {name}(cx: &Cx) -> R {{\n"
+                    f"    G_{name}.get(cx, |cx| Box::pin(async move {{\n"
+                    f"        match {runner}(cx).await? {{\n"
+                    f"            V::Tuple(t) if !matches!(t[{i}], V::Unbound) => Ok(t[{i}].clone()),\n"
+                    f"            _ => Err(Exc::msg(&{RT}::v::NAME_ERROR, {rs(f'name {sym.name!r} is not defined')})),\n"
+                    f"        }}\n    }})).await\n}}"
+                )
+                self.__dict__.setdefault("eager", []).append((sym.module, node.lineno, name))
+                return name
+            self.globals[sym] = name
             self.__dict__.setdefault("eager", []).append((sym.module, getattr(node, "lineno", 0), name))
             fc = FnCompiler(self, sym.module, None, name)
             try:
@@ -2201,7 +2278,7 @@ class FnCompiler:
             if isinstance(n, ast.Global):
                 for name in n.names:
                     sym = Sym(self.module, name)
-                    if not isinstance(self.p.ix.definition(sym), (ast.Assign, ast.AnnAssign)):
+                    if not isinstance(self.p.ix.definition(sym), (ast.Assign, ast.AnnAssign, ast.Try, ast.If, ast.For, ast.While, ast.With)):
                         raise self.err(f"`global {name}`: only a variable assigned at module level is supported", n)
                     self.globals_decl[name] = sym
         self.locals = assigned_names(node.body) - self.params - set(self.globals_decl)
@@ -2217,12 +2294,25 @@ class FnCompiler:
         sig = ", ".join(f"mut v_{ident(p.name)}: V" for p in params)
         gen_param = (f", y: &{RT}::web::DepYield" if self.variant == "depgen" else f", y: &{RT}::web::Yielder") if self.gen else ""
         caps = "".join(f", {c}: V" for c in self.captures.values())
+        traced = self.p.traced()
+        self.__dict__["traced_fn"] = traced
         for name in sorted(self.locals):
             self.emit(f"let mut v_{ident(name)}: V = V::Unbound;")
         self.block(node.body)
         self.emit("#[allow(unreachable_code)]")
         self.emit("Ok(V::None)")
         head = f"pub async fn {self.name}(cx: &Cx{', ' + sig if sig else ''}{caps}{gen_param}) -> R {{"
+        if traced:
+            # sys.settrace: `call` on entry, `return` / `exception` on exit (dynrt/trace.rs)
+            ln, qual = node.lineno, self.qualname() or node.name
+            pre = [f"    let __tf = ({RT}::trace::enter(cx, {rs(self.module)}, {rs(qual)}, {rs(self.p.rel_file(self.module))}, {ln}).await)?;",
+                   f"    let __ln = std::sync::atomic::AtomicU32::new({ln});",
+                   "    let (__lnr, __tfr) = (&__ln, &__tf);",
+                   "    let _ = (__lnr, __tfr);",
+                   "    let __r: R = async move {"]
+            post = ["    }.await;",
+                    f"    {RT}::trace::leave(cx, __tf, __r, __ln.load(std::sync::atomic::Ordering::Relaxed)).await"]
+            return "\n".join([*self.extra_fns, head, *pre, *("    " + l for l in self.lines), *post, "}"])
         return "\n".join([*self.extra_fns, head, *self.lines, "}"])
 
     # ---------------------------------------------------------------- statements
@@ -2232,6 +2322,8 @@ class FnCompiler:
             self.stmt(s)
 
     def stmt(self, node: ast.stmt) -> None:
+        if self.__dict__.get("traced_fn") and getattr(node, "lineno", None):
+            self.emit(f"__lnr.store({node.lineno}, std::sync::atomic::Ordering::Relaxed);")
         if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
                 and node.value.func.id in {"\0ctx_exit", "\0ctx_exc"}):
             # `with`: __exit__(None, None, None) on a normal exit, __exit__(type, exc, tb) when the body raises
@@ -2391,6 +2483,13 @@ class FnCompiler:
             for i, e in enumerate(target.elts):
                 self.assign(e, f"{t}[{i}].clone()")
         elif isinstance(target, ast.Attribute):
+            ref = self.static_ref(target)
+            if isinstance(ref, Ext) and ref.dotted in libmap.HOOKS:
+                # `aiohttp.ClientSession._request = wrapper(...)`: the runtime's client calls the wrapper
+                self.emit(f"{self.q(libmap.HOOKS[ref.dotted].format(val=val))};")
+                return
+            if isinstance(self.static_ref(target.value), Ext):
+                raise self.err(f"assigning `{ast.unparse(target)}` (a library attribute) is not supported", target)
             obj = self.expr(target.value)
             self.emit(f"{self.q(f'{RT}::methods::setattr(&{obj}, {rs(target.attr)}, {val})')};")
         elif isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Slice):
@@ -2677,6 +2776,10 @@ class FnCompiler:
         self.emit("}")
         self.emit(f"Some({e}) => {{")
         self.ind += 1
+        if self.__dict__.get("traced_fn"):
+            # the exception entered this frame: its `exception` event, before the handlers
+            ev = self.q(f"{RT}::trace::caught(cx, __tfr, &{e}, __lnr.load(std::sync::atomic::Ordering::Relaxed)).await.map(|_| V::None)")
+            self.emit(f"let _ = {ev};")
         if fin:
             self.sinks.pop()  # handlers: their own raises go to 'hnd
             self.sinks.append((hl, slot))
@@ -2741,8 +2844,16 @@ class FnCompiler:
                 for i in range(len(params))]
         outer = self.qualname()
         qual = f"{outer}.<locals>.{node.name}" if outer else node.name
-        held = list(caps.values()) + list(dflts.values())
+        # a function naming itself (`return handler`, recursion): CPython reads the enclosing cell at call
+        # time; here a cell filled once the name is bound
+        selfref = node.name in caps and node.name not in self.params
+        cell = self.tmp("cell") if selfref else None
+        if selfref:
+            self.emit(f"let {cell} = std::sync::Arc::new(std::sync::OnceLock::<V>::new());")
+        held = [c for v, c in caps.items() if not (selfref and v == node.name)] + list(dflts.values())
         hold = "".join(f"let {c} = {c}.clone(); " for c in held)
+        if selfref:
+            hold += f"let {caps[node.name]} = {cell}_c.get().cloned().unwrap_or(V::Unbound); "
         bind = (f"let mut __s = {RT}::bind_params({rs(qual + '()')}, 0, args, kwargs, &[{spec}])?; let _ = &mut __s; "
                 + "".join(f"let __a{i} = {v}; " for i, v in enumerate(vals)))
         argl = "".join(f", __a{i}" for i in range(len(vals)))
@@ -2752,7 +2863,8 @@ class FnCompiler:
                     f"Ok({RT}::web::spawn_gen(move |y| Box::pin(async move {{ {name}(&cx2{argl}{capl}, &y).await }}))) }})")
         else:
             body = f"{hold}Box::pin(async move {{ {bind}{name}(cx{argl}{capl}).await }})"
-        cap_clone = " ".join(f"let {caps[v]} = {self.load_local(v)};" for v in free)
+        cap_clone = " ".join(f"let {cell}_c = {cell}.clone();" if selfref and v == node.name else f"let {caps[v]} = {self.load_local(v)};"
+                             for v in free)
         doc = fn_doc(self.p, node)
         is_async = isinstance(node, ast.AsyncFunctionDef) and not has_yield(node)
         fv = (f"{RT}::pyfn({rs(self.module)}, {rs(qual)}, {'Some(' + rs(doc) + ')' if doc is not None else 'None'}, "
@@ -2763,6 +2875,8 @@ class FnCompiler:
         for d in reversed(decos):
             fv = self.q(f"{RT}::methods::call_value(cx, &{d}, vec![{fv}], vec![]).await")
         self.emit(f"{self.store_name(node.name, node)} = {fv};")
+        if selfref:
+            self.emit(f"let _ = {cell}.set({self.load_local(node.name)});")
 
     def scope_root(self):
         """The outermost function enclosing this code: its local imports are visible to nested functions
@@ -2900,22 +3014,32 @@ class FnCompiler:
     def factory_local(self, name: str):
         """A local of the application factory read by an endpoint defined in it: its single top-level
         assignment, evaluated once (the factory runs once, at startup)."""
+        if name in self.__dict__.get("app_alias", ()):
+            return f"{RT}::routing::app()"
         factory = self.__dict__.get("factory")
         if factory is None:
             return None
         assigns = [st for st in factory.body if isinstance(st, ast.Assign) and len(st.targets) == 1
                    and isinstance(st.targets[0], ast.Name) and st.targets[0].id == name]
         others = [n for n in ast.walk(factory) if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store)]
-        if len(assigns) != 1 or len(others) != 1:
+        a = factory.args
+        positional = [*a.posonlyargs, *a.args]
+        defaults = {p.arg: d for p, d in zip(positional[len(positional) - len(a.defaults):], a.defaults)}
+        defaults |= {p.arg: d for p, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None}
+        if name in defaults and not others:
+            value, line, scope = defaults[name], factory.lineno, None  # the server calls the factory without arguments
+        elif len(assigns) == 1 and len(others) == 1:
+            value, line, scope = assigns[0].value, assigns[0].lineno, factory
+        else:
             return None
         g = f"fl_{mod_ident(self.module)}__{ident(factory.name)}__{ident(name)}"
         done = self.p.__dict__.setdefault("_factory_locals", set())
         if g not in done:
             done.add(g)
-            self.p.__dict__.setdefault("eager", []).append((self.module, assigns[0].lineno, g))
+            self.p.__dict__.setdefault("eager", []).append((self.module, line, g))
             fc = FnCompiler(self.p, self.module, None, g)
-            fc.factory = factory
-            code = fc.expr(assigns[0].value)
+            fc.factory = scope
+            code = fc.expr(value)
             body = "\n".join("        " + l for l in fc.lines)
             self.p.items.append(
                 f"static G_{g}: {RT}::Global = {RT}::Global::new();\n"
@@ -2952,12 +3076,14 @@ class FnCompiler:
             if kind == "missing":
                 raise self.err(f"module {ref[1]} has no attribute `{ref[2]}`", node)
         if isinstance(ref, Sym):
+            if ref.module == self.module and ref.name in self.__dict__.get("app_alias", ()):
+                return f"{RT}::routing::app()"  # the application handed to a configuration function
             d = self.p.ix.definition(ref)
             if isinstance(d, ast.ClassDef):
                 return self.class_value(ref, node)
             if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 return self.fn_value(ref, d, node)
-            if isinstance(d, (ast.Assign, ast.AnnAssign)):
+            if isinstance(d, (ast.Assign, ast.AnnAssign, ast.Try, ast.If, ast.For, ast.While, ast.With)):
                 if isinstance(node, ast.Name) and ref.module != self.module and ref in self.p.rebound_globals():
                     raise self.err(f"`from {ref.module} import {ref.name}` copies a variable that a function rebinds "
                                    "with `global`: not supported (read it as module attribute or via a function)", node)
@@ -2977,6 +3103,9 @@ class FnCompiler:
                 return f"V::native({RT}::Native::Type({rs(ref.dotted[9:])}))"
             if ref.dotted in libmap.CALLS and ref.dotted not in self.p.LIB_FN_NOT_VALUES:
                 return self.lib_fn_value(ref.dotted, node)
+            obj = self.object_value(ref.dotted)
+            if obj is not None:
+                return obj
             raise self.err(f"library value `{ref.dotted}` is not supported (not in the py2axum library map)", node)
         raise self.err(f"unsupported name `{ast.unparse(node)}`", node)
 
@@ -3221,7 +3350,7 @@ class FnCompiler:
             scope: dict[str, str] = {}
             names: set[str] = set()
             target_names(g.target, names)
-            for n in names:
+            for n in sorted(names):  # sorted: set order follows PYTHONHASHSEED
                 scope[n] = f"cv{self.p.uid()}_{ident(n)}"
             self.comp_scopes.append(scope)
             pushed += 1
@@ -3293,8 +3422,12 @@ class FnCompiler:
                            for i, q in enumerate(params)))
         cap_clone = " ".join(f"let {caps[v]} = {self.load_local(v)};" for v in free)
         inner = "".join(f"let {c} = {c}.clone(); " for c in [*caps.values(), *dflts.values()])
+        run = f"{pre} Ok({body})"
+        if self.p.traced():
+            run = (f"let __tf = ({RT}::trace::enter(cx, {rs(self.module)}, {rs(qual)}, {rs(self.p.rel_file(self.module))}, {node.lineno}).await)?; "
+                   f"let __r: R = async {{ {run} }}.await; {RT}::trace::leave(cx, __tf, __r, {node.lineno}).await")
         clo = (f"move |cx: &Cx, args: Vec<V>, kwargs: Vec<(String, V)>| -> {RT}::BoxFut<'_> {{ "
-               f"{inner}Box::pin(async move {{ {binds}{pre} Ok({body}) }}) }}")
+               f"{inner}Box::pin(async move {{ {binds}{run} }}) }}")
         clo = f"{{ {cap_clone} {clo} }}" if cap_clone else clo
         return f"{RT}::pyfn({rs(self.module)}, {rs(qual)}, None, false, std::sync::Arc::new({clo}))"
 
@@ -3484,6 +3617,20 @@ class FnCompiler:
         if fmt is not None:
             return fmt
         if isinstance(node.func, ast.Attribute):
+            if node.func.attr == "add_middleware" and node.args:
+                # `app.add_middleware(Cls, ...)` in a function given the app: the instance is built now (the
+                # stack is being built), its `dispatch` registered
+                if mw_kind(self.p.fe, self.module, node) != "user" or any(isinstance(a, ast.Starred) for a in node.args) \
+                        or any(k.arg is None for k in node.keywords):
+                    raise self.err(f"add_middleware({ast.unparse(node.args[0])}) outside the app factory is not supported "
+                                   "(only a project BaseHTTPMiddleware subclass, arguments written out)", node)
+                recv = self.expr(node.func.value)
+                inst = ast.Call(func=node.args[0], args=[ast.Constant(None)] + node.args[1:], keywords=node.keywords)
+                ast.copy_location(inst, node)
+                ast.fix_missing_locations(inst)
+                obj = self.expr(inst)
+                d = self.q(f"{RT}::methods::getattr(cx, &{obj}, \"dispatch\").await")
+                return self.q(f"{RT}::routing::add_dispatch(&{recv}, {d})")
             recv = self.expr(node.func.value)
             self.check_method(node)
             self.p.method_edges(node.func.attr)
@@ -3758,6 +3905,22 @@ class FnCompiler:
         tv = self.expr(t)
         return f"V::native({RT}::Native::Adapter({self.q(f'{RT}::types::td_of(&{tv})')}, \"\"))"
 
+    def object_value(self, dotted: str, values: bool = True) -> str | None:
+        """`REGISTRY._names_to_collectors`, `Match.FULL.value`: attributes of a library object
+        (`libmap.OBJECT_VALUES`) or of a library enum member, read at run time."""
+        base, attrs = dotted, []
+        while base and base not in libmap.OBJECT_VALUES:
+            base, _, a = base.rpartition(".")
+            attrs.insert(0, a)
+            if values and libmap.VALUES.get(base, "").startswith("V::Enum("):  # `Match.FULL.value`
+                break
+        if not base:
+            return None
+        code = libmap.VALUES[base]
+        for a in attrs:
+            code = self.q(f"{RT}::methods::getattr(cx, &{code}, {rs(a)}).await")
+        return code
+
     def ext_call(self, ref: Ext, node: ast.Call) -> str:
         name = ref.dotted
         # generic namespaces: func.count(...)
@@ -3773,6 +3936,12 @@ class FnCompiler:
         if name == "pydantic.TypeAdapter":
             return self.type_adapter(node)
         tmpl = libmap.CALLS.get(name)
+        recv, _, meth = name.rpartition(".")
+        if tmpl is None and self.object_value(recv, values=False) is not None:
+            # a method of a library object (`REGISTRY.register(c)`): dispatched at run time like any value's
+            obj = self.object_value(recv, values=False)
+            args, kwargs = self.dyn_args(node)
+            return self.q(f"{RT}::methods::call_method(cx, &{obj}, {rs(meth)}, {args}, {kwargs}).await")
         if tmpl is None:
             raise self.err(f"library call `{name}()` is not supported (not in the py2axum library map)", node)
         for k in node.keywords:
@@ -4369,7 +4538,7 @@ class RouteBuilder:
         has_body = self.needs_body(params) or any(self.p.__dict__.get("dep_body", {}).get(t) for t in pre_syms)
         rm = f"Some(&{response_model})" if response_model else "None"
         self.p.items.append(
-            f"/// {method.upper()} {path}  (from {Path(src).name}:{fn.lineno} `{fn.name}`)\n"
+            f"/// {method.upper()} {self.p.fe.shown_path(path)}  (from {Path(src).name}:{fn.lineno} `{fn.name}`)\n"
             f"async fn {name}(cx: &Cx) -> R<axum::response::Response> {{\n"
             + (f"    let __body = {RT}::web::read_body(cx)?;\n" if has_body else "    let __body: Option<V> = None;\n")
             + (f"    let __form = {RT}::web::read_form(cx).await?;\n" if any(p.kind in {"form", "file", "oauth2form"} for p in params) else "")
@@ -4518,7 +4687,8 @@ def emit_descriptors(p: Project) -> list[str]:
             f"pk: {info.pk}, pks: &[{', '.join(str(i) for i in info.pks)}], fk_tables: &[{', '.join(rs(t) for t in info.fk_tables)}], "
             f"fks: &[{fks}], "
             f"rank: {ranks[info.table]}, "
-            f"methods: &[{methods}], rels: &[{rels}], async_methods: {async_names(p, info.methods)} }};"
+            f"methods: &[{methods}], class_methods: &[{', '.join(rs(n) for n in class_level_methods(p, info.methods))}], "
+            f"rels: &[{rels}], async_methods: {async_names(p, info.methods)} }};"
         )
     # TDs last: emitting schemas may have created new ones
     for init, name in p.tds.items():
@@ -4602,9 +4772,15 @@ def raw_fn_value(p: Project, sym: Sym) -> str:
     fw = function_wrapper(p, sym)
     doc = fn_doc(p, node)
     is_async = isinstance(node, ast.AsyncFunctionDef) and not has_yield(node)
-    return (f"{RT}::pyfn({rs(sym.module)}, {rs(sym.name)}, {'Some(' + rs(doc) + ')' if doc is not None else 'None'}, "
+    # one object per function, like CPython (`is`, attributes set on it)
+    cell = f"FNV_{fw}"
+    if cell not in p.__dict__.setdefault("_fn_cells", set()):
+        p._fn_cells.add(cell)
+        p.items.append(f"static {cell}: std::sync::OnceLock<V> = std::sync::OnceLock::new();")
+    return (f"{cell}.get_or_init(|| "
+            f"{RT}::pyfn({rs(sym.module)}, {rs(sym.name)}, {'Some(' + rs(doc) + ')' if doc is not None else 'None'}, "
             f"{str(is_async).lower()}, std::sync::Arc::new(|cx: &Cx, args: Vec<V>, kwargs: Vec<(String, V)>| -> {RT}::BoxFut<'_> "
-            f"{{ {fw}(cx, V::None, {RT}::pack(args, kwargs)) }}))")
+            f"{{ {fw}(cx, V::None, {RT}::pack(args, kwargs)) }}))).clone()")
 
 
 def function_wrapper(p: Project, sym: Sym) -> str:
@@ -4782,7 +4958,12 @@ async fn main() {{
     dynrt::set_pydantic("{pydantic}");
     gen::register_classes();
     dynrt::asgi::set_python_side(&[{python_side}]);
+    dynrt::routing::set_app(&gen::APP_ROUTES);
     gen::init_globals(&dynrt::root_cx()).await;
+    if let Err(e) = gen::init_prefixes(&dynrt::root_cx()).await {{
+        eprintln!("ERROR:py2axum:include_router prefix: {{:?}}", e);
+        std::process::exit(1);
+    }}
     let router = gen::router(app.clone()){layers};
     let addr = format!("{{}}:{{}}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
@@ -4870,6 +5051,9 @@ def prepare(fe: Frontend, python_side: set[str]):
             if path in python_side:
                 fe.notes.append(f"{txt} — {path} declared Python-side")
                 continue
+            if isinstance(path, str) and fe.__dict__.get("auto_side") is not None:
+                fe.auto_side[path] = e  # --python-side auto: a raw route with a literal path moves too
+                continue
         if "middleware" in txt and e.node is not None and _conditional(fe, e):
             fe.notes.append(f"{txt} — under an `if`: ignored (documented difference)")
             continue
@@ -4937,9 +5121,43 @@ def stack_node(fe: Frontend, module: str, node: ast.AST) -> bool:
     return False
 
 
+def configure_call(fe: Frontend, module: str, call: ast.Call) -> set[str]:
+    """`configure(app)`: a call of a project function given the application (as argument or keyword): the
+    names of the application in it, else an empty set."""
+    names = {a.id for a in [*call.args, *(k.value for k in call.keywords)] if isinstance(a, ast.Name) and fe._is_app(module, a)}
+    if not names:
+        return set()
+    t = fe.index.resolve_expr(module, call.func)
+    if isinstance(t, Sym) and isinstance(fe.index.definition(t), (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return names
+    return set()
+
+
+# registrations a function given the app cannot make in the binary (routes and handlers are compiled)
+CONFIGURE_REFUSED = {"include_router", "mount", "add_api_route", "add_exception_handler", "add_websocket_route",
+                     "add_event_handler", "exception_handler", "middleware", "on_event", "websocket", "api_route",
+                     "get", "post", "put", "patch", "delete", "head", "options"}
+
+
+def check_configure(p: "Project", fe: Frontend, module: str, call: ast.Call) -> None:
+    """`configure(app)`: refuse the registrations its body makes on the app parameter."""
+    t = fe.index.resolve_expr(module, call.func)
+    fn = fe.index.definition(t)
+    params = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args]]
+    names = configure_call(fe, module, call)
+    bound = {params[i] for i, a in enumerate(call.args) if i < len(params) and isinstance(a, ast.Name) and a.id in names}
+    bound |= {k.arg for k in call.keywords if isinstance(k.value, ast.Name) and k.value.id in names}
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in CONFIGURE_REFUSED
+                and isinstance(n.func.value, ast.Name) and n.func.value.id in bound):
+            raise TranspileError(f"{fn.name}(): `{n.func.value.id}.{n.func.attr}(...)` on the application passed to a "
+                                 "function is not supported (register routes and handlers in the factory or at module level)",
+                                 n, p.src(t.module))
+
+
 def _stack_relevant(fe: Frontend, module: str, node: ast.AST) -> bool:
     for n in ast.walk(node):
-        if isinstance(n, ast.Call) and stack_node(fe, module, n):
+        if isinstance(n, ast.Call) and (stack_node(fe, module, n) or configure_call(fe, module, n)):
             return True
     return False
 
@@ -5020,10 +5238,24 @@ def module_statements(p: "Project", fe: Frontend) -> None:
         if m.name not in used:
             continue
         for st in m.tree.body:
-            if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)):
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
+                f = st.value.func
+                if isinstance(f, ast.Attribute) and (f.attr in FRAMEWORK_CALLS or fe._is_app(m.name, f.value)):
+                    continue
+                if configure_call(fe, m.name, st.value):
+                    continue  # run by the middleware stack
+            elif not isinstance(st, (ast.For, ast.While, ast.If, ast.With, ast.Try)) or import_guard(st) or startup_skipped(st):
                 continue
-            f = st.value.func
-            if isinstance(f, ast.Attribute) and (f.attr in FRAMEWORK_CALLS or fe._is_app(m.name, f.value)):
+            elif any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                     and (n.func.attr in FRAMEWORK_CALLS or fe._is_app(m.name, n.func.value)) for n in walk_scope(st)):
+                continue  # registrations: the frontend's
+            else:
+                try:
+                    p.stmt_runner(m.name, st)
+                except TranspileError as e:
+                    if not p.collect:
+                        raise
+                    fe.global_errors.append(TranspileError(f"module-level statement not translated: {e.msg}", e.node, e.file))
                 continue
             name = f"modst_{mod_ident(m.name)}__{st.lineno}"
             fc = FnCompiler(p, m.name, None, name)
@@ -5059,7 +5291,16 @@ def build_stack(p: "Project", fe: Frontend) -> str:
         for st in body:
             if not _stack_relevant(fe, module, st):
                 continue
-            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and stack_node(fe, module, st.value):
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and configure_call(fe, module, st.value):
+                # `configure(app)`: a project function given the application, run while the stack is built
+                check_configure(p, fe, module, st.value)
+                fc.__dict__["app_alias"] = configure_call(fe, module, st.value)
+                try:
+                    fc.emit(f"let _ = {fc.expr(st.value)};")
+                finally:
+                    fc.__dict__.pop("app_alias")
+                fc.emit(f"for __mw in {RT}::routing::take_built() {{ __st.add_middleware(__mw); }}")
+            elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and stack_node(fe, module, st.value):
                 middleware(fc, module, st.value)
             elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(stack_deco(fe, module, d) for d in st.decorator_list):
                 handler(fc, module, st, factory)
@@ -5140,7 +5381,102 @@ def build_stack(p: "Project", fe: Frontend) -> str:
         out.extend(fc.lines)
     body = "\n".join("        " + l for l in out)
     return (f"pub fn stack(cx: &Cx) -> std::pin::Pin<Box<dyn std::future::Future<Output = R<{RT}::asgi::Stack>> + Send + '_>> {{\n"
-            f"    Box::pin(async move {{\n        let mut __st = {RT}::asgi::Stack::default();\n{body}\n        Ok(__st)\n    }})\n}}")
+            f"    Box::pin(async move {{\n        let mut __st = {RT}::asgi::Stack::default();\n        {RT}::routing::begin_build();\n"
+            f"        let __r = async {{\n{body}\n        Ok::<(), Exc>(())\n        }}.await;\n"
+            f"        {RT}::routing::end_build();\n        __r?;\n        Ok(__st)\n    }})\n}}")
+
+
+def route_tree(p: "Project", fe: Frontend) -> tuple[str, dict]:
+    """`APP_ROUTES`: the application's routes as `app.router.routes` lists them (FastAPI's docs routes, then
+    each `include_router` as an `_IncludedRouter` and each app route, in registration order), for code
+    inspecting them at run time. Returns the Rust items and {(module, def line): APIRoute node}."""
+    order = {name: i for i, name in enumerate(import_order(fe))}
+    items: list[str] = []
+    nodes: dict[tuple[str, int], str] = {}
+    members: dict[object, list[tuple[tuple, str]]] = {}  # owner ("app" or router sym) -> [(key, node)]
+    for m in fe.index.package_modules():
+        parents = fe._parents(m.name)
+        for fn in ast.walk(m.tree):
+            if not isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            found = fe._route_decorator(fn, m.name, parents)
+            if found is None:
+                continue
+            deco, router = found
+            r = fe.routers.get(router) if router else None
+            try:
+                path = (r.prefix if r else "") + literal(deco.args[0], str(m.path))
+                pattern = starlette_pattern(path, fn, str(m.path))
+            except (TranspileError, IndexError):
+                continue  # the route itself is refused
+            name = next((k.value.value for k in deco.keywords if k.arg == "name" and isinstance(k.value, ast.Constant)), fn.name)
+            ident_ = f"RN_{len(nodes) + 1}"
+            nodes[(m.name, fn.lineno)] = ident_
+            items.append(f"static {ident_}: {RT}::routing::Node = {RT}::routing::Node::Api {{ path: {rs(path)}, pattern: {rs(pattern)}, "
+                         f"methods: &[{rs(deco.func.attr.upper())}], name: {rs(name)} }};")
+            members.setdefault(router or "app", []).append(((order.get(m.name, 0), fn.lineno), ident_))
+    routers: dict[object, str] = {}
+
+    def router_def(sym) -> str:
+        if sym not in routers:
+            routers[sym] = f"RT_{mod_ident(sym.module)}__{ident(sym.name)}"
+            items.append(f"static {routers[sym]}: {RT}::routing::RouterDef = {RT}::routing::RouterDef {{ "
+                         f"prefix: {rs(fe.routers[sym].prefix)}, routes: &[{', '.join('&' + n for n in owned(sym))}], error: \"\" }};")
+        return routers[sym]
+
+    def owned(owner) -> list[str]:
+        out = list(members.get(owner, []))
+        for i, (own, child, call, file, *_) in enumerate(fe.__dict__.get("include_edges", [])):
+            if own != owner:
+                continue
+            prefix = next((k.value.value for k in call.keywords if k.arg == "prefix" and isinstance(k.value, ast.Constant)), "")
+            # a runtime prefix (settings): its marker, resolved at run time
+            prefix = next((f"\x01{j}\x01" for k in call.keywords if k.arg == "prefix"
+                           for j, (v, _, _) in enumerate(fe.dyn_prefixes) if v is k.value), prefix)
+            node = f"RI_{len(items) + 1}_{i}"
+            items.append(f"static {node}: {RT}::routing::Node = {RT}::routing::Node::Included {{ prefix: {rs_marked(prefix)}, "
+                         f"router: &{router_def(child)} }};")
+            mod = next((mm.name for mm in fe.index.package_modules() if str(mm.path) == file), "")
+            out.append(((order.get(mod, 0), call.lineno), node))
+        return [n for _, n in sorted(out, key=lambda x: x[0])]
+
+    docs = []
+    docs_routes, error = fastapi_docs_routes(fe)
+    for i, (path, name) in enumerate(docs_routes or []):
+        node = f"RD_{i}"
+        items.append(f"static {node}: {RT}::routing::Node = {RT}::routing::Node::Starlette {{ path: {rs(path)}, "
+                     f"pattern: {rs(starlette_pattern(path, None, ''))}, name: {rs(name)} }};")
+        docs.append(node)
+    app_routes = docs + owned("app")
+    items.append(f"pub static APP_ROUTES: {RT}::routing::RouterDef = {RT}::routing::RouterDef {{ prefix: \"\", "
+                 f"routes: &[{', '.join('&' + n for n in app_routes)}], error: {rs(error)} }};")
+    return "\n".join(items), nodes
+
+
+def fastapi_docs_routes(fe: Frontend) -> tuple[list[tuple[str, str]] | None, str]:
+    """The routes `FastAPI(...)` adds for its documentation, with its literal `*_url` options (else None and
+    the error raised when the routes are inspected)."""
+    opts = {"openapi_url": "/openapi.json", "docs_url": "/docs", "redoc_url": "/redoc",
+            "swagger_ui_oauth2_redirect_url": "/docs/oauth2-redirect"}
+    for m in fe.index.package_modules():
+        for node in ast.walk(m.tree):
+            if (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call)
+                    and is_ext(fe.index.resolve_expr(m.name, node.value.func), "fastapi.FastAPI")):
+                for k in node.value.keywords:
+                    if k.arg in opts:
+                        if not isinstance(k.value, ast.Constant):
+                            return None, f"py2axum: app.routes needs a literal FastAPI({k.arg}=) ({m.path}:{k.value.lineno})"
+                        opts[k.arg] = k.value.value
+    out = []
+    if opts["openapi_url"]:
+        out.append((opts["openapi_url"], "openapi"))
+        if opts["docs_url"]:
+            out.append((opts["docs_url"], "swagger_ui_html"))
+            if opts["swagger_ui_oauth2_redirect_url"]:
+                out.append((opts["swagger_ui_oauth2_redirect_url"], "swagger_ui_redirect"))
+        if opts["redoc_url"]:
+            out.append((opts["redoc_url"], "redoc_html"))
+    return out, ""
 
 
 FASTAPI_DOC_OPTIONS = {"title", "description", "version", "summary", "openapi_tags", "contact", "license_info",
@@ -5187,6 +5523,24 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     rb = RouteBuilder(proj)
     routes = []
     idx = 0
+    prefix_fns, empty_under = [], {}
+    for i, (value, file, module) in enumerate(fe.dyn_prefixes):
+        name = f"prefix_{i}"
+        prefix_fns.append(name)
+        proj.cur = ("prefix", i)
+        fc = FnCompiler(proj, module, None, name)
+        try:
+            code = fc.expr(value)
+            body = "\n".join("    " + l for l in fc.lines)
+            proj.items.append(f"/// include_router(prefix={ast.unparse(value)}) ({Path(file).name}:{value.lineno})\n"
+                              f"async fn {name}(cx: &Cx) -> R {{\n{body}\n    Ok({code})\n}}")
+            proj.drain()
+        except TranspileError as e:
+            if not collect:
+                raise
+            proj.fn_errors[("prefix", i)] = e
+            proj.items.append(f"async fn {name}(cx: &Cx) -> R {{ unreachable!() }}")
+        proj.cur = None
     for m in fe.index.package_modules():
         parents = fe._parents(m.name)
         for fn in ast.walk(m.tree):
@@ -5201,27 +5555,35 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                 idx += 1
                 r = fe.routers.get(router) if router else None
                 path = mt.prefix + (r.prefix if r else "") + literal(deco.args[0], str(m.path))
-                if path in fe.__dict__.get("python_side", ()):
-                    fe.notes.append(f"{m.path}:{fn.lineno}: {deco.func.attr.upper()} {path} declared Python-side")
+                if fe.shown_path(path) in fe.__dict__.get("python_side", ()):
+                    fe.notes.append(f"{m.path}:{fn.lineno}: {deco.func.attr.upper()} {fe.shown_path(path)} declared Python-side")
                     continue
                 rid = ("route", idx)
+                for k in re.findall("\x01(\\d+)\x01", path):
+                    proj.edges.setdefault(rid, set()).add(("prefix", int(k)))
+                tail = path.rsplit("\x01", 1)[-1] if "\x01" in path else None
+                if tail == "":
+                    empty_under.setdefault(int(path.split("\x01")[-2]), fn.name)
                 proj.cur = rid
-                info = {"method": deco.func.attr, "path": path, "func": fn.name, "file": str(m.path), "line": fn.lineno,
+                info = {"method": deco.func.attr, "path": fe.shown_path(path), "func": fn.name, "file": str(m.path), "line": fn.lineno,
                         "conditional": mt.conditional, "node": fn, "module": m.name, "router": router, "id": rid}
                 try:
                     if r is not None and r.unsupported:
                         raise TranspileError(f"unsupported APIRouter option {r.unsupported[0].arg}=", r.unsupported[0], r.file)
                     if mt.unsupported:
                         node, f = mt.unsupported[0]
-                        raise TranspileError(f"unsupported include_router option {getattr(node, 'arg', '?')}= "
-                                             "(a non-literal prefix too)", node, f)
+                        if getattr(node, "arg", None) == "prefix":
+                            raise TranspileError("include_router(prefix=<non-literal>) inside a function (app factory) "
+                                                 "is not supported: call include_router at module level, or use a "
+                                                 "literal prefix", node, f)
+                        raise TranspileError(f"unsupported include_router option {getattr(node, 'arg', '?')}=", node, f)
                     if mt.conditional:
                         raise TranspileError("include_router(...) under an `if` is not supported: the binary would "
                                              "serve the route unconditionally", fn, str(m.path))
                     handler, axum_path = rb.route(fn, m.name, path, deco.func.attr, deco, router, mt, idx)
                     proj.cur = None
                     proj.drain()
-                    routes.append((deco.func.attr, axum_path, handler, path, fn, m))
+                    routes.append((deco.func.attr, axum_path, handler, path, fn, m, router))
                     proj.__dict__.setdefault("route_infos", []).append((info, None))
                 except TranspileError as e:
                     proj.cur = None
@@ -5266,7 +5628,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     order = {name: i for i, name in enumerate(import_order(fe))}
     keep = set(proj.globals.values()) | proj.__dict__.get("modst", set())
     eager = sorted({e for e in proj.__dict__.get("eager", []) if e[2] in keep or e[2].startswith(("fl_", "gd_", "ca_"))},
-                   key=lambda e: (order.get(e[0], 0), e[1]))
+                   key=lambda e: (order.get(e[0], 0), e[1], e[2]))
     proj.items.append(
         "/// Module globals evaluated at startup like Python's import (a failure is logged; the routes reading\n"
         "/// the value then raise it).\n"
@@ -5275,14 +5637,23 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                   for _, _, g in eager)
         + "}")
 
+    proj.items.append(
+        "/// The runtime `include_router(prefix=...)` values, read once the module globals are set.\n"
+        "pub async fn init_prefixes(cx: &Cx) -> R<()> {\n"
+        f"    {RT}::web::set_prefixes(vec![" + "".join(
+            f"({f}(cx).await?, {'Some(' + rs(empty_under[i]) + ')' if i in empty_under else 'None'}), "
+            for i, f in enumerate(prefix_fns)) + "])\n}")
     body = emit_descriptors(proj)
     # the project's schema / plain / enum classes, found by name when unpickling
     picklable = sorted({m.group(1) for it in [*proj.items, *body] for m in re.finditer(
         r"pub static (CLS_\w+): [\w:]*Class = [^;]*?ClassKind::(?:Schema|Enum)\(", it)})
     body.append("pub fn register_classes() {\n    " + f"{RT}::pickle::register(&[{', '.join('&' + c for c in picklable)}]);\n}}")
     # declaration order, as Starlette tries them
-    route_defs = [f"    {RT}::web::RouteDef {{ method: {rs(method.upper())}, pattern: {rs(pattern)}, run: {handler} }},"
-                  for method, pattern, handler, *_ in routes]
+    tree, nodes = route_tree(proj, fe)
+    proj.items.append(tree)
+    route_defs = [f"    {RT}::web::RouteDef {{ method: {rs(method.upper())}, pattern: {rs_marked(pattern)}, run: {handler}, "
+                  f"node: {('Some(&' + nodes[(m.name, fn.lineno)] + ')') if (m.name, fn.lineno) in nodes else 'None'} }},"
+                  for method, pattern, handler, _, fn, m, _ in routes]
     gen = [
         "// Generated by py2axum (dyn backend) from the FastAPI project. Do not edit.",
         "#![allow(unused_mut, unused_variables, unused_imports, unreachable_code, dead_code, non_snake_case, unused_parens, unused_labels, unused_assignments, non_upper_case_globals, clippy::all)]",
@@ -5354,6 +5725,17 @@ def runtime_names() -> set[str]:
         names |= set(re.findall(r"""["']([A-Za-z_][A-Za-z0-9_]*)["']""", Path(libmap.__file__).read_text()))
         _RUNTIME_NAMES = names
     return _RUNTIME_NAMES
+
+
+def class_level_methods(p: Project, methods) -> list[str]:
+    """The `@staticmethod`/`@classmethod`s of a class: the methods read on the class itself."""
+    out = []
+    for n, _prop, sym in methods:
+        decos = {((dotted(d.func) if isinstance(d, ast.Call) else dotted(d)) or "").split(".")[-1]
+                 for d in p.fn_node(sym).decorator_list}
+        if decos & {"staticmethod", "classmethod"}:
+            out.append(n)
+    return out
 
 
 def closure_errors(p: Project, start) -> list[TranspileError]:

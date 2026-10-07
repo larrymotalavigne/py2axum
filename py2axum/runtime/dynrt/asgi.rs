@@ -222,7 +222,7 @@ pub async fn call_next(cx: &Cx, n: &Next) -> R {
     Ok(super::resp::from_response(r))
 }
 
-fn to_response(v: &V) -> R<Response> {
+pub fn to_response(v: &V) -> R<Response> {
     if let V::Native(n) = v {
         if let Native::RespObj(r) = &**n {
             return super::resp::into_response(r);

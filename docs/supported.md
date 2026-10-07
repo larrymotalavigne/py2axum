@@ -17,7 +17,14 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - `FastAPI()` apps, `APIRouter(prefix=, tags=, dependencies=)`, `include_router`, routers split across
   modules, apps built by a factory function (`create_app()`), including endpoints defined inside it; a
   local of the factory assigned once is evaluated once. `if` statements around registrations are evaluated
-  at startup in the factory's scope (e.g. `if not settings.TESTING:`).
+  at startup in the factory's scope (e.g. `if not settings.TESTING:`); the factory's parameters have their
+  default values (the server calls it without arguments).
+- `include_router(router, prefix=<expression>)` at module level (e.g. `prefix=settings.API_V1_PREFIX`): the
+  prefix is evaluated at startup, after the module globals, so the environment still overrides the
+  settings; it is checked like FastAPI (must start with `/`, must not end with `/`; a failure stops the
+  binary as an import error stops uvicorn). Differences: a runtime prefix containing a path parameter
+  (`{...}`) stops the binary; a non-literal prefix inside a function (app factory) is refused at compile
+  time; `--python-side` cannot name a route under a runtime prefix (it is compiled).
 - Imports are resolved statically, without executing code: relative imports, re-exports from `__init__`,
   lazy imports inside functions (visible from nested functions and lambdas), `--root` as `sys.path`.
 - Routing like Starlette: declaration order, decoded path, first match on path and method wins, then 405
@@ -78,6 +85,20 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   `response.headers`), `@app.middleware("http")`, `@app.exception_handler(class | code)`.
 - `request.cookies` (Starlette's parser), `request.client` (TCP peer), `request.url`, `request.headers`,
   `request.state`, `request.body()`/`json()`.
+- A project function given the application from the factory or the app's module (`configure(app)`) runs
+  while the middleware stack is built (on the first request, when Starlette instantiates its middlewares):
+  in it, `app.add_middleware(ProjectMiddleware, ...)` with a project `BaseHTTPMiddleware` subclass,
+  `app.add_route(path, endpoint, methods=)` (a Starlette `Route`: GET implies HEAD; such routes are tried
+  after the declared ones, as when added last), `app.routes`. Other registrations there are refused.
+- Routing objects as values: `request.app`, `app.router.routes` as FastAPI 0.141+ lists them (its docs
+  routes, an `_IncludedRouter` per `include_router` with its `original_router`, `APIRoute`s, the added
+  `Route`s), their `path`, `path_format`, `methods`, `name`, `matches(scope)` returning
+  `starlette.routing.Match` and the child scope, `isinstance(r, Route | APIRoute)`. `request.scope` is a
+  snapshot dict with `type`, `http_version`, `scheme`, `method`, `root_path`, `path`, `raw_path`,
+  `query_string`, `headers`, `client`, `app`, and, once the router has run, `path_params` and `route` (the
+  `APIRoute`, as Starlette sets it); the `endpoint` of scopes is None. A 405 on an added `Route` lists
+  `GET, HEAD` in that order (CPython: set order). `FastAPI(docs_url=...)` and the other `*_url` options must
+  be literals for `app.routes` to be read.
 
 ## Pydantic v2
 
@@ -114,7 +135,9 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   (value, callable or SQL), `unique`, `nullable`, `ForeignKey` (a foreign key without a type takes the
   referenced column's), composite primary keys, `Identity()`, `JSON`/`JSONB` (`none_as_null=`),
   `Numeric` (`Decimal`, or float with `asdecimal=False`), `Enum` columns, project `TypeDecorator`s
-  (`process_bind_param`/`process_result_value` without `self`/`dialect`).
+  (`process_bind_param`/`process_result_value` without `self`/`dialect`). Methods of mapped classes:
+  plain, `@property`, `@staticmethod` and `@classmethod` (`cls(...)` builds an instance); other decorators
+  (`@hybrid_property`, `@validates`...) are refused.
 - Session: identity map (weak, like SQLAlchemy), autoflush, implicit transaction, `get` (scalar, tuple,
   list or dict identities), `add`/`add_all`/`delete`/`flush`/`commit`/`rollback`/`refresh`/`close`,
   `expire_on_commit`, savepoints (`begin_nested()` then `commit()`/`rollback()`), `session.bind`,
@@ -161,13 +184,31 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 - Types as values: `list[X]`, `X | None`, library classes (`BaseModel`, `AsyncSession`...),
   `isinstance`/`issubclass` with run-time types, `inspect.isclass`, `typing.get_args/get_origin/
   get_type_hints` (annotations kept on decorated functions).
-- Module globals are evaluated at startup in import order, like importing the app; module-level calls too.
+- Module globals are evaluated at startup in import order, like importing the app; module-level calls too, and
+  module-level `try`, `if`, `for`, `while` and `with` statements, whose bindings are module variables
+  (`except E as e` names are deleted as in CPython). A `try` whose body only imports and assigns constants is an
+  import fallback: its imports were resolved at compile time, so its `except` branches never run.
+  `if __name__ == "__main__":` and `if TYPE_CHECKING:` blocks are skipped. Refused: a module variable bound
+  by several module-level statements when one of them is compound (`X = 1` then `try: X = f()`).
+  Attributes and methods of a library object such as `prometheus_client.REGISTRY` are resolved at run time.
 - `importlib.import_module("pkg.mod")` with a literal name of a project module returns a module object
   (`getattr`/`hasattr` with run-time names, attribute calls, `__name__`). The module is compiled into the
   binary and its globals are evaluated at startup with the others (CPython: at the first import), so a
   "lazy import" saves neither memory nor startup time. A top-level name that does not translate raises
   when read. Refused: computed module names, library
   modules, modules with `import *`.
+- `sys.settrace(f)`, `threading.settrace(f)`, `threading.settrace_all_threads(f)`, `sys.gettrace()`: when a
+  project calls one of them, its compiled functions (methods, nested functions, lambdas) report `call`, then
+  `return` or `exception` (raised there, coming from a callee, or caught there) followed by `return` with
+  None, to a process-wide trace function that is not traced itself. Frames expose `f_globals["__name__"]`,
+  `f_code.co_qualname`/`co_name`/`co_filename`/`co_firstlineno` and `f_lineno`; tracebacks `tb_lineno`,
+  `tb_frame`, `tb_next`, and `traceback.extract_tb`. Differences: one `call`/`return` pair per invocation (a
+  coroutine suspended by an `await` does not report each suspension and resumption), no `line`/`opcode`
+  events, only project frames exist (library frames are absent from tracebacks, so depths count project
+  frames), a frame's line is the line where its current statement starts. Without such a call the
+  functions are compiled without any of this.
+- A module-level function is one object (`is`, attributes set on it); a nested function naming itself reads
+  its name when called, as CPython's closure cell.
 - `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`; a builtin exception
   class held in a variable can be called.
 
@@ -213,11 +254,12 @@ read back as integral `Decimal`s.
 | Library | Scope |
 |---|---|
 | httpx (0.28) | `AsyncClient`, requests, timeouts, `raise_for_status`, exceptions; no redirects followed, no `files=`, cookies or custom transports |
-| aiohttp (3.14) | `ClientSession` (`timeout=None` = default timeouts), `async with session.post(...) as resp`, `ssl=False`, `proxy=None`, `status/reason/text()/json()`, `ClientTimeout`; `reason` is the standard phrase; a per-request `timeout=None` keeps the session's timeout |
+| aiohttp (3.14) | `ClientSession` (`timeout=None` = default timeouts), `async with session.post(...) as resp`, `ssl=False`, `proxy=None`, `status/reason/text()/json()`, `ClientTimeout`; `reason` is the standard phrase; a per-request `timeout=None` keeps the session's timeout Replacing the request method (`aiohttp.ClientSession._request = wrap(aiohttp.ClientSession._request)`, `httpx.AsyncClient.request = ...`, e.g. to time outgoing calls) is supported: the clients call the replacement with the session, the method, the URL and the keyword arguments aiohttp passes (`allow_redirects=` for get/options/head, `data=` for post/put/patch); httpx's replacement receives only the keyword arguments given by the caller (httpx passes all its defaults). Other assignments to library attributes are refused. |
 | yarl | `URL(str)`: `host`, `port` (scheme default), `scheme`, `path`, `query_string`, `fragment`, `user`, `password`, `str()` |
 | redis.asyncio (redis-py 5+) | `from_url`/`Redis(...)`, get/set (ex, px, nx, xx, get)/setex/delete/exists/incr/decr/mget/expire/ttl/keys/scan_iter/hash commands/ping, `Retry(backoff, n)` (retries without the backoff delay), redis-py's encoding and exceptions |
 | aio-pika 10 | `connect`/`connect_robust` (`async with`), `channel()`, `declare_queue(name, durable=...)`, `default_exchange.publish(Message(...), routing_key=)` with publisher confirms, `queue.get(no_ack=, fail=)` and the received message's properties, `ack()`; `AMQPConnectionError`, `QueueEmpty`. `connect_robust` does not reconnect after a connection loss; `DeliveryMode` members are plain ints (`2`, not `<DeliveryMode.PERSISTENT: 2>`); consumers (`queue.iterator()`, `consume`) are not supported |
 | tenacity 9 | `@retry(stop=, wait=, retry=, before=, after=, before_sleep=, reraise=, retry_error_callback=)` on async and sync functions (bare `@retry` too), `stop_after_attempt/after_delay/never/any/all`, `wait_fixed/none/random/exponential/exponential_jitter/incrementing/combine/chain`, `retry_if_exception_type/not_exception_type/exception/result`, `retry_always/never/any/all`, `|`/`&`/`+` combinations, `before_sleep_log`, `RetryError` (`last_attempt`), the retry state seen by callbacks (`attempt_number`, `outcome`, `fn`, `args`...). `str(RetryError)` shows `0x0` instead of CPython's object address. Refused: `sleep=`, `retry_error_cls=`, `before_sleep_log(exc_info=True)`, `Retrying`/`AsyncRetrying` objects |
+| prometheus_client 0.26 | `Counter`, `Gauge`, `Summary`, `Histogram`, `Info`, `Enum` (namespace/subsystem/unit, buckets, multiprocess_mode, states, `registry=`), `.labels()` by position or keyword, `inc`/`dec`/`set`/`set_to_current_time`/`set_function`/`observe`/`info`/`state`/`reset`/`remove`/`remove_by_labels`/`clear`, `time()`, `count_exceptions()`, `track_inprogress()` as context managers and decorators (a plain function, like the library: on an `async def` it times the creation of the coroutine), exemplar validation, `CollectorRegistry(target_info=)`, `register`/`unregister`/`get_sample_value`/`get_target_info`/`set_target_info`, `REGISTRY`, `generate_latest(registry, escaping=)` (the text format byte for byte, the four name escapings), `openmetrics.exposition.generate_latest` (OpenMetrics 1.0 with units and exemplars), `restricted_registry(names)` (its collectors in registration order: CPython iterates a set), `start_http_server(port, addr=, registry=)` (the exporter on its own port: content negotiation, gzip, `name[]`, OPTIONS/405, `/favicon.ico`; its `Server`/`Date` headers differ; TLS options refused), `CONTENT_TYPE_LATEST`, `disable_created_metrics()`, `PROMETHEUS_DISABLE_CREATED_SERIES`, CPython's messages. `REGISTRY` holds `GC_COLLECTOR`, `PLATFORM_COLLECTOR` and `PROCESS_COLLECTOR` (unregistering them works, their names stay reserved) but they produce no samples: the binary is not a CPython process, so `python_gc_*`, `python_info` and `process_*` are absent from its output. When several names collide, `DuplicateTimeseries` lists them in the collector's order (CPython prints a set, in hash order). Multiprocess mode (`PROMETHEUS_MULTIPROC_DIR` set at startup): values are written to the library's per-process files (same names, keys and binary layout, so Python workers can share the directory) and `multiprocess.MultiProcessCollector(registry, path=)` merges every file of the directory like prometheus_client (gauge modes `all`/`live*`/`min`/`max`/`sum`/`mostrecent`, histogram accumulation, `pid` labels), `mark_process_dead(pid)`. Refused: custom collectors, `make_asgi_app`/`make_wsgi_app`, the push gateway |
 | python-jose (3.5) | `jwt.encode/decode` with HMAC algorithms and decode options; identical tokens, same exceptions |
 | bcrypt (5.0), pyotp (2.9) | same hashes and codes |
 | itsdangerous (2.2) | `URLSafeTimedSerializer` with the default signer and serializer |
@@ -240,4 +282,5 @@ For applications made only of simple CRUD handlers, `--backend typed` emits stat
 `FromRow`, static SQL) and can stream large list responses straight from PostgreSQL in 64 KiB chunks with
 constant memory (`--no-stream` disables it; `PY2AXUM_STREAM_CHUNK`, `PY2AXUM_STREAM_MIN_ROWS`). Its
 subset is narrower: no relationships, no `datetime`/`UUID`/`Decimal`, `AsyncSession` and
-`aiohttp.ClientSession` dependencies only, `GZipMiddleware` as the only middleware.
+`aiohttp.ClientSession` dependencies only, `GZipMiddleware` as the only middleware, literal router
+prefixes only.

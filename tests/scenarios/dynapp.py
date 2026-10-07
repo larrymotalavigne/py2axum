@@ -427,6 +427,23 @@ STEPS: list = [
     # aio_pika (fixtures/dynapp/amqp.py; RabbitMQ at BROKER_DSN)
     ("POST", "/amqp/roundtrip/alpha", None),
     ("GET", "/amqp/down", None),
+    # @staticmethod / @classmethod of a mapped class (fixtures/dynapp/models.py Owner)
+    ("POST", "/owners-cls/named", {"name": "  Ada  Lovelace "}),
+    ("POST", "/owners-cls/named", {"name": "grace hopper", "shout": True}),
+    ("GET", "/owners-cls/slug?q=Hello%20World", None),
+    ("GET", "/owners-cls/slug?q=x&bad=true", None),
+    # include_router(prefix=<settings>) read at startup (DYNAPP_API_PREFIX=/api/v9 in scripts_start_dyn.sh,
+    # the default /api/v1 must not answer), include_router(dependencies=...) (fixtures/dynapp/apiv.py)
+    ("GET", "/api/v9/things/whoami", None, {"x-user": "u"}),
+    ("GET", "/api/v9/things/whoami", None),
+    ("GET", "/api/v9/things/box", None, {"x-user": "u"}),
+    ("GET", "/api/v9/things/admin/ping", None, {"x-user": "u"}),
+    ("GET", "/api/v9/things/admin/zed", None, {"x-user": "u"}),
+    ("GET", "/api/v9/things/admin/ping/", None, {"x-user": "u"}),
+    ("GET", "/api/v1/things/whoami", None, {"x-user": "u"}),
+    ("DELETE", "/api/v9/things/whoami", None, {"x-user": "u"}),
+    ("GET", "/api/v9/things/probe?path=/api/v9/things/admin/zed", None, {"x-user": "u"}),
+    ("GET", "/api/v9/things/probe?path=/api/v1/things/admin/zed", None, {"x-user": "u"}),
     # importlib.import_module (fixtures/dynapp/lazy.py)
     ("GET", "/lazy/attr/BIG_TABLE", None),
     ("GET", "/lazy/attr/FACTOR", None),
@@ -491,6 +508,21 @@ STEPS: list = [
     ("GET", "/retry/case/result?arg=5", None),
     ("GET", "/retry/case/sync", None),
     ("GET", "/retry/case/bare", None),
+    # prometheus_client (fixtures/dynapp/prom.py); timer durations only in /prom/timers, last
+    ("GET", "/prom/metrics", None),
+    ("GET", "/prom/module", None),
+    ("POST", "/prom/run", None),
+    ("GET", "/prom/metrics", None),
+    ("GET", "/prom/nocreated", None),
+    ("GET", "/prom/default", None),
+    ("GET", "/prom/targeted", None),
+    ("GET", "/prom/single", None),
+    ("GET", "/prom/errors", None),
+    ("POST", "/prom/mutate", None),
+    ("GET", "/prom/metrics", None),
+    ("POST", "/prom/reset", None),
+    ("GET", "/prom/exporter", None),
+    ("GET", "/prom/timers", None),
     # coroutine objects (fixtures/dynapp/aio.py)
     ("GET", "/aio/gather", None),
     ("GET", "/aio/coro", None),
@@ -524,6 +556,9 @@ STEPS: list = [
     ("POST", "/libs/alert/one", None),
     ("POST", "/libs/alert/two", None),
     ("GET", "/libs/http", None),
+    ("GET", "/outbound/run", None),
+    ("GET", "/traced/run", None),
+    ("GET", "/traced/run", None),
     ("GET", "/libs/yarl", None),
     # pywebpush: tests/push_sink.py on port 8299 (started by scripts_start_dyn.sh)
     ("POST", "/libs/push?target=http://127.0.0.1:8299/sink", None),
@@ -608,9 +643,29 @@ def reset(db: str) -> None:
     engine.dispose()
 
 
-def normalize(body):
-    """MIME boundaries are random (email.generator): masked."""
+def normalize_text(text: str) -> str:
+    """prometheus_client: the `_created` series and the exemplars hold instants, masked when they have their
+    shape."""
     import re as _re
+    text = _re.sub(r"(?m)^(\S+_created(?:\{.*\})?) \d\.\d+e\+09$", r"\1 <created>", text)
+    return _re.sub(r"(?m)^(.* # \{.*\} \S+) \d{10}\.\d+$", r"\1 <timestamp>", text)
+
+
+def normalize(body):
+    """MIME boundaries are random (email.generator): masked. prometheus_client texts: see normalize_text."""
+    import re as _re
+    if isinstance(body, dict) and "events" in body and "metrics" in body:
+        body = dict(body, metrics=normalize_text(body["metrics"]))
+    if isinstance(body, dict) and "texts" in body and "om" in body:
+        def walk(v):
+            return normalize_text(v) if isinstance(v, str) else [walk(x) for x in v] if isinstance(v, list) else v
+
+        def families(text):
+            # a restricted registry collects a set of collectors: CPython's order follows their hashes
+            return "".join(sorted(f for f in _re.split(r"(?m)^(?=# HELP )", text.removesuffix("# EOF\n")) if f))
+        body = {k: walk(v) for k, v in body.items()}
+        body["texts"] = [t[:4] + [families(t[4])] if "name[]" in str(t[0]) else t for t in body["texts"]]
+        body["restricted"] = [families(t) for t in body["restricted"]]
     if isinstance(body, dict) and set(body) == {"slots", "proto4"}:
         body = {k: _unpickled(v) for k, v in body.items()}
     if isinstance(body, dict) and isinstance(body.get("text"), str):

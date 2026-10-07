@@ -3,6 +3,8 @@
 cd "$(dirname "$0")"
 LOG=${LOG:-/tmp/py2axum-logs}; mkdir -p "$LOG"
 DB=${DATABASE_URL:?DATABASE_URL required}
+# fixtures/dynapp/apiv.py: a router prefix read from the settings, overridden here (read at startup, not frozen)
+export DYNAPP_API_PREFIX=/api/v9
 for port in 8200 8280 8299; do pid=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -n "$pid" ] && kill $pid; done; sleep 1
 # web push sink (tests/push_sink.py): pywebpush blocks the server that calls it, so its own process
 nohup uvicorn tests.push_sink:app --port 8299 --log-level warning > "$LOG/push-sink.log" 2>&1 &

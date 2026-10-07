@@ -840,6 +840,9 @@ pub fn str_(v: &V) -> R<String> {
         if let Native::YarlUrl(u) = &**n {
             return Ok(u.clone()); // yarl keeps the text it was given (no added `/`)
         }
+        if let Native::Prom(p) = &**n {
+            return Ok(super::prom::str(p));
+        }
     }
     Ok(match v {
         V::Str(s) => s.to_string(),
@@ -876,6 +879,9 @@ pub fn repr(v: &V) -> R<String> {
     if let V::Native(n) = v {
         if let Native::PydUrl(name, u) = &**n {
             return Ok(format!("{name}('{}')", u.as_str()));
+        }
+        if let Native::Prom(p) = &**n {
+            return Ok(super::prom::repr(p));
         }
     }
     Ok(match v {

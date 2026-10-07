@@ -65,6 +65,12 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
         match &**n {
             Native::Module(m) => return (m.attr)(cx, name).await,
             Native::Tenacity(t) => return super::tenacity::attr(t, name),
+            Native::Prom(p) => return super::prom::attr(p, name),
+            Native::Routing(o) => return super::routing::attr(o, name),
+            Native::TraceFrame(f) => return super::trace::frame_attr(f, name),
+            Native::TraceCode(f) => return super::trace::code_attr(f, name),
+            Native::Traceback(c, i) => return super::trace::tb_attr(c, *i, name),
+            Native::FrameSummary(f, l) => return super::trace::summary_attr(f, *l, name),
             _ => {}
         }
     }
@@ -113,6 +119,10 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             (ClassKind::Model(m), _) if m.col_index(name).is_some() => Ok(V::Col(m, m.col_index(name).unwrap())),
             (ClassKind::Model(m), _) if m.rel_index(name).is_some() => Ok(orm::sql(orm::Sql::Rel(m, m.rel_index(name).unwrap()))),
             (ClassKind::Model(m), "__tablename__") => Ok(V::str(m.table)),
+            (ClassKind::Model(m), _) if m.class_methods.contains(&name) => match find_method(m.methods, name) {
+                Some((_, f)) => Ok(bound(f, v.clone())),
+                None => unreachable!("class method {name} not in the method table"),
+            },
             (ClassKind::Schema(s), "model_fields") => schema_fields(s),
             (ClassKind::Enum(e), _) if e.by_name(name).is_some() => Ok(e.by_name(name).unwrap()),
             (ClassKind::Enum(e), _) if find_method(e.methods, name).is_some() => Ok(bound(find_method(e.methods, name).unwrap().1, v.clone())),
@@ -203,6 +213,8 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 "cookies" => cookies(r)?,
                 "client" => r.client.as_ref().map(|(h, p)| V::native(Native::Address(h.clone(), *p))).unwrap_or(V::None),
                 "path_params" => V::dict_from(r.path_params.lock().iter().map(|(k, x)| (V::str(k), V::str(x))).collect())?,
+                "app" => super::routing::app(),
+                "scope" => super::routing::scope(cx)?,
                 _ => return Err(no_attr(v, name)),
             }),
             Native::Totp(t) => super::auth::totp_attr(t, name),
@@ -404,6 +416,14 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 return Err(Exc::type_error(format!("{name}() takes no keyword arguments")));
             }
             super::tenacity::method(t, name, &args)
+        }
+        V::Native(n) if matches!(&**n, Native::Routing(_)) => {
+            let Native::Routing(o) = &**n else { unreachable!() };
+            super::routing::method(cx, o, name, args, kwargs).await
+        }
+        V::Native(n) if matches!(&**n, Native::Prom(_)) => {
+            let Native::Prom(p) = &**n else { unreachable!() };
+            super::prom::method(cx, p, name, args, kwargs).await
         }
         V::Native(n) if matches!(&**n, Native::Adapter(..)) => {
             let Native::Adapter(td, _) = &**n else { unreachable!() };
@@ -632,6 +652,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 let obj = pyd::loads(&ops::str_(args.first().unwrap_or(&V::None))?)?;
                 pyd::construct(cx, s, obj).await
             }
+            (ClassKind::Model(m), _) if m.class_methods.contains(&name) => match find_method(m.methods, name) {
+                Some((_, f)) => f(cx, recv.clone(), super::pack(args, kwargs)).await,
+                None => unreachable!("class method {name} not in the method table"),
+            },
             _ => Err(Exc::attr_error(format!("type object '{}' has no attribute '{}'", c.name, name))),
         },
         V::Session(s) => {
@@ -734,7 +758,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 "dispose" => Ok(V::None),
                 _ => Err(no_attr(recv, name)),
             },
-            Native::HttpClient(c) => super::http::client_method(c, name, &args, &kwargs).await,
+            Native::HttpClient(c) => super::http::client_method(cx, recv, c, name, args, kwargs).await,
             Native::HttpResp(r) => super::http::resp_method(r, recv, name, &args, &kwargs),
             Native::Savepoint(sess, sp) => match name {
                 "commit" | "rollback" => sess.end_savepoint(sp, name == "commit").await.map(|_| V::None),
@@ -778,6 +802,12 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
         if let Native::PyFn(pf) = &**n {
             return (pf.call)(cx, args, kwargs).await;
         }
+        if let Native::Prom(p) = &**n {
+            if !kwargs.is_empty() {
+                return Err(Exc::type_error("py2axum: keyword arguments to a prometheus_client decorator are not supported"));
+            }
+            return super::prom::decorate(p, &args);
+        }
         if let Native::Tenacity(t) = &**n {
             if !kwargs.is_empty() {
                 return Err(Exc::type_error("py2axum: keyword arguments to a tenacity decorator are not supported"));
@@ -819,6 +849,13 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
                 return Err(Exc::type_error(format!("{}() takes no keyword arguments", c.name)));
             }
             return Ok(V::Exc(Exc::new(c, args)));
+        }
+        // a mapped class held as a value (`cls(...)` in a classmethod): SQLAlchemy's keyword constructor
+        if let ClassKind::Model(m) = c.kind {
+            if !args.is_empty() {
+                return Err(Exc::type_error(format!("_declarative_constructor() takes 1 positional argument but {} were given", args.len() + 1)));
+            }
+            return orm::construct(m, kwargs);
         }
     }
     if !kwargs.is_empty() {

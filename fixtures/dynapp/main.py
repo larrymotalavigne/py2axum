@@ -32,7 +32,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
-from . import aio, amqp, bgloop, colls, composite, decos, dunders, lazyimp, libs, pk, rds, retrying
+from . import aio, amqp, apiv, bgloop, colls, composite, decos, dunders, lazyimp, libs, outbound, pk, prom, rds, retrying, tracing
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Owner, Project, Secret, Task
@@ -55,6 +55,10 @@ app.include_router(amqp.router)
 app.include_router(lazyimp.router)
 app.include_router(colls.router)
 app.include_router(retrying.router)
+app.include_router(prom.router)
+app.include_router(outbound.router)
+app.include_router(apiv.router, prefix=apiv.settings.API_PREFIX, dependencies=[Depends(apiv.require_user)])
+app.include_router(tracing.router)
 
 oauth2 = OAuth2PasswordBearer(tokenUrl="/token")
 maybe_oauth2 = OAuth2PasswordBearer("/token", auto_error=False)
@@ -214,6 +218,26 @@ async def get_owner(owner_id: int, db: DbDep):
     if owner is None:
         raise HTTPException(status_code=404, detail="Owner not found")
     return {"id": owner.id, "name": owner.name, "projects": [p.name for p in owner.projects]}
+
+
+@app.post("/owners-cls/named")
+async def owner_named(payload: dict, db: DbDep):
+    """@staticmethod / @classmethod of a mapped class, read on the class, on `cls` and on an instance."""
+    owner = Owner.named(payload["name"], shout=payload.get("shout", False))
+    db.add(owner)
+    await db.flush()
+    return {"id": owner.id, "name": owner.name, "describe": owner.describe(), "label": Owner.label(),
+            "via_instance": owner.slug(" A  B "), "named": owner.named("x y").name}
+
+
+@app.get("/owners-cls/slug")
+async def owner_slug(q: str, bad: bool = False):
+    if bad:
+        try:
+            Owner.slug(q, q)
+        except TypeError as e:
+            return {"err": str(e)}
+    return {"slug": Owner.slug(q)}
 
 
 @app.get("/tasks/{task_id}/project")

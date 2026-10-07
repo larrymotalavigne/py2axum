@@ -100,11 +100,28 @@ def _where(e: TranspileError) -> str:
     return e.file or "?"
 
 
-def build(package: Path, root: Path | None = None, stream: bool = True, python_side=("lifespan",)) -> dict:
-    """Per-route coverage with the dyn backend (the typed one first, when it covers everything)."""
+def collect_dyn(package: Path, root: Path | None, python_side, auto: bool = False) -> tuple[Frontend, list]:
+    """Dyn pass that never stops: the frontend (global errors) and, per route, its info and errors (its own and
+    those of the functions it reaches). auto: raw `add_route` with a literal path go to `fe.auto_side`."""
     import tempfile
 
     from . import dyn
+
+    fe = Frontend(package, root, collect=True)
+    if auto:
+        fe.auto_side = {}
+    for path, e in fe.index.syntax_errors:
+        fe.global_errors.append(TranspileError(f"syntax error: {e.msg}", None, f"{path}:{e.lineno}"))
+    dyn.prepare(fe, set(python_side))
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = dyn.generate_project(fe, Path(tmp), str(package), "check", collect=True)
+    return fe, [(info, ([err] if err else []) + dyn.closure_errors(proj, info["id"]))
+                for info, err in getattr(proj, "route_infos", [])]
+
+
+def build(package: Path, root: Path | None = None, stream: bool = True, python_side=("lifespan",)) -> dict:
+    """Per-route coverage with the dyn backend (the typed one first, when it covers everything)."""
+    import tempfile
 
     try:
         fe = Frontend(package, root)
@@ -117,15 +134,9 @@ def build(package: Path, root: Path | None = None, stream: bool = True, python_s
                 "poisoned": [], "notes": fe.notes, "backend": "typed"}
     except Exception:
         pass
-    fe = Frontend(package, root, collect=True)
-    for path, e in fe.index.syntax_errors:
-        fe.global_errors.append(TranspileError(f"syntax error: {e.msg}", None, f"{path}:{e.lineno}"))
-    dyn.prepare(fe, set(python_side))
-    with tempfile.TemporaryDirectory() as tmp:
-        proj = dyn.generate_project(fe, Path(tmp), str(package), "check", collect=True)
+    fe, per_route = collect_dyn(package, root, python_side)
     routes = []
-    for info, err in getattr(proj, "route_infos", []):
-        errs = ([err] if err else []) + dyn.closure_errors(proj, info["id"])
+    for info, errs in per_route:
         rr = RouteReport(info["method"].upper(), info["path"], info["func"], f"{info['file']}:{info['line']}",
                          info["conditional"], "bloquée" if errs else "traduite")
         if errs:

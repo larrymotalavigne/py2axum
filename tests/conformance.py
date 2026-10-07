@@ -8,6 +8,7 @@ Scenarios live in tests/scenarios/<name>.py and define:
   STEPS       list of (method, path, payload[, headers]); payload = None, bytes or a JSON value
   reset(db)   bring the database (DATABASE_URL) back to the scenario's initial state
   normalize   optional: body -> body, for differences proven not to be semantic
+  normalize_text  optional: text -> text, the same for bodies that are not JSON
 
 Generated instants (`created_at`, ...) cannot match between two runs: every ISO-8601 datetime the
 client did not send is replaced by its *shape* (digits -> 9), so the format (Z vs offset, fraction
@@ -91,7 +92,7 @@ def run(base: str, scenario) -> list[dict]:
             try:
                 body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
             except ValueError:
-                body = r.text
+                body = getattr(scenario, "normalize_text", lambda text: text)(r.text)
             if method not in ("GET", "HEAD") and getattr(scenario, "SETTLE", 0):
                 # FastAPI commits a `yield` session dependency after sending the response: let it land
                 # before the next request reads (the reference is racy otherwise, the binary is not)

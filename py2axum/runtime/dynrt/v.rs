@@ -173,6 +173,15 @@ pub enum Native {
     /// a project module returned by `importlib.import_module("literal")`
     Module(&'static ModDesc),
     Tenacity(Arc<super::tenacity::Ten>),
+    /// `sys.settrace`: a frame, its code, a traceback (frames, index), a FrameSummary (see `trace`)
+    TraceFrame(Arc<super::trace::Frame>),
+    TraceCode(Arc<super::trace::Frame>),
+    Traceback(Arc<Vec<(Arc<super::trace::Frame>, u32)>>, usize),
+    FrameSummary(Arc<super::trace::Frame>, u32),
+    /// Starlette / FastAPI routing objects (see `routing`)
+    Routing(Arc<super::routing::RObj>),
+    /// prometheus_client objects (see `prom`)
+    Prom(Arc<super::prom::Prom>),
     /// a coroutine object (see `aio`)
     Coro(Mutex<Option<super::BoxFut<'static>>>),
     /// `asyncio.Semaphore` / `asyncio.Lock`
@@ -311,6 +320,12 @@ impl V {
                 Native::AmqpIncoming(_) => "IncomingMessage",
                 Native::Module(_) => "module",
                 Native::Tenacity(t) => super::tenacity::type_name(t),
+                Native::Prom(p) => super::prom::type_name(p),
+                Native::Routing(o) => super::routing::type_name(o),
+                Native::TraceFrame(_) => "frame",
+                Native::TraceCode(_) => "code",
+                Native::Traceback(..) => "traceback",
+                Native::FrameSummary(..) => "FrameSummary",
                 Native::Redis(_) => "Redis",
                 Native::RRetry(_) => "Retry",
                 Native::AsyncItems(_) => "async_generator",
@@ -538,6 +553,8 @@ pub struct ExcObj {
     pub new_args: Mutex<Option<Vec<V>>>,
     /// HTTPException.__init__ run by a project subclass's `__init__` (`super().__init__(status_code=...)`)
     pub http_late: Mutex<Option<(u16, V, Vec<(String, String)>)>>,
+    /// the traced project frames it has left, innermost first (`sys.settrace`, see `trace`)
+    pub tb: Mutex<Vec<(Arc<super::trace::Frame>, u32)>>,
 }
 
 /// A raised exception. Cheap to clone.
@@ -579,6 +596,7 @@ builtin_exc!(PICKLE_ERROR, "PickleError", [EXCEPTION]);
 builtin_exc!(REDIS_ERROR, "RedisError", [EXCEPTION]);
 builtin_exc!(AMQP_ERROR, "AMQPError", [EXCEPTION]);
 builtin_exc!(TENACITY_RETRY_ERROR, "RetryError", [EXCEPTION]);
+builtin_exc!(DUPLICATE_TIMESERIES, "DuplicateTimeseries", [VALUE_ERROR]);
 builtin_exc!(AMQP_CONNECTION_ERROR, "AMQPConnectionError", [AMQP_ERROR]);
 builtin_exc!(AMQP_QUEUE_EMPTY, "QueueEmpty", [AMQP_ERROR]);
 builtin_exc!(REDIS_CONNECTION_ERROR, "ConnectionError", [REDIS_ERROR]);
@@ -607,6 +625,7 @@ builtin_exc!(CONNECTION_RESET_ERROR, "ConnectionResetError", [CONNECTION_ERROR])
 builtin_exc!(CONNECTION_ABORTED_ERROR, "ConnectionAbortedError", [CONNECTION_ERROR]);
 builtin_exc!(BROKEN_PIPE_ERROR, "BrokenPipeError", [CONNECTION_ERROR]);
 builtin_exc!(STOP_ITERATION, "StopIteration", [EXCEPTION]);
+builtin_exc!(STOP_ASYNC_ITERATION, "StopAsyncIteration", [EXCEPTION]);
 builtin_exc!(QUEUE_FULL, "QueueFull", [EXCEPTION]);
 builtin_exc!(QUEUE_EMPTY, "QueueEmpty", [EXCEPTION]);
 builtin_exc!(HTTP_EXCEPTION, "HTTPException", [EXCEPTION]);
@@ -666,6 +685,7 @@ builtin_exc!(HTTPX_NETWORK_ERROR, "NetworkError", [HTTPX_TRANSPORT_ERROR]);
 builtin_exc!(HTTPX_CONNECT_ERROR, "ConnectError", [HTTPX_NETWORK_ERROR]);
 builtin_exc!(HTTPX_UNSUPPORTED_PROTOCOL, "UnsupportedProtocol", [HTTPX_TRANSPORT_ERROR]);
 builtin_exc!(HTTPX_TOO_MANY_REDIRECTS, "TooManyRedirects", [HTTPX_REQUEST_ERROR]);
+builtin_exc!(HTTPX_DECODING_ERROR, "DecodingError", [HTTPX_REQUEST_ERROR]);
 builtin_exc!(HTTPX_STATUS_ERROR, "HTTPStatusError", [HTTPX_HTTP_ERROR]);
 builtin_exc!(HTTPX_INVALID_URL, "InvalidURL", [EXCEPTION]);
 // requests, pywebpush, py-vapid
@@ -699,7 +719,7 @@ builtin_exc!(IS_A_DIRECTORY_ERROR, "IsADirectoryError", [OS_ERROR]);
 
 impl Exc {
     pub fn new(class: &'static Class, args: Vec<V>) -> Exc {
-        Exc(Arc::new(ExcObj { class, args, http: None, errors: None, attrs: Default::default(), new_args: Default::default(), http_late: Default::default() }))
+        Exc(Arc::new(ExcObj { class, args, http: None, errors: None, attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default() }))
     }
     pub fn msg(class: &'static Class, msg: impl AsRef<str>) -> Exc {
         Exc::new(class, vec![V::str(msg)])
@@ -725,10 +745,11 @@ impl Exc {
             attrs: Default::default(),
             new_args: Default::default(),
             http_late: Default::default(),
+            tb: Default::default(),
         }))
     }
     pub fn validation(class: &'static Class, errors: Vec<pyd::ErrDetail>) -> Exc {
-        Exc(Arc::new(ExcObj { class, args: vec![], http: None, errors: Some(errors), attrs: Default::default(), new_args: Default::default(), http_late: Default::default() }))
+        Exc(Arc::new(ExcObj { class, args: vec![], http: None, errors: Some(errors), attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default() }))
     }
     /// `exc.args` (rebound by `super().__init__(...)` in a project exception)
     pub fn args(&self) -> Vec<V> {

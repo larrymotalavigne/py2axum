@@ -63,9 +63,54 @@ Paths declared with `--python-side PATH` (a route pattern like `/items/{id}` or 
 relays those paths to it (method, headers, body; streamed response), so one entry point serves both;
 otherwise it answers 404 and your ingress routes them.
 
+`--python-side auto` finds those routes for you: a first pass compiles every route without stopping, then
+every path whose route does not translate (its own code or a function it reaches) is left to Python, along
+with raw `add_route` routes with a literal path. Each moved path is printed with the error that blocked it:
+
+```
+python-side (auto): /assistant/chat (POST chat) — app/tools.py:61: method .model_json_schema() is not
+    implemented by the runtime for any type (it would raise AttributeError at run time)
+```
+
+Rules:
+
+- A path moves as a whole: if `GET /items/{id}` translates but `DELETE /items/{id}` does not, both are served
+  by Python. The binary relays by path, and Python serving a route is always correct.
+- Errors about the whole application (an unsupported middleware, `FastAPI(lifespan=...)`, an app option) are
+  not moved: generation stops on them, with `file:line`. Declare `--python-side lifespan` explicitly: a
+  lifespan left to Python does not run in the binary, which is a decision only you can make.
+- The list follows the code: a route that becomes translatable after a py2axum upgrade moves to the binary on
+  the next build. Pin the list with explicit `--python-side PATH` flags (or check `--report` in CI) if you
+  want deployments to change only when you decide.
+- Moved paths go through the Python app's own middleware stack, not the translated one (the relay happens
+  before it). State shared between the two processes must be external (database, Redis, broker).
+
 ## 5. Why differential testing
 
 The compiler aims at observable equivalence: status, headers, content type and body bytes. The only reliable
 way to know is to run both implementations on the same inputs, which `tests/conformance.py` does (see
 [conformance.md](conformance.md)). Every supported construct in this repository has such a test, and
 every refused construct has a rejection test.
+
+## 6. How it differs from RustPython
+
+[RustPython](https://github.com/RustPython/RustPython) and py2axum are both "Python in Rust", but they solve
+different problems.
+
+| | RustPython | py2axum |
+|---|---|---|
+| What it is | A Python 3 **interpreter** written in Rust: it replaces CPython and runs any program at run time | An ahead-of-time **compiler** for one stack (FastAPI, SQLAlchemy, Pydantic): it emits Rust, then no Python runs |
+| Scope | The whole language and standard library (in progress) | A closed subset of Python and a closed list of libraries |
+| Outside the scope | Fails at run time | Refused at compile time with `file:line`, or left to Python (`--python-side`) |
+| C and PyO3 extensions | Not loadable (no CPython C API): pydantic-core, psycopg's binary build, uvloop... | Not needed: Pydantic validation, the ORM session and asyncio are reimplemented natively in the runtime |
+| Speed | An interpreter, generally slower than CPython | Native code on axum/tokio/sqlx; measured against uvicorn and granian in `bench/` |
+| Correctness check | CPython's test suite, partially passing | Differential testing against the Python app itself, byte for byte |
+| Best at | Python in the browser (WebAssembly), scripting embedded in a Rust program | Serving an existing FastAPI API from a single binary |
+
+In practice a FastAPI application does not run on RustPython today, since Pydantic v2 depends on pydantic-core,
+a compiled extension; and if it did, it would not be faster than on CPython. py2axum gets its speed and its
+guarantees from its narrow scope: because it only targets one framework stack, it can reproduce that stack's
+observable behaviour exactly and compile everything else away.
+
+The two projects share one concern: reproducing CPython's semantics in Rust (`repr`, float formatting,
+hashing, integer and string methods). RustPython's implementation is a useful reference for those edge cases.

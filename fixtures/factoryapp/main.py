@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from fixtures.factoryapp.middleware import CountingMiddleware, SecurityHeadersMiddleware
+from fixtures.factoryapp.observe import install_observability, introspect, router as shop
 
 
 class Settings:
@@ -36,7 +37,7 @@ def country_for(ip: str) -> str | None:
         return None
 
 
-def create_app() -> FastAPI:
+def create_app(observed: bool = True) -> FastAPI:
     settings = get_settings()
     prefix = settings.app_name.upper() + "-"
     app = FastAPI()
@@ -105,6 +106,11 @@ def create_app() -> FastAPI:
     async def root():
         return {"message": f"Welcome to {prefix}{settings.app_name}", "country": country_for("1.2.3.4")}
 
+    app.include_router(shop)
+    app.include_router(shop, prefix="/v2")
+    app.include_router(introspect)
+    if observed:  # a parameter of the factory: the server calls it without arguments
+        install_observability(app)
     return app
 
 

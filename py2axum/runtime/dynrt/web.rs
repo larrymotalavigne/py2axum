@@ -23,6 +23,8 @@ pub struct ReqCell {
     pub headers: Vec<(String, String)>,
     /// set by the router, once the middlewares have run
     pub path_params: Mutex<Vec<(String, String)>>,
+    /// the declared route the router chose (`scope["route"]`)
+    pub route: Mutex<Option<&'static super::routing::Node>>,
     pub query: Vec<(String, String)>,
     /// the peer address (`request.client`)
     pub client: Option<(String, u16)>,
@@ -39,6 +41,7 @@ impl ReqCell {
             raw_query: String::new(),
             headers: vec![],
             path_params: Mutex::new(vec![]),
+            route: Mutex::new(None),
             query: vec![],
             client: None,
             body: Bytes::new(),
@@ -58,6 +61,7 @@ impl ReqCell {
                 .map(|(k, v)| (k.as_str().to_ascii_lowercase(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
                 .collect(),
             path_params: Mutex::new(path_params),
+            route: Mutex::new(None),
             query,
             client: None,
             body,
@@ -830,12 +834,65 @@ pub struct RouteDef {
     pub method: &'static str,
     pub pattern: &'static str,
     pub run: RunFn,
+    /// its `APIRoute` in the route tree (`request.scope["route"]`)
+    pub node: Option<&'static super::routing::Node>,
 }
 
 static ROUTE_RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+/// `include_router(prefix=<runtime value>)`: their values (raw), in the place of `\u{1}<index>\u{1}` in the patterns
+static PREFIXES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The runtime router prefixes (settings, env), read at startup after the module globals, checked as
+/// FastAPI's `include_router` does (a failure stops the application, as an import error does). Each value
+/// comes with the path operation of an empty route path under it, if any.
+pub fn set_prefixes(vals: Vec<(V, Option<&'static str>)>) -> R<()> {
+    let mut out = Vec::new();
+    for (v, empty_route) in vals {
+        let Some(p) = v.as_str() else {
+            return Err(Exc::type_error(format!("can only concatenate str (not \"{}\") to str", v.type_name())));
+        };
+        if !p.is_empty() {
+            if !p.starts_with('/') {
+                return Err(Exc::msg(&super::v::ASSERTION_ERROR, "A path prefix must start with '/'"));
+            }
+            if p.ends_with('/') {
+                return Err(Exc::msg(&super::v::ASSERTION_ERROR, "A path prefix must not end with '/', as the routes will start with '/'"));
+            }
+            if p.contains('{') {
+                return Err(Exc::msg(&super::v::NOT_IMPLEMENTED_ERROR, format!("py2axum: the router prefix {p:?} has a path parameter: not supported")));
+            }
+        } else if let Some(op) = empty_route {
+            return Err(Exc::msg(&super::v::RUNTIME_ERROR, format!("FastAPIError: Prefix and path cannot be both empty (path operation: {op})")));
+        }
+        out.push(p.to_string());
+    }
+    let _ = PREFIXES.set(out);
+    Ok(())
+}
+
+/// A prefix that may hold runtime prefix markers, with their values (`_IncludedRouter` of the route tree).
+pub fn runtime_prefix(prefix: &str) -> String {
+    let mut out = prefix.to_string();
+    if let Some(ps) = PREFIXES.get() {
+        for (i, p) in ps.iter().enumerate() {
+            out = out.replace(&format!("\u{1}{i}\u{1}"), p);
+        }
+    }
+    out
+}
+
+fn route_regex(pattern: &str) -> regex::Regex {
+    let mut pat = pattern.to_string();
+    if let Some(ps) = PREFIXES.get() {
+        for (i, p) in ps.iter().enumerate() {
+            pat = pat.replace(&format!("\u{1}{i}\u{1}"), &regex::escape(p));
+        }
+    }
+    regex::Regex::new(&pat).expect("route pattern")
+}
 
 /// `urllib.parse.unquote` (what uvicorn puts in `scope["path"]`).
-fn unquote(s: &str) -> String {
+pub fn unquote(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -871,7 +928,7 @@ fn quote_url(s: &str) -> String {
 /// else the path with/without a trailing slash is tried (307 redirect), else a 404 HTTPException
 /// (FastAPI apps raise them, for the exception handlers).
 pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
-    let res = ROUTE_RES.get_or_init(|| routes.iter().map(|r| regex::Regex::new(r.pattern).expect("route pattern")).collect());
+    let res = ROUTE_RES.get_or_init(|| routes.iter().map(|r| route_regex(r.pattern)).collect());
     let path = unquote(&cx.req.path);
     let mut partial: Option<&RouteDef> = None;
     for (r, re) in routes.iter().zip(res) {
@@ -883,6 +940,7 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
                     .filter_map(|n| caps.name(n).map(|m| (n.to_string(), m.as_str().to_string())))
                     .collect();
                 *cx.req.path_params.lock() = pp;
+                *cx.req.route.lock() = r.node;
                 return run_route(cx, r.run).await;
             }
             partial.get_or_insert(r);
@@ -891,12 +949,25 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
     if let Some(r) = partial {
         return Err(Exc::http(405, V::str("Method Not Allowed"), vec![("allow".into(), r.method.into())]));
     }
+    // routes added at run time (`app.add_route`) come after the declared ones
+    if let Some((a, full)) = super::routing::added_match(&path, &cx.req.method) {
+        if !full {
+            return Err(Exc::http(405, V::str("Method Not Allowed"), vec![("allow".into(), a.methods.join(", "))]));
+        }
+        let pp: Vec<(String, String)> = match a.re.captures(&path) {
+            Some(caps) => a.re.capture_names().flatten().filter_map(|n| caps.name(n).map(|m| (n.to_string(), m.as_str().to_string()))).collect(),
+            None => vec![],
+        };
+        *cx.req.path_params.lock() = pp;
+        let ret = super::methods::call_value(cx, &a.endpoint, vec![super::request(cx)], vec![]).await?;
+        return super::asgi::to_response(&ret);
+    }
     if path != "/" {
         let alt = match path.strip_suffix('/') {
             Some(p) => p.to_string(),
             None => format!("{path}/"),
         };
-        if res.iter().any(|re| re.is_match(&alt)) {
+        if res.iter().any(|re| re.is_match(&alt)) || super::routing::added_is_match(&alt) {
             let host = cx.req.header("host").unwrap_or_default();
             let mut url = format!("http://{host}{alt}");
             if !cx.req.raw_query.is_empty() {
