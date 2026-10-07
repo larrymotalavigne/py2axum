@@ -172,6 +172,7 @@ pub enum Native {
     AmqpIncoming(Arc<super::rmq::AIncoming>),
     /// a project module returned by `importlib.import_module("literal")`
     Module(&'static ModDesc),
+    Tenacity(Arc<super::tenacity::Ten>),
     /// a coroutine object (see `aio`)
     Coro(Mutex<Option<super::BoxFut<'static>>>),
     /// `asyncio.Semaphore` / `asyncio.Lock`
@@ -309,6 +310,7 @@ impl V {
                 Native::AmqpMsg(_) => "Message",
                 Native::AmqpIncoming(_) => "IncomingMessage",
                 Native::Module(_) => "module",
+                Native::Tenacity(t) => super::tenacity::type_name(t),
                 Native::Redis(_) => "Redis",
                 Native::RRetry(_) => "Retry",
                 Native::AsyncItems(_) => "async_generator",
@@ -576,6 +578,7 @@ builtin_exc!(ATTRIBUTE_ERROR, "AttributeError", [EXCEPTION]);
 builtin_exc!(PICKLE_ERROR, "PickleError", [EXCEPTION]);
 builtin_exc!(REDIS_ERROR, "RedisError", [EXCEPTION]);
 builtin_exc!(AMQP_ERROR, "AMQPError", [EXCEPTION]);
+builtin_exc!(TENACITY_RETRY_ERROR, "RetryError", [EXCEPTION]);
 builtin_exc!(AMQP_CONNECTION_ERROR, "AMQPConnectionError", [AMQP_ERROR]);
 builtin_exc!(AMQP_QUEUE_EMPTY, "QueueEmpty", [AMQP_ERROR]);
 builtin_exc!(REDIS_CONNECTION_ERROR, "ConnectionError", [REDIS_ERROR]);
@@ -598,6 +601,11 @@ builtin_exc!(ASSERTION_ERROR, "AssertionError", [EXCEPTION]);
 builtin_exc!(NOT_IMPLEMENTED_ERROR, "NotImplementedError", [RUNTIME_ERROR]);
 builtin_exc!(OS_ERROR, "OSError", [EXCEPTION]);
 builtin_exc!(TIMEOUT_ERROR, "TimeoutError", [OS_ERROR]);
+builtin_exc!(CONNECTION_ERROR, "ConnectionError", [OS_ERROR]);
+builtin_exc!(CONNECTION_REFUSED_ERROR, "ConnectionRefusedError", [CONNECTION_ERROR]);
+builtin_exc!(CONNECTION_RESET_ERROR, "ConnectionResetError", [CONNECTION_ERROR]);
+builtin_exc!(CONNECTION_ABORTED_ERROR, "ConnectionAbortedError", [CONNECTION_ERROR]);
+builtin_exc!(BROKEN_PIPE_ERROR, "BrokenPipeError", [CONNECTION_ERROR]);
 builtin_exc!(STOP_ITERATION, "StopIteration", [EXCEPTION]);
 builtin_exc!(QUEUE_FULL, "QueueFull", [EXCEPTION]);
 builtin_exc!(QUEUE_EMPTY, "QueueEmpty", [EXCEPTION]);

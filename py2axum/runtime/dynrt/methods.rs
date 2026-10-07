@@ -62,8 +62,10 @@ const NATIVE_METHODS: &[&str] = &["acquire", "release", "locked", "set", "clear"
 
 pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
     if let V::Native(n) = v {
-        if let Native::Module(m) = &**n {
-            return (m.attr)(cx, name).await;
+        match &**n {
+            Native::Module(m) => return (m.attr)(cx, name).await,
+            Native::Tenacity(t) => return super::tenacity::attr(t, name),
+            _ => {}
         }
     }
     if let Some(r) = orm::sql_attr(v, name) {
@@ -395,6 +397,13 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         V::Native(n) if matches!(&**n, Native::Module(_)) => {
             let f = getattr(cx, recv, name).await?;
             call_value(cx, &f, args, kwargs).await
+        }
+        V::Native(n) if matches!(&**n, Native::Tenacity(_)) => {
+            let Native::Tenacity(t) = &**n else { unreachable!() };
+            if !kwargs.is_empty() {
+                return Err(Exc::type_error(format!("{name}() takes no keyword arguments")));
+            }
+            super::tenacity::method(t, name, &args)
         }
         V::Native(n) if matches!(&**n, Native::Adapter(..)) => {
             let Native::Adapter(td, _) = &**n else { unreachable!() };
@@ -769,6 +778,12 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
         if let Native::PyFn(pf) = &**n {
             return (pf.call)(cx, args, kwargs).await;
         }
+        if let Native::Tenacity(t) = &**n {
+            if !kwargs.is_empty() {
+                return Err(Exc::type_error("py2axum: keyword arguments to a tenacity decorator are not supported"));
+            }
+            return super::tenacity::decorate(t, &args);
+        }
         // `async_sessionmaker(...)()`: a new session on the process pool
         if let Native::Maker(expire, autoflush) = &**n {
             if !args.is_empty() || !kwargs.is_empty() {
@@ -795,6 +810,15 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
         if let Native::MethodOf(recv, name) = &**n {
             return Box::pin(call_method(cx, recv, name, args, kwargs)).await;
+        }
+    }
+    // a builtin exception class held as a value: `(ValueError if c else TypeError)(msg)`
+    if let V::Class(c) = f {
+        if matches!(c.kind, ClassKind::Exception) {
+            if !kwargs.is_empty() {
+                return Err(Exc::type_error(format!("{}() takes no keyword arguments", c.name)));
+            }
+            return Ok(V::Exc(Exc::new(c, args)));
         }
     }
     if !kwargs.is_empty() {
@@ -1021,42 +1045,8 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
             }
         }
         "format" => {
-            let mut out = String::new();
-            let mut idx = 0;
-            let mut it = s.chars().peekable();
-            while let Some(c) = it.next() {
-                if c == '{' {
-                    if it.peek() == Some(&'{') {
-                        it.next();
-                        out.push('{');
-                        continue;
-                    }
-                    let mut field = String::new();
-                    for d in it.by_ref() {
-                        if d == '}' {
-                            break;
-                        }
-                        field.push(d);
-                    }
-                    let (fname, spec) = field.split_once(':').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or((field.clone(), String::new()));
-                    let v = if fname.is_empty() {
-                        idx += 1;
-                        args.get(idx - 1).cloned()
-                    } else if let Ok(i) = fname.parse::<usize>() {
-                        args.get(i).cloned()
-                    } else {
-                        kw(kwargs, &fname).cloned()
-                    };
-                    let v = v.ok_or_else(|| Exc::msg(&INDEX_ERROR, "Replacement index out of range"))?;
-                    out += &ops::format_spec(&v, &spec)?;
-                } else if c == '}' && it.peek() == Some(&'}') {
-                    it.next();
-                    out.push('}');
-                } else {
-                    out.push(c);
-                }
-            }
-            V::str(out)
+            let pos = |i: usize| args.get(i).cloned().ok_or_else(|| Exc::msg(&INDEX_ERROR, format!("Replacement index {i} out of range for positional args tuple")));
+            V::str(format_with(s, &pos, &|n: &str| kw(kwargs, n).cloned().ok_or_else(|| Exc::new(&KEY_ERROR, vec![V::str(n)])), false)?)
         }
         _ => return Err(Exc::attr_error(format!("'str' object has no attribute '{name}'"))),
     })
@@ -1403,6 +1393,95 @@ pub fn b_callable(args: &[V]) -> R {
         V::Obj(o) => find_method(o.desc.methods, "__call__").is_some(),
         _ => false,
     }))
+}
+
+/// `str.format` / `string.Formatter().vformat`: `{}`/`{0}`/`{name}`, `!r`/`!s` conversions, format specs;
+/// `positional`/`named` look a field up. `formatter`: `string.Formatter`'s messages (it is written in Python).
+/// Attribute/index fields (`{a.b}`, `{a[0]}`) and nested specs are refused.
+pub fn format_with(s: &str, positional: &dyn Fn(usize) -> R, named: &dyn Fn(&str) -> R, formatter: bool) -> R<String> {
+    let mut out = String::new();
+    let (mut auto, mut manual) = (0usize, false);
+    let mut auto_used = false;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '}' {
+            if it.peek() == Some(&'}') {
+                it.next();
+                out.push('}');
+                continue;
+            }
+            return Err(Exc::value_error("Single '}' encountered in format string"));
+        }
+        if c != '{' {
+            out.push(c);
+            continue;
+        }
+        if it.peek() == Some(&'{') {
+            it.next();
+            out.push('{');
+            continue;
+        }
+        let mut field = String::new();
+        let mut closed = false;
+        for d in it.by_ref() {
+            if d == '}' {
+                closed = true;
+                break;
+            }
+            if d == '{' {
+                return Err(Exc::type_error("py2axum: nested replacement fields in a format spec are not supported"));
+            }
+            field.push(d);
+        }
+        if !closed {
+            return Err(Exc::value_error("expected '}' before end of string"));
+        }
+        let (head, spec) = field.split_once(':').map(|(a, b)| (a, b)).unwrap_or((field.as_str(), ""));
+        let (fname, conv) = match head.split_once('!') {
+            Some((f, c)) => (f, Some(c)),
+            None => (head, None),
+        };
+        if fname.contains('.') || fname.contains('[') {
+            return Err(Exc::type_error(format!("py2axum: format field '{fname}' (attribute or index access) is not supported")));
+        }
+        let v = if fname.is_empty() {
+            if manual {
+                return Err(Exc::value_error("cannot switch from manual field specification to automatic field numbering"));
+            }
+            auto_used = true;
+            auto += 1;
+            positional(auto - 1)?
+        } else if let Ok(i) = fname.parse::<usize>() {
+            if auto_used {
+                return Err(Exc::value_error(if formatter {
+                    "cannot switch from manual field specification to automatic field numbering"
+                } else {
+                    "cannot switch from automatic field numbering to manual field specification"
+                }));
+            }
+            manual = true;
+            positional(i)?
+        } else {
+            named(fname)?
+        };
+        let v = match conv {
+            None => v,
+            Some("r") => V::str(ops::repr(&v)?),
+            Some("s") => V::str(ops::str_(&v)?),
+            Some(c) if c.chars().count() == 1 && c != "a" => return Err(Exc::value_error(format!("Unknown conversion specifier {c}"))),
+            Some("a") => return Err(Exc::type_error("py2axum: the !a conversion is not supported")),
+            Some(_) => return Err(Exc::value_error("expected ':' after conversion specifier")),
+        };
+        out += &ops::format_spec(&v, spec)?;
+    }
+    Ok(out)
+}
+
+/// `string.Formatter().vformat(format_string, args, kwargs)`: named fields read with `kwargs[name]`
+/// (a defaultdict fills them).
+pub fn vformat(fmt: &V, args: &V, mapping: &V) -> R {
+    let V::Str(s) = fmt else { return Err(Exc::type_error(format!("expected str, got {}", fmt.type_name()))) };
+    Ok(V::str(format_with(s, &|i: usize| ops::getitem(args, &V::Int(i as i64)), &|n: &str| ops::getitem(mapping, &V::str(n)), true)?))
 }
 
 pub fn b_repr(v: &V) -> R {

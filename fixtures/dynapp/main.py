@@ -32,7 +32,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
-from . import aio, amqp, bgloop, composite, decos, dunders, lazyimp, libs, pk, rds
+from . import aio, amqp, bgloop, colls, composite, decos, dunders, lazyimp, libs, pk, rds, retrying
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Owner, Project, Secret, Task
@@ -53,6 +53,8 @@ app.include_router(pk.router)
 app.include_router(rds.router)
 app.include_router(amqp.router)
 app.include_router(lazyimp.router)
+app.include_router(colls.router)
+app.include_router(retrying.router)
 
 oauth2 = OAuth2PasswordBearer(tokenUrl="/token")
 maybe_oauth2 = OAuth2PasswordBearer("/token", auto_error=False)

@@ -31,7 +31,7 @@ pub async fn await_value(v: V) -> R {
     fut.await
 }
 
-fn is_async_fn(f: &V) -> bool {
+pub fn is_async_fn(f: &V) -> bool {
     match f {
         V::Native(n) => match &**n {
             Native::PyFn(p) => p.is_async,

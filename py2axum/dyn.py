@@ -3403,6 +3403,44 @@ class FnCompiler:
             raise self.err("BaseException.__init__() takes no keyword arguments", node)
         return self.q(f"{RT}::exc_set_args(&{me}, {args})")
 
+    DEFAULT_FACTORIES = {"int", "float", "str", "list", "dict", "set", "tuple", "bool"}
+
+    def defaultdict_call(self, node: ast.Call) -> str:
+        """`defaultdict(int)`, `defaultdict(list, mapping, **kw)`: a dict whose missing keys are filled by a
+        builtin type (other factories call project code from a subscript: refused)."""
+        if not node.args or any(isinstance(a, ast.Starred) for a in node.args) or len(node.args) > 2:
+            raise self.err("defaultdict(factory[, mapping]) with a builtin type as factory is the only supported form", node)
+        fac = node.args[0]
+        if not (isinstance(fac, ast.Name) and self.static_ref(fac) == ("builtin", fac.id) and fac.id in self.DEFAULT_FACTORIES):
+            raise self.err(f"defaultdict({ast.unparse(fac)}): only a builtin type factory is supported "
+                           f"({', '.join(sorted(self.DEFAULT_FACTORIES))})", node)
+        init = [self.expr(a) for a in node.args[1:]]
+        kwargs = "vec![" + ", ".join(f"({rs(k.arg)}.to_string(), {self.expr(k.value)})" for k in node.keywords if k.arg) + "]"
+        if any(k.arg is None for k in node.keywords):
+            raise self.err("defaultdict(..., **mapping) is not supported", node)
+        return self.q(f"{RT}::ops::defaultdict({rs(fac.id)}, {RT}::methods::b_dict(&vec![{', '.join(init)}], &{kwargs})?)")
+
+    def formatter_call(self, node: ast.Call) -> str | None:
+        """`string.Formatter().vformat(fmt, args, mapping)` / `.format(fmt, *args, **kw)` (the base class:
+        same rules as `str.format`, named fields looked up with `mapping[name]`)."""
+        f = node.func
+        if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call) and not f.value.args
+                and not f.value.keywords and self.static_ref(f.value.func) == Ext("string.Formatter")):
+            return None
+        if f.attr == "vformat":
+            if len(node.args) != 3 or node.keywords:
+                raise self.err("Formatter().vformat(format_string, args, kwargs) takes three positional arguments", node)
+            fmt, args, mapping = (self.expr(a) for a in node.args)
+            return self.q(f"{RT}::methods::vformat(&{fmt}, &{args}, &{mapping})")
+        if f.attr == "format":
+            if not node.args or isinstance(node.args[0], ast.Starred):
+                raise self.err("Formatter().format(format_string, ...) needs the format string first", node)
+            fmt = self.expr(node.args[0])
+            rest = ast.Call(func=node.func, args=node.args[1:], keywords=node.keywords)
+            args, kwargs = self.dyn_args(rest)
+            return self.q(f"{RT}::methods::call_method(cx, &{fmt}, \"format\", {args}, {kwargs}).await")
+        raise self.err(f"string.Formatter().{f.attr}() is not supported (vformat and format are)", node)
+
     def task_call(self, node: ast.Call) -> str | None:
         """`asyncio.create_task(f(...))`, `asyncio.get_running_loop().create_task(f(...))`: `f` and its
         arguments are evaluated now (creating the coroutine), the call runs on its own.
@@ -3438,8 +3476,13 @@ class FnCompiler:
         if task is not None:
             return task
         ref = self.static_ref(node.func)
+        if ref == Ext("collections.defaultdict"):
+            return self.defaultdict_call(node)
         if ref is not None:
             return self.static_call(ref, node, awaited)
+        fmt = self.formatter_call(node)
+        if fmt is not None:
+            return fmt
         if isinstance(node.func, ast.Attribute):
             recv = self.expr(node.func.value)
             self.check_method(node)
@@ -3732,6 +3775,9 @@ class FnCompiler:
         tmpl = libmap.CALLS.get(name)
         if tmpl is None:
             raise self.err(f"library call `{name}()` is not supported (not in the py2axum library map)", node)
+        for k in node.keywords:
+            if k.arg in libmap.REFUSED_KWARGS.get(name, ()):
+                raise self.err(f"{name}({k.arg}=) is not supported", node)
         if name in {"sqlalchemy.and_", "sqlalchemy.or_"} and any(isinstance(a, ast.Starred) for a in node.args) and not node.keywords:
             # and_(*conditions): the list is expanded at run time
             args, _ = self.dyn_args(node)

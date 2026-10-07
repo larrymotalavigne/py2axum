@@ -39,6 +39,9 @@ VALUES: dict[str, str] = {
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean")},
     "os.environ": f"{RT}::libs::environ()",
     "aio_pika.DeliveryMode.PERSISTENT": "V::Int(2)",
+    **{f"tenacity.{n}": f'{RT}::tenacity::value("{n}")' for n in ("stop_never", "retry_always", "retry_never")},
+    **{f"logging.{n}": f"V::Int({v})" for n, v in (("NOTSET", 0), ("DEBUG", 10), ("INFO", 20), ("WARNING", 30), ("WARN", 30),
+                                                    ("ERROR", 40), ("CRITICAL", 50), ("FATAL", 50))},
     "aio_pika.DeliveryMode.NOT_PERSISTENT": "V::Int(1)",
     "datetime.time.min": "V::Time(chrono::NaiveTime::MIN)",
     "datetime.time.max": "V::Time(chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).unwrap())",
@@ -90,6 +93,11 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.OverflowError": "OVERFLOW_ERROR",
     "builtins.TimeoutError": "TIMEOUT_ERROR",
     "builtins.OSError": "OS_ERROR",
+    "builtins.ConnectionError": "CONNECTION_ERROR",
+    "builtins.ConnectionRefusedError": "CONNECTION_REFUSED_ERROR",
+    "builtins.ConnectionResetError": "CONNECTION_RESET_ERROR",
+    "builtins.ConnectionAbortedError": "CONNECTION_ABORTED_ERROR",
+    "builtins.BrokenPipeError": "BROKEN_PIPE_ERROR",
     "builtins.StopIteration": "STOP_ITERATION",
     "builtins.NameError": "NAME_ERROR",
     "builtins.FileNotFoundError": "FILE_NOT_FOUND_ERROR",
@@ -148,6 +156,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.EOFError": "EOF_ERROR",
     "pickle.PickleError": "PICKLE_ERROR",
     "aio_pika.exceptions.AMQPError": "AMQP_ERROR",
+    "tenacity.RetryError": "TENACITY_RETRY_ERROR",
     "aio_pika.exceptions.AMQPConnectionError": "AMQP_CONNECTION_ERROR",
     "aio_pika.exceptions.QueueEmpty": "AMQP_QUEUE_EMPTY",
     **{f"redis.exceptions.{n}": c for n, c in (("RedisError", "REDIS_ERROR"), ("ConnectionError", "REDIS_CONNECTION_ERROR"),
@@ -191,6 +200,12 @@ EXCEPTIONS: dict[str, str] = {
     "itsdangerous.exc.BadHeader": "BAD_HEADER",
     "itsdangerous.BadPayload": "BAD_PAYLOAD",
     "itsdangerous.exc.BadPayload": "BAD_PAYLOAD",
+}
+
+# keyword arguments refused at transpile time (the call is otherwise supported)
+REFUSED_KWARGS = {
+    "tenacity.retry": {"sleep", "retry_error_cls"},
+    "tenacity.before_sleep_log": {"exc_info"},
 }
 
 BUILTIN_EXC_NAMES = {k.split(".", 1)[1]: v for k, v in EXCEPTIONS.items() if k.startswith("builtins.")}
@@ -295,6 +310,13 @@ CALLS = {
        for f in ("cpu_percent", "virtual_memory", "disk_usage", "pids")},
     # alembic's Config (the ini file only)
     "alembic.config.Config": lambda a, kw: f"{RT}::ini::new(&{_argv(a)}, &{_kwvec(kw)})",
+    # tenacity 9 (dynrt/tenacity.rs)
+    "tenacity.retry": lambda a, kw: f"{RT}::tenacity::retry(&{_argv(a)}, &{_kwvec(kw)})",
+    **{f"tenacity.{n}": (lambda n: lambda a, kw: f'{RT}::tenacity::make("{n}", &{_argv(a)}, &{_kwvec(kw)})')(n)
+       for n in ("stop_after_attempt", "stop_after_delay", "stop_any", "stop_all", "wait_fixed", "wait_none", "wait_random",
+                 "wait_exponential", "wait_exponential_jitter", "wait_incrementing", "wait_combine", "wait_chain",
+                 "retry_if_exception_type", "retry_if_not_exception_type", "retry_if_exception", "retry_if_result",
+                 "retry_any", "retry_all", "before_sleep_log")},
     # aio_pika 10 (dynrt/rmq.rs)
     **{n: (lambda a, kw: f"{RT}::rmq::connect(&{_argv(a)}, &{_kwvec(kw)}).await") for n in ("aio_pika.connect_robust", "aio_pika.connect")},
     "aio_pika.Message": lambda a, kw: f"{RT}::rmq::message(&{_argv(a)}, &{_kwvec(kw)})",
@@ -447,7 +469,7 @@ CALLS = {
     "logging.basicConfig": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + "Ok::<V, Exc>(V::None) }",
     # module-level functions: the root logger
     **{f"logging.{n}": (lambda n: lambda a, kw: f"{RT}::web::log(\"root\", \"{n}\", &{_argv(a)})")(n)
-       for n in ("debug", "info", "warning", "error", "exception", "critical")},
+       for n in ("debug", "info", "warning", "error", "exception", "critical", "log")},
     "logging.getLogger": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::Logger(std::sync::Arc::from({RT}::ops::str_(&{a[0] if a else 'V::str(\"root\")'})?.as_str()))))",
     "asyncio.Queue": lambda a, kw: f"Ok::<V, Exc>({RT}::web::AQueue::new(match &{a[0] if a else kw.get('maxsize', 'V::Int(0)')} {{ V::Int(i) => *i as usize, _ => 0 }}))",
     "asyncio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0]}).await",

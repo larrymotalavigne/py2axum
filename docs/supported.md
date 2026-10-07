@@ -143,7 +143,8 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
 ## Python semantics
 
 - Values and operators with CPython's semantics: int (64-bit: beyond is an `OverflowError`), float formatting
-  and `repr`, str methods, `%`/`format`/f-strings, slicing, comparisons, `**`, bit operators, truthiness,
+  and `repr`, str methods, `%`/`format`/f-strings (presentations `d f % e g x o b` and their upper-case forms, `#`;
+  not `n`, `c`, `=` with non-numbers), slicing, comparisons, `**`, bit operators, truthiness,
   `hash()` rules (unhashable Pydantic models and dataclasses unless frozen, `__hash__ = None`, `__eq__`
   without `__hash__`); `hash(int)` is CPython's, other hashes are stable but not CPython's (CPython
   randomizes str hashes anyway).
@@ -167,7 +168,8 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   "lazy import" saves neither memory nor startup time. A top-level name that does not translate raises
   when read. Refused: computed module names, library
   modules, modules with `import *`.
-- `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`.
+- `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`; a builtin exception
+  class held in a variable can be called.
 
 ## asyncio and threading
 
@@ -194,9 +196,10 @@ add/mul then rounding, CPython's division, `quantize`, `round`, formatting; mixi
 Python 3.7+), `csv` (simplified `Sniffer`), `io.StringIO/BytesIO`, `pathlib`/`open()` (UTF-8, POSIX),
 `os.environ`/`os.getenv` (read-only), `os.path`, `math`, `random` (OS-seeded), `secrets`, `hashlib`,
 `hmac`, `base64`, `urllib.parse`, `string` constants, `time.time/monotonic/perf_counter`,
-`statistics.median`, `logging` (stderr, `LEVEL:logger:message`, level from `PY2AXUM_LOG_LEVEL`),
+`statistics.median`, `logging` (stderr, `LEVEL:logger:message`, level from `PY2AXUM_LOG_LEVEL`; level constants,
+`Logger.log` with a standard level),
 `email.mime`/`email.utils`, `pickle` (see below), `functools.wraps`, `inspect.iscoroutinefunction`,
-`typing.get_args/get_origin/get_type_hints`. Not yet: `collections.defaultdict`/`Counter`, `string.Formatter`.
+`typing.get_args/get_origin/get_type_hints`, `collections.defaultdict` with a builtin type factory (`int`, `list`, `str`...; `type()` of it reports `dict`), `string.Formatter().vformat/format`. `str.format` and `Formatter` support `{}`/`{0}`/`{name}`, `!r`/`!s` and format specs; attribute/index fields (`{a.b}`, `{a[0]}`), nested specs and `!a` raise. Not yet: `collections.Counter`, other `Formatter` methods.
 
 `pickle.dumps/loads` use CPython's format (protocol 5 when the project targets Python ≥ 3.14, else 4):
 bytes written by the binary are read by CPython and the other way round (e.g. a Redis cache shared with
@@ -214,6 +217,7 @@ read back as integral `Decimal`s.
 | yarl | `URL(str)`: `host`, `port` (scheme default), `scheme`, `path`, `query_string`, `fragment`, `user`, `password`, `str()` |
 | redis.asyncio (redis-py 5+) | `from_url`/`Redis(...)`, get/set (ex, px, nx, xx, get)/setex/delete/exists/incr/decr/mget/expire/ttl/keys/scan_iter/hash commands/ping, `Retry(backoff, n)` (retries without the backoff delay), redis-py's encoding and exceptions |
 | aio-pika 10 | `connect`/`connect_robust` (`async with`), `channel()`, `declare_queue(name, durable=...)`, `default_exchange.publish(Message(...), routing_key=)` with publisher confirms, `queue.get(no_ack=, fail=)` and the received message's properties, `ack()`; `AMQPConnectionError`, `QueueEmpty`. `connect_robust` does not reconnect after a connection loss; `DeliveryMode` members are plain ints (`2`, not `<DeliveryMode.PERSISTENT: 2>`); consumers (`queue.iterator()`, `consume`) are not supported |
+| tenacity 9 | `@retry(stop=, wait=, retry=, before=, after=, before_sleep=, reraise=, retry_error_callback=)` on async and sync functions (bare `@retry` too), `stop_after_attempt/after_delay/never/any/all`, `wait_fixed/none/random/exponential/exponential_jitter/incrementing/combine/chain`, `retry_if_exception_type/not_exception_type/exception/result`, `retry_always/never/any/all`, `|`/`&`/`+` combinations, `before_sleep_log`, `RetryError` (`last_attempt`), the retry state seen by callbacks (`attempt_number`, `outcome`, `fn`, `args`...). `str(RetryError)` shows `0x0` instead of CPython's object address. Refused: `sleep=`, `retry_error_cls=`, `before_sleep_log(exc_info=True)`, `Retrying`/`AsyncRetrying` objects |
 | python-jose (3.5) | `jwt.encode/decode` with HMAC algorithms and decode options; identical tokens, same exceptions |
 | bcrypt (5.0), pyotp (2.9) | same hashes and codes |
 | itsdangerous (2.2) | `URLSafeTimedSerializer` with the default signer and serializer |

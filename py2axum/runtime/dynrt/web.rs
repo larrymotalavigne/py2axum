@@ -765,6 +765,19 @@ fn min_level() -> i32 {
 }
 
 pub fn log(name: &str, method: &str, args: &[V]) -> R {
+    if method == "log" {
+        // Logger.log(level, msg, *args): the standard levels (CPython names others "Level N")
+        let m = match args.first() {
+            Some(V::Int(10)) => "debug",
+            Some(V::Int(20)) => "info",
+            Some(V::Int(30)) => "warning",
+            Some(V::Int(40)) => "error",
+            Some(V::Int(50)) => "critical",
+            Some(V::Int(l)) => return Err(Exc::type_error(format!("py2axum: logging at level {l} is not supported (standard levels only)"))),
+            _ => return Err(Exc::type_error("level must be an integer")),
+        };
+        return log(name, m, &args[1..]);
+    }
     let (level_name, level) = match method {
         "debug" => ("DEBUG", 10),
         "info" => ("INFO", 20),

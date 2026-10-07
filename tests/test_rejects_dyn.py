@@ -366,3 +366,69 @@ def test_import_module_rejected(tmp_path, capsys, arg, message):
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:11" in err
+
+
+COLLS_MAIN = '''
+import string
+from collections import defaultdict
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/c")
+async def c():
+    return {{"v": {expr}}}
+'''
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("defaultdict(lambda: 0)", "defaultdict(lambda: 0): only a builtin type factory is supported"),
+        ("defaultdict()", "defaultdict(factory[, mapping]) with a builtin type as factory is the only supported form"),
+        ('list(string.Formatter().parse("{a}"))', "string.Formatter().parse() is not supported"),
+    ],
+)
+def test_collections_rejected(tmp_path, capsys, expr, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(COLLS_MAIN.format(expr=expr))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:12" in err
+
+
+TENACITY_MAIN = '''
+import asyncio
+
+from fastapi import FastAPI
+from tenacity import retry, stop_after_attempt
+
+app = FastAPI()
+
+
+@retry(stop=stop_after_attempt(2), {opt})
+async def flaky():
+    return 1
+
+
+@app.get("/t")
+async def t():
+    return {{"v": await flaky()}}
+'''
+
+
+@pytest.mark.parametrize("opt", ["sleep=asyncio.sleep", "retry_error_cls=ValueError"])
+def test_tenacity_options_rejected(tmp_path, capsys, opt):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(TENACITY_MAIN.format(opt=opt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert f"tenacity.retry({opt.split('=')[0]}=) is not supported" in err
+    assert "main.py:10" in err

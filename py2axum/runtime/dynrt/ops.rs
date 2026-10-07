@@ -119,6 +119,9 @@ fn dec_op(a: &V, b: &V, op: &str) -> Option<R> {
 }
 
 pub fn add(a: &V, b: &V) -> R {
+    if let Some(r) = super::tenacity::binop(a, "+", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_binop(a, "+", b);
     }
@@ -334,6 +337,9 @@ pub fn pos(a: &V) -> R {
 }
 
 pub fn bitor(a: &V, b: &V) -> R {
+    if let Some(r) = super::tenacity::binop(a, "|", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_bool(a, "OR", b);
     }
@@ -421,6 +427,9 @@ pub fn rshift(a: &V, b: &V) -> R {
 }
 
 pub fn bitand(a: &V, b: &V) -> R {
+    if let Some(r) = super::tenacity::binop(a, "&", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_bool(a, "AND", b);
     }
@@ -894,7 +903,10 @@ pub fn repr(v: &V) -> R<String> {
                 .values()
                 .map(|(k, v)| Ok(format!("{}: {}", repr(k)?, repr(v)?)))
                 .collect::<R<Vec<_>>>()?;
-            format!("{{{}}}", parts.join(", "))
+            match default_factory(d) {
+                Some(f) => format!("defaultdict(<class '{f}'>, {{{}}})", parts.join(", ")),
+                None => format!("{{{}}}", parts.join(", ")),
+            }
         }
         V::Set(s) => {
             let items = s.lock().clone();
@@ -930,6 +942,62 @@ pub fn repr(v: &V) -> R<String> {
 // ---------------------------------------------------------------- formatting
 
 /// `format(value, spec)` for the spec subset used in f-strings: [[fill]align][sign][0][width][.prec][type]
+/// CPython's `e` presentation of a non-negative float: `d.ddde+XX` (two exponent digits at least).
+fn fmt_exp(x: f64, prec: usize, upper: bool) -> String {
+    if !x.is_finite() {
+        let s = if x.is_nan() { "nan" } else { "inf" };
+        return if upper { s.to_uppercase() } else { s.into() };
+    }
+    let r = format!("{:.*e}", prec, x);
+    let (m, e) = r.split_once('e').unwrap_or((&r, "0"));
+    let e: i32 = e.parse().unwrap_or(0);
+    let out = format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs());
+    if upper { out.to_uppercase() } else { out }
+}
+
+/// CPython's `g` presentation: `p` significant digits, scientific when the exponent is < -4 or >= p,
+/// trailing zeros (and a trailing point) removed.
+fn fmt_general(x: f64, prec: usize, upper: bool) -> String {
+    if !x.is_finite() {
+        return fmt_exp(x, 0, upper);
+    }
+    let p = prec.max(1);
+    if x == 0.0 {
+        return "0".into();
+    }
+    let r = format!("{:.*e}", p - 1, x);
+    let exp: i32 = r.split_once('e').map(|(_, e)| e.parse().unwrap_or(0)).unwrap_or(0);
+    let strip = |s: String| -> String {
+        if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+    };
+    if exp < -4 || exp >= p as i32 {
+        let (m, _) = r.split_once('e').unwrap();
+        let out = format!("{}e{}{:02}", strip(m.to_string()), if exp < 0 { '-' } else { '+' }, exp.abs());
+        if upper { out.to_uppercase() } else { out }
+    } else {
+        strip(format!("{:.*}", (p as i32 - 1 - exp).max(0) as usize, x))
+    }
+}
+
+/// a float with a precision and no presentation type (`{:.3}`): like `g`, but scientific from an exponent
+/// of p-1 and at least one digit after the point in fixed notation.
+fn fmt_general_none(x: f64, prec: usize) -> String {
+    let p = prec.max(1);
+    if !x.is_finite() {
+        return fmt_exp(x, 0, false);
+    }
+    let r = format!("{:.*e}", p - 1, x);
+    let (m, e) = r.split_once('e').unwrap_or((&r, "0"));
+    let exp: i32 = e.parse().unwrap_or(0);
+    if exp < -4 || exp >= p as i32 - 1 {
+        let m = if m.contains('.') { m.trim_end_matches('0').trim_end_matches('.') } else { m };
+        return format!("{m}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
+    }
+    let s = format!("{:.*}", (p as i32 - 1 - exp).max(0) as usize, x);
+    let s = if s.contains('.') { s.trim_end_matches('0').to_string() } else { s };
+    if s.ends_with('.') { format!("{s}0") } else if s.contains('.') { s } else { format!("{s}.0") }
+}
+
 pub fn format_spec(v: &V, spec: &str) -> R<String> {
     if let V::Decimal(d) = v {
         return super::decimal::format(d, spec);
@@ -957,6 +1025,11 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
     let mut sign = '-';
     if i < chars.len() && matches!(chars[i], '+' | '-' | ' ') {
         sign = chars[i];
+        i += 1;
+    }
+    let mut alt = false;
+    if i < chars.len() && chars[i] == '#' {
+        alt = true;
         i += 1;
     }
     if i < chars.len() && chars[i] == '0' {
@@ -992,11 +1065,18 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         (Some('d'), _) if int_of(v).is_some() => int_of(v).unwrap().abs().to_string(),
         (Some('f') | Some('F'), _) if num(v).is_some() => format!("{:.*}", prec.unwrap_or(6), num(v).unwrap().abs()),
         (Some('%'), _) if num(v).is_some() => format!("{:.*}%", prec.unwrap_or(6), num(v).unwrap().abs() * 100.0),
-        (Some('x'), _) if int_of(v).is_some() => format!("{:x}", int_of(v).unwrap().abs()),
+        (Some('x'), _) if int_of(v).is_some() => format!("{}{:x}", if alt { "0x" } else { "" }, int_of(v).unwrap().abs()),
+        (Some('X'), _) if int_of(v).is_some() => format!("{}{:X}", if alt { "0X" } else { "" }, int_of(v).unwrap().abs()),
+        (Some('o'), _) if int_of(v).is_some() => format!("{}{:o}", if alt { "0o" } else { "" }, int_of(v).unwrap().abs()),
+        (Some('b'), _) if int_of(v).is_some() => format!("{}{:b}", if alt { "0b" } else { "" }, int_of(v).unwrap().abs()),
+        (Some(c @ ('e' | 'E')), _) if num(v).is_some() => fmt_exp(num(v).unwrap().abs(), prec.unwrap_or(6), c == 'E'),
+        (Some(c @ ('g' | 'G')), _) if num(v).is_some() => fmt_general(num(v).unwrap().abs(), prec.unwrap_or(6), c == 'G'),
         (Some('s') | None, V::Str(s)) => match prec {
             Some(p) => s.chars().take(p).collect(),
             None => s.to_string(),
         },
+        (None, V::Float(x)) if prec.is_some() => fmt_general_none(x.abs(), prec.unwrap()),
+        (None, V::Int(_) | V::Bool(_)) if prec.is_some() => return Err(Exc::value_error("Precision not allowed in integer format specifier")),
         (None, _) if numeric => {
             let s = str_(v)?;
             s.trim_start_matches('-').to_string()
@@ -1097,6 +1177,13 @@ pub fn percent_format(fmt: &str, args: &V) -> R<String> {
             },
             'f' => format!("{:.*}", p.unwrap_or(6), num(&arg).ok_or_else(|| Exc::type_error("must be real number"))?),
             'x' => format!("{:x}", int_of(&arg).unwrap_or(0)),
+            'e' | 'E' | 'g' | 'G' | 'X' | 'o' => {
+                // same presentation as format(): flags and width applied below
+                let n = num(&arg).ok_or_else(|| Exc::type_error(format!("must be real number, not {}", arg.type_name())))?;
+                let v = if matches!(conv, 'X' | 'o') { V::Int(n as i64) } else { V::Float(n) };
+                let body = format_spec(&v, &match p { Some(p) => format!(".{p}{conv}"), None => conv.to_string() })?;
+                if n < 0.0 && !body.starts_with('-') { format!("-{body}") } else { body }
+            }
             _ => str_(&arg)?,
         };
         let body = if conv == 's' { match p { Some(p) => body.chars().take(p).collect(), None => body } } else { body };
@@ -1231,6 +1318,47 @@ pub fn getslice(v: &V, start: &V, stop: &V, step: &V) -> R {
     })
 }
 
+// ---------------------------------------------------------------- collections.defaultdict
+
+type DictCell = Mutex<IndexMap<Key, (V, V)>>;
+
+/// defaultdicts are plain dicts registered here with their factory (a builtin type): only a missing key
+/// and `repr` look it up. The `Weak` keeps the allocation, so an address is never reused while registered.
+static DEFAULTS: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, (std::sync::Weak<DictCell>, &'static str)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// `collections.defaultdict(factory, init)`; `init` is already a fresh dict.
+pub fn defaultdict(factory: &'static str, init: V) -> R {
+    let V::Dict(d) = &init else { return Err(Exc::type_error("py2axum: defaultdict initial value must be a dict")) };
+    let mut reg = DEFAULTS.lock();
+    if reg.len() >= 64 && reg.len().is_power_of_two() {
+        reg.retain(|_, (w, _)| w.strong_count() > 0);
+    }
+    reg.insert(Arc::as_ptr(d) as usize, (Arc::downgrade(d), factory));
+    Ok(init)
+}
+
+pub fn default_factory(d: &Arc<DictCell>) -> Option<&'static str> {
+    let reg = DEFAULTS.lock();
+    if reg.is_empty() {
+        return None;
+    }
+    reg.get(&(Arc::as_ptr(d) as usize)).filter(|(w, _)| w.strong_count() > 0).map(|(_, f)| *f)
+}
+
+fn default_value(factory: &str) -> V {
+    match factory {
+        "int" => V::Int(0),
+        "float" => V::Float(0.0),
+        "str" => V::str(""),
+        "bool" => V::Bool(false),
+        "list" => V::list(vec![]),
+        "tuple" => V::tuple(vec![]),
+        "set" => V::Set(Arc::new(Mutex::new(IndexMap::new()))),
+        _ => V::Dict(Arc::new(Mutex::new(IndexMap::new()))),
+    }
+}
+
 pub fn getitem(v: &V, k: &V) -> R {
     if let Some(t) = row_tuple(v) {
         return getitem(&t, k);
@@ -1277,9 +1405,18 @@ pub fn getitem(v: &V, k: &V) -> R {
         }
         V::Dict(d) => {
             let key = Key::of(k)?;
-            match d.lock().get(&key) {
-                Some((_, v)) => v.clone(),
-                None => return Err(Exc::new(&KEY_ERROR, vec![k.clone()])),
+            let found = d.lock().get(&key).map(|(_, v)| v.clone());
+            match found {
+                Some(v) => v,
+                None => match default_factory(d) {
+                    // defaultdict.__missing__: the factory's value is stored, then returned
+                    Some(f) => {
+                        let v = default_value(f);
+                        d.lock().insert(key, (k.clone(), v.clone()));
+                        v
+                    }
+                    None => return Err(Exc::new(&KEY_ERROR, vec![k.clone()])),
+                },
             }
         }
         V::Inst(i) => i.getitem(k)?,
