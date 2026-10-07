@@ -77,7 +77,10 @@ async def load(body: dict):
             "scalars": [repr(x) for x in v["scalars"]], "dates": [repr(x) for x in v["dates"]],
             "misc": [repr(x) for x in v["misc"]], "shared": v["shared"][0] is v["shared"][1],
             "objects": [repr(o) if not isinstance(o, Bag) else sorted(vars(o).items()) for o in v["objects"]],
-            "again": _b64(pickle.dumps(e)) == _b64(pickle.dumps(pickle.loads(pickle.dumps(e))))}
+            # dumping the same object twice is byte-stable; a reload round-trips by value (byte equality of a
+            # re-dump depends on CPython's string interning state: not a stable observable)
+            "again": pickle.dumps(e) == pickle.dumps(e),
+            "reload": repr(pickle.loads(pickle.dumps(e)).value["scalars"]) == repr(v["scalars"])}
 
 
 @router.get("/errors")

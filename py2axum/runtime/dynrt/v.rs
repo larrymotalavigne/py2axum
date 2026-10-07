@@ -54,6 +54,12 @@ pub enum V {
 }
 
 /// Values without a natural representation elsewhere.
+/// A project module as a value: its top-level names, read by a generated function.
+pub struct ModDesc {
+    pub name: &'static str,
+    pub attr: for<'a> fn(&'a super::Cx, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send + 'a>>,
+}
+
 pub enum Native {
     Request(Arc<web::ReqCell>),
     Headers(Arc<web::ReqCell>),
@@ -164,6 +170,8 @@ pub enum Native {
     AmqpExchange(Arc<super::rmq::AChan>, String),
     AmqpMsg(Arc<super::rmq::AMsg>),
     AmqpIncoming(Arc<super::rmq::AIncoming>),
+    /// a project module returned by `importlib.import_module("literal")`
+    Module(&'static ModDesc),
     /// a coroutine object (see `aio`)
     Coro(Mutex<Option<super::BoxFut<'static>>>),
     /// `asyncio.Semaphore` / `asyncio.Lock`
@@ -300,6 +308,7 @@ impl V {
                 Native::AmqpExchange(..) => "Exchange",
                 Native::AmqpMsg(_) => "Message",
                 Native::AmqpIncoming(_) => "IncomingMessage",
+                Native::Module(_) => "module",
                 Native::Redis(_) => "Redis",
                 Native::RRetry(_) => "Retry",
                 Native::AsyncItems(_) => "async_generator",

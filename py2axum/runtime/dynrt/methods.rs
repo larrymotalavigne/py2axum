@@ -61,6 +61,11 @@ const NATIVE_METHODS: &[&str] = &["acquire", "release", "locked", "set", "clear"
     "call_soon", "call_soon_threadsafe", "run_forever", "stop", "close", "create_task", "run_in_executor"];
 
 pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
+    if let V::Native(n) = v {
+        if let Native::Module(m) = &**n {
+            return (m.attr)(cx, name).await;
+        }
+    }
     if let Some(r) = orm::sql_attr(v, name) {
         return r;
     }
@@ -387,6 +392,10 @@ pub async fn hasattr(cx: &Cx, v: &V, name: &str) -> R {
 
 pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     match recv {
+        V::Native(n) if matches!(&**n, Native::Module(_)) => {
+            let f = getattr(cx, recv, name).await?;
+            call_value(cx, &f, args, kwargs).await
+        }
         V::Native(n) if matches!(&**n, Native::Adapter(..)) => {
             let Native::Adapter(td, _) = &**n else { unreachable!() };
             pyd::adapter_method(cx, td, name, args, kwargs).await
@@ -1382,6 +1391,18 @@ pub fn b_str(args: &[V]) -> R {
         Some(V::Bytes(b)) if args.len() > 1 => Ok(V::str(String::from_utf8_lossy(b))),
         Some(v) => Ok(V::str(ops::str_(v)?)),
     }
+}
+
+/// `callable(x)`: functions, bound methods, classes, builtin types, instances with `__call__`.
+pub fn b_callable(args: &[V]) -> R {
+    let [v] = args else { return Err(Exc::type_error(format!("callable() takes exactly one argument ({} given)", args.len()))) };
+    Ok(V::Bool(match v {
+        V::Class(_) => true,
+        V::Native(n) => matches!(&**n, Native::Bound(..) | Native::PyFn(_) | Native::Type(_) | Native::Maker(..) | Native::CallNext(_)),
+        V::Inst(i) => find_method(i.desc.methods, "__call__").is_some(),
+        V::Obj(o) => find_method(o.desc.methods, "__call__").is_some(),
+        _ => false,
+    }))
 }
 
 pub fn b_repr(v: &V) -> R {

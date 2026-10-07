@@ -161,7 +161,13 @@ Two backends exist: the **dyn** backend (`--backend dyn`, the general one, descr
   `isinstance`/`issubclass` with run-time types, `inspect.isclass`, `typing.get_args/get_origin/
   get_type_hints` (annotations kept on decorated functions).
 - Module globals are evaluated at startup in import order, like importing the app; module-level calls too.
-- `map`/`filter` return lists (materialized); `frozenset` behaves as `set`.
+- `importlib.import_module("pkg.mod")` with a literal name of a project module returns a module object
+  (`getattr`/`hasattr` with run-time names, attribute calls, `__name__`). The module is compiled into the
+  binary and its globals are evaluated at startup with the others (CPython: at the first import), so a
+  "lazy import" saves neither memory nor startup time. A top-level name that does not translate raises
+  when read. Refused: computed module names, library
+  modules, modules with `import *`.
+- `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`.
 
 ## asyncio and threading
 

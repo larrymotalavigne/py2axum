@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 
 - aio-pika 10: connect, channels, durable queues, publishing with confirms, `queue.get()`.
 - `json.loads` accepts bytes (UTF-8/16/32 detection, like CPython).
+- `importlib.import_module` of a literal project module (module objects), `callable()`.
 
 ## [0.1.0] — first public release
 

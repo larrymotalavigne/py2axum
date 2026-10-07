@@ -427,6 +427,12 @@ STEPS: list = [
     # aio_pika (fixtures/dynapp/amqp.py; RabbitMQ at BROKER_DSN)
     ("POST", "/amqp/roundtrip/alpha", None),
     ("GET", "/amqp/down", None),
+    # importlib.import_module (fixtures/dynapp/lazy.py)
+    ("GET", "/lazy/attr/BIG_TABLE", None),
+    ("GET", "/lazy/attr/FACTOR", None),
+    ("GET", "/lazy/attr/scale", None),
+    ("GET", "/lazy/attr/missing", None),
+    ("GET", "/lazy/use", None),
     # coroutine objects (fixtures/dynapp/aio.py)
     ("GET", "/aio/gather", None),
     ("GET", "/aio/coro", None),

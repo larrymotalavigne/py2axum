@@ -29,7 +29,7 @@ RUNTIME_DIR = Path(__file__).parent / "runtime" / "dynrt"
 BUILTIN_FUNCS = {
     "len", "str", "repr", "int", "float", "bool", "list", "tuple", "set", "frozenset", "dict", "sorted",
     "reversed", "min", "max", "sum", "any", "all", "next", "round", "abs", "enumerate", "zip", "range",
-    "print", "isinstance", "getattr", "setattr", "hasattr", "iter", "open", "type", "chr", "ord", "divmod",
+    "print", "isinstance", "getattr", "setattr", "hasattr", "iter", "open", "type", "chr", "ord", "divmod", "callable",
     "hash", "id", "filter", "map", "issubclass", "vars",
 }
 BUILTIN_TYPES = {"str", "int", "float", "bool", "dict", "list", "tuple", "set", "frozenset", "bytes", "object"}
@@ -289,6 +289,14 @@ class Project:
                                 names |= {t.id for t in st.targets if isinstance(t, ast.Name)}
                     elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
                         names.add(n.attr)
+                    elif (isinstance(n, ast.Call) and len(n.args) == 1 and isinstance(n.args[0], ast.Constant)
+                          and isinstance(n.args[0].value, str)
+                          and (isinstance(n.func, ast.Name) and n.func.id == "import_module"
+                               or isinstance(n.func, ast.Attribute) and n.func.attr == "import_module")):
+                        # a module object's top-level names (importlib.import_module("pkg.mod").name)
+                        mod = self.ix.module(n.args[0].value)
+                        if mod is not None:
+                            names |= {*mod.defs, *mod.imports}
             self.__dict__["_attrs"] = names
         return self.__dict__["_attrs"]
 
@@ -2023,6 +2031,35 @@ class Project:
                 raise
         return self.globals[sym]
 
+    def module_desc(self, module: str, node, fc: "FnCompiler") -> str:
+        """A project module as a value: a static descriptor whose `attr` reads its top-level names (each
+        compiled like a `from module import name`; a name that does not translate raises when read)."""
+        mods = self.__dict__.setdefault("module_descs", {})
+        if module not in mods:
+            m = self.ix.module(module)
+            if m.stars:
+                raise fc.err(f"module `{module}` used as a value has `import *`: not supported", node)
+            name = f"MOD_{mod_ident(module).upper()}"
+            mods[module] = name
+            arms = []
+            for attr in sorted({*m.defs, *m.imports}):
+                afc = FnCompiler(self, module, None, f"mattr_{mod_ident(module)}")
+                try:
+                    code = afc.ref_value(self.ix.resolve(module, attr), ast.Name(id=attr, lineno=1, col_offset=0))
+                    body = "".join(f"{l} " for l in afc.lines)
+                    arms.append(f"            {rs(attr)} => {{ {body}Ok({code}) }}")
+                except TranspileError as e:
+                    arms.append(f"            {rs(attr)} => Err(Exc::runtime({rs('py2axum: ' + e.render())})),")
+            arms.append(f"            \"__name__\" => Ok(V::str({rs(module)})),")
+            arms.append(f"            _ => Err(Exc::attr_error(format!(\"module '{module}' has no attribute '{{name}}'\"))),")
+            fn = f"mattr_{mod_ident(module)}"
+            self.items.append(
+                f"fn {fn}<'a>(cx: &'a Cx, name: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send + 'a>> {{\n"
+                f"    Box::pin(async move {{\n        match name {{\n" + "\n".join(arms) + "\n        }\n    })\n}\n"
+                f"pub static {name}: {RT}::v::ModDesc = {RT}::v::ModDesc {{ name: {rs(module)}, attr: {fn} }};"
+            )
+        return mods[module]
+
     def decorated_value(self, sym: Sym) -> str:
         """A module-level `def` with project decorators: `d1(d2(f))` built once at startup (decorator
         expressions evaluated top to bottom, then applied bottom-up, like CPython at import)."""
@@ -2824,6 +2861,14 @@ class FnCompiler:
             # __import__("datetime"): the module itself
             name = node.args[0].value
             return ModRef(name) if self.p.ix.module(name) else Ext(libmap.canonical(name))
+        if (isinstance(node, ast.Call) and len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str) and not node.keywords
+                and self.static_ref(node.func) == Ext("importlib.import_module")):
+            # importlib.import_module("pkg.mod"): the module itself (a literal project module only)
+            name = node.args[0].value
+            if not self.p.ix.module(name):
+                raise self.err(f"importlib.import_module({name!r}): only modules of the project are supported", node)
+            return ModRef(name)
         if isinstance(node, ast.Name):
             if self.is_local(node.id):
                 return None
@@ -2919,7 +2964,7 @@ class FnCompiler:
                 return self.q(f"{self.p.global_value(ref)}(cx).await")
             raise self.err(f"`{ref.qual}` cannot be used as a value", node)
         if isinstance(ref, ModRef):
-            raise self.err(f"module `{ref.module}` cannot be used as a value", node)
+            return f"V::native({RT}::Native::Module(&{self.p.module_desc(ref.module, node, self)}))"
         if isinstance(ref, Ext):
             if ref.dotted in libmap.VALUES:
                 return libmap.VALUES[ref.dotted]
@@ -3288,6 +3333,12 @@ class FnCompiler:
         return self.q(f"y.send({v}).await")
 
     def e_Call(self, node: ast.Call) -> str:
+        if (len(node.args) == 1 and not node.keywords and isinstance(node.func, (ast.Name, ast.Attribute))
+                and self.static_ref(node.func) == Ext("importlib.import_module")):
+            if not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                raise self.err("importlib.import_module() of a computed name is not supported (only a literal module "
+                               "of the project)", node)
+            return self.ref_value(self.static_ref(node), node)  # a literal project module, or refused
         return self.call(node, awaited=False)
 
     # ---------------------------------------------------------------- calls
@@ -3786,7 +3837,7 @@ class FnCompiler:
             "divmod": f"{RT}::methods::b_divmod(&{args})",
             "open": f"{RT}::pathio::open(&{args}, &{kwargs})",
             "sorted": f"{RT}::methods::b_sorted(cx, &{args}[0], &{kwargs}).await",
-            "id": f"{RT}::methods::b_id(&{args})",
+            "id": f"{RT}::methods::b_id(&{args})", "callable": f"{RT}::methods::b_callable(&{args})",
             "vars": f"{RT}::methods::getattr(cx, &{args}[0], \"__dict__\").await", "issubclass": f"{RT}::types::issubclass(&{args})",
             "filter": f"{RT}::methods::b_filter(cx, &{args}).await", "map": f"{RT}::methods::b_map(cx, &{args}).await",
             "min": f"{RT}::methods::b_minmax(cx, false, &{args}, &{kwargs}).await",

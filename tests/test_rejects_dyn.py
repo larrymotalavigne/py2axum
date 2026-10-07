@@ -334,3 +334,35 @@ def test_mixed_decorators_rejected(tmp_path, capsys):
     assert "@lru_cache combined with @deco is not supported" in err
     assert "main.py:" in err
 
+
+
+IMPORT_MAIN = '''
+import importlib
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/m/{{name}}")
+async def m(name: str):
+    return {{"v": getattr(importlib.import_module({arg}), "X")}}
+'''
+
+
+@pytest.mark.parametrize(
+    "arg, message",
+    [
+        ("name", "importlib.import_module() of a computed name is not supported"),
+        ('"json"', "importlib.import_module('json'): only modules of the project are supported"),
+    ],
+)
+def test_import_module_rejected(tmp_path, capsys, arg, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(IMPORT_MAIN.format(arg=arg))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:11" in err
