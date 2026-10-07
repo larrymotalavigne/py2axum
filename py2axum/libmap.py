@@ -38,6 +38,8 @@ VALUES: dict[str, str] = {
     "sqlalchemy.null": "V::None",
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean")},
     "os.environ": f"{RT}::libs::environ()",
+    "aio_pika.DeliveryMode.PERSISTENT": "V::Int(2)",
+    "aio_pika.DeliveryMode.NOT_PERSISTENT": "V::Int(1)",
     "datetime.time.min": "V::Time(chrono::NaiveTime::MIN)",
     "datetime.time.max": "V::Time(chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).unwrap())",
     "datetime.date.min": "V::Date(chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap())",
@@ -145,6 +147,9 @@ EXCEPTIONS: dict[str, str] = {
     "sqlalchemy.exc.InvalidRequestError": "INVALID_REQUEST_ERROR",
     "builtins.EOFError": "EOF_ERROR",
     "pickle.PickleError": "PICKLE_ERROR",
+    "aio_pika.exceptions.AMQPError": "AMQP_ERROR",
+    "aio_pika.exceptions.AMQPConnectionError": "AMQP_CONNECTION_ERROR",
+    "aio_pika.exceptions.QueueEmpty": "AMQP_QUEUE_EMPTY",
     **{f"redis.exceptions.{n}": c for n, c in (("RedisError", "REDIS_ERROR"), ("ConnectionError", "REDIS_CONNECTION_ERROR"),
                                                 ("TimeoutError", "REDIS_TIMEOUT_ERROR"), ("DataError", "REDIS_DATA_ERROR"),
                                                 ("ResponseError", "REDIS_RESPONSE_ERROR"))},
@@ -290,6 +295,9 @@ CALLS = {
        for f in ("cpu_percent", "virtual_memory", "disk_usage", "pids")},
     # alembic's Config (the ini file only)
     "alembic.config.Config": lambda a, kw: f"{RT}::ini::new(&{_argv(a)}, &{_kwvec(kw)})",
+    # aio_pika 10 (dynrt/rmq.rs)
+    **{n: (lambda a, kw: f"{RT}::rmq::connect(&{_argv(a)}, &{_kwvec(kw)}).await") for n in ("aio_pika.connect_robust", "aio_pika.connect")},
+    "aio_pika.Message": lambda a, kw: f"{RT}::rmq::message(&{_argv(a)}, &{_kwvec(kw)})",
     # redis.asyncio (dynrt/rds.rs)
     **{n: (lambda a, kw: f"{RT}::rds::from_url(&{_argv(a)}, &{_kwvec(kw)})") for n in ("redis.asyncio.from_url", "redis.asyncio.client.from_url")},
     **{n: (lambda a, kw: f"{RT}::rds::new(&{_argv(a)}, &{_kwvec(kw)})") for n in ("redis.asyncio.Redis", "redis.asyncio.client.Redis", "redis.asyncio.StrictRedis")},
@@ -363,7 +371,7 @@ CALLS = {
     "secrets.compare_digest": lambda a, kw: f"{RT}::libs::compare_digest(&{a[0]}, &{a[1]})",
     "statistics.median": lambda a, kw: f"{RT}::libs::median(&{a[0]})",
     "json.dumps": _json_dumps,
-    "json.loads": lambda a, kw: f"{RT}::pyd::loads(&{RT}::ops::str_(&{a[0]})?)",
+    "json.loads": lambda a, kw: f"{RT}::libs::json_loads(&{a[0]})",
     # python-jose (HMAC only; other options refused)
     "jose.jwt.encode": _jwt_encode,
     "jose.jwt.decode": _jwt_decode,

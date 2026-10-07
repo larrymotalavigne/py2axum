@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- aio-pika 10: connect, channels, durable queues, publishing with confirms, `queue.get()`.
+- `json.loads` accepts bytes (UTF-8/16/32 detection, like CPython).
+
 ## [0.1.0] — first public release
 
 - Ahead-of-time compilation of FastAPI + SQLAlchemy 2.0 (async, PostgreSQL) + Pydantic v2 applications to

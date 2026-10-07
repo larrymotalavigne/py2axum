@@ -157,6 +157,13 @@ pub enum Native {
     AsyncItems(Mutex<Option<Vec<V>>>),
     /// `yarl.URL`
     YarlUrl(String),
+    /// aio_pika objects (see `rmq`)
+    AmqpConn(Arc<super::rmq::AConn>),
+    AmqpChan(Arc<super::rmq::AChan>),
+    AmqpQueue(Arc<super::rmq::AChan>, String),
+    AmqpExchange(Arc<super::rmq::AChan>, String),
+    AmqpMsg(Arc<super::rmq::AMsg>),
+    AmqpIncoming(Arc<super::rmq::AIncoming>),
     /// a coroutine object (see `aio`)
     Coro(Mutex<Option<super::BoxFut<'static>>>),
     /// `asyncio.Semaphore` / `asyncio.Lock`
@@ -287,6 +294,12 @@ impl V {
                 Native::Func(_) | Native::PyFn(_) => "function",
                 Native::Coro(_) => "coroutine",
                 Native::YarlUrl(_) => "URL",
+                Native::AmqpConn(_) => "RobustConnection",
+                Native::AmqpChan(_) => "RobustChannel",
+                Native::AmqpQueue(..) => "RobustQueue",
+                Native::AmqpExchange(..) => "Exchange",
+                Native::AmqpMsg(_) => "Message",
+                Native::AmqpIncoming(_) => "IncomingMessage",
                 Native::Redis(_) => "Redis",
                 Native::RRetry(_) => "Retry",
                 Native::AsyncItems(_) => "async_generator",
@@ -553,6 +566,9 @@ builtin_exc!(TYPE_ERROR, "TypeError", [EXCEPTION]);
 builtin_exc!(ATTRIBUTE_ERROR, "AttributeError", [EXCEPTION]);
 builtin_exc!(PICKLE_ERROR, "PickleError", [EXCEPTION]);
 builtin_exc!(REDIS_ERROR, "RedisError", [EXCEPTION]);
+builtin_exc!(AMQP_ERROR, "AMQPError", [EXCEPTION]);
+builtin_exc!(AMQP_CONNECTION_ERROR, "AMQPConnectionError", [AMQP_ERROR]);
+builtin_exc!(AMQP_QUEUE_EMPTY, "QueueEmpty", [AMQP_ERROR]);
 builtin_exc!(REDIS_CONNECTION_ERROR, "ConnectionError", [REDIS_ERROR]);
 builtin_exc!(REDIS_TIMEOUT_ERROR, "TimeoutError", [REDIS_ERROR]);
 builtin_exc!(REDIS_DATA_ERROR, "DataError", [REDIS_ERROR]);

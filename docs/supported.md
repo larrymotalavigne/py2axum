@@ -207,6 +207,7 @@ read back as integral `Decimal`s.
 | aiohttp (3.14) | `ClientSession` (`timeout=None` = default timeouts), `async with session.post(...) as resp`, `ssl=False`, `proxy=None`, `status/reason/text()/json()`, `ClientTimeout`; `reason` is the standard phrase; a per-request `timeout=None` keeps the session's timeout |
 | yarl | `URL(str)`: `host`, `port` (scheme default), `scheme`, `path`, `query_string`, `fragment`, `user`, `password`, `str()` |
 | redis.asyncio (redis-py 5+) | `from_url`/`Redis(...)`, get/set (ex, px, nx, xx, get)/setex/delete/exists/incr/decr/mget/expire/ttl/keys/scan_iter/hash commands/ping, `Retry(backoff, n)` (retries without the backoff delay), redis-py's encoding and exceptions |
+| aio-pika 10 | `connect`/`connect_robust` (`async with`), `channel()`, `declare_queue(name, durable=...)`, `default_exchange.publish(Message(...), routing_key=)` with publisher confirms, `queue.get(no_ack=, fail=)` and the received message's properties, `ack()`; `AMQPConnectionError`, `QueueEmpty`. `connect_robust` does not reconnect after a connection loss; `DeliveryMode` members are plain ints (`2`, not `<DeliveryMode.PERSISTENT: 2>`); consumers (`queue.iterator()`, `consume`) are not supported |
 | python-jose (3.5) | `jwt.encode/decode` with HMAC algorithms and decode options; identical tokens, same exceptions |
 | bcrypt (5.0), pyotp (2.9) | same hashes and codes |
 | itsdangerous (2.2) | `URLSafeTimedSerializer` with the default signer and serializer |

@@ -4638,6 +4638,8 @@ x509-cert = {{ version = "0.2", features = ["pem"] }}
 reqwest = {{ version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "stream"] }}
 unicode-normalization = "0.1"
 redis = {{ version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "aio"] }}
+lapin = "4"
+
 {extra}
 [profile.release]
 lto = "fat"

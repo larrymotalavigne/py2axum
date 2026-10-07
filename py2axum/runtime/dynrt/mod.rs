@@ -18,6 +18,7 @@ pub mod resp;
 pub mod pathio;
 pub mod pickle;
 pub mod rds;
+pub mod rmq;
 pub mod files;
 pub mod fernet;
 pub mod google;

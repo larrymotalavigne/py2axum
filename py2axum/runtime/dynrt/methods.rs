@@ -214,6 +214,10 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::Type(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t)),
             Native::TThread(t) => super::thread::thread_attr(t, name),
             Native::YarlUrl(u) => super::http::yarl_attr(u, name),
+            Native::AmqpConn(c) => super::rmq::conn_attr(c, name),
+            Native::AmqpChan(c) => super::rmq::chan_attr(c, name),
+            Native::AmqpIncoming(m) => super::rmq::incoming_attr(m, name),
+            Native::AmqpQueue(_, q) if name == "name" => Ok(V::str(q)),
             Native::ExtType(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t.rsplit('.').next().unwrap_or(t))),
             Native::ExtType(t) if name == "__module__" => Ok(V::str(t.rsplit_once('.').map(|x| x.0).unwrap_or("builtins"))),
             Native::PyFn(f) => f.attrs.lock().iter().find(|(k, _)| k == name).map(|(_, x)| x.clone()).ok_or_else(|| no_attr(v, name)),
@@ -387,6 +391,14 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let Native::Adapter(td, _) = &**n else { unreachable!() };
             pyd::adapter_method(cx, td, name, args, kwargs).await
         }
+        V::Native(n) if matches!(&**n, Native::AmqpConn(_) | Native::AmqpChan(_) | Native::AmqpQueue(..) | Native::AmqpExchange(..) | Native::AmqpIncoming(_)) => match &**n {
+            Native::AmqpConn(c) => super::rmq::conn_method(c, name, &args).await,
+            Native::AmqpChan(c) => super::rmq::chan_method(c, name, &args, &kwargs).await,
+            Native::AmqpQueue(c, q) if name == "get" => super::rmq::queue_get(c, q, &kwargs).await,
+            Native::AmqpExchange(c, x) if name == "publish" => super::rmq::publish(c, x, &args, &kwargs).await,
+            Native::AmqpIncoming(m) => super::rmq::incoming_method(m, name).await,
+            _ => Err(no_attr(recv, name)),
+        },
         V::Native(n) if matches!(&**n, Native::Redis(_)) => {
             let Native::Redis(c) = &**n else { unreachable!() };
             super::rds::method(c, name, args, kwargs).await

@@ -391,6 +391,68 @@ pub fn strftime(wall: &NaiveDateTime, offset: Option<i32>, tzname: Option<String
 // ---------------------------------------------------------------- os
 
 /// `os.getenv(key, default=None)` / `os.environ.get(key, default=None)`
+/// `json.loads(s)`: str, or bytes decoded as `json.detect_encoding` does (UTF-8 with or without BOM,
+/// UTF-16/32 by BOM or by the position of the zero bytes).
+pub fn json_loads(s: &V) -> R {
+    let b = match s {
+        V::Str(t) => {
+            if t.starts_with('\u{feff}') {
+                return Err(Exc::msg(&JSON_DECODE_ERROR, "Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"));
+            }
+            return pyd::loads(t);
+        }
+        V::Bytes(b) => b.clone(),
+        o => return Err(Exc::type_error(format!("the JSON object must be str, bytes or bytearray, not {}", o.type_name()))),
+    };
+    let (enc, skip): (&str, usize) = if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        ("utf-8", 3)
+    } else if b.starts_with(&[0xFF, 0xFE, 0, 0]) {
+        ("utf-32-le", 4)
+    } else if b.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        ("utf-32-be", 4)
+    } else if b.starts_with(&[0xFF, 0xFE]) {
+        ("utf-16-le", 2)
+    } else if b.starts_with(&[0xFE, 0xFF]) {
+        ("utf-16-be", 2)
+    } else if b.len() >= 4 && b[0] == 0 && b[1] == 0 {
+        ("utf-32-be", 0)
+    } else if b.len() >= 2 && b[0] == 0 {
+        ("utf-16-be", 0)
+    } else if b.len() >= 4 && b[1] == 0 && b[2] == 0 && b[3] == 0 {
+        ("utf-32-le", 0)
+    } else if b.len() >= 2 && b[1] == 0 {
+        ("utf-16-le", 0)
+    } else {
+        ("utf-8", 0)
+    };
+    let d = &b[skip..];
+    let bad = || Exc::msg(&UNICODE_DECODE_ERROR, format!("'{}' codec can't decode bytes", enc.trim_end_matches("-le").trim_end_matches("-be")));
+    let text: String = match enc {
+        "utf-8" => std::str::from_utf8(d).map_err(|_| bad())?.to_string(),
+        "utf-16-le" | "utf-16-be" => {
+            if d.len() % 2 != 0 {
+                return Err(bad());
+            }
+            let units: Vec<u16> =
+                d.chunks(2).map(|c| if enc == "utf-16-le" { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect();
+            String::from_utf16(&units).map_err(|_| bad())?
+        }
+        _ => {
+            if d.len() % 4 != 0 {
+                return Err(bad());
+            }
+            d.chunks(4)
+                .map(|c| {
+                    let a = [c[0], c[1], c[2], c[3]];
+                    char::from_u32(if enc == "utf-32-le" { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) })
+                })
+                .collect::<Option<String>>()
+                .ok_or_else(bad)?
+        }
+    };
+    pyd::loads(&text)
+}
+
 pub fn getenv(key: &V, default: Option<&V>) -> R {
     let k = match key {
         V::Str(s) => s,

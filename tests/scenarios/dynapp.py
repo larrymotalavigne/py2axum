@@ -424,6 +424,9 @@ STEPS: list = [
     ("POST", "/rds/basic", None),
     ("POST", "/rds/pickled", None),
     ("GET", "/rds/down", None),
+    # aio_pika (fixtures/dynapp/amqp.py; RabbitMQ at BROKER_DSN)
+    ("POST", "/amqp/roundtrip/alpha", None),
+    ("GET", "/amqp/down", None),
     # coroutine objects (fixtures/dynapp/aio.py)
     ("GET", "/aio/gather", None),
     ("GET", "/aio/coro", None),
@@ -496,6 +499,31 @@ STEPS: list = [
 ]
 
 
+def _reset_broker() -> None:
+    """Delete the test queues of fixtures/dynapp/amqp.py; waits up to 60 s for the broker (CI service start)."""
+    import asyncio
+    import time
+
+    import aio_pika
+
+    async def run():
+        url = os.environ.get("BROKER_DSN", "amqp://guest:guest@localhost:5672/")
+        for attempt in range(60):
+            try:
+                conn = await aio_pika.connect(url)
+                break
+            except (aio_pika.exceptions.AMQPConnectionError, OSError):
+                if attempt == 59:
+                    raise
+                time.sleep(1)
+        async with conn:
+            ch = await conn.channel()
+            for name in ("alpha",):
+                await ch.queue_delete(f"py2axum_test_{name}")
+
+    asyncio.run(run())
+
+
 def reset(db: str) -> None:
     from sqlalchemy import create_engine
 
@@ -508,6 +536,7 @@ def reset(db: str) -> None:
     os.utime("storage-test/fixed.pdf", (1700000000.123456, 1700000000.123456))
     import redis as _redis
     _redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/13")).flushdb()
+    _reset_broker()
     engine = create_engine(db.replace("postgresql://", "postgresql+psycopg://", 1))
     Base.metadata.create_all(engine)  # once; afterwards only emptied (servers cache their plans)
     with engine.begin() as conn:

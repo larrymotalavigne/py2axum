@@ -21,7 +21,7 @@ uv venv && uv pip install -e ".[dev,conformance]"
 python -m pytest                     # transpiler tests (rejections, report)
 ```
 
-Conformance suites need PostgreSQL (and Redis for `dynapp`):
+Conformance suites need PostgreSQL (and Redis and RabbitMQ for `dynapp`):
 
 ```bash
 createdb py2axum_dyn

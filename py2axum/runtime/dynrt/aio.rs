@@ -164,7 +164,7 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
     }
     match v {
         V::Native(n) => match &**n {
-            Native::HttpClient(_) | Native::HttpResp(_) => Ok(v.clone()),
+            Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) => Ok(v.clone()),
             Native::Sem(s) => sem_method(s, "__aenter__").await,
             _ => Err(no_acm(v)),
         },
@@ -190,6 +190,11 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         V::Native(n) if matches!(&**n, Native::Sem(_)) => {
             let Native::Sem(s) = &**n else { unreachable!() };
             sem_method(s, "__aexit__").await
+        }
+        V::Native(n) if matches!(&**n, Native::AmqpConn(_)) => {
+            let Native::AmqpConn(c) = &**n else { unreachable!() };
+            super::rmq::conn_method(c, "close", &[]).await?;
+            Ok(V::Bool(false))
         }
         _ => {
             super::http::aexit(v).await?;

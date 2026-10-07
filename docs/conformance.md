@@ -46,10 +46,11 @@ masked automatically.
 
 | Scenario | Application | Requests |
 |---|---|---:|
-| `dynapp` | `fixtures/dynapp`: the dyn backend's reference app (every supported construct) | 355 |
+| `dynapp` | `fixtures/dynapp`: the dyn backend's reference app (every supported construct) | 358 |
 | `factoryapp` | `fixtures/factoryapp`: app factory, middleware stack, exception handlers | 25 |
 | `notes` | `examples/notes` | 24 |
 | `app` | `app/`: the typed backend's reference app | 40 |
 
-`dynapp` needs PostgreSQL, Redis (database 13 is flushed) and the web-push sink (`tests/push_sink.py`,
+`dynapp` needs PostgreSQL, Redis (database 13 is flushed), RabbitMQ (`BROKER_DSN`, default
+`amqp://guest:guest@localhost:5672/`; its `py2axum_test_*` queues are deleted) and the web-push sink (`tests/push_sink.py`,
 started by `scripts_start_dyn.sh`).
