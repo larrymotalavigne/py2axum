@@ -983,6 +983,7 @@ dependencies = [
  "subtle",
  "sysinfo",
  "tokio",
+ "tower-http",
  "unicode-normalization",
  "url",
  "x509-cert",

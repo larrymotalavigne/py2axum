@@ -76,6 +76,8 @@ All notable changes to this project are documented here. The format follows
   `socket.create_connection`, `cryptography` RSA key generation and serialization (DKIM), and
   `zipfile.ZipFile(io.BytesIO(), "w")` with CPython's bytes.
 - A pydantic `ValidationError` raised by an assignment carries the model's `title` (and `str(e)` names it).
+- A crate generated from an application with `GZipMiddleware` failed `cargo build --locked`: the shipped
+  `Cargo.lock` did not list `tower-http` among the root crate's dependencies. It is now always declared.
 - Fixed: a list of `UploadFile` holding an empty string was treated as absent; FastAPI reports it (422).
   `str.splitlines()` split on `\n` and `\r\n` only (CPython's line boundaries now: `\r`, `\v`, `\f`,
   `\x1c`-`\x1e`, `\x85`, U+2028/2029); iterating an `io.BytesIO` (a `StreamingResponse` over one) raised.

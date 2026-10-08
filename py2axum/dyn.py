@@ -7785,7 +7785,9 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     if rt_dir.exists():
         shutil.rmtree(rt_dir)
     shutil.copytree(RUNTIME_DIR, rt_dir)
-    extra = 'tower-http = { version = "0.6", features = ["compression-gzip"] }\n' if gzip else ""
+    # always declared (already in the dependency graph): the shipped Cargo.lock lists the root crate's
+    # dependencies, so a crate with GZip would otherwise fail `cargo build --locked`
+    extra = 'tower-http = { version = "0.6", features = ["compression-gzip"] }\n'
     layers = ""
     if gzip:
         layers = (f"\n        .layer(tower_http::compression::CompressionLayer::new()"
