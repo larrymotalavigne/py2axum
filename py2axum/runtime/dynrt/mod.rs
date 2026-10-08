@@ -4,7 +4,9 @@
 pub mod agen;
 pub mod aio;
 pub mod asgi;
+pub mod ctxmw;
 pub mod auth;
+pub mod crypto;
 pub mod decimal;
 pub mod deque;
 pub mod dt;
@@ -34,6 +36,7 @@ pub mod fernet;
 pub mod google;
 pub mod itsd;
 pub mod jose;
+pub mod pyjwt;
 pub mod libs;
 pub mod mcp;
 pub mod methods;
@@ -48,6 +51,7 @@ pub mod v;
 pub mod web;
 pub mod webpush;
 pub mod ws;
+pub mod zipw;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -94,6 +98,8 @@ pub struct CxInner {
     pub sentry: std::sync::OnceLock<Arc<sentry::Iso>>,
     /// the exceptions being handled (`except` blocks entered, innermost last): `sys.exc_info()`
     pub handling: parking_lot::Mutex<Vec<Exc>>,
+    /// the endpoint whose `return (await s.execute(q)).scalars().all()` may stream, with its response_model
+    pub stream_list: parking_lot::Mutex<Option<(&'static str, &'static pyd::TD)>>,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -114,6 +120,7 @@ impl CxInner {
             ws: std::sync::OnceLock::new(),
             sentry: std::sync::OnceLock::new(),
             handling: parking_lot::Mutex::new(Vec::new()),
+            stream_list: parking_lot::Mutex::new(None),
         }
     }
 }

@@ -11,8 +11,9 @@ Open an issue with:
 2. what FastAPI answers (status, headers, body) and what the binary answers, or py2axum's error message;
 3. the versions involved (Python, FastAPI, Pydantic, SQLAlchemy — or your `uv.lock`).
 
-`py2axum <package> --root <root> --report coverage.md` lists, per route, the first blocking construct with
-`file:line`: attach the relevant lines.
+`py2axum check <package> --root <root>` lists, per route, what blocks it with `file:line`: attach the relevant
+lines. For a behaviour that differs, a [conformance scenario](docs/conformance.md) step that shows it is the best
+reproduction.
 
 ## Development setup
 
@@ -26,7 +27,7 @@ Conformance suites need PostgreSQL (and Redis and RabbitMQ for `dynapp`):
 ```bash
 createdb py2axum_dyn
 export DATABASE_URL=postgresql://postgres@127.0.0.1/py2axum_dyn
-python -m py2axum fixtures/dynapp --root . --backend dyn --python-side '/dunders/proxied/{name}' --python-side mount \
+python -m py2axum fixtures/dynapp --root . --python-side '/dunders/proxied/{name}' --python-side mount \
     -o generated/dynapp_axum --name dynapp_axum
 (cd generated/dynapp_axum && RUSTFLAGS="-D warnings" cargo build --release)
 python -c "from tests.scenarios import dynapp; dynapp.reset('$DATABASE_URL')"
@@ -49,7 +50,7 @@ python tests/conformance.py http://127.0.0.1:8200 http://127.0.0.1:8280 --scenar
 
 ## Where things are
 
-- `py2axum/dyn.py` — the compiler of project code (dyn backend); `libmap.py` — the library map.
+- `py2axum/dyn.py` — the compiler of project code; `libmap.py` — the library map.
 - `py2axum/runtime/dynrt/*.rs` — the runtime (one module per area or library).
 - `fixtures/dynapp/` — the reference app; add your case to the module that fits (or a new router) and a
   request to `tests/scenarios/dynapp.py`.

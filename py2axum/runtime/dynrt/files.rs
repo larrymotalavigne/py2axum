@@ -55,6 +55,16 @@ fn size_arg(args: &[V]) -> R<Option<usize>> {
     }
 }
 
+/// iterating a BytesIO: its remaining lines (each ending with b"\n" but the last), the position at the end
+pub fn bytesio_lines(b: &BytesIO) -> Vec<V> {
+    let buf = b.buf.lock();
+    let mut pos = b.pos.lock();
+    let rest = &buf[(*pos).min(buf.len())..];
+    let out = rest.split_inclusive(|c| *c == b'\n').map(|l| V::Bytes(Arc::from(l))).collect();
+    *pos = (*pos).max(buf.len());
+    out
+}
+
 pub fn bytesio_method(b: &BytesIO, name: &str, args: &[V]) -> R {
     match name {
         "read" => {

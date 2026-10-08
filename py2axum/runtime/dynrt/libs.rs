@@ -559,7 +559,8 @@ pub fn json_text(b: &[u8]) -> R<String> {
     let d = &b[skip..];
     let bad = || Exc::msg(&UNICODE_DECODE_ERROR, format!("'{}' codec can't decode bytes", enc.trim_end_matches("-le").trim_end_matches("-be")));
     let text: String = match enc {
-        "utf-8" => std::str::from_utf8(d).map_err(|_| bad())?.to_string(),
+        // CPython's message (byte, position, reason); positions count from after the BOM, as the codec sees them
+        "utf-8" => ops::str_(&super::methods::utf8_decode(d, 0)?)?,
         "utf-16-le" | "utf-16-be" => {
             if d.len() % 2 != 0 {
                 return Err(bad());

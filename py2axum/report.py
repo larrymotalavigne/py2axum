@@ -17,7 +17,6 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import codegen
 from .frontend import Frontend
 from .ir import TranspileError
 
@@ -121,20 +120,7 @@ def collect_dyn(package: Path, root: Path | None, python_side, auto: bool = Fals
 
 
 def build(package: Path, root: Path | None = None, stream: bool = True, python_side=("lifespan",)) -> dict:
-    """Per-route coverage with the dyn backend (the typed one first, when it covers everything)."""
-    import tempfile
-
-    try:
-        fe = Frontend(package, root)
-        app = fe.run()
-        with tempfile.TemporaryDirectory() as tmp:
-            codegen.generate(app, Path(tmp), str(package), "check", stream=stream)
-        routes = [RouteReport(info["method"].upper(), info["path"], info["func"], f"{info['file']}:{info['line']}",
-                              info["conditional"], "traduite") for info, _ in fe.route_infos]
-        return {"package": str(package), "routes": sorted(routes, key=lambda r: (r.path, r.method)), "global": [],
-                "poisoned": [], "notes": fe.notes, "backend": "typed"}
-    except Exception:
-        pass
+    """Per-route coverage."""
     fe, per_route = collect_dyn(package, root, python_side)
     routes = []
     for info, errs in per_route:

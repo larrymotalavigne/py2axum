@@ -30,7 +30,7 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "httpx": ("0.28.1", "0.28.1", "0.29"),
     "aiohttp": ("3.13.0", "3.14.4", "3.15"),
     "mcp": ("2.2.0", "2.2.0", "2.3"),  # MCP servers: tested through a real MCP server's lock (internal conformance)
-    "asyncpg": ("0.31.0", "0.31.0", "0.32"),  # the asyncpg driver: tested through a real application's lock
+    "asyncpg": ("0.31.0", "0.31.0", "0.32"),  # the asyncpg driver: verified on a real application's lock (since moved to psycopg)
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg")
@@ -225,7 +225,7 @@ def check_project(root: Path, package: Path | None = None) -> list[tuple[str, st
     for f in found:
         for label, dist, lowest in features:
             iv = (parse(f.constraint), parse(f.constraint)) if f.exact else interval(f.constraint)
-            if f.name == dist and iv is not None and (iv[1] <= parse(lowest) or (f.exact and iv[0] < parse(lowest))):
+            if f.name == dist and iv is not None and (iv[0] < parse(lowest) if f.exact else iv[1] <= parse(lowest)):
                 errors.append((f"{dist} {f.constraint}: {label} need {dist}>={lowest}", f.file, f.line))
         lo, hi = parse(SUPPORTED[f.name][0]), parse(SUPPORTED[f.name][2])
         if f.exact:

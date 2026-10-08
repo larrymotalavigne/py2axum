@@ -1,4 +1,5 @@
-"""Large-response test: GET /users/export?limit=N sized to 5, 10, ... 50 MB of JSON.
+"""Large-response test: GET /users/export?limit=N sized to 5, 10, ... 50 MB of JSON (app/: the list is
+streamed from the session's statement, at constant memory; PY2AXUM_STREAM_MIN_ROWS=1e12 buffers it).
 
 For each size and each server (restarted per size so peak memory is per size):
 - latency of 3 sequential requests (median),

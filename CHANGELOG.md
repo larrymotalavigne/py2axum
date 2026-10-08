@@ -5,6 +5,81 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-08
+
+### Breaking
+
+- **The typed backend is removed** (`--backend typed`, `codegen.py`, `body.py`, `runtime/rt.rs`). It emitted
+  statically-typed Rust for simple CRUD handlers only and covered none of the real applications measured; every
+  application already went through the general backend. `--backend typed` now exits with an error
+  ("removed in 0.4: use the default backend"); `--backend auto` and `--backend dyn` are accepted until 1.0 and
+  change nothing. `py2axum check` and `--report` no longer try it first; `check --json` keeps `"backend": "dyn"`.
+
+### Added
+
+- Large list responses streamed at constant memory (what only the typed backend did): an endpoint with
+  `response_model=list[Schema]` returning `(await session.execute(stmt)).scalars().all()` (or `session.scalars`,
+  or through a local) reads the rows with a cursor and sends the JSON array in 64 KiB blocks — 57 MB served with
+  13–16 MiB of RSS instead of 1.6 GiB, first byte after 16 ms instead of 2.9 s, identical bytes. Only when
+  nothing observable changes (the session wrote nothing, one mapped class without loader options, a schema of
+  plain columns...); `PY2AXUM_STREAM_CHUNK`, `PY2AXUM_STREAM_MIN_ROWS` and `--no-stream` keep their meaning. See
+  docs/supported.md, "Large list responses".
+- `app.state` (set in the lifespan, read through `request.app.state`).
+- Raw ASGI middleware: a project class with `__init__(self, app, ...)` and `async def __call__(self, scope, receive,
+  send)`, registered with `app.add_middleware(...)` or `FastAPI(middleware=[Middleware(...)])`, runs natively in
+  Starlette's stack around the router (shared scope, uvicorn's `receive`, `send` chunked without a
+  `content-length`, rewritten scope as a new request, wrapped `receive`/`send`, short-circuit answers, exceptions
+  raised through the stack). `starlette_context`'s `RawContextMiddleware` with `RequestIdPlugin` and
+  `CorrelationIdPlugin`, `FastAPI(strict_content_type=)` and `traceback.format_exception(...)` /
+  `format_exception_only(exc)` are translated too. An application without raw middleware gets no extra layer;
+  each one costs about 2.5 µs per request. See docs/supported.md.
+- `create_engine(connect_args=...)` / `create_async_engine(connect_args=...)` applied to every pooled connection:
+  libpq `options` (`-c name=value`, `-cname=value`, `--name=value`, split like libpq, `\` escapes) and asyncpg's
+  `server_settings`. A `TimeZone` setting overrides the time zone discovered from the server, so timestamps decode
+  in the session's zone as psycopg does (they kept the server's zone before). Any other literal libpq option is
+  refused at transpile time.
+- PyJWT 2.15 (`import jwt`) translated natively, like python-jose: `jwt.encode` (`algorithm=`, `headers=`,
+  `sort_headers=`; `exp`/`iat`/`nbf` datetimes encoded from a copy), `jwt.decode` / `decode_complete` (every
+  `options=` key, `audience=`, `issuer=`, `subject=`, `leeway=` as a number or a timedelta),
+  `get_unverified_header`, with HS256/HS384/HS512 and `none`: identical tokens, the same checks in the same order,
+  the `jwt.exceptions` hierarchy and messages. An asymmetric algorithm written as a literal, `json_encoder=`,
+  `detached_payload=`, `verify=` and `PyJWK`/`PyJWKClient` are refused at transpile time.
+
+### Changed
+
+- Assigning another module's attribute (`config.LIMIT = 2`) is refused at transpile time with `file:line`; the
+  binary used to fail at startup.
+- `json.loads(bytes)` with invalid UTF-8 raises CPython's exact `UnicodeDecodeError` message.
+- `JSONB` columns: `contains` (`@>`), `contained_by` (`<@`), `has_key` (`?`), `has_any` (`?|`) and `has_all`
+  (`?&`) are compiled to PostgreSQL's operators, their argument typed as SQLAlchemy types it. They raised a
+  `TypeError` at run time (a 500 where Python answered).
+- A path left to Python (`--python-side`) answers FastAPI's 404 when `PY2AXUM_PYTHON_URL` is unset, as
+  documented; it used to fall through to a translated route whose pattern also matched (`/books/export.zip`
+  reached `/books/{book_id}` and answered 422).
+- An exact pin equal to the lowest version a feature needs is accepted: `starlette==1.7.0` was refused for
+  WebSocket routes ("need starlette>=1.7.0").
+- `tests/conformance.py --scenario path/to/scenario.py` (and `tests/difftest.py`) load a scenario file from
+  anywhere, so an application can keep its scenario in its own repository.
+- New example, `examples/bookshelf`: users, JWT Bearer authentication (PyJWT), CRUD, relationships, 422s, a
+  WebSocket and one route left to Python; its conformance scenario (75 steps) and `compare.sh` run in CI.
+  `examples/docker`: a reference multi-stage Dockerfile, the Python sidecar and a Compose file for the hybrid
+  mode. `bench/bench.py --target bookshelf` measures it against FastAPI.
+- Documentation: a getting-started guide (`docs/getting-started.md`), the conformance guide rewritten for
+  users, the README, `docs/supported.md` and `docs/how-it-works.md` reviewed for first-time readers.
+- Translated natively: `validate_assignment=True` with field and model
+  validators (before, type, after with `info.data`, model `after`, as pydantic-core; refused with a model
+  `before` validator), `Field(min_items=, max_items=)`, `File(default=[])`, a SQL column name other than the
+  attribute (`Column("metadata", JSON)`), the `undefer()` loader option (top level, `session.get(options=)`,
+  `selectinload(...).options(undefer(...))`), `exists().where(...)` with SQLAlchemy's auto-correlation,
+  `regexp_match`, `delete().returning(columns)`, `...` as a sentinel value, `collections.Counter`,
+  `asyncio.open_connection` (asyncio's or uvloop's messages, after the project's lock),
+  `socket.create_connection`, `cryptography` RSA key generation and serialization (DKIM), and
+  `zipfile.ZipFile(io.BytesIO(), "w")` with CPython's bytes.
+- A pydantic `ValidationError` raised by an assignment carries the model's `title` (and `str(e)` names it).
+- Fixed: a list of `UploadFile` holding an empty string was treated as absent; FastAPI reports it (422).
+  `str.splitlines()` split on `\n` and `\r\n` only (CPython's line boundaries now: `\r`, `\v`, `\f`,
+  `\x1c`-`\x1e`, `\x85`, U+2028/2029); iterating an `io.BytesIO` (a `StreamingResponse` over one) raised.
+
 ## [0.3.1] — 2026-10-08
 
 - An Enum member given to a scalar field is validated as pydantic-core does: an ORM enum column read into

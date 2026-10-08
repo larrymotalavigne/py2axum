@@ -4,7 +4,8 @@ content-encoding and JSON bodies must match byte for byte, key order included.
 
 usage: python tests/conformance.py REF_URL CAND_URL [--scenario app] [--ignore-encoding]
 
-Scenarios live in tests/scenarios/<name>.py and define:
+--scenario NAME loads tests/scenarios/NAME.py; a path ending in .py (`--scenario myapp/scenario.py`) loads
+that file, so an application can keep its scenario in its own repository. A scenario defines:
   STEPS       list of (method, path, payload[, headers]); payload = None, bytes or a JSON value;
               method "WS": a WebSocket connection, payload = its script (see ws_step)
   reset(db)   bring the database (DATABASE_URL) back to the scenario's initial state
@@ -21,6 +22,7 @@ compresses it even under GZipMiddleware's minimum_size; everything else must sti
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import re
@@ -163,7 +165,8 @@ def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str
         # FastAPI commits a `yield` session dependency after sending the response: let it land
         # before the next request reads (the reference is racy otherwise, the binary is not)
         time.sleep(scenario.SETTLE)
-    return {"req": f"{method} {path}", "status": r.status_code, "ctype": ctype,
+    shapes = getattr(scenario, "HEADER_SHAPES", {})
+    out = {"req": f"{method} {path}", "status": r.status_code, "ctype": ctype,
             "encoding": r.headers.get("content-encoding"), "allow": r.headers.get("allow"),
             # a redirect to the server itself: its own address differs between the two
             "location": (r.headers.get("location") or "").replace(base, "<base>") or None,
@@ -171,9 +174,29 @@ def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str
             "cookies": [mask_cookie(scenario, re.sub(r"expires=[^;]+", "expires=<date>", c)) for c in r.headers.get_list("set-cookie")],
             "file": [mask_file(scenario, r.headers.get(h)) for h in ("content-disposition", "etag", "last-modified", "accept-ranges")],
             # middlewares: CORS, security headers, rate limiting...
-            "mw": {k: "<masked>" if k in getattr(scenario, "HEADER_MASKS", ()) else ", ".join(r.headers.get_list(k))
+            "mw": {k: "<masked>" if k in getattr(scenario, "HEADER_MASKS", ()) else
+                   # a generated value (a request id...) compared by its shape only
+                   "<shape>" if k in shapes and re.fullmatch(shapes[k], ", ".join(r.headers.get_list(k))) else
+                   ", ".join(r.headers.get_list(k))
                    for k in sorted(set(r.headers.keys())) if k.startswith(MW_HEADER_PREFIXES)},
             "body": mask_datetimes(body, sent)}
+    if path.startswith(getattr(scenario, "FRAMING_PREFIXES", ())):
+        # how the body is delimited: a middleware dropping content-length makes uvicorn send it chunked
+        out["framing"] = "length" if "content-length" in r.headers else r.headers.get("transfer-encoding", "none")
+    return out
+
+
+def load_scenario(name: str):
+    """tests/scenarios/NAME.py, or the scenario file at NAME when it ends in .py."""
+    if not name.endswith(".py"):
+        return importlib.import_module(f"tests.scenarios.{name}")
+
+    path = Path(name).resolve()
+    spec = importlib.util.spec_from_file_location(f"scenario_{path.stem}", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def client(base: str) -> httpx.Client:
@@ -216,7 +239,7 @@ def main() -> int:
     if name is None and "--scenario" in sys.argv:
         name = sys.argv[sys.argv.index("--scenario") + 1]
         args.remove(name)
-    scenario = importlib.import_module(f"tests.scenarios.{name or 'app'}")
+    scenario = load_scenario(name or "app")
     ignore_encoding = "--ignore-encoding" in flags
     ref_url, cand_url = args[0], args[1]
     ref, cand = run(ref_url, scenario), run(cand_url, scenario)

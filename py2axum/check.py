@@ -36,8 +36,6 @@ def run(package: Path, root: Path | None, python_side: list[str], backend: str =
         for msg, file, line in versions.check_project(root or package.resolve().parent, package):
             result["global"].append({"construction": "library version", "error": f"{file}:{line}: {msg}",
                                      "where": f"{file}:{line}"})
-    if backend == "auto" and _typed_covers(package, root, result):
-        return _summarise(result)
     from .report import collect_dyn
 
     fe, per_route = collect_dyn(package, root, side, auto=auto)
@@ -72,28 +70,6 @@ def run(package: Path, root: Path | None, python_side: list[str], backend: str =
     return _summarise(result)
 
 
-def _typed_covers(package: Path, root: Path | None, result: dict) -> bool:
-    """`--backend auto` generates with the typed backend when it covers the whole application."""
-    import tempfile
-
-    from . import codegen
-    from .frontend import Frontend
-
-    try:
-        fe = Frontend(package, root)
-        app = fe.run()
-        with tempfile.TemporaryDirectory() as tmp:
-            codegen.generate(app, Path(tmp), str(package), "check")
-    except Exception:
-        return False
-    result["backend"] = "typed"
-    result["routes"] = sorted((RouteReport(info["method"].upper(), info["path"], info["func"],
-                                           f"{info['file']}:{info['line']}", info["conditional"], "native")
-                               for info, _ in fe.route_infos), key=lambda r: (r.path, r.method))
-    result["notes"] = list(fe.notes)
-    return True
-
-
 def _summarise(result: dict) -> dict:
     routes = result["routes"]
     count = {s: sum(r.status == s for r in routes) for s in ("native", "python-side", "refused")}
@@ -125,7 +101,7 @@ def to_text(result: dict, color: bool = False) -> str:
 
     mark = {"native": c("32", "native     "), "python-side": c("33", "python-side"), "refused": c("31", "refused    ")}
     s = result["summary"]
-    o = [f"py2axum check {result['package']} ({result['backend']} backend)", ""]
+    o = [f"py2axum check {result['package']}", ""]
     if result["global"]:
         o.append(c("31", "Whole application — generation refused whatever the routes:"))
         o += [f"  {g['error']}" for g in result["global"]]
@@ -161,7 +137,7 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="py2axum check", description=__doc__.splitlines()[0])
     ap.add_argument("package", type=Path, help="directory of the FastAPI application package")
     ap.add_argument("--root", type=Path, default=None, help="import root, like sys.path (default: parent of the package)")
-    ap.add_argument("--backend", choices=["auto", "dyn"], default="auto")
+    ap.add_argument("--backend", choices=["auto", "dyn"], default="auto", help="deprecated, no effect (one backend since 0.4)")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|auto",
                     help="as for generation: routes or the lifespan left to Python; auto: every route that does not translate")
     ap.add_argument("--json", action="store_true", help="machine-readable output on stdout")

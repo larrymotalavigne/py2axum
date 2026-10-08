@@ -297,6 +297,19 @@ pub fn set_status(r: &RespObj, v: &V) -> R<()> {
     }
 }
 
+/// uvicorn (httptools) has a status line for 100..599 only: any other status is a KeyError raised by the
+/// server's `send` and the connection is dropped without an answer. The KeyError goes up through the
+/// middlewares (their `finally` blocks run), then the server drops the connection (`is_drop`).
+pub fn status_drop(status: u16) -> Exc {
+    let e = Exc::new(&KEY_ERROR, vec![V::Int(status as i64)]);
+    e.0.attrs.lock().insert("__py2axum_drop__".into(), V::Bool(true));
+    e
+}
+
+pub fn is_drop(e: &Exc) -> bool {
+    e.0.attrs.lock().contains_key("__py2axum_drop__")
+}
+
 /// The returned response object, sent as Starlette would.
 /// A status kept as given while it fits (0 stands for any other value: never a valid status, never a
 /// truncated one that would look valid).
@@ -307,9 +320,7 @@ fn status_u16(s: i64) -> u16 {
 pub fn into_response(r: &RespObj) -> R<Response> {
     let status = *r.status.lock();
     if !(100..=599).contains(&status) {
-        // uvicorn (httptools) has a status line for 100..599 only: any other status is a KeyError on the first
-        // send and the connection is dropped without an answer. A panic in the handler drops it the same way.
-        panic!("py2axum: status code outside 100..599: no status line, the connection is dropped (as uvicorn does)");
+        return Err(status_drop(status));
     }
     let mut headers = r.headers.lock().clone();
     let body = match &r.body {

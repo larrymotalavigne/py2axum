@@ -12,6 +12,47 @@ your package (.py)                py2axum (Python, stdlib only)                 
                       └──────────────────────────────────────────────┘
 ```
 
+py2axum is a compiler: it turns the Python source of a FastAPI application into a Rust crate, once, at build
+time. Nothing of Python remains at run time, except for the routes you choose to leave to a Python process
+(section 4). This page follows a route through the three stages, then explains the design choices. To use
+py2axum, start with the [getting-started guide](getting-started.md); for what is and is not translated, see
+[supported.md](supported.md).
+
+**One route, end to end.** In the [bookshelf example](../examples/bookshelf), `GET /me` returns the user
+behind a JWT Bearer token:
+
+```python
+# app/routers/auth.py
+@router.get("/me", response_model=UserOut)
+async def me(user: CurrentUser):          # CurrentUser = Annotated[User, Depends(current_user)]
+    return user
+```
+
+The frontend finds the route, its `response_model` and its dependency chain (`current_user` → `get_db` and
+`HTTPBearer`). The compiler emits one handler that resolves the parameters in FastAPI's order, collects
+validation errors like FastAPI, calls the compiled endpoint and serializes the result through the
+`UserOut` schema:
+
+```rust
+/// GET /me  (from auth.py:34 `me`)
+async fn route_4_me(cx: &Cx) -> R<axum::response::Response> {
+    let __body: Option<V> = None;
+    let mut __errv: Vec<crate::dynrt::pyd::ErrDetail> = Vec::new();
+    let __errs = &mut __errv;
+    let p_user = dep_app_security__current_user(cx, &__body, __errs).await?.unwrap_or(V::None);
+    crate::dynrt::web::check(__errv)?;                    // a 422 with FastAPI's body, if any
+    let __ret = f_app_routers_auth__me(cx, p_user).await?;
+    crate::dynrt::web::respond(cx, __ret, Some(&TD_5), 200).await    // response_model=UserOut
+}
+```
+
+`current_user` itself is compiled the same way, statement by statement: `jwt.decode(...)` becomes a call to
+the runtime's PyJWT implementation, `except jwt.ExpiredSignatureError` an `isinstance` test on the error,
+`await db.get(User, ...)` a call to the runtime's SQLAlchemy session, which emits the same SQL as
+SQLAlchemy and keeps the same identity map. The runtime is what makes the result identical: it implements
+Pydantic's validation and serialization, SQLAlchemy's session, Starlette's routing and middleware, and
+CPython's semantics for every value the code touches.
+
 ## 1. Reading the project without running it
 
 `modules.py` parses every module of the package with `ast` and indexes its definitions and imports
@@ -20,12 +61,13 @@ a module, or an external dotted name (`fastapi.APIRouter`), never by importing a
 finds the FastAPI app(s), routers and their prefixes, routes, SQLAlchemy models and Pydantic schemas.
 
 Library versions matter (Starlette changed CORS, Pydantic error URLs carry its version, CPython changed
-some messages): they are read from the project's `uv.lock` (falling back to installed packages), and the
-target Python version from `requires-python`.
+some messages): they are read from the project's `uv.lock` (else `requirements*.txt`, else `pyproject.toml`), and the
+target Python version from `requires-python`. A library version outside the
+[tested ranges](supported.md#supported-versions) is refused.
 
 ## 2. Compiling project code
 
-The **dyn** backend (`dyn.py`) compiles, for each route, its whole closure: dependencies, schemas, models
+The compiler (`dyn.py`) compiles, for each route, its whole closure: dependencies, schemas, models
 and every project function it can reach (calls on objects of unknown class depend on all project methods of
 that name). Each Python function becomes a Rust `async fn` over a dynamic value type `V` (None, bool, int,
 float, str, bytes, list, tuple, dict, set, datetime types, Decimal, model and schema instances, enum
@@ -115,3 +157,11 @@ observable behaviour exactly and compile everything else away.
 
 The two projects share one concern: reproducing CPython's semantics in Rust (`repr`, float formatting,
 hashing, integer and string methods). RustPython's implementation is a useful reference for those edge cases.
+
+## See also
+
+- [Getting started](getting-started.md): install, check, build, run, deploy.
+- [Supported subset and known differences](supported.md).
+- [Conformance](conformance.md): checking your own application against the binary.
+- The generated code of the example: run `py2axum examples/bookshelf/app --root examples/bookshelf
+  --python-side auto -o build/bookshelf` and read `build/bookshelf/src/gen.rs`.

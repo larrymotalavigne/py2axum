@@ -671,10 +671,12 @@ async fn prepare_schema(cx: &super::Cx, input: V, desc: &'static SchemaDesc) -> 
         _ => return Ok(data),
     };
     let mut map = map;
+    let mut originals: Vec<(&'static str, V)> = Vec::new();
     for i in touched {
         let f = &desc.fields[i];
         let key = Key::Str(Arc::from(f.alias.unwrap_or(f.name)));
         let Some((kv, raw)) = map.get(&key).cloned() else { continue };
+        originals.push((f.name, raw.clone()));
         let mut v = raw;
         let mut failed = false;
         for b in desc.before.iter().rev().filter(|b| b.fields.contains(&f.name)) {
@@ -696,10 +698,27 @@ async fn prepare_schema(cx: &super::Cx, input: V, desc: &'static SchemaDesc) -> 
     if from_attrs && desc.init.is_some() {
         mark_from_attrs(&d);
     }
+    if !desc.validators.is_empty() && !originals.is_empty() {
+        mark_originals(&d, originals);
+    }
     Ok(V::Dict(d))
 }
 
 type DictCell = Mutex<IndexMap<Key, (V, V)>>;
+
+/// The inputs `prepare_schema` replaced (field name, value before the `mode="before"` validators): an
+/// `after` validator's error reports the raw input (the transpiler refuses a `before` defined after an `after`)
+static ORIGINALS: Mutex<Vec<(std::sync::Weak<DictCell>, Arc<Vec<(&'static str, V)>>)>> = Mutex::new(Vec::new());
+
+fn mark_originals(d: &Arc<DictCell>, originals: Vec<(&'static str, V)>) {
+    let mut m = ORIGINALS.lock();
+    m.retain(|(w, _)| w.strong_count() > 0);
+    m.push((Arc::downgrade(d), Arc::new(originals)));
+}
+
+fn originals_of(d: &Arc<DictCell>) -> Option<Arc<Vec<(&'static str, V)>>> {
+    ORIGINALS.lock().iter().find(|(w, _)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(d)) && w.strong_count() > 0).map(|(_, o)| o.clone())
+}
 
 /// The dicts `prepare_schema` built from an object's attributes, for a model with its own `__init__`:
 /// pydantic-core validates such an input attribute by attribute, without calling `__init__`.
@@ -737,6 +756,75 @@ pub fn validate_sync(input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDe
         }
     }
     got
+}
+
+/// A validator's ValueError/AssertionError as an error detail; other exceptions propagate.
+fn validator_error(x: Exc, loc: Vec<V>, input: V) -> R<ErrDetail> {
+    let (kind, word) = if x.isinstance(&ASSERTION_ERROR) {
+        ("assertion_error", "Assertion failed")
+    } else if x.isinstance(&VALUE_ERROR) {
+        ("value_error", "Value error")
+    } else {
+        return Err(x);
+    };
+    let msg = format!("{word}, {}", x.message());
+    Ok(ErrDetail { kind, loc, msg, input, ctx: Some(vec![("error", V::Exc(x))]) })
+}
+
+/// `inst.field = v` under `validate_assignment=True`, as pydantic-core's `validate_assignment`: the
+/// field's `before` validators, its type (nested validators included), its `after` validators
+/// (`info.data` = every other field), then the model's `after` validators, which see the new value: one
+/// that raises leaves it assigned (error at loc `()`, input the instance). Measured on pydantic 2.13.
+pub async fn assign_validated(cx: &super::Cx, inst: &Arc<Inst>, name: &str, v: V) -> R<()> {
+    let desc = inst.desc;
+    let Some(i) = desc.field_index(name).filter(|_| !desc.frozen) else { return inst.set_field(name, v) };
+    let fname = desc.fields[i].name;
+    let loc = vec![V::str(name)];
+    let raw = v.clone();
+    let mut cur = v;
+    for b in desc.before.iter().rev().filter(|b| b.fields.contains(&fname)) {
+        match (b.f)(cx, V::Class(desc.class), vec![cur.clone()]).await {
+            Ok(nv) => cur = nv,
+            Err(x) => return Err(Exc::validation_titled(&VALIDATION_ERROR, vec![validator_error(x, loc, cur)?], desc.name)),
+        }
+    }
+    let pre = cur.clone();
+    let mut errs = Vec::new();
+    let Some(mut cur) = validate(cx, &pre, desc.fields[i].td, &loc, &mut errs).await? else {
+        return Err(Exc::validation_titled(&VALIDATION_ERROR, errs, desc.name));
+    };
+    for vd in desc.validators.iter().filter(|vd| vd.fields.contains(&fname)) {
+        let mut args = vec![cur.clone()];
+        if vd.info != 0 {
+            let data: Vec<(V, V)> = {
+                let vals = inst.vals.lock();
+                desc.fields.iter().enumerate().filter(|(j, _)| *j != i).map(|(j, f)| (V::str(f.name), vals[j].clone())).collect()
+            };
+            let data = V::dict_from(data)?;
+            args.push(if vd.info == 1 {
+                V::Inst(Arc::new(Inst {
+                    desc: &VALINFO,
+                    vals: Mutex::new(vec![data, V::str(fname)]),
+                    set: Mutex::new(vec![true, true]),
+                    extra: Mutex::new(IndexMap::new()),
+                }))
+            } else {
+                V::native(Native::Kwargs(vec![("values".to_string(), data)]))
+            });
+        }
+        match (vd.f)(cx, V::Class(desc.class), args).await {
+            Ok(nv) => cur = nv,
+            Err(x) => return Err(Exc::validation_titled(&VALIDATION_ERROR, vec![validator_error(x, loc, raw)?], desc.name)),
+        }
+    }
+    inst.vals.lock()[i] = cur;
+    inst.set.lock()[i] = true;
+    for f in desc.model_after {
+        if let Err(x) = f(cx, V::Inst(inst.clone()), vec![]).await {
+            return Err(Exc::validation_titled(&VALIDATION_ERROR, vec![validator_error(x, vec![], V::Inst(inst.clone()))?], desc.name));
+        }
+    }
+    Ok(())
 }
 
 async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>, errs: &mut Vec<ErrDetail>) -> R<()> {
@@ -1660,6 +1748,11 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
         Map(&'a IndexMap<Key, (V, V)>),
         Attrs(&'a V),
     }
+    let originals = match input {
+        V::Dict(d) if !desc.validators.is_empty() => originals_of(d),
+        _ => None,
+    };
+    let raw_of = |name: &str, v: &V| originals.as_ref().and_then(|o| o.iter().find(|(n, _)| *n == name).map(|(_, x)| x.clone())).unwrap_or_else(|| v.clone());
     let dict_snapshot;
     let src = match input {
         V::Dict(d) => {
@@ -1721,7 +1814,7 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
                         if let (Some(slot), true) = (slot, e.n == n_field) {
                             if desc.validators.iter().any(|vd| vd.fields.contains(&f.name)) {
                                 let prior = prior(fi, &vals, &ok);
-                                e.steps.push(Step::Validators { slot, field: fi, desc, value: x.clone(), raw: v.clone(), loc: floc, prior });
+                                e.steps.push(Step::Validators { slot, field: fi, desc, value: x.clone(), raw: raw_of(f.name, &v), loc: floc, prior });
                             }
                         }
                         vals.push(x)
@@ -2055,7 +2148,7 @@ impl Inst {
         if self.desc.frozen {
             // model_config frozen=True
             let e = ErrDetail { kind: "frozen_instance", loc: vec![V::str(name)], msg: "Instance is frozen".into(), input: v, ctx: None };
-            return Err(Exc::validation(&VALIDATION_ERROR, vec![e]));
+            return Err(Exc::validation_titled(&VALIDATION_ERROR, vec![e], self.desc.name));
         }
         match self.desc.field_index(name) {
             Some(i) => {
@@ -2063,7 +2156,7 @@ impl Inst {
                     let mut errs = Vec::new();
                     match validate_sync(&v, self.desc.fields[i].td, &[V::str(name)], &mut errs) {
                         Some(x) if errs.is_empty() => x,
-                        _ => return Err(Exc::validation(&VALIDATION_ERROR, errs)),
+                        _ => return Err(Exc::validation_titled(&VALIDATION_ERROR, errs, self.desc.name)),
                     }
                 } else {
                     v

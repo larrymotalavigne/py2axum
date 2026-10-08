@@ -25,6 +25,24 @@ pub enum Mw {
     Cors(Cors),
     /// `dispatch` of a BaseHTTPMiddleware instance, bound
     Dispatch(V),
+    /// a raw ASGI middleware instance (`async __call__(scope, receive, send)`), built with
+    /// `Native::AsgiApp(slot)` as its `app`: the rest of the stack
+    Asgi(V, Arc<Slot>),
+    /// starlette_context's RawContextMiddleware
+    Context(super::ctxmw::RawContext),
+}
+
+/// Where the `app` a raw middleware was built with leads: (the stack, the next layer), set once the
+/// stack is complete (Starlette builds the whole stack before the first request)
+#[derive(Default)]
+pub struct Slot {
+    at: std::sync::OnceLock<(std::sync::Weak<Stack>, usize, &'static [RouteDef])>,
+}
+
+impl Slot {
+    pub fn new() -> Arc<Slot> {
+        Arc::new(Slot::default())
+    }
 }
 
 /// The application's middlewares and exception handlers, built once (Starlette builds its stack on the
@@ -41,6 +59,11 @@ impl Stack {
     /// `app.add_middleware(...)`: Starlette inserts at 0, the last added runs first.
     pub fn add_middleware(&mut self, mw: Mw) {
         self.mws.insert(0, mw);
+    }
+    /// `FastAPI(middleware=[...])`: Starlette's `user_middleware` starts as that list, so its entries stay
+    /// inside every `add_middleware`, in list order
+    pub fn push_middleware(&mut self, mw: Mw) {
+        self.mws.push(mw);
     }
     /// `@app.exception_handler(key)` (a dict: registering a key again replaces its handler)
     pub fn exception_handler(&mut self, key: &V, handler: V) -> R<()> {
@@ -74,6 +97,22 @@ fn same(a: &HKey, b: &HKey) -> bool {
 pub type StackFn = for<'a> fn(&'a Cx) -> Pin<Box<dyn Future<Output = R<Stack>> + Send + 'a>>;
 
 static STACK: tokio::sync::OnceCell<Arc<Stack>> = tokio::sync::OnceCell::const_new();
+
+/// The stack, built on the first request; each raw middleware's `app` then leads to the layer after it.
+async fn get_stack(stack_fn: StackFn, routes: &'static [RouteDef]) -> R<Arc<Stack>> {
+    STACK
+        .get_or_try_init(|| async move {
+            let st = Arc::new(stack_fn(&super::root_cx()).await?);
+            for (i, mw) in st.mws.iter().enumerate() {
+                if let Mw::Asgi(_, slot) = mw {
+                    let _ = slot.at.set((Arc::downgrade(&st), i + 1, routes));
+                }
+            }
+            Ok(st)
+        })
+        .await
+        .cloned()
+}
 
 fn plain_500() -> Response {
     Response::builder()
@@ -184,21 +223,24 @@ pub async fn app(
     // a WebSocket handshake: the scope `websocket` (the HTTP middlewares let it through; never relayed
     // to the Python side)
     if super::ws::is_upgrade(&req) {
-        if let Err(e) = STACK.get_or_try_init(|| async move { stack_fn(&super::root_cx()).await.map(Arc::new) }).await {
+        if let Err(e) = get_stack(stack_fn, routes).await {
             log_exc(&e);
             return plain_500();
         }
         return super::ws::serve(app, req, ws_routes, ws_handle).await;
     }
     if python_side(req.uri().path()) {
-        if let Ok(up) = std::env::var("PY2AXUM_PYTHON_URL") {
-            return proxy(&up, req).await;
-        }
+        return match std::env::var("PY2AXUM_PYTHON_URL") {
+            Ok(up) => proxy(&up, req).await,
+            // no Python process: the path is not the binary's (the ingress routes it elsewhere), and a
+            // translated route must not answer in its place (`/items/export` would reach `/items/{id}`)
+            Err(_) => web::not_found().await,
+        };
     }
     if under_mount(req.uri().path()) {
         if let Ok(up) = std::env::var("PY2AXUM_PYTHON_URL") {
             // the stack registers the routes `app.add_route` adds: built before matching
-            if STACK.get_or_try_init(|| async move { stack_fn(&super::root_cx()).await.map(Arc::new) }).await.is_ok()
+            if get_stack(stack_fn, routes).await.is_ok()
                 && !web::full_match(req.uri().path(), req.method().as_str(), routes)
             {
                 return proxy(&up, req).await;
@@ -216,14 +258,8 @@ pub async fn app(
     };
     let mut cell = web::ReqCell::from_parts(parts.method.as_str(), &parts.uri, &parts.headers, vec![], bytes);
     cell.client = client;
-    let stack = match STACK
-        .get_or_try_init(|| async move {
-            let rc = super::root_cx();
-            stack_fn(&rc).await.map(Arc::new)
-        })
-        .await
-    {
-        Ok(s) => s.clone(),
+    let stack = match get_stack(stack_fn, routes).await {
+        Ok(s) => s,
         Err(e) => {
             log_exc(&e);
             return plain_500();
@@ -234,6 +270,9 @@ pub async fn app(
     let traced = super::sentry::active() && super::sentry::request_start(&cx).await;
     let r = match chain(&cx, &stack, 0, routes).await {
         Ok(r) => r,
+        Err(e) if super::resp::is_drop(&e) => {
+            panic!("py2axum: status code outside 100..599: no status line, the connection is dropped (as uvicorn does)")
+        }
         Err(e) => {
             let r = server_error(&cx, &stack, e.clone()).await;
             if traced {
@@ -263,8 +302,47 @@ fn chain<'a>(cx: &'a Cx, stack: &'a Arc<Stack>, i: usize, routes: &'static [Rout
                 let ret = super::methods::call_value(cx, f, vec![super::request(cx), next], vec![]).await?;
                 to_response(&ret)
             }
+            Some(Mw::Asgi(inst, _)) => {
+                let scope = super::rawasgi::mw_scope(cx)?;
+                super::rawasgi::run(cx, inst, scope, cx.req.body.clone()).await
+            }
+            Some(Mw::Context(c)) => c.call(cx, chain(cx, stack, i + 1, routes)).await,
         }
     })
+}
+
+/// `await self.app(scope, receive, send)` in a raw middleware: the rest of the stack for the request the
+/// scope describes (a rewritten scope or a wrapped `receive` makes a new request), its response delivered
+/// through `send`; an exception it lets through is raised here, in the middleware.
+pub async fn call_app(cx: &Cx, slot: &Slot, args: Vec<V>) -> R {
+    let [scope, receive, send] = &args[..] else {
+        return Err(Exc::type_error(format!("py2axum: an ASGI app takes 3 positional arguments (scope, receive, send) but {} were given", args.len())));
+    };
+    let Some((st, i, routes)) = slot.at.get() else {
+        return Err(Exc::runtime("py2axum: the middleware stack is not built yet"));
+    };
+    let Some(stack) = st.upgrade() else { return Err(Exc::runtime("py2axum: the middleware stack is gone")) };
+    if !matches!(super::rawasgi::get(scope, "type")?, Some(V::Str(t)) if &*t == "http") {
+        return Err(Exc::runtime("py2axum: a raw middleware handing a non-http scope to the application is not supported"));
+    }
+    // the body: the request's, unless `receive` is a wrapper (read whole, like the server does)
+    let body = match receive {
+        V::Native(n) if matches!(&**n, Native::AsgiReceive(_)) => None,
+        f => Some(super::rawasgi::drain(cx, f).await?),
+    };
+    let inner = super::rawasgi::derive(cx, scope, body)?;
+    let icx = inner.as_ref().unwrap_or(cx);
+    let prev = icx.asgi_scope.lock().replace(scope.clone());
+    super::rawasgi::state_in(icx, scope)?;
+    let r = chain(icx, &stack, *i, routes).await;
+    super::rawasgi::state_out(icx, scope)?;
+    if let Some(icx) = &inner {
+        super::rawasgi::merge_back(cx, icx);
+    } else {
+        *cx.asgi_scope.lock() = prev;
+    }
+    super::rawasgi::deliver(cx, r?, send).await?;
+    Ok(V::None)
 }
 
 /// `call_next` handed to a BaseHTTPMiddleware's `dispatch`.
@@ -305,6 +383,9 @@ fn mro(c: &'static Class, out: &mut Vec<&'static Class>) {
 /// ExceptionMiddleware: a handler by status code (HTTPException), else the first class of the MRO
 /// with a handler; FastAPI registers HTTPException and RequestValidationError by default.
 async fn handle(cx: &Cx, stack: &Stack, e: Exc) -> R<Response> {
+    if super::resp::is_drop(&e) {
+        return Err(e); // raised by the server's send: no handler sees it
+    }
     let mut found: Option<V> = None;
     if let Some((code, ..)) = &e.http_info() {
         found = stack.handlers.iter().find(|(k, _)| matches!(k, HKey::Status(s) if s == code)).map(|(_, h)| h.clone());

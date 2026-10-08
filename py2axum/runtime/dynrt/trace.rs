@@ -211,3 +211,38 @@ pub fn summary_attr(f: &Arc<Frame>, line: u32, name: &str) -> R {
         _ => Err(Exc::attr_error(format!("'FrameSummary' object has no attribute '{name}'"))),
     }
 }
+
+/// `traceback.format_exception(exc)` / `(type, value, tb)`: the exception's own line(s), as CPython formats
+/// them for a traceback of None (`module.QualName: message`); frames and chained exceptions are not
+/// rendered (the binary has no Python frames, a documented difference)
+pub fn format_exception(cx: &Cx, args: &[V], kwargs: &[(String, V)]) -> R {
+    let _ = cx;
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !["value", "tb", "limit", "chain"].contains(&k.as_str())) {
+        return Err(Exc::type_error(format!("format_exception() got an unexpected keyword argument '{k}'")));
+    }
+    let value = match (args.first(), args.get(1).or_else(|| kwargs.iter().find(|(k, _)| k == "value").map(|(_, v)| v))) {
+        (Some(V::Class(_)), Some(v)) => v.clone(),
+        (Some(v), _) => v.clone(),
+        (None, _) => return Err(Exc::type_error("format_exception() missing required argument 'exc' (pos 1)")),
+    };
+    format_exception_only(&value)
+}
+
+/// `traceback.format_exception_only(exc)`
+pub fn format_exception_only(value: &V) -> R {
+    let line = match value {
+        V::None => "NoneType: None\n".to_string(),
+        V::Exc(e) => {
+            let c = e.0.class;
+            // a project exception's qualname already carries its module
+            let ty = match super::sentry::exc_module(c) {
+                Some(m) if m != "builtins" && m != "__main__" && !c.qualname.starts_with(&format!("{m}.")) => format!("{m}.{}", c.qualname),
+                _ => c.qualname.to_string(),
+            };
+            let msg = super::ops::str_(value)?;
+            if msg.is_empty() { format!("{ty}\n") } else { format!("{ty}: {msg}\n") }
+        }
+        o => return Err(Exc::type_error(format!("py2axum: format_exception() of a {} is not supported", o.type_name()))),
+    };
+    Ok(V::list(vec![V::str(&line)]))
+}

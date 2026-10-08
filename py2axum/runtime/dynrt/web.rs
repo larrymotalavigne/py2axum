@@ -478,15 +478,17 @@ pub async fn form_field(cx: &Cx, form: &[(String, FormVal)], alias: &str, td: &'
 }
 
 /// A `File()` / `UploadFile` parameter (one file, or `list[UploadFile]`).
-pub fn form_file(form: &[(String, FormVal)], alias: &str, list: bool, required: bool, errs: &mut Vec<ErrDetail>) -> V {
+pub fn form_file(form: &[(String, FormVal)], alias: &str, list: bool, required: bool, dflt: fn() -> V, errs: &mut Vec<ErrDetail>) -> V {
     let loc = vec![V::str("body"), V::str(alias)];
     let vals: Vec<&FormVal> = form.iter().filter(|(k, _)| k == alias).map(|(_, v)| v).collect();
-    let present: Vec<&FormVal> = vals.into_iter().filter(|v| !matches!(v, FormVal::Text(t) if t.is_empty())).collect();
+    // FastAPI's `_get_multidict_value`: an empty string is absent for a single field, a list keeps it
+    let present: Vec<&FormVal> = vals.into_iter().filter(|v| list || !matches!(v, FormVal::Text(t) if t.is_empty())).collect();
     if present.is_empty() {
         if required {
             errs.push(ErrDetail { kind: "missing", loc, msg: "Field required".into(), input: V::None, ctx: None });
+            return V::None;
         }
-        return V::None;
+        return dflt();
     }
     let check = |v: &FormVal, loc: Vec<V>, errs: &mut Vec<ErrDetail>| -> V {
         match v {
@@ -632,6 +634,12 @@ async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) 
             let s = s.lock().take().ok_or_else(|| Exc::runtime("response already consumed"))?;
             return Ok(stream_response(s, &cx.resp.headers.lock().clone()));
         }
+        if let Native::ListStream(l) = &**n {
+            let l = l.lock().take().ok_or_else(|| Exc::runtime("response already consumed"))?;
+            let status = cx.resp.status.lock().unwrap_or(status);
+            let headers = cx.resp.headers.lock().clone();
+            return stream_list(cx, l, status, headers).await;
+        }
     }
     let status = cx.resp.status.lock().unwrap_or(status);
     let headers = cx.resp.headers.lock().clone();
@@ -645,6 +653,102 @@ async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) 
     let content = encode(cx, &ret, model).await?;
     let style = if model.is_some() && response_dump_json() { &pyd::DUMP_JSON } else { &pyd::RESPONSE };
     Ok(json_body(status, pyd::to_json(&content, style, false)?, &headers))
+}
+
+/// The route's endpoint may return its list as a `ListStream` (orm::defer_list): set before calling it.
+pub fn stream_list_ok(cx: &Cx, fname: &'static str, model: &'static TD) {
+    *cx.stream_list.lock() = Some((fname, model));
+}
+
+/// Blocks queued between the query task and the socket (back-pressure bound).
+const STREAM_QUEUE: usize = 4;
+
+enum Block {
+    /// the whole body fitted in one block: answered with a content-length, like the buffered path
+    Complete(Bytes),
+    /// first block of a body that is streamed
+    Start(Bytes),
+    Chunk(Bytes),
+}
+
+/// A `ListStream` as the response: rows read from Postgres as a stream, each validated by the item schema
+/// and serialized like `encode` does for the whole list, block by block, so memory stays bounded
+/// (~STREAM_QUEUE blocks per request) whatever the size. Same bytes as the buffered path. An exception
+/// before the first block is the endpoint's (500); after it, the connection can only be aborted.
+async fn stream_list(cx: &Cx, l: super::orm::ListStream, status: u16, extra: Vec<(String, String)>) -> R<Response> {
+    use futures_util::{StreamExt, TryStreamExt};
+    let (chunk, _) = super::orm::stream_cfg();
+    let style = if response_dump_json() { &pyd::DUMP_JSON } else { &pyd::RESPONSE };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Block, Exc>>(STREAM_QUEUE);
+    let cx2 = cx.clone();
+    tokio::spawn(async move {
+        let super::orm::ListStream { pool, sql, args, model, item } = l;
+        let cx = cx2;
+        let run = async {
+            let mut conn = pool.acquire().await.map_err(|e| super::orm::stream_sql_error(e, &sql))?;
+            let mut rows = sqlx::query_with(&sql, args).fetch(&mut *conn);
+            let mut buf = String::with_capacity(chunk + 4096);
+            buf.push('[');
+            let mut started = false;
+            let mut i = 0i64;
+            while let Some(row) = rows.try_next().await.map_err(|e| super::orm::stream_sql_error(e, &sql))? {
+                let obj = super::orm::row_object(&cx, model, &row).await?;
+                let mut errs = Vec::new();
+                let v = match pyd::validate(&cx, &prepare_for(&obj, item)?, item, &[V::str("response"), V::Int(i)], &mut errs).await? {
+                    Some(v) => v,
+                    None => {
+                        let detail: Vec<String> = errs.iter().map(|e| format!("{}: {}", e.kind, e.msg)).collect();
+                        return Err(Exc::runtime(format!("ResponseValidationError: {}", detail.join("; "))));
+                    }
+                };
+                let content = pyd::dump(&v, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() })?;
+                if i > 0 {
+                    buf.push(',');
+                }
+                buf.push_str(&pyd::to_json(&content, style, false)?);
+                i += 1;
+                if buf.len() >= chunk {
+                    let block = Bytes::from(std::mem::replace(&mut buf, String::with_capacity(chunk + 4096)));
+                    let msg = if started { Block::Chunk(block) } else { Block::Start(block) };
+                    started = true;
+                    if tx.send(Ok(msg)).await.is_err() {
+                        return Ok(()); // the client went away: dropping `rows` cancels the query
+                    }
+                }
+            }
+            buf.push(']');
+            let block = Bytes::from(buf);
+            let _ = tx.send(Ok(if started { Block::Chunk(block) } else { Block::Complete(block) })).await;
+            Ok::<(), Exc>(())
+        };
+        if let Err(e) = run.await {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+    let mut b = Response::builder().status(status).header(header::CONTENT_TYPE, "application/json");
+    for (k, v) in &extra {
+        b = b.header(k.as_str(), v.as_str());
+    }
+    match rx.recv().await {
+        Some(Ok(Block::Complete(body))) => Ok(b.body(Body::from(body)).unwrap()),
+        Some(Ok(Block::Start(first) | Block::Chunk(first))) => {
+            let rest = futures_util::stream::unfold(rx, |mut rx| async move {
+                match rx.recv().await {
+                    Some(Ok(Block::Chunk(b) | Block::Start(b) | Block::Complete(b))) => Some((Ok::<Bytes, std::io::Error>(b), rx)),
+                    Some(Err(e)) => {
+                        eprintln!("ERROR:py2axum:list response aborted after its first block: {:?}", e);
+                        Some((Err(std::io::Error::other("list response aborted")), rx))
+                    }
+                    None => None,
+                }
+            });
+            // fuse(): the compression layer may poll again after the end
+            let body = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(first) }).chain(rest).fuse();
+            Ok(b.body(Body::from_stream(body)).unwrap())
+        }
+        Some(Err(e)) => Err(e),
+        None => Err(Exc::runtime("py2axum: list stream ended without a result")),
+    }
 }
 
 fn stream_response(s: Streaming, extra: &[(String, String)]) -> Response {

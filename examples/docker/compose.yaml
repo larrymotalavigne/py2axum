@@ -1,0 +1,44 @@
+# The bookshelf example in hybrid mode: the binary is the only public entry point and relays the routes left
+# to Python (GET /books/export.zip) to the uvicorn sidecar. From the repository root:
+#   docker compose -f examples/docker/compose.yaml up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bookshelf
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      # stands for your migrations: the binary does not create tables
+      - ../bookshelf/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "bookshelf"]
+      interval: 2s
+      retries: 30
+
+  python:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile.python
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres@db/bookshelf
+      BOOKSHELF_SECRET: ${BOOKSHELF_SECRET:-change-me-in-production-0123456789}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../..
+      dockerfile: examples/docker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres@db/bookshelf
+      PY2AXUM_PYTHON_URL: http://python:8000
+      # the same settings as the Python process: both must sign and verify the same tokens
+      BOOKSHELF_SECRET: ${BOOKSHELF_SECRET:-change-me-in-production-0123456789}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      python:
+        condition: service_started

@@ -178,7 +178,6 @@ def test_sync_session_dependency_rejected(tmp_path, capsys, maker, dep, param, m
     [
         ("total = column_property(id + 1)", "only columns and relationships are supported"),
         ('__mapper_args__ = {"version_id_col": id}', "__mapper_args__ is not supported"),
-        ('label: Mapped[str] = mapped_column("lbl", String(20))', "a SQL column name different from the attribute"),
         ("data: Mapped[dict] = mapped_column(JSON(astext_type=None, foo=1))", "JSON(foo=) is not supported"),
         ("codes: Mapped[list] = mapped_column(ARRAY(Integer))", "only ARRAY(String) is supported"),
         ("codes: Mapped[list] = mapped_column(ARRAY(String, as_tuple=True))", "ARRAY(as_tuple=) is not supported"),
@@ -268,25 +267,29 @@ def test_python_semantics_rejected(tmp_path, capsys, body, message):
     assert "main.py:" in err
 
 
-def test_validate_assignment_with_validators_rejected(tmp_path, capsys):
+def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
+    """Field and model `after` validators run on assignment; a model `before` validator would get the whole data."""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(textwrap.dedent('''
         from fastapi import FastAPI
-        from pydantic import BaseModel, ConfigDict, field_validator
+        from pydantic import BaseModel, ConfigDict, model_validator
 
         app = FastAPI()
 
 
-        class In(BaseModel):
+        class Base(BaseModel):
             model_config = ConfigDict(validate_assignment=True)
+
+
+        class In(Base):
             name: str
 
-            @field_validator("name")
+            @model_validator(mode="before")
             @classmethod
-            def up(cls, v):
-                return v.upper()
+            def up(cls, data):
+                return data
 
 
         @app.post("/x")
@@ -295,7 +298,7 @@ def test_validate_assignment_with_validators_rejected(tmp_path, capsys):
     '''))
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "validate_assignment=True with @field_validator is not supported" in err
+    assert 'validate_assignment=True with @model_validator(mode="before") is not supported' in err
     assert "main.py:" in err
 
 
@@ -443,6 +446,22 @@ def test_form_in_dependency_rejected(tmp_path, capsys):
         ("opts = {}\napp.add_middleware(CORSMiddleware, **opts)\n", "add_middleware(*args/**kwargs) is not supported"),
         ("@app.middleware('websocket')\nasync def mw(request, call_next):\n    return await call_next(request)\n",
          'only @app.middleware("http") is supported'),
+        # a raw ASGI middleware needs `async def __call__(self, scope, receive, send)`
+        ("class Sync:\n    def __init__(self, app):\n        self.app = app\n\n    def __call__(self, scope, receive, send):\n"
+         "        return self.app(scope, receive, send)\n\n\napp.add_middleware(Sync)\n",
+         "middleware Sync is not supported (CORSMiddleware, GZipMiddleware, BaseHTTPMiddleware"),
+        ("flag = False\napp2 = FastAPI(strict_content_type=flag)\n",
+         "FastAPI(strict_content_type=...) must be a literal True or False"),
+        ("from fastapi.middleware import Middleware\nfrom fastapi.middleware.gzip import GZipMiddleware\n"
+         "app2 = FastAPI(middleware=[Middleware(GZipMiddleware)])\n",
+         "Middleware(GZipMiddleware) in FastAPI(middleware=[...]) is not supported"),
+        ("mws = []\napp2 = FastAPI(middleware=mws)\n", "FastAPI(middleware=...) must be a literal list of Middleware(...)"),
+        ("from starlette_context import plugins\nfrom starlette_context.middleware import RawContextMiddleware\n"
+         "app.add_middleware(RawContextMiddleware, plugins=(plugins.UserAgentPlugin(),))\n",
+         "RawContextMiddleware: plugin plugins.UserAgentPlugin() is not supported"),
+        ("from starlette_context import plugins\nfrom starlette_context.middleware import RawContextMiddleware\n"
+         "app.add_middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(force_new_uuid=FORCE),))\nFORCE = True\n",
+         "RawContextMiddleware: plugin option force_new_uuid= is not supported"),
     ],
 )
 def test_middleware_stack_rejected(tmp_path, capsys, code, message):
@@ -609,6 +628,43 @@ def test_prometheus_outside_subset_rejected(tmp_path, capsys, stmt, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(PROM_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:11" in err
+
+
+PYJWT_MAIN = """
+import jwt
+from fastapi import FastAPI
+
+app = FastAPI()
+KEY = "k" * 32
+
+
+@app.get("/t")
+async def t(token: str):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("jwt.encode({'a': 1}, KEY, algorithm='RS256')", "jwt.encode(): algorithm 'RS256' is not supported"),
+    ("jwt.encode({'a': 1}, KEY, headers={'alg': 'ES256'})", "jwt.encode(): algorithm 'ES256' is not supported"),
+    ("jwt.decode(token, KEY, algorithms=['HS256', 'EdDSA'])", "jwt.decode(): algorithm 'EdDSA' is not supported"),
+    ("jwt.decode(token, KEY, ['PS256'])", "jwt.decode(): algorithm 'PS256' is not supported"),
+    ("jwt.encode({'a': 1}, KEY, json_encoder=None)", "jwt.encode(json_encoder=) is not supported"),
+    ("jwt.decode(token, KEY, algorithms=['HS256'], detached_payload=b'x')", "jwt.decode(detached_payload=) is not supported"),
+    ("jwt.decode(token, KEY, algorithms=['HS256'], verify=True)", "jwt.decode(verify=) is not supported"),
+    ("jwt.decode(token, KEY, ['HS256'], None, True)", "jwt.decode(): verify is not supported"),
+    ("jwt.decode(token, KEY, algorithms=['HS256'], foo=1)", "jwt.decode(foo=) is not supported"),
+    ("jwt.PyJWKClient('https://idp/jwks').get_signing_key_from_jwt(token)", "is not supported"),
+])
+def test_pyjwt_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PYJWT_MAIN.format(stmt=stmt))
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
@@ -1847,3 +1903,132 @@ def test_super_cls_cls_with_subclass_rejected(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "`super(cls, cls)` in A, which B subclass" in err
     assert "main.py:" in err
+
+
+def test_module_attribute_assignment_rejected(tmp_path, capsys):
+    """`mod.ATTR = v` rebinds another module's global: refused (it used to fail at startup, read-only)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "conf.py").write_text("LIMIT = 1\n")
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        from fastapi import FastAPI
+        from . import conf
+
+        app = FastAPI()
+
+
+        @app.get("/limit")
+        async def limit():
+            conf.LIMIT = 2
+            return {"limit": conf.LIMIT}
+    '''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "assigning `conf.LIMIT` (an attribute of module proj.conf) is not supported" in err
+    assert "main.py:" in err
+
+
+NET_MAIN = """
+import asyncio
+import io
+import socket
+import zipfile
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+async def use():
+    {body}
+
+
+@app.get("/x")
+async def x():
+    return await use()
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("return zipfile.ZipFile(io.BytesIO(), 'r')", 'only zipfile.ZipFile(file, "w", ...) is supported'),
+    ("return zipfile.ZipFile(io.BytesIO(), 'w', strict_timestamps=False)", "zipfile.ZipFile(strict_timestamps=) is not supported"),
+    ("return await asyncio.open_connection('h', 1, ssl=True)", "asyncio.open_connection(ssl=) is not supported"),
+    ("return socket.create_connection(('h', 1), 5, ('', 0))", "socket.create_connection() takes at most 2 positional arguments"),
+    ("return socket.create_connection(('h', 1), all_errors=True)", "socket.create_connection(all_errors=) is not supported"),
+])
+def test_network_and_archive_options_rejected(tmp_path, capsys, body, msg):
+    """Socket, stream and zip calls: options with no native equivalent are refused, with their line."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(NET_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:13" in err
+
+
+def test_before_validator_after_an_after_validator_rejected(tmp_path, capsys):
+    """pydantic nests a field's validators in definition order; the runtime runs every `before` first."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        from fastapi import FastAPI
+        from pydantic import BaseModel, field_validator
+
+        app = FastAPI()
+
+
+        class In(BaseModel):
+            name: str
+
+            @field_validator("name")
+            @classmethod
+            def after(cls, v):
+                return v
+
+            @field_validator("name", mode="before")
+            @classmethod
+            def before(cls, v):
+                return v
+
+
+        @app.post("/x")
+        async def x(body: In):
+            return body
+    '''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert 'a mode="before" validator defined after a mode="after" validator of the same field is not supported' in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize("opts, found", [("-B 10", "'-B'"), ("-c", "'-c'"), ("-c TimeZone=UTC --nope", "'--nope'")])
+def test_engine_libpq_options_rejected(tmp_path, capsys, opts, found):
+    """`connect_args={"options": ...}`: only the `-c`/`--` switches are applied to the pool's connections."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    engine = f'engine = create_async_engine("postgresql+psycopg://x/y", connect_args={{"options": {opts!r}}})'
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace('engine = create_async_engine("postgresql+psycopg://x/y")', engine))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert f"main.py:7: connect_args options: only `-c name=value` and `--name=value` switches are supported (found {found})" in err
+
+
+def test_engine_connect_args_generated(tmp_path):
+    """A supported `options` string: the engine global runs at startup (session parameters for the pool)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    engine = 'engine = create_async_engine("postgresql+psycopg://x/y", connect_args={"options": "-c TimeZone=UTC"})'
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace('engine = create_async_engine("postgresql+psycopg://x/y")', engine))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "engine_connect_args" in gen
+    init = gen[gen.index("pub async fn init_globals"):]
+    assert "g_proj_main__engine(cx)" in init[:init.index("\n}")]

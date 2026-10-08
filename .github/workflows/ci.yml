@@ -33,47 +33,8 @@ jobs:
           pip install build && python -m build --wheel
           python -m venv /tmp/w && /tmp/w/bin/pip install dist/*.whl && /tmp/w/bin/py2axum --help
 
-  typed:
-    name: typed backend conformance
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: poc
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports: ["5432:5432"]
-        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
-    env:
-      DATABASE_URL: postgresql://postgres@127.0.0.1/poc
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: generated/app_axum
-      - run: pip install fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" "psycopg[binary]" pydantic aiohttp httpx pytest
-      - name: transpile (the committed output must be exactly the transpiler's)
-        run: python -m py2axum app -o generated/app_axum --name app_axum && git diff --exit-code -- generated/
-      - run: cd generated/app_axum && cargo build --release --locked
-      - run: ./scripts_start.sh && python tests/conformance.py http://127.0.0.1:8000 http://127.0.0.1:8080
-      - name: forced streaming
-        run: |
-          RUST_ENV="PY2AXUM_STREAM_CHUNK=256 PY2AXUM_STREAM_MIN_ROWS=0" ./scripts_start.sh
-          python tests/conformance.py http://127.0.0.1:8000 http://127.0.0.1:8080 --ignore-encoding
-      - if: failure()
-        uses: actions/upload-artifact@v5
-        with:
-          name: typed-logs
-          path: /tmp/py2axum-logs
-
   dyn:
-    name: dyn backend conformance
+    name: conformance
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -105,12 +66,12 @@ jobs:
       - name: Python reference dependencies
         run: >
           pip install fastapi "uvicorn[standard]" "sqlalchemy[asyncio]" "psycopg[binary]" "pydantic[email]"
-          aiohttp==3.14.3 httpx==0.28.1 pytest python-jose==3.5.0 bcrypt==5.0.0 pyotp==2.9.0 pywebpush==2.3.0
+          aiohttp==3.14.3 httpx==0.28.1 pytest python-jose==3.5.0 pyjwt==2.15.1 bcrypt==5.0.0 pyotp==2.9.0 pywebpush==2.3.0
           py-vapid==1.9.4 http-ece==1.2.1 google-auth==2.49.0 requests psutil==7.2.2 alembic pydantic-settings
           sentry-sdk==2.71.0 itsdangerous==2.2.0 cryptography python-multipart==0.0.32 jinja2 aiosmtplib redis==8.1.0 aio-pika==10.0.1 tenacity==9.1.4 prometheus-client==0.26.0 nh3==0.3.6
           python-dateutil==2.9.0.post0 xmltodict==1.0.4
       - run: |
-          for db in py2axum_dyn py2axum_notes; do psql -h 127.0.0.1 -U postgres -qc "CREATE DATABASE $db"; done
+          for db in py2axum_dyn py2axum_notes poc; do psql -h 127.0.0.1 -U postgres -qc "CREATE DATABASE $db"; done
       - name: dynapp (reference app of the dyn backend)
         env:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
@@ -126,6 +87,16 @@ jobs:
           (cd generated/factoryapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           ./scripts_start_factory.sh
           python tests/conformance.py http://127.0.0.1:8300 http://127.0.0.1:8380 --scenario factoryapp
+      - name: app (CRUD, GZip, aiohttp, lists streamed from the session), normal and forced streaming
+        env:
+          DATABASE_URL: postgresql://postgres@127.0.0.1/poc
+          APP_BIN: generated/dynapp_axum/target/release/app_axum
+        run: |
+          python -m py2axum app -o generated/app_axum --name app_axum
+          (cd generated/app_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
+          ./scripts_start.sh && python tests/conformance.py http://127.0.0.1:8000 http://127.0.0.1:8080
+          RUST_ENV="PY2AXUM_STREAM_CHUNK=256 PY2AXUM_STREAM_MIN_ROWS=0" ./scripts_start.sh
+          python tests/conformance.py http://127.0.0.1:8000 http://127.0.0.1:8080 --ignore-encoding
       - name: examples/notes
         env:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_notes
@@ -145,30 +116,66 @@ jobs:
             /tmp/py2axum-logs
             /tmp/*.log
 
+  example:
+    name: examples/bookshelf (hybrid mode, compared with FastAPI)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: bookshelf
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
+    env:
+      DATABASE_URL: postgresql://postgres@127.0.0.1/bookshelf
+      # the job checks equivalence, not speed: no fat LTO
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      LOG: /tmp/bookshelf-logs
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: generated/bookshelf
+      - run: pip install -e . -r examples/bookshelf/requirements.txt httpx websockets
+      - run: examples/bookshelf/compare.sh
+      - name: without PY2AXUM_PYTHON_URL, a python-side path answers 404
+        run: |
+          (PORT=9091 generated/bookshelf/target/release/bookshelf > /tmp/bookshelf-logs/alone.log 2>&1 &)
+          for i in $(seq 50); do curl -sf -o /dev/null 127.0.0.1:9091/health && break; sleep 0.1; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:9091/books/export.zip)" = 404
+      - if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: example-logs
+          path: /tmp/bookshelf-logs
+
   docker:
-    name: example Docker image
+    name: reference Docker build (examples/docker, hybrid)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: examples/notes/Dockerfile
-          tags: notes:ci
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: build and start (PostgreSQL, Python sidecar, binary)
+        run: docker compose -f examples/docker/compose.yaml up --build --detach --wait --wait-timeout 1800
       - name: smoke test
         run: |
-          docker network create t
-          docker run -d --name db --network t -e POSTGRES_DB=notes -e POSTGRES_HOST_AUTH_METHOD=trust \
-            -v "$PWD/examples/notes/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro" postgres:16-alpine
-          for i in $(seq 60); do docker exec db pg_isready -U postgres -d notes && break; sleep 1; done
-          sleep 2
-          docker run -d --name notes --network t -p 8080:8080 -e DATABASE_URL=postgresql://postgres@db/notes notes:ci
           for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 1; done
-          curl -sf -X POST localhost:8080/authors -H 'content-type: application/json' -d '{"name":"ada"}'
-          curl -sf -X POST localhost:8080/notes -H 'content-type: application/json' -d '{"title":"hi","author_id":1}'
-          test "$(curl -sf localhost:8080/notes | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["title"])')" = hi
-          docker image ls notes:ci
+          curl -sf localhost:8080/auth/register -H 'content-type: application/json' \
+            -d '{"email": "ada@example.org", "password": "correct horse battery", "display_name": "Ada"}'
+          TOKEN=$(curl -sf localhost:8080/auth/login -H 'content-type: application/json' \
+            -d '{"email": "ada@example.org", "password": "correct horse battery"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+          curl -sf localhost:8080/books -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            -d '{"title": "Dune", "author": "Frank Herbert", "tags": ["SF"]}'
+          test "$(curl -sf 'localhost:8080/books?tag=sf' | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["title"])')" = Dune
+          # relayed to the Python sidecar
+          curl -sf localhost:8080/books/export.zip -H "authorization: Bearer $TOKEN" -o /tmp/export.zip
+          python3 -c 'import zipfile; print(zipfile.ZipFile("/tmp/export.zip").read("books.csv").decode())' | grep -q Dune
+          docker image ls
+      - if: failure()
+        run: docker compose -f examples/docker/compose.yaml logs

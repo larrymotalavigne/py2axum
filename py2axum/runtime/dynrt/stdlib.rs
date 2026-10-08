@@ -1747,3 +1747,101 @@ pub fn template_method(t: &str, name: &str, args: &[V], kwargs: &[(String, V)]) 
     out += &t[last..];
     Ok(V::str(out))
 }
+
+/// `gzip.decompress(data)` (CPython 3.12+): every member, its header read like `_read_gzip_header`, the
+/// deflate stream inflated raw, then CRC and length checked; NUL padding between members skipped.
+pub fn gzip_decompress(args: &[V], kwargs: &[(String, V)]) -> R {
+    let data = match (args, kwargs) {
+        ([V::Bytes(b)], []) => b.clone(),
+        ([], [(k, V::Bytes(b))]) if k == "data" => b.clone(),
+        ([o], []) => return Err(Exc::type_error(format!("a bytes-like object is required, not '{}'", o.type_name()))),
+        _ => return Err(Exc::type_error("py2axum: gzip.decompress(data) takes the data only")),
+    };
+    let eof = || Exc::new(&EOF_ERROR, vec![V::str("Compressed file ended before the end-of-stream marker was reached")]);
+    let bad = |m: String| Exc::new(&BAD_GZIP_FILE, vec![V::str(&m)]);
+    let mut out: Vec<u8> = Vec::new();
+    let mut d: &[u8] = &data;
+    loop {
+        // header
+        if d.is_empty() {
+            return Ok(V::Bytes(Arc::from(out)));
+        }
+        let magic = &d[..d.len().min(2)];
+        if magic != b"\x1f\x8b" {
+            return Err(bad(format!("Not a gzipped file ({})", super::ops::repr(&V::Bytes(Arc::from(magic)))?)));
+        }
+        if d.len() < 10 {
+            return Err(eof());
+        }
+        let (method, flag) = (d[2], d[3]);
+        if method != 8 {
+            return Err(bad("Unknown compression method".into()));
+        }
+        let mut p = 10;
+        if flag & 4 != 0 {
+            if d.len() < p + 2 {
+                return Err(eof());
+            }
+            let n = u16::from_le_bytes([d[p], d[p + 1]]) as usize;
+            p += 2;
+            if d.len() < p + n {
+                return Err(eof());
+            }
+            p += n;
+        }
+        for bit in [8u8, 16] {
+            if flag & bit != 0 {
+                while p < d.len() {
+                    p += 1;
+                    if d[p - 1] == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        if flag & 2 != 0 {
+            if d.len() < p + 2 {
+                return Err(eof());
+            }
+            p += 2;
+        }
+        // raw deflate
+        let input = &d[p..];
+        let mut z = flate2::Decompress::new(false);
+        let mut member: Vec<u8> = Vec::with_capacity(input.len() * 3);
+        let mut done = false;
+        loop {
+            if member.capacity() - member.len() < 32 * 1024 {
+                member.reserve(64 * 1024);
+            }
+            let before = (z.total_in(), z.total_out());
+            let st = z
+                .decompress_vec(&input[z.total_in() as usize..], &mut member, flate2::FlushDecompress::None)
+                .map_err(|e| Exc::new(&ZLIB_ERROR, vec![V::str(&format!("Error -3 while decompressing data: {}", e.message().unwrap_or("invalid data")))]))?;
+            if st == flate2::Status::StreamEnd {
+                done = true;
+                break;
+            }
+            if (z.total_in(), z.total_out()) == before {
+                break; // input exhausted before the end of the stream
+            }
+        }
+        let unused = &input[z.total_in() as usize..];
+        if !done || unused.len() < 8 {
+            return Err(eof());
+        }
+        let crc = u32::from_le_bytes([unused[0], unused[1], unused[2], unused[3]]);
+        let len = u32::from_le_bytes([unused[4], unused[5], unused[6], unused[7]]);
+        let mut c = flate2::Crc::new();
+        c.update(&member);
+        if crc != c.sum() {
+            return Err(bad("CRC check failed".into()));
+        }
+        if len != member.len() as u32 {
+            return Err(bad("Incorrect length of data produced".into()));
+        }
+        out.extend_from_slice(&member);
+        let rest = &unused[8..];
+        d = &rest[rest.iter().position(|b| *b != 0).unwrap_or(rest.len())..];
+    }
+}

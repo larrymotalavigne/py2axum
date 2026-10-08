@@ -53,6 +53,21 @@ async def export_users(
     return result.scalars().all()
 
 
+@app.get("/users/newest", response_model=list[UserOut])
+async def newest_users(session: AsyncSession = Depends(get_session)):
+    return (await session.scalars(select(User).order_by(User.id.desc()))).all()
+
+
+@app.post("/users/{user_id}/shout", response_model=list[UserOut])
+async def shout_then_list(user_id: int, session: AsyncSession = Depends(get_session)):
+    # an unflushed change, written by autoflush before the SELECT (and rolled back: no commit)
+    user = await session.get(User, user_id)
+    if user is not None:
+        user.name = user.name + "!"
+    result = await session.execute(select(User).order_by(User.id))
+    return result.scalars().all()
+
+
 @app.get("/users/{user_id}", response_model=UserOut)
 async def get_user(user_id: int, session: AsyncSession = Depends(get_session)):
     user = await session.get(User, user_id)

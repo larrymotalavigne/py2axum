@@ -10,6 +10,9 @@ usage: python bench/bench.py [--duration 10s] [--conns 128]
          the generated fixtures/dynapp binary alone (DYNAPP_BIN, default generated/dynapp_axum/...), compared
          with a reference measured on the same machine: a drop of more than --tolerance (30 %) on any endpoint
          makes the exit status 1 (CI: a warning, the runners are shared and noisy)
+       python bench/bench.py --target bookshelf [--interleave 3]
+         examples/bookshelf: FastAPI + Uvicorn against the binary (BOOKSHELF_BIN, default
+         generated/bookshelf/target/release/bookshelf), on a database seeded with 1 000 books and 3 000 reviews
 """
 from __future__ import annotations
 
@@ -59,12 +62,12 @@ SERVERS = {
     },
     "axum (généré)": {
         "port": 8080,
-        "cmd": "generated/app_axum/target/release/app_axum",
+        "cmd": os.environ.get("APP_BIN", "generated/app_axum/target/release/app_axum"),
         "env": {"PORT": "8080", "TOKIO_WORKER_THREADS": str(WORKERS), "DB_POOL_SIZE": "32"},
     },
 }
 
-# --target dynapp: the dyn backend's reference app, seeded by seed_dynapp (60 tasks, 10 projects of 5 tasks)
+# --target dynapp: the reference app of real-project constructions, seeded by seed_dynapp (60 tasks, 10 projects of 5 tasks)
 DYNAPP_PORT = int(os.environ.get("DYNAPP_PORT", "8090"))
 DYNAPP = {
     "axum dynapp": {
@@ -82,6 +85,54 @@ DYNAPP_ENDPOINTS = {
         "-d", '{"title": "t", "priority": "high", "tags": ["a", "b"], "channel": "mail"}',
     ],
     "GET /tasks/0 (404)": ["/tasks/0"],
+}
+
+# --target bookshelf: the example application, seeded by seed_bookshelf
+BOOKSHELF_SECRET = "change-me-in-production-0123456789"  # the example's default
+BOOKSHELF = {
+    "FastAPI + Uvicorn": {
+        "port": 9050,
+        "cmd": f"uvicorn --app-dir examples/bookshelf app.main:app --port 9050 --workers {WORKERS} --log-level warning "
+               "--no-access-log",
+        "env": {"DATABASE_URL": DB.replace("postgresql://", "postgresql+psycopg://", 1)},
+    },
+    "py2axum binary": {
+        "port": 9090,
+        "cmd": os.environ.get("BOOKSHELF_BIN", "generated/bookshelf/target/release/bookshelf"),
+        "env": {"PORT": "9090", "TOKIO_WORKER_THREADS": str(WORKERS)},
+    },
+}
+
+
+def hs256(claims: dict, key: str) -> str:
+    """a JWT signed with HS256, without PyJWT (the bench's only dependencies are oha and the servers')"""
+    import base64
+    import hashlib
+    import hmac
+
+    b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()  # noqa: E731
+    head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = b64(json.dumps(claims, separators=(",", ":")).encode())
+    sig = hmac.new(key.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{b64(sig)}"
+
+
+BOOKSHELF_AUTH = f"authorization: Bearer {hs256({'sub': '1', 'exp': 4102444800}, BOOKSHELF_SECRET)}"
+BOOKSHELF_ENDPOINTS = {
+    "GET /health": ["/health"],
+    "GET /books/{id} (book, owner, reviews)": ["--rand-regex-url", "/books/([1-9][0-9]{0,2}|1000)"],
+    "GET /books?limit=20 (20 rows)": ["/books?limit=20"],
+    "GET /books?tag=sf&limit=20 (JSONB @>)": ["/books?tag=sf&limit=20"],
+    "GET /books/stats (aggregates)": ["/books/stats"],
+    "GET /me (JWT + 1 SELECT)": ["/me", "-H", BOOKSHELF_AUTH],
+    "POST /books (validation + INSERT)": [
+        "/books", "-m", "POST", "-H", BOOKSHELF_AUTH, "-H", "content-type: application/json",
+        "-d", '{"title": " Dune ", "author": "Frank Herbert", "year": 1965, "tags": ["SF", "classic"]}',
+    ],
+    "POST /auth/register (422)": [
+        "/auth/register", "-m", "POST", "-H", "content-type: application/json",
+        "-d", '{"email": "not-an-email", "password": "short", "display_name": ""}',
+    ],
 }
 
 ENDPOINTS = {
@@ -133,6 +184,26 @@ def seed_dynapp(port: int) -> None:
         post("/tasks", {"title": f"task {i}", "priority": "low" if i % 3 == 0 else "high", "tags": ["a"] * (i % 3)})
     for i in range(10):
         post("/projects", {"name": f"project {i}", "owner": f"owner {i}", "tasks": [f"pt {i}.{j}" for j in range(5)]})
+
+
+def seed_bookshelf() -> None:
+    """50 users, 1 000 books (a third tagged sf), 3 000 reviews; the schema from examples/bookshelf/schema.sql"""
+    sql = (ROOT / "examples/bookshelf/schema.sql").read_text() + """
+    TRUNCATE users, books, reviews RESTART IDENTITY CASCADE;
+    INSERT INTO users (email, display_name, password_hash)
+        SELECT 'user' || g || '@example.org', 'User ' || g, repeat('x', 60) FROM generate_series(1, 50) g;
+    INSERT INTO books (owner_id, title, author, year, status, tags)
+        SELECT 1 + g % 50, 'Book ' || g, 'Author ' || (g % 97), 1900 + g % 120,
+               (ARRAY['to_read', 'reading', 'done'])[1 + g % 3],
+               CASE WHEN g % 3 = 0 THEN '["sf", "classic"]'::jsonb ELSE '["novel"]'::jsonb END
+        FROM generate_series(1, 1000) g;
+    INSERT INTO reviews (book_id, user_id, rating, body)
+        SELECT 1 + g % 1000, 1 + (g / 1000 + 1 + g % 1000) % 50, 1 + g % 5, 'review ' || g
+        FROM generate_series(0, 2999) g ON CONFLICT DO NOTHING;
+    VACUUM ANALYZE users, books, reviews;
+    """
+    subprocess.run(["psql", DB, "-q", "-v", "ON_ERROR_STOP=1", "-c", "SET client_min_messages = warning", "-f", "-"],
+                   input=sql, text=True, check=True, capture_output=True)
 
 
 def pin_postgres() -> None:
@@ -229,26 +300,35 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration", default="10s")
     ap.add_argument("--conns", type=int, default=64)
-    ap.add_argument("--target", choices=["app", "dynapp"], default="app",
-                    help="app: the typed backend's app against FastAPI; dynapp: the dyn backend's binary alone")
+    ap.add_argument("--target", choices=["app", "dynapp", "bookshelf"], default="app",
+                    help="app: app/ against FastAPI (APP_BIN); dynapp: fixtures/dynapp's binary alone; "
+                         "bookshelf: examples/bookshelf against FastAPI (BOOKSHELF_BIN)")
     ap.add_argument("--out", default=str(ROOT / "bench" / "results.json"))
     ap.add_argument("--compare", help="reference results (same format as --out)")
     ap.add_argument("--tolerance", type=float, default=0.30)
     ap.add_argument("--table", help="write the comparison as a markdown table")
+    ap.add_argument("--interleave", type=int, metavar="ROUNDS",
+                    help="start every server at once and alternate them, endpoint by endpoint, ROUNDS times (median "
+                         "kept): the fair comparison on a machine whose load varies (needs distinct ports)")
     args = ap.parse_args()
+    if args.interleave:
+        return interleaved(args)
 
     pin_postgres()
     results: dict = {"config": {"target": args.target, "server_cpus": SERVER_CPUS, "workers": WORKERS,
                                 "duration": args.duration, "conns": args.conns,
                                 "cpus_available": cpu_count(None)}, "servers": {}}
     only = os.environ.get("ONLY")
-    servers, endpoints = (DYNAPP, DYNAPP_ENDPOINTS) if args.target == "dynapp" else (SERVERS, ENDPOINTS)
+    servers, endpoints = {"dynapp": (DYNAPP, DYNAPP_ENDPOINTS), "bookshelf": (BOOKSHELF, BOOKSHELF_ENDPOINTS)}.get(
+        args.target, (SERVERS, ENDPOINTS))
     probe = "/tasks/0" if args.target == "dynapp" else "/health"
     for name, cfg in servers.items():
         if only and only.lower() not in name.lower():
             continue
         if args.target == "app":
             seed()
+        elif args.target == "bookshelf":
+            seed_bookshelf()
         env = {**os.environ, **cfg["env"]}
         proc = subprocess.Popen(
             pinned(SERVER_CPUS, ["sh", "-c", f"exec {cfg['cmd']}"]),
@@ -265,9 +345,10 @@ def main() -> None:
             per = {}
             for ep, ep_args in endpoints.items():
                 per[ep] = oha(cfg["port"], ep_args, args.duration, args.conns)
-                if args.target == "dynapp" and "(404)" in ep:
+                expected = "404" if "(404)" in ep else "422" if "(422)" in ep else None
+                if expected:
                     codes = per[ep]["codes"]
-                    per[ep]["ok_ratio"] = codes.get("404", 0) / (sum(codes.values()) or 1)
+                    per[ep]["ok_ratio"] = codes.get(expected, 0) / (sum(codes.values()) or 1)
                 print(f"{name:20} {ep:30} {per[ep]['rps']:>10.0f} req/s  p99 {per[ep]['p99_ms']:7.2f} ms  "
                       f"ok {per[ep]['ok_ratio']:.3f}", flush=True)
             peak = mem_mb(proc.pid, "VmHWM")
@@ -288,6 +369,57 @@ def main() -> None:
         if bad:
             print(f"throughput below the reference by more than {args.tolerance:.0%} (see the table)")
             raise SystemExit(1)
+
+
+def interleaved(args) -> None:
+    """--interleave: every server up at once, runs alternated per endpoint, the median of ROUNDS runs kept."""
+    import statistics
+
+    servers, endpoints = {"dynapp": (DYNAPP, DYNAPP_ENDPOINTS), "bookshelf": (BOOKSHELF, BOOKSHELF_ENDPOINTS)}.get(
+        args.target, (SERVERS, ENDPOINTS))
+    probe = "/tasks/0" if args.target == "dynapp" else "/health"
+    {"app": seed, "bookshelf": seed_bookshelf}.get(args.target, lambda: None)()
+    procs = {}
+    try:
+        for name, cfg in servers.items():
+            procs[name] = subprocess.Popen(pinned(SERVER_CPUS, ["sh", "-c", f"exec {cfg['cmd']}"]), cwd=ROOT,
+                                           env={**os.environ, **cfg["env"]}, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, start_new_session=True)
+        for cfg in servers.values():
+            wait_up(cfg["port"], probe)
+        if args.target == "dynapp":
+            seed_dynapp(next(iter(servers.values()))["port"])
+        time.sleep(1)
+        results: dict = {"config": {"target": args.target, "workers": WORKERS, "duration": args.duration,
+                                    "conns": args.conns, "rounds": args.interleave, "interleaved": True,
+                                    "cpus_available": cpu_count(None)},
+                         "servers": {n: {"endpoints": {}, "rss_idle_mb": mem_mb(p.pid, "VmRSS")} for n, p in procs.items()}}
+        for cfg in servers.values():
+            oha(cfg["port"], [probe], "2s", args.conns)  # warm-up
+        for ep, ep_args in endpoints.items():
+            runs: dict = {n: [] for n in servers}
+            for _ in range(args.interleave):
+                for name, cfg in servers.items():
+                    runs[name].append(oha(cfg["port"], ep_args, args.duration, args.conns))
+            for name, rs in runs.items():
+                m = {k: statistics.median(r[k] for r in rs) for k in ("rps", "p50_ms", "p99_ms", "ok_ratio")}
+                m["codes"] = rs[-1]["codes"]
+                expected = "404" if "(404)" in ep else "422" if "(422)" in ep else None
+                if expected:
+                    m["ok_ratio"] = m["codes"].get(expected, 0) / (sum(m["codes"].values()) or 1)
+                results["servers"][name]["endpoints"][ep] = m
+                print(f"{name:20} {ep:40} {m['rps']:>10.0f} req/s  p99 {m['p99_ms']:7.2f} ms  ok {m['ok_ratio']:.3f}",
+                      flush=True)
+        for name, p in procs.items():
+            results["servers"][name]["rss_peak_mb"] = mem_mb(p.pid, "VmHWM")
+            print(f"{name:20} memory: {results['servers'][name]['rss_idle_mb']:.0f} MB idle, "
+                  f"{results['servers'][name]['rss_peak_mb']:.0f} MB after the runs", flush=True)
+    finally:
+        for p in procs.values():
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=40)
+    Path(args.out).write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    print(f"\nwrote {args.out}")
 
 
 if __name__ == "__main__":

@@ -45,3 +45,17 @@ async def closed(op: str, db: DbDep):
         out.append([type(e).__name__, str(e), isinstance(e, InvalidRequestError)])
     await db.rollback()
     return out
+
+
+@router.get("/session")
+async def session_params(db: DbDep):
+    """`create_async_engine(connect_args={"options": ...})` (db.py): the pool's session parameters."""
+    when = await db.scalar(text("select timestamptz '2026-06-01 12:00:00+00'"))
+    return {
+        "tz": await db.scalar(text("show timezone")),
+        "app": await db.scalar(text("show application_name")),
+        "timeout": await db.scalar(text("show statement_timeout")),
+        "when": when,
+        "offset": str(when.utcoffset()),
+        "local": str(await db.scalar(text("select (timestamptz '2026-06-01 12:00:00+00')::timestamp"))),
+    }

@@ -1,5 +1,6 @@
 """Coverage report on a multi-module project: import resolution, routers, continue-on-error."""
 import json
+import re
 import textwrap
 from pathlib import Path
 
@@ -49,10 +50,10 @@ FILES = {
             at: SecretStr
     ''',
     "proj/deps.py": '''
-        import jwt
+        import boto3
 
         async def get_current_user():
-            return jwt.decode("t", "k", algorithms=["HS256"])
+            return boto3.client("s3", region_name="eu-west-3")
     ''',
     "proj/views/__init__.py": "",
     "proj/views/items.py": '''
@@ -121,12 +122,12 @@ def test_report(tmp_path):
     # dyn backend: the SecretStr field blocks the schema, the unmapped lib blocks the dependency; one
     # blocker per route (compilation of a route's closure stops at its first error)
     assert set(routes["/api/items/stamp/now"]["blockers"]) == {"type SecretStr"}
-    assert set(routes["/api/items/me/info"]["blockers"]) == {"lib jwt"}
+    assert set(routes["/api/items/me/info"]["blockers"]) == {"lib boto3"}
     # the second route using the same refused dependency is blocked too (no stale dependency cache)
-    assert set(routes["/api/items/me/again"]["blockers"]) == {"lib jwt"}
+    assert set(routes["/api/items/me/again"]["blockers"]) == {"lib boto3"}
     assert len(routes["/api/items/me/stamp"]["blockers"]) == 1
     alone = {c["construction"]: c["débloquées_seule"] for c in data["constructions"]}
-    assert alone == {"type SecretStr": 2, "lib jwt": 2}
+    assert alone == {"type SecretStr": 2, "lib boto3": 2}
     assert data["glouton"][-1]["cumul"] == 6
     assert data["résumé"] == {"total": 6, "traduites": 2, "bloquées": 4}
 
@@ -142,8 +143,8 @@ def test_required_field_with_ellipsis(tmp_path):
         .split('@router.get("/stamp')[0]
     )
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
-    schemas = (tmp_path / "out" / "src" / "schemas.rs").read_text()
-    assert 'rt::missing(errs, rt::loc(prefix, "label"), v)' in schemas
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert re.search(r'name: "label",\s*alias: None,\s*td: &TD_\d+,\s*default: crate::dynrt::pyd::Dflt::Required,', gen)
 
 
 def test_python_side_auto(tmp_path, capsys):

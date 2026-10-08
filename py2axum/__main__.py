@@ -10,7 +10,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from .codegen import TranspileErrors, generate
 from .frontend import Frontend
 from .ir import TranspileError
 
@@ -27,7 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", type=Path, default=None,
                     help="import root, like sys.path (default: parent of the package)")
     ap.add_argument("--backend", choices=["auto", "typed", "dyn"], default="auto",
-                    help="typed: static Rust (narrow subset); dyn: dynamic values (real projects); auto: typed, else dyn")
+                    help="deprecated, no effect: there is one backend (auto and dyn are accepted until 1.0; "
+                         "typed was removed in 0.4)")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
                          "mount: the app's last app.mount(), which gets every request no translated route fully matches); "
@@ -39,6 +39,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--allow-untested-versions", action="store_true",
                     help="translate even if the project locks library versions outside the tested ranges")
     args = ap.parse_args(argv)
+    if args.backend == "typed":
+        print("error: --backend typed was removed in 0.4: use the default backend (drop --backend)", file=sys.stderr)
+        return 2
     from .versions import check_project
 
     bad = [] if args.allow_untested_versions else check_project(args.root or args.package.resolve().parent, args.package)
@@ -63,24 +66,6 @@ def main(argv: list[str] | None = None) -> int:
     python_side = set(args.python_side)
     auto = "auto" in python_side
     python_side.discard("auto")
-    if auto and args.backend == "typed":
-        ap.error("--python-side auto needs the dyn backend")
-    typed_error = None
-    if args.backend in {"auto", "typed"}:
-        try:
-            app = Frontend(args.package, args.root).run()
-            generate(app, args.out, str(args.package), crate, stream=not args.no_stream)
-            print(
-                f"generated {args.out}: {len(app.routes)} routes, {len(app.models)} models, {len(app.schemas)} schemas",
-                file=sys.stderr,
-            )
-            return 0
-        except (TranspileError, TranspileErrors) as e:
-            typed_error = e
-            if args.backend == "typed":
-                for err in getattr(e, "errors", [e]):
-                    print(f"error: {err.render()}", file=sys.stderr)
-                return 1
     from . import dyn
 
     if auto:
@@ -91,15 +76,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fe = Frontend(args.package, args.root)
         gzip = dyn.prepare(fe, python_side)
-        proj = dyn.generate_project(fe, args.out, str(args.package), crate, gzip=gzip)
+        proj = dyn.generate_project(fe, args.out, str(args.package), crate, gzip=gzip, stream=not args.no_stream)
     except TranspileError as e:
         print(f"error: {e.render()}", file=sys.stderr)
         return 1
     for n in fe.notes:
         print(f"note: {n}", file=sys.stderr)
     print(
-        f"generated {args.out} (dyn backend): {len(proj.fns)} functions, {len(proj.models)} models, "
-        f"{len(proj.schemas)} schemas" + (f" — typed backend: {typed_error.render()}" if typed_error and args.backend == "auto" and hasattr(typed_error, "render") else ""),
+        f"generated {args.out}: {len(proj.fns)} functions, {len(proj.models)} models, {len(proj.schemas)} schemas",
         file=sys.stderr,
     )
     return 0

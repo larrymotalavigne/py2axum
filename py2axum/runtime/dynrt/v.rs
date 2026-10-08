@@ -156,6 +156,8 @@ pub enum Native {
     /// synchronous validation
     ValErr(&'static str, String, V, V),
     Streaming(Mutex<Option<web::Streaming>>),
+    /// a list response streamed from the database (orm::defer_list)
+    ListStream(Mutex<Option<super::orm::ListStream>>),
     Gen(Arc<super::agen::AGen>),
     /// `@asynccontextmanager` called: `_AsyncGeneratorContextManager`
     Acm(Arc<super::agen::AGen>),
@@ -168,6 +170,8 @@ pub enum Native {
     /// the `receive` / `send` callables given to a raw ASGI app
     AsgiReceive(Arc<super::rawasgi::Chan>),
     AsgiSend(Arc<super::rawasgi::Chan>),
+    /// the `app` a raw ASGI middleware was built with: the rest of the middleware stack
+    AsgiApp(Arc<super::asgi::Slot>),
     /// `mcp.server.mcpserver.MCPServer`, its `@tool(...)` decorator, `session_manager`, `session_manager.run()`
     McpServer(Arc<super::mcp::Server>),
     McpToolDeco(Arc<super::mcp::Server>, &'static super::mcp::ToolSpec),
@@ -229,6 +233,16 @@ pub enum Native {
     Sem(Arc<super::aio::Sem>),
     /// sentry_sdk objects: integrations, scopes (see `sentry`)
     Sentry(Arc<super::sentry::Obj>),
+    /// `asyncio.open_connection()`: its StreamReader (false) or StreamWriter (true), see `net`
+    Stream(Arc<super::net::Stream>, bool),
+    /// `zipfile.ZipFile(io.BytesIO(), "w")` (see `zipw`)
+    ZipW(Arc<super::zipw::ZipW>),
+    /// `socket.create_connection()` (see `net`)
+    Socket(Arc<super::net::Sock>),
+    /// `...` used as a value (one object: `ops::ellipsis()`)
+    Ellipsis,
+    /// a `cryptography` RSA key, private or public (see `crypto`)
+    Rsa(Arc<super::crypto::Key>),
 }
 
 pub struct PyFn {
@@ -359,12 +373,14 @@ impl V {
                 Native::Kwargs(_) => "kwargs",
                 Native::ValErr(..) => "ValErr",
                 Native::Streaming(_) => "StreamingResponse",
+                Native::ListStream(_) => "list",
                 Native::Gen(_) => "async_generator",
                 Native::Acm(_) => "_AsyncGeneratorContextManager",
                 Native::Suppress(_) => "suppress",
                 Native::CtxVar(_) => "ContextVar",
                 Native::CtxToken(..) => "Token",
                 Native::AsgiReceive(_) | Native::AsgiSend(_) => "function",
+                Native::AsgiApp(_) => "ExceptionMiddleware",
                 Native::McpServer(_) => "MCPServer",
                 Native::McpToolDeco(..) => "function",
                 Native::McpManager(_) => "StreamableHTTPSessionManager",
@@ -404,6 +420,11 @@ impl V {
                 Native::ExtType(_) => "type",
                 Native::TypeExpr(..) => "GenericAlias",
                 Native::Sem(_) => "Semaphore",
+                Native::Stream(_, w) => if *w { "StreamWriter" } else { "StreamReader" },
+                Native::Ellipsis => "ellipsis",
+                Native::Socket(_) => "socket",
+                Native::ZipW(_) => "ZipFile",
+                Native::Rsa(k) => if matches!(&**k, super::crypto::Key::Private(_)) { "RSAPrivateKey" } else { "RSAPublicKey" },
             },
         }
     }
@@ -468,6 +489,8 @@ impl Key {
                 }
             }
             V::Str(s) => Key::Str(s.clone()),
+            // value semantics, never equal to a str
+            V::Bytes(b) => Key::Str(Arc::from(format!("\u{0}bytes:{}", hex::encode(&b[..])))),
             V::Tuple(t) => Key::Tuple(t.iter().map(Key::of).collect::<R<Vec<_>>>()?),
             V::Date(d) => Key::Date(*d),
             V::DateTime(d) => Key::DateTime(d.key_micros(), d.tz.is_some()),
@@ -705,6 +728,9 @@ builtin_exc!(REDIS_TIMEOUT_ERROR, "TimeoutError", [REDIS_ERROR]);
 builtin_exc!(REDIS_DATA_ERROR, "DataError", [REDIS_ERROR]);
 builtin_exc!(REDIS_RESPONSE_ERROR, "ResponseError", [REDIS_ERROR]);
 builtin_exc!(EOF_ERROR, "EOFError", [EXCEPTION]);
+// gzip.BadGzipFile, zlib.error
+builtin_exc!(BAD_GZIP_FILE, "BadGzipFile", [OS_ERROR]);
+builtin_exc!(ZLIB_ERROR, "error", [EXCEPTION]);
 builtin_exc!(PICKLING_ERROR, "PicklingError", [PICKLE_ERROR]);
 builtin_exc!(UNPICKLING_ERROR, "UnpicklingError", [PICKLE_ERROR]);
 builtin_exc!(LOOKUP_ERROR, "LookupError", [EXCEPTION]);
@@ -731,12 +757,14 @@ builtin_exc!(STOP_ASYNC_ITERATION, "StopAsyncIteration", [EXCEPTION]);
 builtin_exc!(QUEUE_FULL, "QueueFull", [EXCEPTION]);
 builtin_exc!(QUEUE_EMPTY, "QueueEmpty", [EXCEPTION]);
 builtin_exc!(HTTP_EXCEPTION, "HTTPException", [EXCEPTION]);
-builtin_exc!(REQUEST_VALIDATION_ERROR, "RequestValidationError", [VALUE_ERROR]);
+// FastAPI: ValidationException(Exception) <- RequestValidationError, WebSocketRequestValidationError
+builtin_exc!(VALIDATION_EXCEPTION, "ValidationException", [EXCEPTION]);
+builtin_exc!(REQUEST_VALIDATION_ERROR, "RequestValidationError", [VALIDATION_EXCEPTION]);
 // Starlette / FastAPI WebSockets (dynrt/ws.rs); ClientDisconnected is uvicorn's (an OSError)
 builtin_exc!(WS_DISCONNECT, "WebSocketDisconnect", [EXCEPTION]);
 builtin_exc!(WS_DISCONNECTED, "WebSocketDisconnected", [RUNTIME_ERROR]);
 builtin_exc!(WS_EXCEPTION, "WebSocketException", [EXCEPTION]);
-builtin_exc!(WS_VALIDATION_ERROR, "WebSocketRequestValidationError", [EXCEPTION]);
+builtin_exc!(WS_VALIDATION_ERROR, "WebSocketRequestValidationError", [VALIDATION_EXCEPTION]);
 builtin_exc!(CLIENT_DISCONNECTED, "ClientDisconnected", [OS_ERROR]);
 builtin_exc!(VALIDATION_ERROR, "ValidationError", [VALUE_ERROR]);
 builtin_exc!(SQLALCHEMY_ERROR, "SQLAlchemyError", [EXCEPTION]);
@@ -764,6 +792,26 @@ builtin_exc!(JWT_ERROR, "JWTError", [JOSE_ERROR]);
 builtin_exc!(JWT_CLAIMS_ERROR, "JWTClaimsError", [JWT_ERROR]);
 builtin_exc!(EXPIRED_SIGNATURE_ERROR, "ExpiredSignatureError", [JWT_ERROR]);
 builtin_exc!(JWK_ERROR, "JWKError", [JOSE_ERROR]);
+// PyJWT (jwt.exceptions)
+builtin_exc!(PYJWT_ERROR, "PyJWTError", [EXCEPTION]);
+builtin_exc!(PYJWT_INVALID_TOKEN, "InvalidTokenError", [PYJWT_ERROR]);
+builtin_exc!(PYJWT_DECODE_ERROR, "DecodeError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_INVALID_SIGNATURE, "InvalidSignatureError", [PYJWT_DECODE_ERROR]);
+builtin_exc!(PYJWT_EXPIRED_SIGNATURE, "ExpiredSignatureError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_INVALID_AUDIENCE, "InvalidAudienceError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_INVALID_ISSUER, "InvalidIssuerError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_INVALID_ISSUED_AT, "InvalidIssuedAtError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_IMMATURE_SIGNATURE, "ImmatureSignatureError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_INVALID_KEY, "InvalidKeyError", [PYJWT_ERROR]);
+builtin_exc!(PYJWT_INVALID_ALGORITHM, "InvalidAlgorithmError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_MISSING_REQUIRED_CLAIM, "MissingRequiredClaimError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWK_ERROR, "PyJWKError", [PYJWT_ERROR]);
+builtin_exc!(PYJWT_MISSING_CRYPTOGRAPHY, "MissingCryptographyError", [PYJWK_ERROR]);
+builtin_exc!(PYJWK_SET_ERROR, "PyJWKSetError", [PYJWT_ERROR]);
+builtin_exc!(PYJWK_CLIENT_ERROR, "PyJWKClientError", [PYJWT_ERROR]);
+builtin_exc!(PYJWK_CLIENT_CONNECTION_ERROR, "PyJWKClientConnectionError", [PYJWK_CLIENT_ERROR]);
+builtin_exc!(PYJWT_INVALID_SUBJECT, "InvalidSubjectError", [PYJWT_INVALID_TOKEN]);
+builtin_exc!(PYJWT_INVALID_JTI, "InvalidJTIError", [PYJWT_INVALID_TOKEN]);
 builtin_exc!(BAD_DATA, "BadData", [EXCEPTION]);
 builtin_exc!(BAD_SIGNATURE, "BadSignature", [BAD_DATA]);
 builtin_exc!(BAD_TIME_SIGNATURE, "BadTimeSignature", [BAD_SIGNATURE]);
@@ -866,6 +914,12 @@ impl Exc {
     pub fn validation(class: &'static Class, errors: Vec<pyd::ErrDetail>) -> Exc {
         Exc(Arc::new(ExcObj { class, args: vec![], http: None, errors: Some(errors), attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default() }))
     }
+    /// a pydantic `ValidationError` raised for a model: `title` is its name (`str(e)` names it too)
+    pub fn validation_titled(class: &'static Class, errors: Vec<pyd::ErrDetail>, title: &str) -> Exc {
+        let e = Exc::validation(class, errors);
+        e.0.attrs.lock().insert("title".into(), V::str(title));
+        e
+    }
     /// `exc.args` (rebound by `super().__init__(...)` in a project exception)
     pub fn args(&self) -> Vec<V> {
         self.0.new_args.lock().clone().unwrap_or_else(|| self.0.args.clone())
@@ -899,6 +953,12 @@ impl Exc {
                 _ => String::new(),
             };
             return format!("WebPushException: {msg}{extra}");
+        }
+        if std::ptr::eq(self.0.class, &PYJWT_MISSING_REQUIRED_CLAIM) {
+            // MissingRequiredClaimError.__str__
+            if let Some(c) = self.0.attrs.lock().get("claim") {
+                return format!("Token is missing the \"{}\" claim", super::ops::str_(c).unwrap_or_default());
+            }
         }
         if std::ptr::eq(self.0.class, &PACKAGE_NOT_FOUND) && args.len() == 1 {
             // PackageNotFoundError.__str__

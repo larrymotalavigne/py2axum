@@ -1,11 +1,15 @@
 """An application built by a factory (create_app()): endpoints defined inside it read the
 factory's locals; a missing optional module is an ImportError caught at run time."""
+import logging
 import os
+import traceback
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from fixtures.factoryapp.middleware import CountingMiddleware, SecurityHeadersMiddleware, StampMiddleware
 from fixtures.factoryapp.observe import install_observability, introspect, router as shop
@@ -24,6 +28,41 @@ class Conflict(Exception):
         self.what = what
 
 
+class Gone(Exception):
+    pass
+
+
+class Typed(BaseModel):
+    qty: int
+
+
+async def _gone(request: Request, exc: Gone):
+    # the traceback is logged as the application does; the response shows the exception's own line
+    logging.getLogger("factory").info("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    return JSONResponse(status_code=410, content={"lines": traceback.format_exception(type(exc), exc, None),
+                                                  "only": traceback.format_exception_only(exc)})
+
+
+def add_error_handlers(app: FastAPI):
+    """handlers registered by a function given the application (not in the factory's body)"""
+    @app.exception_handler(RequestValidationError)
+    async def _invalid(request: Request, exc: RequestValidationError):
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logging.getLogger("factory").info(f"{request.method} {request.url} 422\n{tb}")
+        return JSONResponse(status_code=422, content={"invalid": exc.errors(), "n": len(exc.errors())})
+
+    async def _key(request: Request, exc: KeyError):
+        return JSONResponse(status_code=400, content={"lines": traceback.format_exception(type(exc), exc, None), "path": request.url.path})
+
+    app.add_exception_handler(KeyError, _key)
+
+    @app.middleware("http")
+    async def _configured(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["x-configured"] = "yes"
+        return response
+
+
 def get_settings() -> Settings:
     return Settings()
 
@@ -40,7 +79,7 @@ def country_for(ip: str) -> str | None:
 def create_app(observed: bool = True) -> FastAPI:
     settings = get_settings()
     prefix = settings.app_name.upper() + "-"
-    app = FastAPI()
+    app = FastAPI(strict_content_type=False)
 
     # last added = outermost: CORS, then the counter, then the security headers
     app.add_middleware(StampMiddleware)
@@ -72,6 +111,21 @@ def create_app(observed: bool = True) -> FastAPI:
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
         return JSONResponse(status_code=500, content={"detail": "Erreur interne du serveur."})
+
+    add_error_handlers(app)
+    app.add_exception_handler(Gone, _gone)
+
+    @app.post("/typed")
+    async def typed(item: Typed):
+        return {"qty": item.qty}
+
+    @app.get("/keyerror")
+    async def keyerror():
+        return {}["missing"]
+
+    @app.get("/gone/{what}")
+    async def gone(what: str):
+        raise Gone(f"{what} is gone")
 
     @app.get("/conflict/{what}")
     async def conflict(what: str):

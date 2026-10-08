@@ -73,6 +73,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::TraceCode(f) => return super::trace::code_attr(f, name),
             Native::Traceback(c, i) => return super::trace::tb_attr(c, *i, name),
             Native::FrameSummary(f, l) => return super::trace::summary_attr(f, *l, name),
+            Native::Rsa(k) => {
+                if let Some(r) = super::crypto::attr(k, name) {
+                    return r;
+                }
+            }
             _ => {}
         }
     }
@@ -151,6 +156,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
         V::Exc(e) if e.0.attrs.lock().contains_key(name) => Ok(e.0.attrs.lock()[name].clone()),
         V::Exc(e) => match name {
             "args" => Ok(V::tuple(e.args())),
+            // the frames a `sys.settrace` function saw, else none (the binary has no Python frames)
+            "__traceback__" => Ok({
+                let chain: Vec<_> = e.0.tb.lock().iter().rev().cloned().collect();
+                if chain.is_empty() { V::None } else { V::native(Native::Traceback(Arc::new(chain), 0)) }
+            }),
             "status_code" if e.http_info().is_some() => Ok(V::Int(e.http_info().unwrap().0 as i64)),
             "detail" if e.http_info().is_some() => Ok(e.http_info().unwrap().1),
             "headers" if e.http_info().is_some() => {
@@ -204,7 +214,9 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
         },
         V::Result(r) => orm::result_attr(r, name),
         V::Col(m, i) => match name {
-            "key" | "name" => Ok(V::str(m.cols[*i].name)),
+            "key" => Ok(V::str(m.cols[*i].name)),
+            // the Column's SQL name (`Column("metadata", ...)` mapped as `extra_data`)
+            "name" => Ok(V::str(m.cols[*i].sql)),
             _ => Err(no_attr(v, name)),
         },
         V::Native(n) if matches!(&**n, Native::McpServer(_)) => match &**n {
@@ -387,7 +399,7 @@ fn schema_fields(s: &'static pyd::SchemaDesc) -> R {
 }
 
 /// UTF-8 decoding with CPython's error messages (`offset`: bytes already consumed, a BOM)
-fn utf8_decode(b: &[u8], offset: usize) -> R {
+pub(super) fn utf8_decode(b: &[u8], offset: usize) -> R {
     match std::str::from_utf8(b) {
         Ok(s) => Ok(V::str(s)),
         Err(e) => {
@@ -427,6 +439,22 @@ fn bytes_method(b: &Arc<[u8]>, name: &str, args: &[V]) -> R {
             let end = if name == "lstrip" { b.len() } else { b.iter().rposition(keep).map(|i| i + 1).unwrap_or(start) };
             Ok(bytes(&b[start..end.max(start)]))
         }
+        "join" => {
+            let [it] = &args[..] else {
+                return Err(Exc::type_error(format!("bytes.join() takes exactly one argument ({} given)", args.len())));
+            };
+            let mut out = Vec::new();
+            for (i, x) in super::ops::iter(it)?.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b);
+                }
+                match x {
+                    V::Bytes(p) => out.extend_from_slice(p),
+                    o => return Err(Exc::type_error(format!("sequence item {i}: expected a bytes-like object, {} found", o.type_name()))),
+                }
+            }
+            Ok(bytes(&out))
+        }
         "startswith" | "endswith" => {
             let check = |p: &[u8]| if name == "startswith" { b.starts_with(p) } else { b.ends_with(p) };
             match args.first() {
@@ -446,6 +474,34 @@ fn bytes_method(b: &Arc<[u8]>, name: &str, args: &[V]) -> R {
                     o.map(|o| o.type_name()).unwrap_or("NoneType")
                 ))),
             }
+        }
+        // bytes.splitlines(keepends=False): \n, \r and \r\n only (not str's Unicode line boundaries)
+        "splitlines" => {
+            let keep = match args.first() {
+                Some(v) => ops::truthy(v)?,
+                None => false,
+            };
+            let mut out = Vec::new();
+            let mut start = 0;
+            let mut i = 0;
+            while i < b.len() {
+                let eol = match b[i] {
+                    b'\r' if b.get(i + 1) == Some(&b'\n') => 2,
+                    b'\r' | b'\n' => 1,
+                    _ => 0,
+                };
+                if eol > 0 {
+                    out.push(bytes(&b[start..if keep { i + eol } else { i }]));
+                    i += eol;
+                    start = i;
+                } else {
+                    i += 1;
+                }
+            }
+            if start < b.len() {
+                out.push(bytes(&b[start..]));
+            }
+            Ok(V::list(out))
         }
         "lower" => Ok(bytes(&b.to_ascii_lowercase())),
         "upper" => Ok(bytes(&b.to_ascii_uppercase())),
@@ -468,6 +524,16 @@ pub fn setattr_raw(v: &V, name: &str, val: V) -> R<()> {
         V::Inst(i) => i.set_field(name, val),
         _ => setattr(v, name, val),
     }
+}
+
+/// `obj.name = val` in project code: a model with `validate_assignment=True` runs its validators (async)
+pub async fn setattr_cx(cx: &Cx, v: &V, name: &str, val: V) -> R<()> {
+    if let V::Inst(i) = v {
+        if i.desc.validate_assignment && ops::dunder(v, "__setattr__").is_none() {
+            return pyd::assign_validated(cx, i, name, val).await;
+        }
+    }
+    setattr(v, name, val)
 }
 
 pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
@@ -572,6 +638,22 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let Native::Sem(s) = &**n else { unreachable!() };
             super::aio::sem_method(s, name).await
         }
+        V::Native(n) if matches!(&**n, Native::ZipW(_)) => {
+            let Native::ZipW(z) = &**n else { unreachable!() };
+            super::zipw::method(z, name, &args, &kwargs)
+        }
+        V::Native(n) if matches!(&**n, Native::Socket(_)) => {
+            let Native::Socket(s) = &**n else { unreachable!() };
+            super::net::sock_method(s, name)
+        }
+        V::Native(n) if matches!(&**n, Native::Rsa(_)) => {
+            let Native::Rsa(k) = &**n else { unreachable!() };
+            super::crypto::method(k, name, &args, &kwargs)
+        }
+        V::Native(n) if matches!(&**n, Native::Stream(..)) => {
+            let Native::Stream(s, w) = &**n else { unreachable!() };
+            super::net::stream_method(s, *w, name, &args).await
+        }
         V::Native(n) if matches!(&**n, Native::TLock(_) | Native::TEvent(_) | Native::TThread(_) | Native::ELoop(_)) => match &**n {
             Native::TLock(l) => super::thread::lock_method(l, name, &args, &kwargs),
             Native::TEvent(e) => super::thread::event_method(e, name, &args, &kwargs),
@@ -590,6 +672,11 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             if name == "error_count" {
                 return Ok(V::Int(errs.len() as i64));
             }
+            // FastAPI's ValidationException.errors(): the stored list, without `url`, no options
+            let fastapi = e.isinstance(&VALIDATION_EXCEPTION);
+            if fastapi && (!args.is_empty() || !kwargs.is_empty()) {
+                return Err(Exc::type_error(format!("ValidationException.errors() takes 1 positional argument but {} were given", args.len() + kwargs.len() + 1)));
+            }
             if !args.is_empty() {
                 return Err(Exc::type_error("ValidationError.errors() takes keyword arguments only"));
             }
@@ -599,7 +686,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             if let Some((k, _)) = kwargs.iter().find(|(k, _)| !matches!(k.as_str(), "include_url" | "include_context" | "include_input")) {
                 return Err(Exc::type_error(format!("errors() got an unexpected keyword argument '{k}'")));
             }
-            let (url, ctx, input) = (flag("include_url")?, flag("include_context")?, flag("include_input")?);
+            let (url, ctx, input) = (flag("include_url")? && !fastapi, flag("include_context")?, flag("include_input")?);
             let mut out = Vec::new();
             for d in errs {
                 let mut items = vec![
@@ -677,7 +764,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         }
         V::Bytes(b) => bytes_method(b, name, &args),
         V::List(l) => list_method(cx, l, name, args, kwargs).await,
-        V::Dict(d) => dict_method(d, name, &args, &kwargs),
+        V::Dict(d) => match ops::is_counter(d).then(|| ops::counter_method(d, name, &args, &kwargs)).flatten() {
+            Some(r) => r,
+            None => dict_method(d, name, &args, &kwargs),
+        },
         V::Set(s) => set_method(s, name, &args),
         V::Tuple(t) => match name {
             "index" => t.iter().position(|x| ops::eq_bool(x, &args[0])).map(|i| V::Int(i as i64)).ok_or_else(|| Exc::value_error("tuple.index(x): x not in tuple")),
@@ -1044,6 +1134,11 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
             let c = c.clone();
             return Ok(super::aio::coro(Box::pin(async move { super::rawasgi::receive(&c).await })));
         }
+        // `await self.app(scope, receive, send)` in a raw middleware: the rest of the stack
+        if let Native::AsgiApp(slot) = &**n {
+            let (cx2, slot) = (cx.clone(), slot.clone());
+            return Ok(super::aio::coro(Box::pin(async move { super::asgi::call_app(&cx2, &slot, args).await })));
+        }
         if let Native::AsgiSend(c) = &**n {
             let (c, msg) = (c.clone(), args.into_iter().next().unwrap_or(V::None));
             return Ok(super::aio::coro(Box::pin(async move { super::rawasgi::send(&c, &msg).await })));
@@ -1242,7 +1337,33 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
                 _ => return Err(Exc::type_error("must be str or None")),
             }
         }
-        "splitlines" => V::list(s.lines().map(V::str).collect()),
+        // str.splitlines: CPython's line boundaries (\r alone, \v, \f, \x1c-\x1e, \x85, U+2028/2029 too)
+        "splitlines" => {
+            let keep = match a0() {
+                Some(v) => ops::truthy(v)?,
+                None => false,
+            };
+            let cs: Vec<char> = s.chars().collect();
+            let (mut out, mut start, mut i) = (Vec::new(), 0, 0);
+            while i < cs.len() {
+                let eol = match cs[i] {
+                    '\r' if cs.get(i + 1) == Some(&'\n') => 2,
+                    '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}' => 1,
+                    _ => 0,
+                };
+                if eol > 0 {
+                    out.push(V::str(cs[start..if keep { i + eol } else { i }].iter().collect::<String>()));
+                    i += eol;
+                    start = i;
+                } else {
+                    i += 1;
+                }
+            }
+            if start < cs.len() {
+                out.push(V::str(cs[start..].iter().collect::<String>()));
+            }
+            V::list(out)
+        }
         "join" => {
             let items = ops::iter(a0().ok_or_else(|| Exc::type_error("join() takes one argument"))?)?;
             let parts = items
@@ -1757,7 +1878,7 @@ pub fn b_callable(args: &[V]) -> R {
     let [v] = args else { return Err(Exc::type_error(format!("callable() takes exactly one argument ({} given)", args.len()))) };
     Ok(V::Bool(match v {
         V::Class(_) => true,
-        V::Native(n) => matches!(&**n, Native::Bound(..) | Native::PyFn(_) | Native::Type(_) | Native::Maker(..) | Native::CallNext(_)),
+        V::Native(n) => matches!(&**n, Native::Bound(..) | Native::PyFn(_) | Native::Type(_) | Native::Maker(..) | Native::CallNext(_) | Native::AsgiApp(_)),
         V::Inst(i) => find_method(i.desc.methods, "__call__").is_some(),
         V::Obj(o) => find_method(o.desc.methods, "__call__").is_some(),
         _ => false,

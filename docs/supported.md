@@ -10,9 +10,21 @@ compare the binary with the Python application, response by response.
 "Differences" are the places where the binary is knowingly not identical to CPython; they are listed so you
 can decide whether they matter for your application.
 
-Two backends exist: the **dyn** backend (`--backend dyn`, the general one, described here) and a small
-**typed** backend that emits statically-typed Rust for simple CRUD handlers (see the end of this page).
-`--backend auto` uses the typed backend when it covers the whole application, else dyn.
+New to py2axum? Start with the [getting-started guide](getting-started.md); `py2axum check` tells you what this
+page means for your application, route by route. To check the binary against your application, see
+[conformance.md](conformance.md).
+
+**Contents:** [Supported versions](#supported-versions) · [Applications, routes, parameters](#applications-routes-parameters)
+· [Dependencies and security](#dependencies-and-security) · [Responses](#responses)
+· [Middleware and exception handlers](#middleware-and-exception-handlers) · [Shutdown](#shutdown-sigterm-sigint)
+· [WebSockets](#websockets) · [Pydantic v2](#pydantic-v2) · [SQLAlchemy 2.0](#sqlalchemy-20-async-postgresql)
+· [Python semantics](#python-semantics) · [asyncio and threading](#asyncio-and-threading) · [Sentry](#sentry-sentry-sdk-2x)
+· [MCP servers](#mcp-servers-mcp-22) · [Standard library](#standard-library) · [Libraries](#libraries)
+· [Hybrid deployments](#hybrid-deployments) · [Runtime environment](#runtime-environment) · [Not supported](#not-supported) · [Large list responses](#large-list-responses)
+
+There is one backend since 0.4 (the statically-typed one was removed: it covered only simple CRUD handlers;
+its list streaming moved to [Large list responses](#large-list-responses)). `--backend auto` and
+`--backend dyn` are still accepted until 1.0 and change nothing; `--backend typed` is an error.
 
 ## Supported versions
 
@@ -36,8 +48,9 @@ forced-streaming passes) at both ends of every range: lowest versions on Python 
 | asyncpg | 0.31.0 | 0.31.0 | `>=0.31.0,<0.32` |
 | Python | 3.12 | 3.14 | `>=3.12,<3.15` |
 
-`mcp` is covered by the conformance of a real MCP server, `asyncpg` by that of a real application on that
-driver (both conformance-tested internally), rather than by the matrix. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
+`mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;
+`asyncpg` was verified the same way on a real application at 0.31.0, which has since moved to psycopg: that
+check is no longer run. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
 inside a range follow the project's version: CPython's messages (3.14 names the role of an unhashable dict key
 or set element and the expected input of a `math` domain error), Pydantic's (2.12 lists the expected
 characters of an invalid UUID), Starlette's `CORSMiddleware`. WebSocket routes reproduce Starlette 1.7
@@ -88,7 +101,8 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
   the mount are not relayed (see WebSockets).
 - Path, query and header parameters (`int/str/bool/float/Enum/UUID/datetime`, `X | None`, lists,
   `Query/Path/Header(...)` constraints and aliases), JSON bodies (one or several models, `Body(embed=)`),
-  `Form()`/`File()`/`UploadFile` (single, optional or list; multipart via `multer` or urlencoded; an empty
+  `Form()`/`File()`/`UploadFile` (single, optional or list, a literal default such as `File(default=[])`, a
+  fresh copy per request; multipart via `multer` or urlencoded; an empty
   string counts as absent like FastAPI; `UploadFile` in memory: `read`, `seek`, `filename`,
   `content_type`, `size`, `.file`). Errors are FastAPI's 422 bodies, byte for byte.
 - JSON bodies (and `json.loads`) are decoded as CPython's `json` does: `NaN`/`Infinity`, encodings detected
@@ -166,6 +180,7 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
   (`vars(obj)` without SQLAlchemy's `_sa_*` keys: its loaded attributes), but its keys come in column order.
   CPython's order follows SQLAlchemy's iteration over a set of columns, which depends on memory addresses:
   it changes from one process to the next, so no order can be reproduced. Same keys and values.
+- Large lists returned straight from the session are streamed: see [Large list responses](#large-list-responses).
 - `StreamingResponse` and async generators (SSE). `await request.is_disconnected()` always returns `False`:
   a disconnected client is noticed at the next send, then the generator's `finally` runs.
 - `BackgroundTasks`: run after the response (an error is logged), not after an error response.
@@ -181,14 +196,50 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
 - `CORSMiddleware` with the behaviour of the Starlette version locked by the project (`uv.lock`: 1.7 adds
   `Vary: Origin` to every response), `GZipMiddleware` (`Vary: Accept-Encoding` like Starlette),
   `BaseHTTPMiddleware` subclasses (one instance per app, built on the first request; `call_next`, mutable
-  `response.headers`; with or without their own `__init__`), `@app.middleware("http")`, `@app.exception_handler(class | code)`.
+  `response.headers`; with or without their own `__init__`), `@app.middleware("http")`, `@app.exception_handler(class | code)`,
+  `app.add_exception_handler(class | code, handler)`.
+- Raw ASGI middleware: a project class with `__init__(self, app, ...)` and `async def __call__(self, scope,
+  receive, send)`, registered with `app.add_middleware(Cls, ...)` or `FastAPI(middleware=[Middleware(Cls,
+  ...)])` (those entries stay inside every `add_middleware`, in list order, as in Starlette). The instance is
+  built with the rest of the stack as its `app`. One `scope` dict per request, shared by every layer (and
+  by `request.scope` below them); `receive()` returns the whole body in one `http.request` message, then
+  `http.disconnect` once the response is complete (uvicorn); `send()` takes `http.response.start` /
+  `http.response.body` (`more_body` streams; without `content-length` the response is sent chunked, as
+  uvicorn does). `await self.app(scope, receive, send)` runs the rest of the stack: a rewritten scope
+  (`headers`, `method`, `path`, `query_string`) is a new request for it, `scope["state"]` is
+  `request.state`, a wrapped `receive` is read to the end of the body and becomes the request body, the
+  response goes through a wrapped `send` as Starlette's messages (`http.response.start` with the raw
+  headers, one body message for a body of known size, one per part plus an empty last one when
+  streamed), and an exception the stack lets through is raised in the middleware. The middleware can
+  answer itself (`send()` messages, or `await response(scope, receive, send)`); its code after
+  `await self.app(...)` runs once the body is complete (`finally` blocks included). An exception before the
+  response starts reaches the outer middlewares, then `ServerErrorMiddleware`; after it started, the
+  response is kept and the exception logged. ContextVars set around `await self.app(...)` are seen by the
+  endpoint and back. `app.state` is a process-wide `State` (`add_middleware(Cls, state=app.state)`).
+  `http.response.trailers`/`pathsend`/`zerocopy` messages and a rewritten `root_path` raise at run time.
+- `starlette_context` 0.5's `RawContextMiddleware(plugins=(RequestIdPlugin(), CorrelationIdPlugin()))`
+  (plugin options `force_new_uuid`, `validate`, `version=4` as literals): the id read from its header or a new
+  `uuid4().hex`, validated like `uuid.UUID(value)` (400 with an empty body otherwise), appended to the
+  response headers. The `context` object itself is not available.
+- `FastAPI(strict_content_type=True | False)` (a literal): without it, the default of the locked FastAPI.
+- `traceback.format_exception(...)` / `format_exception_only(exc)`: the exception's own line
+  (`module.Class: message`), as CPython formats it for a traceback of `None`; `exc.__traceback__` is None
+  (the binary has no Python frames), so frames and chained exceptions are not rendered.
+- Differences (raw ASGI middleware): `GZipMiddleware` always runs outermost, so a middleware added after it
+  sees the response before compression; raw middlewares run for `http` scopes only (`websocket` and `lifespan`
+  pass as if the middleware let them through, its usual first line); a wrapped `receive` is read to the end of
+  the body before the rest of the stack runs, and an original `receive` already consumed by an outer layer
+  still yields the body (uvicorn would wait for the client to disconnect); the 500 for a middleware returning
+  without a response is produced by the layer, so outer middlewares see it (uvicorn produces it itself).
 - `request.cookies` (Starlette's parser), `request.client` (TCP peer), `request.url`, `request.headers`,
   `request.state`, `request.body()`/`json()`.
 - A project function given the application from the factory or the app's module (`configure(app)`) runs
   while the middleware stack is built (on the first request, when Starlette instantiates its middlewares):
-  in it, `app.add_middleware(ProjectMiddleware, ...)` with a project `BaseHTTPMiddleware` subclass,
-  `app.add_route(path, endpoint, methods=)` (a Starlette `Route`: GET implies HEAD; such routes are tried
-  after the declared ones, as when added last), `app.routes`. Other registrations there are refused.
+  in it, `app.add_middleware(ProjectMiddleware, ...)` with a project `BaseHTTPMiddleware` subclass or raw
+  ASGI class, `@app.exception_handler(...)` on its nested functions, `app.add_exception_handler(...)`,
+  `@app.middleware("http")`, `app.add_route(path, endpoint, methods=)` (a Starlette `Route`: GET implies
+  HEAD; such routes are tried after the declared ones, as when added last), `app.routes`. Other
+  registrations there are refused.
 - Routing objects as values: `request.app`, `app.router.routes` as FastAPI 0.141+ lists them (its docs
   routes, an `_IncludedRouter` per `include_router` with its `original_router`, `APIRoute`s, the added
   `Route`s), their `path`, `path_format`, `methods`, `name`, `matches(scope)` returning
@@ -254,8 +305,13 @@ the conformance suite compares the handshake, the messages and the close codes w
 
 - Lax-mode validation with pydantic-core's error types, messages, locations and contexts (speedate for
   dates), smart unions (exactness, fields set), enums, literals, nested models, lists/sets/tuples/dicts,
-  `Optional`, `Field` constraints, aliases (`populate_by_name`), defaults and `default_factory`,
-  `validate_assignment`, `extra=`, `from_attributes`, `str_strip_whitespace`/`to_lower`/`to_upper`,
+  `Optional`, `Field` constraints (and pydantic 1's `min_items`/`max_items`, which `Field()` still maps to
+  `min_length`/`max_length`), aliases (`populate_by_name`), defaults and `default_factory`,
+  `validate_assignment` (an assignment runs the field's `before` validators, its type, its `after` validators
+  with `info.data` holding every other field, then the model's `after` validators: one of those that raises
+  leaves the value assigned, error at loc `()`, as pydantic-core does; refused with a `mode="before"` model
+  validator; an `after` validator's error reports the raw input; a `mode="before"` field validator defined after
+  a `mode="after"` one of the same field is refused), `extra=`, `from_attributes`, `str_strip_whitespace`/`to_lower`/`to_upper`,
   `use_enum_values`, `model_config` as a dict or `ConfigDict`, v1 `class Config` (v1-only keys ignored like
   Pydantic v2 does).
 - An Enum member given to a scalar field (an ORM enum column read into `status: str`...) as pydantic-core takes
@@ -321,13 +377,21 @@ the conformance suite compares the handshake, the messages and the close codes w
 
 - Declarative models (`Mapped[...]`, `mapped_column`, types, `default=`/`server_default=`/`onupdate=`
   (value, callable or SQL), `unique`, `nullable`, `ForeignKey` (a foreign key without a type takes the
-  referenced column's), composite primary keys, `Identity()`, `JSON`/`JSONB` (`none_as_null=`),
+  referenced column's), composite primary keys, `Identity()`, `JSON`/`JSONB` (`none_as_null=`; on `JSONB`, the
+  operators `contains` (`@>`), `contained_by` (`<@`), `has_key` (`?`), `has_any` (`?|`), `has_all` (`?&`), their
+  argument typed like SQLAlchemy types it: a list given to `has_any`/`has_all` is bound as JSONB, which PostgreSQL
+  rejects in both implementations),
   `Uuid`/`UUID` and `Mapped[uuid.UUID]` (read as `uuid.UUID`, a str bound to it is cast by PostgreSQL as with
   psycopg; `as_uuid=False` is refused),
   `Numeric` (`Decimal`, or float with `asdecimal=False`), `Enum` columns, `LargeBinary` (bytes), `ARRAY(String)`
   (lists; `contains`/`contained_by`/`overlap`/`any`), `deferred(Column(...))` and `mapped_column(deferred=True)`
   (left out of what a query loads: reading it then is a lazy load, MissingGreenlet in an async session;
-  `select(Model.col)` and `session.refresh(obj, ["col"])` read it; `undefer()` is refused), `T.with_variant(V, "postgresql")` (V; other dialects' variants
+  `select(Model.col)` and `session.refresh(obj, ["col"])` read it, and so does the loader option
+  `undefer(Model.col)`: in `select(...).options()`, `session.get(..., options=[...])` or after a relationship
+  loader, `selectinload(A.b).options(undefer(B.col))`, also into an object of the identity map that has not
+  loaded it),
+  a SQL column name other than the attribute (`extra_data = Column("metadata", JSON)`: SQL uses the column
+  name, rows and `session.get` the attribute key, `Model.attr.name` is the column's name), `T.with_variant(V, "postgresql")` (V; other dialects' variants
   are ignored), `col.op("...")(value)` (the value typed like the column, as SQLAlchemy does), a column type returned by a project function
   (`def _enum(cls, name): return Enum(cls, name=name, ...)`, inlined; its arguments must be literals or names),
   project `TypeDecorator`s
@@ -350,13 +414,15 @@ the conformance suite compares the handshake, the messages and the close codes w
   Difference: `parent.children.append(x)` sets the foreign key at flush but not `x.parent` before it
   (SQLAlchemy does it immediately through the backref event).
 - Core: `select` (entities, columns, labels, `*cols`), `where`/`filter_by`, joins (explicit, inferred from
-  the single foreign key, relationship), `aliased`, subqueries, `exists`, `in_` (lists, selects, `tuple_`),
-  `like/ilike/startswith/contains`, `is_/is_not`, `is_distinct_from`, `case`, `literal`, `cast`, `extract`,
+  the single foreign key, relationship), `aliased`, subqueries, `exists` (`exists(select)`, `select.exists()`,
+  and `exists().where(...)`, whose FROM is the tables of its criteria less those of the enclosing statement:
+  SQLAlchemy's auto-correlation), `in_` (lists, selects, `tuple_`),
+  `like/ilike/startswith/contains`, `regexp_match` (`~`, `~*` with `flags="i"`; other flags raise), `is_/is_not`, `is_distinct_from`, `case`, `literal`, `cast`, `extract`,
   `func.*` (with `FILTER`), `group_by/having/order_by/limit/offset/distinct(on)` (an expression built once and
   used in the columns and in `GROUP BY` shares its bound parameters, like SQLAlchemy's bind objects; two
   identical expressions built apart do not, and PostgreSQL rejects the grouping, as it does for SQLAlchemy),
   `with_for_update`,
-  `update()`/`delete()` (with `synchronize_session`), `insert()` (core and postgresql dialect: several rows,
+  `update()`/`delete()` (with `synchronize_session`; `returning`, of columns only for a DELETE), `insert()` (core and postgresql dialect: several rows,
   Python column defaults, `on_conflict_do_update(index_elements= | constraint=, set_=, where=)`,
   `on_conflict_do_nothing` (a `constraint=` name SQLAlchemy would not quote),
   `excluded`, `returning`), `text()` with `:named` parameters (and `text(...).bindparams(name=value)`, also inside
@@ -371,12 +437,19 @@ the conformance suite compares the handshake, the messages and the close codes w
   SQLAlchemy's `[SQL: ...]`, `[parameters: ...]` and background-link lines (the binary's SQL is not SQLAlchemy's
   text).
 - The PostgreSQL session time zone: sqlx forces UTC, the runtime applies the one psycopg would see
-  (role/database setting, then server config, or `PY2AXUM_DB_TIMEZONE`).
+  (role/database setting, then server config, or `PY2AXUM_DB_TIMEZONE`), unless the engine sets one.
+- Session parameters of `create_async_engine`/`create_engine(connect_args=...)`: psycopg's libpq
+  `options` (`-c name=value`, `-cname=value`, `--name=value`, `\` escapes) and asyncpg's
+  `server_settings` dict are set on every pool connection; a `TimeZone` among them is the zone timestamptz
+  are decoded in (psycopg). Other `options` switches are refused (a literal string, at translation; a
+  computed one raises `ValueError` when the engine is created); other
+  `connect_args` keys (timeouts, `sslmode`, ...) have no effect.
 - The driver named by `DATABASE_URL` (`postgresql+psycopg://` or `postgresql+asyncpg://`): psycopg returns
   timestamptz in the session's zone, asyncpg as `datetime.timezone.utc` (Pydantic writes `Z`); an ORM-enabled
   `insert(Model)` without `returning` reports `rowcount` -1 over psycopg, the rows inserted over asyncpg.
 - `obj.__dict__` of a mapped object: `_sa_instance_state` then the loaded attributes (a snapshot).
-- `create_async_engine(...)` is the binary's pool (one database, `DATABASE_URL`; its options are ignored);
+- `create_async_engine(...)` is the binary's pool (one database, `DATABASE_URL`; its options are ignored
+  but `connect_args`, above);
   `async with engine.connect() as conn` (rolled back on exit), `async with engine.begin() as conn` (committed on
   exit, rolled back when the block raises).
 - `await conn.run_sync(Base.metadata.create_all)` (e.g. in the lifespan): the DDL is compiled at translation
@@ -483,7 +556,12 @@ the conformance suite compares the handshake, the messages and the close codes w
 - A call of an `async def` that is not awaited is a coroutine object (arguments evaluated at the call,
   body run at the first `await`; a second `await` raises like CPython). `asyncio.gather` (concurrent tasks,
   argument order, `return_exceptions`), `create_task` + `await task`, `add_done_callback`, `Semaphore`,
-  `Lock`, `Queue`, `wait_for`, `sleep`, `to_thread`. The runtime is multi-threaded: two tasks finishing at
+  `Lock`, `Queue`, `wait_for`, `sleep`, `to_thread`, `open_connection(host, port)` (the addresses of
+  `getaddrinfo` tried in order like asyncio, its `ConnectionRefusedError`/`OSError("Multiple exceptions: ...")`
+  messages: `[Errno 61] Connect call failed ('127.0.0.1', 9)` under asyncio, `[Errno 61] Connection refused`
+  under uvloop, which uvicorn uses when the project's `uv.lock` installs it (`uvicorn[standard]`); `StreamWriter.write/drain/close/is_closing/wait_closed/get_extra_info("peername"|"sockname")`,
+  `StreamReader.read/readline/at_eof`; `ssl=`, `limit=` and the other keywords are refused, and so are
+  `readexactly`/`readuntil`). The runtime is multi-threaded: two tasks finishing at
   the same instant have no guaranteed order (asyncio follows creation order).
 - `async with` / `with` follow CPython's protocol (the exception is passed to `__exit__`, a true result
   suppresses it).
@@ -616,7 +694,19 @@ Python 3.7+), `csv` (simplified `Sniffer`), `io.StringIO/BytesIO`, `pathlib`/`op
 `email.mime` (incl. `MIMEBase` with `set_payload` and `email.encoders.encode_base64`)/`email.utils` (`formataddr`, `formatdate`, `make_msgid`), `html.escape`, `ipaddress.ip_address`/`ip_network` (prefix length, `strict=`; membership, str/repr; no netmask form, no IPv6 scope id), `socket.getaddrinfo` (the C library's answer; family and kind are plain ints, not `AddressFamily`/`SocketKind` members; `gaierror` carries only its message),
 `unicodedata.normalize/combining` (the Unicode version of the Python that ran the translation: code points it
 leaves unassigned are left alone, as CPython does), `bytes()`, `pickle` (see below), `functools.wraps`, `inspect.iscoroutinefunction`,
-`importlib.metadata.version("literal")` (resolved at compile time from what `uv sync --frozen` installs: the project of the `pyproject.toml` next to a `uv.lock` at `--root` or above, or a package of that lock; any other name raises `PackageNotFoundError`; refused without such a lock), `typing.get_args/get_origin/get_type_hints`, `collections.defaultdict` with a builtin type factory (`int`, `list`, `str`...) or `deque` (`type()` of it reports `dict`), `collections.deque` (`maxlen`, append/pop on both ends, `extend(left)`, `rotate`, `remove`, `index`, `count`, indexing; JSON-encoded as a list by FastAPI), `string.Formatter().vformat/format`, `string.Template` (`substitute`/`safe_substitute`, CPython's KeyError and invalid-placeholder ValueError). `str.format` and `Formatter` support `{}`/`{0}`/`{name}`, `!r`/`!s` and format specs; attribute/index fields (`{a.b}`, `{a[0]}`), nested specs and `!a` raise. Not yet: `collections.Counter`, other `Formatter` methods.
+`importlib.metadata.version("literal")` (resolved at compile time from what `uv sync --frozen` installs: the project of the `pyproject.toml` next to a `uv.lock` at `--root` or above, or a package of that lock; any other name raises `PackageNotFoundError`; refused without such a lock), `typing.get_args/get_origin/get_type_hints`, `collections.defaultdict` with a builtin type factory (`int`, `list`, `str`...) or `deque` (`type()` of it reports `dict`), `zipfile.ZipFile(io.BytesIO(), "w", ZIP_STORED | ZIP_DEFLATED, compresslevel=)` with `writestr(name, str | bytes,
+compress_type=, compresslevel=)`, `namelist`, `close`/`with` (CPython's bytes: same headers, `0o600` permissions,
+local time of the call, zlib raw deflate; a mode other than a literal `"w"` is refused; `write(path)`,
+`ZipInfo`, ZIP64 and a file object other than `io.BytesIO` raise),
+`socket.create_connection((host, port), timeout=)` (blocking connect, the last failure raised as CPython does
+without `all_errors`; the socket supports `with`, `close`, `getpeername`, `getsockname`),
+`cryptography`'s RSA keys (`rsa.generate_private_key(65537 or 3, key_size >= 1024)`, `private_bytes` in PEM or
+DER, PKCS8 or TraditionalOpenSSL, `NoEncryption()` only; `public_key().public_bytes` as SubjectPublicKeyInfo or
+PKCS1; `key_size`), `...` as a value (a "not given" sentinel default compared with `is`),
+`collections.Counter` (from an iterable, a mapping or keywords; a missing key reads 0 and is not stored;
+`most_common`, `update`/`subtract`, `elements`, `total`, `copy`, `+ - | &` between Counters, CPython's `repr`;
+`type()` of it reports `dict`, and `==` compares like a dict, where CPython 3.10+ ignores zero counts),
+`collections.deque` (`maxlen`, append/pop on both ends, `extend(left)`, `rotate`, `remove`, `index`, `count`, indexing; JSON-encoded as a list by FastAPI), `string.Formatter().vformat/format`, `string.Template` (`substitute`/`safe_substitute`, CPython's KeyError and invalid-placeholder ValueError). `str.format` and `Formatter` support `{}`/`{0}`/`{name}`, `!r`/`!s` and format specs; attribute/index fields (`{a.b}`, `{a[0]}`), nested specs and `!a` raise. Not yet: other `Formatter` methods.
 
 `pickle.dumps/loads` use CPython's format (protocol 5 when the project targets Python ≥ 3.14, else 4):
 bytes written by the binary are read by CPython and the other way round (e.g. a Redis cache shared with
@@ -638,6 +728,7 @@ read back as integral `Decimal`s.
 | tenacity 9 | `@retry(stop=, wait=, retry=, before=, after=, before_sleep=, reraise=, retry_error_callback=)` on async and sync functions (bare `@retry` too), `stop_after_attempt/after_delay/never/any/all`, `wait_fixed/none/random/exponential/exponential_jitter/incrementing/combine/chain`, `retry_if_exception_type/not_exception_type/exception/result`, `retry_always/never/any/all`, `|`/`&`/`+` combinations, `before_sleep_log`, `RetryError` (`last_attempt`), the retry state seen by callbacks (`attempt_number`, `outcome`, `fn`, `args`...). `str(RetryError)` shows `0x0` instead of CPython's object address. Refused: `sleep=`, `retry_error_cls=`, `before_sleep_log(exc_info=True)`, `Retrying`/`AsyncRetrying` objects |
 | prometheus_client 0.26 | `Counter`, `Gauge`, `Summary`, `Histogram`, `Info`, `Enum` (namespace/subsystem/unit, buckets, multiprocess_mode, states, `registry=`), `.labels()` by position or keyword, `inc`/`dec`/`set`/`set_to_current_time`/`set_function`/`observe`/`info`/`state`/`reset`/`remove`/`remove_by_labels`/`clear`, `time()`, `count_exceptions()`, `track_inprogress()` as context managers and decorators (a plain function, like the library: on an `async def` it times the creation of the coroutine), exemplar validation, `CollectorRegistry(target_info=)`, `register`/`unregister`/`get_sample_value`/`get_target_info`/`set_target_info`, `REGISTRY`, `generate_latest(registry, escaping=)` (the text format byte for byte, the four name escapings), `openmetrics.exposition.generate_latest` (OpenMetrics 1.0 with units and exemplars), `restricted_registry(names)` (its collectors in registration order: CPython iterates a set), `start_http_server(port, addr=, registry=)` (the exporter on its own port: content negotiation, gzip, `name[]`, OPTIONS/405, `/favicon.ico`; its `Server`/`Date` headers differ; TLS options refused), `CONTENT_TYPE_LATEST`, `disable_created_metrics()`, `PROMETHEUS_DISABLE_CREATED_SERIES`, CPython's messages. `REGISTRY` holds `GC_COLLECTOR`, `PLATFORM_COLLECTOR` and `PROCESS_COLLECTOR` (unregistering them works, their names stay reserved) but they produce no samples: the binary is not a CPython process, so `python_gc_*`, `python_info` and `process_*` are absent from its output. When several names collide, `DuplicateTimeseries` lists them in the collector's order (CPython prints a set, in hash order). Multiprocess mode (`PROMETHEUS_MULTIPROC_DIR` set at startup): values are written to the library's per-process files (same names, keys and binary layout, so Python workers can share the directory) and `multiprocess.MultiProcessCollector(registry, path=)` merges every file of the directory like prometheus_client (gauge modes `all`/`live*`/`min`/`max`/`sum`/`mostrecent`, histogram accumulation, `pid` labels), `mark_process_dead(pid)`. Refused: custom collectors, `make_asgi_app`/`make_wsgi_app`, the push gateway |
 | python-jose (3.5) | `jwt.encode/decode` with HMAC algorithms and decode options; identical tokens, same exceptions |
+| PyJWT (2.15) | `jwt.encode` (`algorithm=`, `headers=`, `sort_headers=`; datetimes of `exp`/`iat`/`nbf` encoded from a copy), `jwt.decode` / `decode_complete` (`algorithms=`, `options=` with every `verify_*`, `require`, `strict_aud`, `enforce_minimum_key_length`; `audience=`, `issuer=`, `subject=`, `leeway=` as a number or a timedelta), `get_unverified_header`, with HS256/HS384/HS512 and `none`: identical tokens, the same checks in the same order, the `jwt.exceptions` hierarchy and messages (`MissingRequiredClaimError.claim` included). Refused at transpile time: an asymmetric algorithm (RS*, ES*, PS*, EdDSA) written as a literal, `json_encoder=`, `detached_payload=`, `verify=`, extra keyword arguments, `PyJWK`/`PyJWKClient`. At run time an asymmetric algorithm raises a py2axum RuntimeError (500), and so does an HMAC key shaped like a DER structure (PyJWT tries it as a public key). `InsecureKeyLengthWarning` is not emitted. |
 | bcrypt (5.0), pyotp (2.9) | same hashes and codes |
 | itsdangerous (2.2) | `URLSafeTimedSerializer` with the default signer and serializer |
 | cryptography | `Fernet` (tokens readable both ways), `Fernet.generate_key()` |
@@ -650,17 +741,48 @@ read back as integral `Decimal`s.
 | python-dateutil (2.9) | `relativedelta(years=, months=, weeks=, days=, hours=, minutes=, seconds=, microseconds=)` with integers: normalization, `repr`, attributes, `date`/`datetime` `+`/`-` (month-end clamping), `+`/`-`/`*`/`==` between deltas. Refused: absolute fields (`year=`, `day=`, `weekday=`...), `relativedelta(dt1, dt2)`; fractional days/hours raise a py2axum `TypeError` |
 | xmltodict (1.0) | `parse(str or UTF-8 bytes, process_namespaces=, namespaces=)` with the default options (`@` attributes, `#text`, lists for repeated elements, whitespace stripped, comments and processing instructions ignored); `dict_constructor=` is accepted, the result is always made of dicts. Malformed XML raises `xml.parsers.expat.ExpatError` with expat's message and position for the usual errors (others may word or place it differently). A DOCTYPE is refused at run time; other options are refused |
 
+## Hybrid deployments
+
+Routes left to Python (`--python-side PATH`, `--python-side auto`, `--python-side mount`) are relayed to
+`PY2AXUM_PYTHON_URL` (method, path, query, headers and body; the response streamed back). Without that
+variable, a request for one of their paths answers FastAPI's 404 (`{"detail":"Not Found"}`): it never falls
+through to a translated route whose pattern also matches. Relayed requests go through the Python
+application's own middleware stack, not the binary's; WebSockets are never relayed. See
+[how-it-works.md § Hybrid deployments](how-it-works.md#4-hybrid-deployments).
+
+## Runtime environment
+
+The binary reads its configuration from the environment ([the list](getting-started.md#10-runtime-configuration));
+it does not read `.env` files (pydantic-settings reads environment variables only, see [Pydantic v2](#pydantic-v2)): export the
+variables, as an orchestrator does.
+
 ## Not supported
 
-Raw ASGI middlewares, an application wrapped in a project ASGI class at module level (`app = Wrapper(api)`, refused: the
+An application wrapped in a project ASGI class at module level (`app = Wrapper(api)`, refused: the
 binary would serve `api` without it) and mounted ASGI apps (left to Python with `--python-side mount` when registered last), libraries not listed, C extensions,
 `eval`/`exec`, metaclasses, multiple inheritance of project classes, OpenAPI `/docs` in the binary.
 
-## The typed backend
+## Large list responses
 
-For applications made only of simple CRUD handlers, `--backend typed` emits statically-typed Rust (structs,
-`FromRow`, static SQL) and can stream large list responses straight from PostgreSQL in 64 KiB chunks with
-constant memory (`--no-stream` disables it; `PY2AXUM_STREAM_CHUNK`, `PY2AXUM_STREAM_MIN_ROWS`). Its
-subset is narrower: no relationships, no `datetime`/`UUID`/`Decimal`, `AsyncSession` and
-`aiohttp.ClientSession` dependencies only, `GZipMiddleware` as the only middleware, literal router
-prefixes only.
+An endpoint whose `response_model` is `list[Schema]` and that returns the session's rows directly —
+`return (await session.execute(stmt)).scalars().all()`, `return (await session.scalars(stmt)).all()`, or
+`result = await session.execute(stmt)` followed by `return result.scalars().all()` — is answered as a stream:
+the rows are read from PostgreSQL with a cursor on a connection of the pool, each one validated by the
+schema and serialized, and the JSON array is sent in 64 KiB blocks. Memory stays constant whatever the size
+(a 57 MB response: 13–16 MiB of RSS instead of 1.6 GiB buffered) and the first byte leaves after the first
+rows. The bytes are the ones FastAPI sends.
+
+Streaming applies only when nothing observable changes: the session has written nothing in its open
+transaction (no flushed or pending change, no `begin_nested()`), the statement selects one mapped class
+without loader options (`selectinload`...) nor `with_for_update()`, the schema reads only columns of that
+class (no relationship, property or `mode="before"` model validator), the return is not inside
+`try`/`with`, the status has a body, and its literal `LIMIT`, if any, is above `PY2AXUM_STREAM_MIN_ROWS`
+(default 1000, so paginated lists keep the usual path). Otherwise the statement runs as written.
+`PY2AXUM_STREAM_CHUNK` sets the block size (bytes); `--no-stream` turns streaming off at generation.
+
+Differences: a streamed response has no `content-length` (chunked transfer) — a response that fits in the
+first block keeps it — and is therefore compressed by `GZipMiddleware` even under `minimum_size`. The
+statement runs when the response starts, on its own connection (READ COMMITTED: the same rows as in the
+session, which wrote nothing). An error before the first block is a 500 like FastAPI's; after it (a row
+failing response validation, a lost connection) the connection is closed mid-body, where FastAPI, which
+serializes everything first, would answer 500.

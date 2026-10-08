@@ -1,6 +1,8 @@
 """`py2axum check`: per-route status without generating, exit status for CI, refusal of untested versions."""
 import json
 
+import pytest
+
 from py2axum.__main__ import main
 from tests.test_report import write_project
 
@@ -20,8 +22,8 @@ def test_text_output(tmp_path, capsys):
     assert "native       GET /users/count" in out
     assert "refused      GET /api/items/me/info" in out
     # the reason, at file:line of the construct (not of the route)
-    assert "proj/deps.py:5: library call `jwt.decode()` is not supported" in out
-    assert "library jwt" in out and "type SecretStr" in out  # blockers summary
+    assert "proj/deps.py:5: library call `boto3.client()` is not supported" in out
+    assert "library boto3" in out and "type SecretStr" in out  # blockers summary
     assert "2/6 routes native (33.3 %), 0 python-side, 4 refused — generation would fail" in out
     assert "hint: --python-side auto" in out
     assert "\x1b[" not in out  # no colour when not a terminal
@@ -35,10 +37,10 @@ def test_json_and_auto(tmp_path, capsys):
     assert {p for p, s in status.items() if s == "refused"} == BLOCKED
     assert {p for p, s in status.items() if s == "native"} == NATIVE
     info = next(r for r in data["routes"] if r["path"] == "/api/items/me/info")
-    assert info["blockers"] == {"library jwt": [f"{pkg}/deps.py:5"]}
+    assert info["blockers"] == {"library boto3": [f"{pkg}/deps.py:5"]}
     assert info["where"] == f"{pkg}/views/items.py:{info['where'].rsplit(':', 1)[1]}"
     assert {b["construction"]: (b["routes"], b["only_blocker"]) for b in data["blockers"]} == {
-        "library jwt": (2, 2), "type SecretStr": (2, 2)}
+        "library boto3": (2, 2), "type SecretStr": (2, 2)}
     assert data["summary"] == {"total": 6, "native": 2, "python-side": 0, "refused": 4, "native_pct": 33.3,
                                "generates": False}
     # --python-side auto: the same routes stay in Python, generation succeeds
@@ -78,16 +80,33 @@ def test_global_error(tmp_path, capsys):
     assert not any(r["status"] == "python-side" for r in data["routes"])
 
 
-def test_typed_backend_covers_everything(tmp_path, capsys):
+def small_project(tmp_path):
     pkg = write_project(tmp_path)
     for name in ("deps.py", "views/items.py", "schemas.py"):
         (pkg / name).unlink()
     main_py = pkg / "main.py"
     main_py.write_text(main_py.read_text().replace("from proj.views import items\n", "")
                        .replace('    app.include_router(items.router, prefix="/api")\n', ""))
+    return pkg
+
+
+def test_small_project_is_native(tmp_path, capsys):
+    """What the removed typed backend covered goes through the one backend (it was tried first until 0.4)."""
+    pkg = small_project(tmp_path)
     rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path))
-    assert rc == 0 and data["backend"] == "typed"
+    assert rc == 0 and data["backend"] == "dyn"
     assert [(r["path"], r["status"]) for r in data["routes"]] == [("/users/count", "native")]
+
+
+@pytest.mark.parametrize("backend, rc", [("typed", 2), ("dyn", 0), ("auto", 0)])
+def test_backend_option(tmp_path, capsys, backend, rc):
+    """--backend typed was removed in 0.4 (clear error); dyn and auto stay accepted until 1.0."""
+    from py2axum.__main__ import main
+
+    pkg = small_project(tmp_path)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", backend, "-o", str(tmp_path / "out")]) == rc
+    if rc:
+        assert "--backend typed was removed in 0.4: use the default backend" in capsys.readouterr().err
 
 
 def test_untested_version_refused(tmp_path, capsys):

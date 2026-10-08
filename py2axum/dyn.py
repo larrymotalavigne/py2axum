@@ -1,7 +1,6 @@
-"""The `dyn` backend: compile a FastAPI project to Rust code operating on dynamic Python values.
+"""The compiler: a FastAPI project to Rust code operating on dynamic Python values.
 
-The typed backend (`body.py`/`codegen.py`) translates a narrow subset to statically typed Rust.
-Real projects (three layers, services, dynamic attribute access...) are compiled here instead:
+Real projects (three layers, services, dynamic attribute access...) are compiled as written:
 every project function reachable from the routes becomes an `async fn(cx, V...) -> R<V>`, Python
 semantics come from `runtime/dynrt` (values, Pydantic, SQLAlchemy session, FastAPI plumbing), and
 library calls go through the closed list of `libmap.py`. No Python interpreter is involved.
@@ -11,8 +10,8 @@ Unsupported constructs raise `TranspileError` with file:line, as everywhere else
 from __future__ import annotations
 
 import ast
-import functools
 import copy
+import functools
 import json
 import re
 import shutil
@@ -84,6 +83,57 @@ def fn_params(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> list
     if a.kwarg:
         out.append(ParamSpec(a.kwarg.arg, "kwarg", None))
     return out
+
+
+def _session_call(node, meth: str):
+    """`await s.<meth>(q)` or `s.<meth>(q)` (sync Session), `s` a name: the call."""
+    if isinstance(node, ast.Await):
+        node = node.value
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == meth
+            and isinstance(node.func.value, ast.Name) and len(node.args) == 1 and not node.keywords
+            and not isinstance(node.args[0], ast.Starred)):
+        return node
+    return None
+
+
+def list_return(stmts: list, i: int):
+    """A list returned straight from the session, which a route may stream (orm::defer_list):
+    `return (await s.execute(q)).scalars().all()`, `return (await s.scalars(q)).all()`, or
+    `r = await s.execute(q)` then `return r.scalars().all()`. (the session's call, statements used)."""
+    def all_of(e):
+        if (isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "all"
+                and not e.args and not e.keywords):
+            return e.func.value
+        return None
+
+    def scalars_of(e):
+        if (isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "scalars"
+                and not e.args and not e.keywords):
+            return e.func.value
+        return None
+
+    node = stmts[i]
+    if isinstance(node, ast.Return) and (x := all_of(node.value)) is not None:
+        if (y := scalars_of(x)) is not None and (c := _session_call(y, "execute")):
+            return c, 1
+        if c := _session_call(x, "scalars"):
+            return c, 1
+    if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and (c := _session_call(node.value, "execute")) and i + 1 < len(stmts)):
+        nxt = stmts[i + 1]
+        if (isinstance(nxt, ast.Return) and (x := all_of(nxt.value)) is not None and (y := scalars_of(x)) is not None
+                and isinstance(y, ast.Name) and y.id == node.targets[0].id and c.func.value.id != y.id):
+            return c, 2
+    return None
+
+
+def has_list_return(fn) -> bool:
+    for n in ast.walk(fn):
+        for body in (getattr(n, f, None) for f in ("body", "orelse", "finalbody")):
+            if isinstance(body, list) and any(isinstance(b, ast.stmt) for b in body):
+                if any(list_return(body, i) for i in range(len(body))):
+                    return True
+    return False
 
 
 def has_yield(node: ast.AST) -> bool:
@@ -971,9 +1021,15 @@ class Project:
             a0 = call.args[0]
             if not (isinstance(a0, ast.Constant) and a0.value is Ellipsis):
                 opts["default"] = a0
+        is_field = (dotted(call.func) or "").split(".")[-1] == "Field"
         for kw in call.keywords:
             if kw.arg in self.FIELD_KW:
                 cons["pattern" if kw.arg == "regex" else kw.arg] = self.const(kw.value, module, scope)
+            elif kw.arg in {"min_items", "max_items"} and is_field:
+                # pydantic 2 `Field()`: deprecated aliases, used only when min_length/max_length is not given
+                v = self.const(kw.value, module, scope)
+                if v is not None:
+                    cons.setdefault("_" + kw.arg, v)
             elif kw.arg == "default":
                 if not (isinstance(kw.value, ast.Constant) and kw.value.value is Ellipsis):
                     opts["default"] = kw.value
@@ -984,6 +1040,9 @@ class Project:
                 pass
             else:
                 raise self.err(f"unsupported option {kw.arg}= in {dotted(call.func)}()", kw, module)
+        for k in ("min", "max"):
+            if f"_{k}_items" in cons:
+                cons.setdefault(f"{k}_length", cons.pop(f"_{k}_items"))
         return cons, opts
 
     def annotated_opts(self, ann, module: str) -> dict:
@@ -1557,9 +1616,9 @@ class Project:
         if not col.get("fk_col") and len(tinfo.pks) > 1:
             raise self.err(f"relationship {info.sym.name}.{name}: foreign key to the composite key of {tinfo.table} "
                            "is not supported", call, module)
-        cname = col.get("fk_col") or tinfo.cols[tinfo.pk]["name"]
+        cname = col.get("fk_col") or tinfo.cols[tinfo.pk].get("sql") or tinfo.cols[tinfo.pk]["name"]
         for j, c in enumerate(tinfo.cols):
-            if c["name"] == cname:
+            if (c.get("sql") or c["name"]) == cname:
                 return j
         raise self.err(f"relationship {info.sym.name}.{name}: {tinfo.table}.{cname} is not a mapped column", call, module)
 
@@ -1673,7 +1732,7 @@ class Project:
 
     def column(self, name: str, ann, call, module: str, stmt) -> dict:
         col = {"name": name, "ty": None, "nullable": None, "pk": False, "default": None, "server_default": False,
-               "onupdate": None, "fk": None, "autoincrement": True, "deferred": False}
+               "onupdate": None, "fk": None, "autoincrement": True, "deferred": False, "jsonb": False}
         if isinstance(call, ast.Call) and isinstance(self.resolve(module, call.func), Ext) and \
                 self.resolve(module, call.func).dotted in {"sqlalchemy.orm.deferred", "sqlalchemy.orm.strategy_options.deferred"}:
             # `deferred(Column(...))`: left out of the entity's loaded state (read, then unloaded)
@@ -1782,6 +1841,7 @@ class Project:
                     continue
                 if last in self.SA_TYPES:
                     col["ty"] = self.SA_TYPES[last]
+                    col["jsonb"] = last == "JSONB"  # its comparator: @>, <@, ?, ?|, ?&
                     if isinstance(a, ast.Call):
                         # String(50), Text(), JSON(): length and no-op options only
                         ok = {"length", "timezone", "as_uuid", "astext_type"}
@@ -1818,9 +1878,8 @@ class Project:
                     col["fk"] = str(target).split(".")[0] if target else None
                     col["fk_col"] = str(target).split(".")[1] if target and "." in str(target) else None
                 elif isinstance(a, ast.Constant) and isinstance(a.value, str):
-                    if a.value != name:
-                        raise self.err(f"column {name}: a SQL column name different from the attribute "
-                                       f"(\"{a.value}\") is not supported", a, amod)
+                    # `extra_data = Column("metadata", JSON)`: the SQL name, the attribute stays the key
+                    col["sql"] = a.value
                 else:
                     raise self.err(f"column {name}: unsupported column type `{ast.unparse(a)}`", a, module)
             for kw in call.keywords:
@@ -2323,6 +2382,12 @@ class Project:
                     if kind:
                         info.__dict__.setdefault("vinfo", {})[msym] = kind
                     if before:
+                        # pydantic wraps the field's schema in definition order: an `after` validator defined
+                        # earlier sees the raw input (its errors report it); a `before` one defined later
+                        # would run first and change what it sees, an order the runtime does not keep
+                        if any(set(n) & set(names) or "*" in n or "*" in names for n, _ in info.validators):
+                            raise self.err(f"schema {sym.name}.{stmt.name}: a mode=\"before\" validator defined after a "
+                                           "mode=\"after\" validator of the same field is not supported", stmt, module)
                         info.__dict__.setdefault("before", []).append((names, msym))
                     else:
                         info.validators.append((names, msym))
@@ -2373,9 +2438,9 @@ class Project:
             if f.get("validate_default") and any(f["name"] in names for names, _ in info.__dict__.get("before", [])):
                 raise self.err(f"schema {sym.name}.{f['name']}: validate_default=True with a mode='before' validator "
                                "is not supported", node, module)
-        if info.validators and info.__dict__.get("validate_assignment"):
-            raise self.err(f"schema {sym.name}: validate_assignment=True with @field_validator is not supported "
-                           "(the validators would not run on assignment)", node, module)
+        if info.__dict__.get("model_before") and info.__dict__.get("validate_assignment"):
+            raise self.err(f"schema {sym.name}: validate_assignment=True with @model_validator(mode=\"before\") is not "
+                           "supported (pydantic calls it on every assignment with the whole data)", node, module)
         info.fields = fields
         return info
 
@@ -2880,8 +2945,40 @@ class FnCompiler:
     # ---------------------------------------------------------------- statements
 
     def block(self, stmts: list[ast.stmt]) -> None:
-        for s in stmts:
-            self.stmt(s)
+        i = 0
+        while i < len(stmts):
+            if n := self.streamed_list_return(stmts, i):
+                i += n
+                continue
+            self.stmt(stmts[i])
+            i += 1
+
+    def streamed_list_return(self, stmts: list[ast.stmt], i: int) -> int:
+        """A list returned straight from the session (`list_return`): when this function is the endpoint of a
+        route with a list response_model, `orm::defer_list` may hand the statement to the response, which
+        streams it; otherwise the statements run as written. Not under try/with (an exception of the query
+        would escape them), in a generator, nor traced. Returns the statements consumed (0: not this shape)."""
+        if (self.variant != "plain" or self.parent is not None or self.gen or self.sinks or self.ret_capture
+                or self.__dict__.get("traced_fn")):
+            return 0
+        found = list_return(stmts, i)
+        if found is None:
+            return 0
+        call, n = found
+        ts, tq = f"_p2a_ls{self.p.uid()}", f"_p2a_lq{self.p.uid()}"
+        self.emit(f"let mut v_{ident(ts)}: V = {self.expr(call.func.value)};")
+        self.emit(f"let mut v_{ident(tq)}: V = {self.expr(call.args[0])};")
+        self.locals |= {ts, tq}
+        d = self.q(f"{RT}::orm::defer_list(cx, {rs(self.name)}, &v_{ident(ts)}, &v_{ident(tq)}).await")
+        self.emit(f"if let Some(__l) = {d} {{ return Ok(__l); }}")
+        # the session and the statement already evaluated: the same calls, on their values
+        copied = copy.deepcopy(stmts[i:i + n])
+        c2, _ = list_return(copied, 0)
+        c2.func.value = ast.copy_location(ast.Name(ts, ast.Load()), c2.func.value)
+        c2.args[0] = ast.copy_location(ast.Name(tq, ast.Load()), c2.args[0])
+        for node in copied:
+            self.stmt(node)
+        return n
 
     def stmt(self, node: ast.stmt) -> None:
         if self.__dict__.get("traced_fn") and getattr(node, "lineno", None):
@@ -3057,8 +3154,11 @@ class FnCompiler:
                 return
             if isinstance(self.static_ref(target.value), Ext):
                 raise self.err(f"assigning `{ast.unparse(target)}` (a library attribute) is not supported", target)
+            if isinstance(base := self.static_ref(target.value), ModRef):
+                raise self.err(f"assigning `{ast.unparse(target)}` (an attribute of module {base.module}) is not supported: "
+                               "assign it in that module (`global`) or keep it in a mutable container", target)
             obj = self.expr(target.value)
-            self.emit(f"{self.q(f'{RT}::methods::setattr(&{obj}, {rs(target.attr)}, {val})')};")
+            self.emit(f"{self.q(f'{RT}::methods::setattr_cx(cx, &{obj}, {rs(target.attr)}, {val}).await')};")
         elif isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Slice):
             self.check_writable(target.value)
             obj = self.expr(target.value)
@@ -3125,7 +3225,7 @@ class FnCompiler:
             if isinstance(node.target, ast.Attribute):
                 cur = self.q(f"{RT}::methods::getattr(cx, &{t}, {rs(node.target.attr)}).await")
                 new = self.q(f"{RT}::ops::{op}(&{cur}, &{rhs})")
-                self.emit(f"{self.q(f'{RT}::methods::setattr(&{t}, {rs(node.target.attr)}, {new})')};")
+                self.emit(f"{self.q(f'{RT}::methods::setattr_cx(cx, &{t}, {rs(node.target.attr)}, {new}).await')};")
             else:
                 k = self.tmp()
                 self.emit(f"let {k} = {self.expr(node.target.slice)};")
@@ -3568,7 +3668,8 @@ class FnCompiler:
         if isinstance(v, bytes):
             return f"V::Bytes(std::sync::Arc::from(&[{', '.join(f'{b}u8' for b in v)}][..]))"
         if v is Ellipsis:
-            raise self.err("`...` is not supported here", node)
+            # a value (a "not given" sentinel default: `x: str | None = ...`, then `x is not ...`)
+            return f"{RT}::ops::ellipsis()"
         raise self.err(f"unsupported constant {v!r}", node)
 
     def e_Name(self, node: ast.Name) -> str:
@@ -3628,6 +3729,8 @@ class FnCompiler:
         assignment, evaluated once (the factory runs once, at startup)."""
         if name in self.__dict__.get("app_alias", ()):
             return f"{RT}::routing::app()"
+        if name in self.__dict__.get("raw_names", {}):
+            return self.__dict__["raw_names"][name]
         factory = self.__dict__.get("factory")
         if factory is None:
             return None
@@ -4353,11 +4456,18 @@ class FnCompiler:
             if node.func.attr == "add_middleware" and node.args:
                 # `app.add_middleware(Cls, ...)` in a function given the app: the instance is built now (the
                 # stack is being built), its `dispatch` registered
-                if mw_kind(self.p.fe, self.module, node) != "user" or any(isinstance(a, ast.Starred) for a in node.args) \
+                kind = mw_kind(self.p.fe, self.module, node)
+                if kind not in {"user", "asgi"} or any(isinstance(a, ast.Starred) for a in node.args) \
                         or any(k.arg is None for k in node.keywords):
                     raise self.err(f"add_middleware({ast.unparse(node.args[0])}) outside the app factory is not supported "
-                                   "(only a project BaseHTTPMiddleware subclass, arguments written out)", node)
+                                   "(only a project BaseHTTPMiddleware subclass or raw ASGI class, arguments written out)", node)
                 recv = self.expr(node.func.value)
+                if kind == "asgi":
+                    self.p.__dict__.setdefault("stack_classes", []).append(self.p.resolve(self.module, node.args[0]))
+                    slot = self.tmp("slot")
+                    self.emit(f"let {slot} = {RT}::asgi::Slot::new();")
+                    obj = asgi_instance(self, node, slot)
+                    return self.q(f"{RT}::routing::add_asgi(&{recv}, {obj}, {slot})")
                 inst = ast.Call(func=node.args[0], args=[ast.Constant(None)] + node.args[1:], keywords=node.keywords)
                 ast.copy_location(inst, node)
                 ast.fix_missing_locations(inst)
@@ -4731,6 +4841,11 @@ class FnCompiler:
             return self.q(f"{RT}::methods::call_method(cx, &{libmap.VALUES[recv]}, {rs(meth)}, {args}, {kwargs}).await")
         if tmpl is None:
             raise self.err(f"library call `{name}()` is not supported (not in the py2axum library map)", node)
+        if name.startswith("jwt."):
+            try:
+                libmap.pyjwt_static(name, node)
+            except ValueError as e:
+                raise self.err(f"{name}(): {e}", node) from None
         for k in node.keywords:
             if k.arg in libmap.REFUSED_KWARGS.get(name, ()):
                 raise self.err(f"{name}({k.arg}=) is not supported", node)
@@ -4886,7 +5001,7 @@ class FnCompiler:
             return self.q(f"{RT}::methods::getattr(cx, &{obj}, &{RT}::ops::str_(&{attr})?).await")
         if name == "setattr":
             obj, attr, val = (self.expr(a) for a in node.args)
-            return f"{{ {self.q(f'{RT}::methods::setattr(&{obj}, &{RT}::ops::str_(&{attr})?, {val})')}; V::None }}"
+            return f"{{ {self.q(f'{RT}::methods::setattr_cx(cx, &{obj}, &{RT}::ops::str_(&{attr})?, {val}).await')}; V::None }}"
         if node.keywords and name not in KWARG_BUILTINS:
             # a keyword argument the template would drop: positional when CPython allows it, else refused
             names = POSITIONAL_KWARGS.get(name, ())
@@ -5218,7 +5333,14 @@ class RouteBuilder:
                 if "default" in opts or "default_factory" in opts:
                     dv = opts.get("default")
                     if not (isinstance(dv, ast.Constant) and dv.value is None):
-                        raise TranspileError(f"{name}: a File() default other than None is not supported", arg, src)
+                        # a literal (`File(default=[])`): FastAPI hands a copy of it when no file is sent
+                        try:
+                            p.default = self.p.dflt(dv, module) if dv is not None else None
+                        except TranspileError:
+                            p.default = None
+                        if p.default is None:
+                            raise TranspileError(f"{name}: a File() default other than None or a literal is not supported",
+                                                 arg, src)
                     p.required = False
                 if "alias" in opts:
                     p.alias = self.p.const(opts["alias"], module, fn)
@@ -5405,7 +5527,7 @@ class RouteBuilder:
                              f"{str(p.required).lower()}, {d}, __errs).await?;")
             elif p.kind == "file":
                 lines.append(f"let p_{ident(p.name)} = {RT}::web::form_file(&__form, {rs(p.alias or p.name)}, "
-                             f"{str(p.list).lower()}, {str(p.required).lower()}, __errs);")
+                             f"{str(p.list).lower()}, {str(p.required).lower()}, {d}, __errs);")
             elif p.kind == "oauth2form":
                 # fastapi.security.OAuth2PasswordRequestForm: its six Form() fields, then the object
                 tstr, tgrant, topt = p.security
@@ -5507,6 +5629,9 @@ class RouteBuilder:
             f"    let __errs = &mut __errv;\n"
             + "".join(f"    {line}\n" for line in lines)
             + f"    {RT}::web::check(__errv)?;\n"
+            + (f"    {RT}::web::stream_list_ok(cx, {rs(endpoint)}, &{response_model});\n"
+               if response_model and resp_cls in {None, "JSONResponse"} and self.p.__dict__.get("stream_lists", True)
+               and has_list_return(fn) else "")
             + f"    let __ret = {endpoint}(cx{''.join(', ' + a for a in args)}).await?;\n"
             + (f"    {RT}::web::respond(cx, __ret, {rm}, {status or 200}).await\n}}" if resp_cls in {None, "JSONResponse"} else
                f"    {RT}::web::respond_as(cx, __ret, {rm}, {f'Some({status})' if status else 'None'}, Some({rs(resp_cls)})).await\n}}")
@@ -5775,9 +5900,10 @@ def emit_descriptors(p: Project) -> list[str]:
             d = f"{RT}::orm::ColDefault::{c['default']}" if c["default"] else f"{RT}::orm::ColDefault::None"
             u = f"{RT}::orm::ColDefault::{c['onupdate']}" if c["onupdate"] else f"{RT}::orm::ColDefault::None"
             cols.append(
-                f"{RT}::orm::ColDesc {{ name: {rs(c['name'])}, ty: {RT}::orm::ColTy::{c['ty']}, nullable: {str(c['nullable']).lower()}, "
+                f"{RT}::orm::ColDesc {{ name: {rs(c['name'])}, sql: {rs(c.get('sql') or c['name'])}, ty: {RT}::orm::ColTy::{c['ty']}, nullable: {str(c['nullable']).lower()}, "
                 f"pk: {str(c['pk']).lower()}, autoincrement: {str(c['autoincrement']).lower()}, default: {d}, "
-                f"server_default: {str(c['server_default']).lower()}, onupdate: {u}, deferred: {str(c['deferred']).lower()} }}"
+                f"server_default: {str(c['server_default']).lower()}, onupdate: {u}, deferred: {str(c['deferred']).lower()}, "
+                f"jsonb: {str(c['jsonb']).lower()} }}"
             )
         methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
         b = lambda x: str(bool(x)).lower()  # noqa: E731
@@ -6004,7 +6130,7 @@ edition = "2021"
 
 [dependencies]
 axum = {{ version = "0.8", features = ["ws"] }}
-tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }}
+tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }}
 futures-util = "0.3"
 sqlx = {{ version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "json", "uuid"] }}
 serde = {{ version = "1", features = ["derive"] }}
@@ -6087,6 +6213,7 @@ async fn main() {{
             }}
             let tz = dynrt::orm::db_tz_name().unwrap_or_else(|| "UTC".into());
             conn.execute(format!("SET TimeZone TO '{{}}'", tz.replace('\\'', "")).as_str()).await?;
+            dynrt::orm::session_params(conn).await?;
             Ok(())
         }}))
         .connect_lazy_with(opts);
@@ -6264,6 +6391,12 @@ def prepare(fe: Frontend, python_side: set[str]):
         if "middleware" in txt and e.node is not None and _conditional(fe, e):
             fe.notes.append(f"{txt} — under an `if`: ignored (documented difference)")
             continue
+        if "(only GZipMiddleware)" in e.msg and isinstance(e.node, ast.Call):
+            # the dyn backend compiles more middlewares than the typed one
+            e = TranspileError(e.msg.replace("(only GZipMiddleware)", "(CORSMiddleware, GZipMiddleware, BaseHTTPMiddleware, a "
+                                             "project BaseHTTPMiddleware subclass or raw ASGI class with `async def "
+                                             "__call__(self, scope, receive, send)`, starlette_context's RawContextMiddleware)"),
+                               e.node, e.file)
         kept.append(e)
     fe.global_errors = kept
     fe.python_side = set(python_side)
@@ -6278,6 +6411,14 @@ def prepare(fe: Frontend, python_side: set[str]):
                         pass  # OpenAPI/docs metadata: no effect on the translated routes (/docs is not served)
                     elif kw.arg == "debug" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
                         pass
+                    elif kw.arg == "middleware":
+                        pass  # compiled into the middleware stack (build_stack)
+                    elif kw.arg == "strict_content_type":
+                        if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                            fe.strict_ct = kw.value.value
+                        else:
+                            kept.append(TranspileError("FastAPI(strict_content_type=...) must be a literal True or False",
+                                                       kw, str(m.path)))
                     else:
                         kept.append(TranspileError(f"FastAPI({kw.arg}=...) is not supported", kw, str(m.path)))
     fe._discover_routers()
@@ -6371,22 +6512,71 @@ def _route_path(fe: Frontend, e: TranspileError):
         return None
 
 
-def mw_kind(fe: Frontend, module: str, call: ast.Call) -> str | None:
-    """The middleware class of `app.add_middleware(X, ...)`: cors, base, user (a project subclass of
-    BaseHTTPMiddleware), gzip (a tower layer) or None (unsupported)."""
-    if not call.args:
-        return None
-    t = fe.index.resolve_expr(module, call.args[0])
+MW_CONTEXT = {"starlette_context.middleware.RawContextMiddleware",
+              "starlette_context.middleware.raw_middleware.RawContextMiddleware"}
+# starlette_context plugins the runtime ports (dynrt/ctxmw.rs): class -> header key
+CONTEXT_PLUGINS = {**{f"starlette_context.plugins.{n}": k for n, k in (("RequestIdPlugin", "X-Request-ID"),
+                                                                      ("CorrelationIdPlugin", "X-Correlation-ID"))},
+                   "starlette_context.plugins.request_id.RequestIdPlugin": "X-Request-ID",
+                   "starlette_context.plugins.correlation_id.CorrelationIdPlugin": "X-Correlation-ID"}
+MW_ENTRY = {"starlette.middleware.Middleware", "fastapi.middleware.Middleware"}
+
+
+def asgi_call_method(fe: Frontend, sym: Sym):
+    """`async def __call__(self, scope, receive, send)` of a project class (or of its project bases), else None."""
+    seen = set()
+    while isinstance(sym, Sym) and sym not in seen:
+        seen.add(sym)
+        d = fe.index.definition(sym)
+        if not isinstance(d, ast.ClassDef):
+            return None
+        for f in d.body:
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == "__call__":
+                a = f.args
+                ok = (isinstance(f, ast.AsyncFunctionDef) and len(a.posonlyargs) + len(a.args) == 4
+                      and not a.vararg and not a.kwarg and not a.kwonlyargs)
+                return f if ok else None
+        bases = [fe.index.resolve_expr(sym.module, b) for b in d.bases]
+        bases = [b for b in bases if isinstance(b, Sym)]
+        sym = bases[0] if len(bases) == 1 and len(d.bases) == 1 else None
+    return None
+
+
+def mw_class_kind(fe: Frontend, module: str, cls: ast.AST) -> str | None:
+    """The kind of a middleware class: cors, base, user (a project subclass of BaseHTTPMiddleware), asgi (a
+    project class with `async __call__(self, scope, receive, send)`), context (starlette_context's
+    RawContextMiddleware), gzip (a tower layer) or None (unsupported)."""
+    t = fe.index.resolve_expr(module, cls)
     if isinstance(t, Ext):
         c = libmap.canonical(t.dotted)
-        return "cors" if c in MW_CORS else "base" if c in MW_BASE else "gzip" if c in MW_GZIP else None
+        return ("cors" if c in MW_CORS else "base" if c in MW_BASE else "gzip" if c in MW_GZIP
+                else "context" if c in MW_CONTEXT else None)
     if isinstance(t, Sym):
         d = fe.index.definition(t)
         if isinstance(d, ast.ClassDef) and len(d.bases) == 1:
             b = fe.index.resolve_expr(t.module, d.bases[0])
             if isinstance(b, Ext) and libmap.canonical(b.dotted) in MW_BASE:
                 return "user"
+        if isinstance(d, ast.ClassDef) and asgi_call_method(fe, t) is not None:
+            return "asgi"
     return None
+
+
+def mw_kind(fe: Frontend, module: str, call: ast.Call) -> str | None:
+    """The middleware class of `app.add_middleware(X, ...)` (see mw_class_kind)."""
+    if not call.args:
+        return None
+    return mw_class_kind(fe, module, call.args[0])
+
+
+def mw_entries(fe: Frontend, module: str, call: ast.Call) -> list | None:
+    """`FastAPI(..., middleware=[Middleware(X, ...), ...])`: the list's elements, else None."""
+    kw = next((k for k in call.keywords if k.arg == "middleware"), None)
+    if kw is None or not (isinstance(call.func, (ast.Name, ast.Attribute)) and dotted(call.func) in {"FastAPI", "fastapi.FastAPI"}):
+        return None
+    if not isinstance(kw.value, (ast.List, ast.Tuple)):
+        raise TranspileError("FastAPI(middleware=...) must be a literal list of Middleware(...)", kw.value, str(fe.index.module(module).path))
+    return list(kw.value.elts)
 
 
 def stack_deco(fe: Frontend, module: str, d: ast.AST) -> str | None:
@@ -6410,7 +6600,9 @@ def stack_node(fe: Frontend, module: str, node: ast.AST) -> bool:
     """A registration the middleware stack compiles (so not a global error)."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr == "add_middleware" and fe._is_app(module, node.func.value):
-            return mw_kind(fe, module, node) in {"cors", "base", "user"}
+            return mw_kind(fe, module, node) in {"cors", "base", "user", "asgi", "context"}
+        if node.func.attr == "add_exception_handler" and fe._is_app(module, node.func.value):
+            return True
         if is_add_route(fe, module, node):
             return True  # run while the stack is built, like Starlette registering the route
         return stack_deco(fe, module, node) is not None
@@ -6430,8 +6622,8 @@ def configure_call(fe: Frontend, module: str, call: ast.Call) -> set[str]:
 
 
 # registrations a function given the app cannot make in the binary (routes and handlers are compiled)
-CONFIGURE_REFUSED = {"include_router", "mount", "add_api_route", "add_exception_handler", "add_websocket_route",
-                     "add_event_handler", "exception_handler", "middleware", "on_event", "websocket", "api_route",
+CONFIGURE_REFUSED = {"include_router", "mount", "add_api_route", "add_websocket_route",
+                     "add_event_handler", "on_event", "websocket", "api_route",
                      "get", "post", "put", "patch", "delete", "head", "options"}
 
 
@@ -6453,7 +6645,10 @@ def check_configure(p: "Project", fe: Frontend, module: str, call: ast.Call) -> 
 
 def _stack_relevant(fe: Frontend, module: str, node: ast.AST) -> bool:
     for n in ast.walk(node):
-        if isinstance(n, ast.Call) and (stack_node(fe, module, n) or configure_call(fe, module, n)):
+        if isinstance(n, ast.Call) and (stack_node(fe, module, n) or configure_call(fe, module, n)
+                                       or (isinstance(n.func, (ast.Name, ast.Attribute))
+                                           and dotted(n.func) in {"FastAPI", "fastapi.FastAPI"}
+                                           and any(k.arg == "middleware" for k in n.keywords))):
             return True
     return False
 
@@ -6896,6 +7091,75 @@ def link_mutated_globals(p: "Project", module: str, st: ast.stmt, node) -> None:
             p.edges.setdefault(("global", sym), set()).add(node)
 
 
+ENGINE_CALLS = ("sqlalchemy.create_engine", "sqlalchemy.ext.asyncio.create_async_engine")
+
+
+def engine_globals(p: "Project", fe: Frontend) -> None:
+    """`engine = create_[async_]engine(..., connect_args=...)` in a module the application imports: evaluated
+    at startup even when nothing reads it (the session dependency is native), before the pool's first
+    connection, so its session parameters (`orm::engine_connect_args`) apply to every connection."""
+    for name in import_order(fe):
+        m = fe.index.module(name)
+        if m is None:
+            continue
+        for st in m.tree.body:
+            if not (isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Call)
+                    and any(k.arg == "connect_args" for k in st.value.keywords)):
+                continue
+            targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+            t = p.resolve(m.name, st.value.func)
+            if not (isinstance(t, Ext) and t.dotted in ENGINE_CALLS) or len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+            try:
+                check_libpq_options(p, m.name, st.value)
+                p.global_value(Sym(m.name, targets[0].id))
+            except TranspileError as e:
+                if not p.collect:
+                    raise
+                fe.global_errors.append(e)
+
+
+def libpq_switches(opts: str) -> list[str]:
+    """libpq `options` split as the server does (`pg_split_opts`); the switches other than `-c name=value`
+    and `--name=value` (what `orm::engine_connect_args` applies)."""
+    words, cur, started, i = [], "", False, 0
+    while i < len(opts):
+        c = opts[i]
+        if c in " \t\n\r\f\v":
+            if started:
+                words.append(cur)
+                cur, started = "", False
+        elif c == "\\":
+            started = True
+            i += 1
+            cur += opts[i] if i < len(opts) else ""
+        else:
+            started = True
+            cur += c
+        i += 1
+    if started:
+        words.append(cur)
+    bad, it = [], iter(words)
+    for w in it:
+        opt = next(it, None) if w == "-c" else w[2:] if w.startswith(("-c", "--")) else None
+        if opt is None or "=" not in opt or opt.startswith("="):
+            bad.append(w if opt is None or w != "-c" else f"-c {opt}")
+    return bad
+
+
+def check_libpq_options(p: "Project", module: str, call: ast.Call) -> None:
+    """A literal `connect_args={"options": "..."}`: a switch the runtime would not apply is refused here."""
+    ca = next(k.value for k in call.keywords if k.arg == "connect_args")
+    if not isinstance(ca, ast.Dict):
+        return
+    for k, v in zip(ca.keys, ca.values):
+        if isinstance(k, ast.Constant) and k.value == "options" and isinstance(v, ast.Constant) and isinstance(v.value, str):
+            bad = libpq_switches(v.value)
+            if bad:
+                raise TranspileError(f"connect_args options: only `-c name=value` and `--name=value` switches are supported "
+                                     f"(found {bad[0]!r})", v, p.src(module))
+
+
 def module_statements(p: "Project", fe: Frontend) -> None:
     """Module-level call statements (`INI.set_main_option(...)`, `logger.setLevel(...)`) of the modules the
     translation uses, compiled to run at startup in their place among the module's globals."""
@@ -6971,6 +7235,56 @@ def starlette_version(p: "Project") -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+def creates_app(fn) -> bool:
+    """an application factory: its body builds the FastAPI application"""
+    return any(isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))
+               and dotted(n.func) in {"FastAPI", "fastapi.FastAPI"} for n in ast.walk(fn))
+
+
+def asgi_instance(fc: "FnCompiler", call: ast.Call, slot: str) -> str:
+    """`Cls(app, *args, **kwargs)` of a raw ASGI middleware, `app` being the stack after it (`slot`)."""
+    if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+        raise fc.err("add_middleware(*args/**kwargs) is not supported", call)
+    name = "__py2axum_next_app"
+    inst = ast.Call(func=call.args[0], args=[ast.Name(id=name, ctx=ast.Load())] + call.args[1:], keywords=call.keywords)
+    ast.copy_location(inst, call)
+    ast.fix_missing_locations(inst)
+    fc.__dict__.setdefault("raw_names", {})[name] = f"V::native({RT}::Native::AsgiApp({slot}.clone()))"
+    try:
+        return fc.expr(inst)
+    finally:
+        fc.__dict__["raw_names"].pop(name)
+
+
+def context_mw(fe: Frontend, module: str, call: ast.Call, src: str) -> str:
+    """`RawContextMiddleware(plugins=(RequestIdPlugin(...), ...))`: the plugins, read statically."""
+    def err(msg, node):
+        return TranspileError(f"RawContextMiddleware: {msg}", node, src)
+    plugins = []
+    for k in call.keywords:
+        if k.arg != "plugins":
+            raise err(f"option {k.arg}= is not supported (only plugins=)", k)
+        if not isinstance(k.value, (ast.Tuple, ast.List)):
+            raise err("plugins= must be a literal tuple or list", k.value)
+        for pc in k.value.elts:
+            t = fe.index.resolve_expr(module, pc.func) if isinstance(pc, ast.Call) else None
+            key = CONTEXT_PLUGINS.get(libmap.canonical(t.dotted)) if isinstance(t, Ext) else None
+            if key is None or pc.args:
+                raise err(f"plugin {ast.unparse(pc)} is not supported (RequestIdPlugin, CorrelationIdPlugin, keyword options)", pc)
+            opts = {"force_new_uuid": False, "validate": True}
+            for o in pc.keywords:
+                if o.arg == "version" and isinstance(o.value, ast.Constant) and o.value.value == 4:
+                    continue
+                if o.arg not in opts or not (isinstance(o.value, ast.Constant) and isinstance(o.value.value, bool)):
+                    raise err(f"plugin option {o.arg}= is not supported (force_new_uuid, validate as literals, version=4)", o)
+                opts[o.arg] = o.value.value
+            plugins.append(f"{RT}::ctxmw::Plugin {{ key: {rs(key)}, force_new_uuid: {str(opts['force_new_uuid']).lower()}, "
+                           f"validate: {str(opts['validate']).lower()} }}")
+    if len(call.args) > 1:
+        raise err("pass plugins= by keyword", call)
+    return f"{RT}::ctxmw::RawContext {{ plugins: vec![{', '.join(plugins)}] }}"
+
+
 def build_stack(p: "Project", fe: Frontend) -> str:
     """`pub fn stack`: the app's middlewares and exception handlers, registered in source order, the
     `if`s around them evaluated at startup (in the factory's scope for a factory)."""
@@ -6984,14 +7298,23 @@ def build_stack(p: "Project", fe: Frontend) -> str:
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and configure_call(fe, module, st.value):
                 # `configure(app)`: a project function given the application, run while the stack is built
                 check_configure(p, fe, module, st.value)
-                fc.__dict__["app_alias"] = configure_call(fe, module, st.value)
+                saved = fc.__dict__.get("app_alias")
+                fc.__dict__["app_alias"] = configure_call(fe, module, st.value) | (saved or set())
                 try:
                     fc.emit(f"let _ = {fc.expr(st.value)};")
                 finally:
                     fc.__dict__.pop("app_alias")
+                    if saved is not None:
+                        fc.__dict__["app_alias"] = saved
                 fc.emit(f"for __mw in {RT}::routing::take_built() {{ __st.add_middleware(__mw); }}")
+                fc.emit(f"for (__k, __h) in {RT}::routing::take_handlers() {{ __st.exception_handler(&__k, __h)?; }}")
             elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and stack_node(fe, module, st.value):
                 middleware(fc, module, st.value)
+            elif (isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Call)
+                  and mw_entries(fe, module, st.value) is not None):
+                # `app = FastAPI(middleware=[...])`: Starlette's user_middleware starts as that list
+                for e in mw_entries(fe, module, st.value):
+                    entry(fc, module, e)
             elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(stack_deco(fe, module, d) for d in st.decorator_list):
                 handler(fc, module, st, factory)
             elif isinstance(st, ast.If):
@@ -7001,9 +7324,12 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                 fc.emit("} else {")
                 stmts(fc, module, st.orelse, factory)
                 fc.emit("}")
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and factory is None and not creates_app(st):
+                continue  # a function given the application (`configure(app)`): run where the factory calls it
             elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and factory is None:
                 sub = FnCompiler(p, module, None, "stack")
                 sub.factory = st
+                sub.__dict__["app_alias"] = set(fe.app_vars.get(module, ()))
                 stmts(sub, module, st.body, st)
                 fc.emit("{")
                 fc.lines.extend(sub.lines)
@@ -7014,7 +7340,26 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                                      "(only at the top level of the module or of the app factory, or under an `if`)",
                                      n, p.src(module))
 
-    def middleware(fc: "FnCompiler", module: str, call: ast.Call) -> None:
+    def entry(fc: "FnCompiler", module: str, e: ast.AST) -> None:
+        """`Middleware(cls, *args, **kwargs)` of `FastAPI(middleware=[...])`"""
+        f = fe.index.resolve_expr(module, e.func) if isinstance(e, ast.Call) else None
+        if not (isinstance(f, Ext) and libmap.canonical(f.dotted) in MW_ENTRY and e.args):
+            raise TranspileError("FastAPI(middleware=[...]) entries must be Middleware(cls, ...)", e, p.src(module))
+        if mw_class_kind(fe, module, e.args[0]) == "gzip":
+            raise TranspileError("Middleware(GZipMiddleware) in FastAPI(middleware=[...]) is not supported "
+                                 "(use app.add_middleware(GZipMiddleware, ...))", e, p.src(module))
+        middleware(fc, module, e, push=True)
+
+    def middleware(fc: "FnCompiler", module: str, call: ast.Call, push: bool = False) -> None:
+        add = "push_middleware" if push else "add_middleware"
+        if (isinstance(call.func, ast.Attribute) and call.func.attr == "add_exception_handler"
+                and not push and fe._is_app(module, call.func.value)):
+            # `app.add_exception_handler(key, handler)`
+            args = list(call.args) + [k.value for k in call.keywords]
+            if len(args) != 2 or any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+                raise TranspileError("app.add_exception_handler(key, handler) takes two arguments", call, p.src(module))
+            fc.emit(f"__st.exception_handler(&{fc.expr(args[0])}, {fc.expr(args[1])})?;")
+            return
         if is_add_route(fe, module, call):
             path = _route_path(fe, TranspileError("", call, p.src(module)))
             if path in fe.python_side:
@@ -7025,11 +7370,14 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                 raise TranspileError("add_route() with a class endpoint (HTTPEndpoint, raw ASGI class) is not supported: "
                                      "pass an instance or a function", ep, p.src(module))
             names = {n.id for n in ast.walk(call.func) if isinstance(n, ast.Name)}
-            fc.__dict__["app_alias"] = names
+            saved = fc.__dict__.get("app_alias")
+            fc.__dict__["app_alias"] = names | (saved or set())
             try:
                 fc.emit(f"let _ = {fc.expr(call)};")
             finally:
                 fc.__dict__.pop("app_alias")
+                if saved is not None:
+                    fc.__dict__["app_alias"] = saved
             return
         kind = mw_kind(fe, module, call)
         if any(k.arg is None for k in call.keywords) or any(isinstance(a, ast.Starred) for a in call.args):
@@ -7039,12 +7387,26 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                 raise TranspileError("CORSMiddleware options must be passed by keyword", call, p.src(module))
             kw = ", ".join(f"({rs(k.arg)}.to_string(), {fc.expr(k.value)})" for k in call.keywords)
             major, minor = starlette_version(p)
-            fc.emit(f"__st.add_middleware({RT}::asgi::Mw::Cors({RT}::asgi::Cors::new(vec![{kw}], ({major}, {minor}))?));")
+            fc.emit(f"__st.{add}({RT}::asgi::Mw::Cors({RT}::asgi::Cors::new(vec![{kw}], ({major}, {minor}))?));")
         elif kind == "base":
             disp = [k for k in call.keywords if k.arg == "dispatch"]
             if len(call.args) != 1 or len(disp) != 1 or len(call.keywords) != 1:
                 raise TranspileError("add_middleware(BaseHTTPMiddleware, dispatch=f) is the only supported form", call, p.src(module))
-            fc.emit(f"__st.add_middleware({RT}::asgi::Mw::Dispatch({fc.expr(disp[0].value)}));")
+            fc.emit(f"__st.{add}({RT}::asgi::Mw::Dispatch({fc.expr(disp[0].value)}));")
+        elif kind == "context":
+            fc.emit(f"__st.{add}({RT}::asgi::Mw::Context({context_mw(fe, module, call, p.src(module))}));")
+        elif kind == "asgi":
+            # Starlette: cls(app, *args, **kwargs) once the stack is built; `app` = the rest of the stack
+            t = fe.index.resolve_expr(module, call.args[0])
+            p.stack_classes.append(t)
+            slot = fc.tmp("slot")
+            fc.emit(f"let {slot} = {RT}::asgi::Slot::new();")
+            obj = asgi_instance(fc, call, slot)
+            fc.emit(f"__st.{add}({RT}::asgi::Mw::Asgi({obj}, {slot}));")
+        elif kind is None:
+            raise TranspileError(f"middleware {ast.unparse(call.args[0]) if call.args else '?'} is not supported "
+                                 "(CORSMiddleware, GZipMiddleware, BaseHTTPMiddleware, a project BaseHTTPMiddleware "
+                                 "subclass or raw ASGI class, starlette_context's RawContextMiddleware)", call, p.src(module))
         else:
             # Starlette: cls(app, *args, **kwargs), then its `dispatch` for every request
             t = fe.index.resolve_expr(module, call.args[0])
@@ -7054,7 +7416,7 @@ def build_stack(p: "Project", fe: Frontend) -> str:
             ast.fix_missing_locations(inst)
             obj = fc.expr(inst)
             d = fc.q(f"{RT}::methods::getattr(cx, &{obj}, \"dispatch\").await")
-            fc.emit(f"__st.add_middleware({RT}::asgi::Mw::Dispatch({d}));")
+            fc.emit(f"__st.{add}({RT}::asgi::Mw::Dispatch({d}));")
 
     def handler(fc: "FnCompiler", module: str, fn, factory) -> None:
         for d in fn.decorator_list:
@@ -7083,6 +7445,7 @@ def build_stack(p: "Project", fe: Frontend) -> str:
         if m.name not in fe.app_vars or not _stack_relevant(fe, m.name, m.tree):
             continue
         fc = FnCompiler(p, m.name, None, "stack")
+        fc.__dict__["app_alias"] = set(fe.app_vars[m.name])  # `state=app.state`: the application object
         stmts(fc, m.name, m.tree.body, None)
         out.extend(fc.lines)
     body = "\n".join("        " + l for l in out)
@@ -7221,13 +7584,16 @@ def _conditional(fe: Frontend, e: TranspileError) -> bool:
     return False
 
 
-def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, gzip=None, collect: bool = False) -> Project:
-    """Compile every route of the project with the dyn backend and write the Rust crate."""
+def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, gzip=None, collect: bool = False,
+                     stream: bool = True) -> Project:
+    """Compile every route of the project with the dyn backend and write the Rust crate (`stream=False`:
+    list responses are always buffered, `--no-stream`)."""
     proj = Project(fe, collect=collect)
+    proj.__dict__["stream_lists"] = stream
     # functions that fail to translate become stubs that raise; the build fails only if a translated
     # route can reach one (below)
     proj.__dict__["defer_fn_errors"] = True
-    for lib in ("httpx", "aiohttp"):
+    for lib in ("httpx", "aiohttp", "uvloop"):
         v = locked_version(fe.index.root, lib)
         if v:
             libmap.LIB_VERSIONS[lib] = v
@@ -7315,6 +7681,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                         raise
                     proj.errors.append(e)
                     proj.__dict__.setdefault("route_infos", []).append((info, e))
+    engine_globals(proj, fe)
     module_statements(proj, fe)
     factory_sentry_init(proj, fe)
     proj.cur = ("stack", 0)
@@ -7437,7 +7804,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     pyver = target_python(fe.index.root)
     (out_dir / "src" / "main.rs").write_text(MAIN.format(expire=b(expire), autoflush=b(autoflush), commit=b(commit), sync=b(sync), layers=layers,
                                                          pymajor=pyver[0], pyminor=pyver[1],
-                                                         strict_ct=b(fastapi_strict_content_type(fe.index.root)),
+                                                         strict_ct=b(fe.__dict__.get("strict_ct", fastapi_strict_content_type(fe.index.root))),
                                                          starlette_major=starlette_version(proj)[0], starlette_minor=starlette_version(proj)[1],
                                                          dump_json=b(fastapi_at_least(fe.index.root, (0, 130))),
                                                          pydantic=".".join((locked_version(fe.index.root, "pydantic") or "2.13").split(".")[:2]),

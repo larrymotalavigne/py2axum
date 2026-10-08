@@ -127,6 +127,23 @@ async def jsonb_get(code: str, db: DbDep):
     return {"data": t.data, "raw": t.raw}
 
 
+@router.post("/jsonb-ops")
+async def jsonb_ops(body: dict, db: DbDep):
+    """JSONB's comparator: @>, <@, ?, ?|, ?& (each argument bound as its operator expects it)"""
+    op, value = body["op"], body["value"]
+    if op == "contains":
+        cond = Ticket.data.contains(value)
+    elif op == "contained_by":
+        cond = Ticket.data.contained_by(value)
+    elif op == "has_key":
+        cond = Ticket.data.has_key(value)
+    elif op == "has_any":
+        cond = Ticket.data.has_any(value)
+    else:
+        cond = Ticket.data.has_all(value)
+    return (await db.execute(select(Ticket.code).where(cond, Ticket.code.like("jq%")).order_by(Ticket.code))).scalars().all()
+
+
 @router.get("/types")
 async def types(i: int | None = None, d: date | None = None, dt: datetime | None = None):
     return {"i": i, "d": d, "dt": dt}

@@ -116,3 +116,8 @@ def test_feature_needs_newer_version(tmp_path):
     (pkg / "ws.py").write_text("from .main import app\n\n@app.websocket('/ws')\nasync def ws(websocket):\n    pass\n")
     [(msg, _, line)] = check_project(tmp_path, pkg)
     assert line == 3 and msg.startswith("starlette 1.6.0: WebSocket routes") and "starlette>=1.7.0" in msg
+    # the lowest version itself is enough, pinned (an exact pin is a one-version interval) or as a lower bound
+    for pin in ("==1.7.0", ">=1.7.0"):
+        (tmp_path / "uv.lock").unlink(missing_ok=True)
+        write(tmp_path, "requirements.txt", f"starlette{pin}\n")
+        assert check_project(tmp_path, pkg) == []

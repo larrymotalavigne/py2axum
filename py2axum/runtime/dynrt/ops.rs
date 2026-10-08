@@ -124,6 +124,9 @@ fn dec_op(a: &V, b: &V, op: &str) -> Option<R> {
 }
 
 pub fn add(a: &V, b: &V) -> R {
+    if let Some(r) = counter_binop(a, "+", b) {
+        return r;
+    }
     if let Some(r) = super::tenacity::binop(a, "+", b) {
         return r;
     }
@@ -162,6 +165,9 @@ pub fn add(a: &V, b: &V) -> R {
 }
 
 pub fn sub(a: &V, b: &V) -> R {
+    if let Some(r) = counter_binop(a, "-", b) {
+        return r;
+    }
     if let Some(r) = super::reldelta::binop(a, "-", b) {
         return r;
     }
@@ -356,6 +362,9 @@ pub fn pos(a: &V) -> R {
 }
 
 pub fn bitor(a: &V, b: &V) -> R {
+    if let Some(r) = counter_binop(a, "|", b) {
+        return r;
+    }
     if let Some(r) = super::tenacity::binop(a, "|", b) {
         return r;
     }
@@ -446,6 +455,9 @@ pub fn rshift(a: &V, b: &V) -> R {
 }
 
 pub fn bitand(a: &V, b: &V) -> R {
+    if let Some(r) = counter_binop(a, "&", b) {
+        return r;
+    }
     if let Some(r) = super::tenacity::binop(a, "&", b) {
         return r;
     }
@@ -908,9 +920,18 @@ pub fn str_(v: &V) -> R<String> {
     })
 }
 
+/// `...`: one object, so that `x is ...` holds
+pub fn ellipsis() -> V {
+    static E: std::sync::LazyLock<V> = std::sync::LazyLock::new(|| V::native(Native::Ellipsis));
+    E.clone()
+}
+
 pub fn repr(v: &V) -> R<String> {
     if let Some(t) = row_tuple(v) {
         return repr(&t);
+    }
+    if matches!(v, V::Native(n) if matches!(&**n, Native::Ellipsis)) {
+        return Ok("Ellipsis".into());
     }
     if let Some(r) = dunder_text(v, &["__repr__"]) {
         return r;
@@ -964,6 +985,12 @@ pub fn repr(v: &V) -> R<String> {
                 .map(|(k, v)| Ok(format!("{}: {}", repr(k)?, repr(v)?)))
                 .collect::<R<Vec<_>>>()?;
             match default_factory(d) {
+                // Counter.__repr__: most_common() order
+                Some("Counter") if parts.is_empty() => "Counter()".to_string(),
+                Some("Counter") => {
+                    let parts = most_common(d)?.iter().map(|(k, v)| Ok(format!("{}: {}", repr(k)?, repr(v)?))).collect::<R<Vec<_>>>()?;
+                    format!("Counter({{{}}})", parts.join(", "))
+                }
                 Some(f) => format!("defaultdict(<class '{f}'>, {{{}}})", parts.join(", ")),
                 None => format!("{{{}}}", parts.join(", ")),
             }
@@ -1422,6 +1449,157 @@ pub fn default_factory(d: &Arc<DictCell>) -> Option<&'static str> {
     reg.get(&(Arc::as_ptr(d) as usize)).filter(|(w, _)| w.strong_count() > 0).map(|(_, f)| *f)
 }
 
+// ---------------------------------------------------------------- collections.Counter
+
+/// a Counter is a dict registered with the factory "Counter": a missing key reads 0 (not stored)
+pub fn is_counter(d: &Arc<DictCell>) -> bool {
+    default_factory(d) == Some("Counter")
+}
+
+fn new_counter() -> R<Arc<DictCell>> {
+    let d = Arc::new(Mutex::new(IndexMap::new()));
+    defaultdict("Counter", V::Dict(d.clone()))?;
+    Ok(d)
+}
+
+/// `Counter.update()` / `subtract()`: from a mapping its counts, from an iterable each element once
+fn counter_add(d: &Arc<DictCell>, src: &V, kwargs: &[(String, V)], sign: i64) -> R<()> {
+    let mut pairs: Vec<(V, V)> = Vec::new();
+    match src {
+        V::None => {}
+        V::Dict(m) => pairs.extend(m.lock().values().cloned()),
+        other => pairs.extend(iter(other)?.into_iter().map(|x| (x, V::Int(1)))),
+    }
+    pairs.extend(kwargs.iter().map(|(k, v)| (V::str(k), v.clone())));
+    for (k, n) in pairs {
+        let key = Key::dict_key(&k)?;
+        let cur = d.lock().get(&key).map(|(_, v)| v.clone());
+        let n = if sign < 0 { neg(&n)? } else { n };
+        let v = match cur {
+            Some(c) => add(&c, &n)?,
+            // `self[elem] = count + self_get(elem, 0)`: an absent key gets 0 + count
+            None => add(&V::Int(0), &n)?,
+        };
+        d.lock().insert(key, (k, v));
+    }
+    Ok(())
+}
+
+/// `collections.Counter(iterable_or_mapping=None, /, **kwds)`
+pub fn counter(args: &[V], kwargs: &[(String, V)]) -> R {
+    if args.len() > 1 {
+        return Err(Exc::type_error(format!("expected at most 1 argument, got {}", args.len())));
+    }
+    let d = new_counter()?;
+    counter_add(&d, args.first().unwrap_or(&V::None), kwargs, 1)?;
+    Ok(V::Dict(d))
+}
+
+fn most_common(d: &Arc<DictCell>) -> R<Vec<(V, V)>> {
+    let mut items: Vec<(V, V)> = d.lock().values().cloned().collect();
+    let mut err = None;
+    // sorted(..., key=count, reverse=True): stable, ties keep the insertion order
+    items.sort_by(|a, b| match cmp(&b.1, &a.1) {
+        Ok(o) => o,
+        Err(e) => {
+            err.get_or_insert(e);
+            std::cmp::Ordering::Equal
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(items),
+    }
+}
+
+/// Counter's own methods (the others are dict's); None: not one of them
+pub fn counter_method(d: &Arc<DictCell>, name: &str, args: &[V], kwargs: &[(String, V)]) -> Option<R> {
+    if !matches!(name, "most_common" | "update" | "subtract" | "elements" | "total" | "copy") {
+        return None;
+    }
+    Some((|| match name {
+        "most_common" => {
+            let items = most_common(d)?;
+            let n = match args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "n").map(|(_, v)| v)) {
+                None | Some(V::None) => items.len(),
+                Some(V::Int(n)) => (*n).max(0) as usize,
+                Some(o) => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+            };
+            Ok(V::list(items.into_iter().take(n).map(|(k, v)| V::tuple(vec![k, v])).collect()))
+        }
+        "update" | "subtract" => {
+            counter_add(d, args.first().unwrap_or(&V::None), kwargs, if name == "update" { 1 } else { -1 })?;
+            Ok(V::None)
+        }
+        "elements" => {
+            let mut out = Vec::new();
+            for (k, v) in d.lock().values() {
+                let n = match v {
+                    V::Int(n) => *n,
+                    V::Bool(b) => *b as i64,
+                    o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+                };
+                out.extend(std::iter::repeat_n(k.clone(), n.max(0) as usize));
+            }
+            Ok(V::list(out))
+        }
+        "total" => {
+            let mut t = V::Int(0);
+            for (_, v) in d.lock().values() {
+                t = add(&t, v)?;
+            }
+            Ok(t)
+        }
+        "copy" => {
+            let c = new_counter()?;
+            *c.lock() = d.lock().clone();
+            Ok(V::Dict(c))
+        }
+        _ => unreachable!(),
+    })())
+}
+
+/// `+ - | &` between two Counters (positive counts kept, as collections.Counter)
+pub fn counter_binop(a: &V, op: &str, b: &V) -> Option<R> {
+    let (V::Dict(x), V::Dict(y)) = (a, b) else { return None };
+    if !is_counter(x) {
+        return None;
+    }
+    if !is_counter(y) {
+        return Some(Err(Exc::type_error(format!("unsupported operand type(s) for {op}: 'Counter' and 'dict'"))));
+    }
+    Some((|| {
+        let out = new_counter()?;
+        let (xs, ys) = (x.lock().clone(), y.lock().clone());
+        let zero = V::Int(0);
+        let pos = |v: &V| -> R<bool> { Ok(cmp(v, &zero)? == std::cmp::Ordering::Greater) };
+        for (k, (kv, c)) in &xs {
+            let o = ys.get(k).map(|(_, v)| v.clone()).unwrap_or(V::Int(0));
+            let n = match op {
+                "+" => add(c, &o)?,
+                "-" => sub(c, &o)?,
+                "|" => if cmp(c, &o)? == std::cmp::Ordering::Less { o } else { c.clone() },
+                _ => if cmp(c, &o)? == std::cmp::Ordering::Less { c.clone() } else { o },
+            };
+            if pos(&n)? {
+                out.lock().insert(k.clone(), (kv.clone(), n));
+            }
+        }
+        if op != "&" {
+            for (k, (kv, c)) in &ys {
+                if xs.contains_key(k) {
+                    continue;
+                }
+                let n = if op == "-" { sub(&V::Int(0), c)? } else { c.clone() };
+                if pos(&n)? {
+                    out.lock().insert(k.clone(), (kv.clone(), n));
+                }
+            }
+        }
+        Ok(V::Dict(out))
+    })())
+}
+
 fn default_value(factory: &str) -> V {
     match factory {
         "int" => V::Int(0),
@@ -1487,6 +1665,8 @@ pub fn getitem(v: &V, k: &V) -> R {
             match found {
                 Some(v) => v,
                 None => match default_factory(d) {
+                    // Counter.__missing__: 0, not stored
+                    Some("Counter") => V::Int(0),
                     // defaultdict.__missing__: the factory's value is stored, then returned
                     Some(f) => {
                         let v = default_value(f);
@@ -1579,6 +1759,11 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         V::Result(r) => r.lock().take_rows()?,
         V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => super::deque::items(d),
+            _ => vec![],
+        },
+        // `for line in io.BytesIO(...)` (and a StreamingResponse over one): its lines from the position
+        V::Native(n) if matches!(&**n, Native::BytesIO(_)) => match &**n {
+            Native::BytesIO(b) => super::files::bytesio_lines(b),
             _ => vec![],
         },
         V::Native(n) if matches!(&**n, Native::CsvRows(..) | Native::StringIO(_) | Native::Iter(_)) => match &**n {

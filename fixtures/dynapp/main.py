@@ -34,7 +34,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
-from . import aio, amqp, apiv, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, lazyimp, libs, life, mounted, outbound, pk, prom, rds, retrying, small, sqlmore, tracing, wsock
+from fastapi.middleware import Middleware
+from starlette_context import plugins
+from starlette_context.middleware import RawContextMiddleware
+
+from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, retrying, small, sqlmore, stdmore, tracing, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -45,7 +49,19 @@ from .schemas import (
     Agenda, Booking, Contact, Span, Invoice, TaskLoose, Trip, Label, Mixed, Point, Point3, ContactV1, OwnerOut, Person, TaskTitle, ProjectIn, ProjectOut, StatusChange, TaskBrief, TaskIn, TaskOut, TaskSummary, Slot,
 )
 
-app = FastAPI(lifespan=life.lifespan)
+app = FastAPI(lifespan=life.lifespan, middleware=[Middleware(asgimw.HeaderStamp, name="listed")])
+# raw ASGI middlewares (fixtures/dynapp/asgimw.py), innermost first: the last added runs first
+app.add_middleware(asgimw.HeaderStamp, name="inner")
+app.add_middleware(asgimw.ResponseUpper)
+app.add_middleware(asgimw.BodyReader)
+app.add_middleware(asgimw.Rewrite, injected="rewrite")
+app.add_middleware(asgimw.RequestContext)
+app.add_middleware(asgimw.HeaderStrip)
+app.add_middleware(asgimw.InFlight, state=app.state)
+app.add_middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(), plugins.CorrelationIdPlugin()))
+app.add_middleware(asgimw.ShortCircuit)
+app.add_middleware(asgimw.Boom)
+app.add_middleware(asgimw.HeaderStamp, name="outer")
 app.include_router(libs.router)
 app.include_router(ddl.router)
 app.include_router(enumcols.router)
@@ -70,6 +86,10 @@ app.include_router(tracing.router)
 app.include_router(small.router)
 app.include_router(edges.router)
 app.include_router(wsock.router)
+app.include_router(pyjwt_auth.router)
+app.include_router(asgimw.router)
+app.include_router(pydmore.router)
+app.include_router(stdmore.router)
 
 
 @app.exception_handler(wsock.WsBoom)

@@ -45,6 +45,16 @@ STEPS: list = [
     ("GET", "/introspect", None),
     ("GET", "/metrics", None),
     ("GET", "/metrics/all", None),
+    # handlers registered by a function given the app, app.add_exception_handler, strict_content_type=False
+    ("POST", "/typed", {"qty": 2}),
+    ("POST", "/typed", {"qty": "x"}),
+    ("POST", "/typed", {}),
+    ("POST", "/typed", b'{"qty": 3}', {"content-type": ""}),
+    ("POST", "/typed", b'{"qty": 3}', {"content-type": "text/plain"}),
+    ("POST", "/typed", b'{"qty": ', {"content-type": ""}),
+    ("GET", "/keyerror", None),
+    ("GET", "/gone/thing", None),
+    ("GET", "/gone/thing", None, OK),
 ]
 
 

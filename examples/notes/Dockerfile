@@ -11,7 +11,7 @@ COPY py2axum ./py2axum
 RUN pip install --no-cache-dir .
 WORKDIR /src
 COPY examples/notes/ .
-RUN py2axum app --root . --backend dyn -o /crate --name notes
+RUN py2axum app --root . -o /crate --name notes
 
 # 2. compile it
 FROM rust:1-bookworm AS build

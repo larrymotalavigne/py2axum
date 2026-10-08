@@ -22,8 +22,8 @@ hypothesis seed, plus a deterministic corpus of edge cases per operation (bounds
 fields, unicode, NaN, lone surrogates, a 6 MB body, odd path parameters). Each request goes to REF then CAND; a
 divergence is shrunk by hypothesis to a minimal request and both databases are restored before the next one.
 
-Common options: --scenario NAME borrows the masks of tests/scenarios/NAME.py (normalize, COOKIE_MASKS,
-HEADER_MASKS, SETTLE); --out DIR writes divergences.jsonl and summary.md there; --ignore-encoding as in
+Common options: --scenario NAME borrows the masks of tests/scenarios/NAME.py, or of a scenario file given by its
+path (normalize, COOKIE_MASKS, HEADER_MASKS, SETTLE); --out DIR writes divergences.jsonl and summary.md there; --ignore-encoding as in
 conformance.py.
 """
 from __future__ import annotations
@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
-import importlib
 import json
 import os
 import re
@@ -49,6 +48,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.conformance import client, exchange, identical, sent_datetimes  # noqa: E402
+from tests.conformance import load_scenario as _scenario_module  # noqa: E402
 
 TOKEN = re.compile(r"py2axum-tok-[0-9a-f]{12}")
 
@@ -118,7 +118,7 @@ def flush_redis(url: str | None) -> None:
 # --------------------------------------------------------------------------------------------- sides
 
 def load_scenario(name: str | None, settle: float | None = None):
-    scenario = importlib.import_module(f"tests.scenarios.{name}") if name else types.SimpleNamespace()
+    scenario = _scenario_module(name) if name else types.SimpleNamespace()
     if settle is not None:
         scenario = types.SimpleNamespace(**{k: getattr(scenario, k) for k in dir(scenario) if not k.startswith("__")})
         scenario.SETTLE = settle

@@ -55,7 +55,10 @@ STEPS: list = [
 STEPS += [("POST", "/users", {"email": f"bulk{i}@example.com", "name": f"Bulk {i}", "age": i}) for i in range(30)]
 STEPS += [("GET", "/users?limit=100", None), ("GET", "/users?limit=3", None),
              ("GET", "/users/export", None), ("GET", "/users/export?limit=5", None),
-             ("GET", "/users/export?limit=0", None)]
+             ("GET", "/users/export?limit=0", None),
+             # streamed from the session's statement (dyn: orm::defer_list), or not when the session wrote
+             ("GET", "/users/newest", None), ("POST", "/users/3/shout", None), ("POST", "/users/999/shout", None),
+             ("GET", "/users/3", None)]
 # a body above axum's 2 MB default limit (Starlette has none): unknown field, ignored by the model
 STEPS += [("POST", "/users", {"email": "big@example.com", "name": "Big", "pad": "x" * 5_000_000})]
 

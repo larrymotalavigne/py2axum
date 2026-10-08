@@ -850,13 +850,17 @@ fn level_name(levelno: i64) -> String {
 
 /// `type(exc).__module__` when it is not builtins: the project module, or the library's (a table of
 /// the library exceptions this runtime raises).
-fn exc_module(c: &'static Class) -> Option<&'static str> {
+pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
     if let ClassKind::UserException(d) = &c.kind {
         return Some(d.module);
     }
     let table: &[(&'static Class, &'static str)] = &[
         (&HTTP_EXCEPTION, "fastapi.exceptions"),
         (&REQUEST_VALIDATION_ERROR, "fastapi.exceptions"),
+        (&VALIDATION_EXCEPTION, "fastapi.exceptions"),
+        (&BAD_GZIP_FILE, "gzip"),
+        (&ZLIB_ERROR, "zlib"),
+        (&WS_VALIDATION_ERROR, "fastapi.exceptions"),
         (&VALIDATION_ERROR, "pydantic_core._pydantic_core"),
         (&SQLALCHEMY_ERROR, "sqlalchemy.exc"),
         (&DBAPI_ERROR, "sqlalchemy.exc"),
@@ -882,6 +886,25 @@ fn exc_module(c: &'static Class) -> Option<&'static str> {
         (&JWT_CLAIMS_ERROR, "jose.exceptions"),
         (&EXPIRED_SIGNATURE_ERROR, "jose.exceptions"),
         (&JWK_ERROR, "jose.exceptions"),
+        (&PYJWT_ERROR, "jwt.exceptions"),
+        (&PYJWT_INVALID_TOKEN, "jwt.exceptions"),
+        (&PYJWT_DECODE_ERROR, "jwt.exceptions"),
+        (&PYJWT_INVALID_SIGNATURE, "jwt.exceptions"),
+        (&PYJWT_EXPIRED_SIGNATURE, "jwt.exceptions"),
+        (&PYJWT_INVALID_AUDIENCE, "jwt.exceptions"),
+        (&PYJWT_INVALID_ISSUER, "jwt.exceptions"),
+        (&PYJWT_INVALID_ISSUED_AT, "jwt.exceptions"),
+        (&PYJWT_IMMATURE_SIGNATURE, "jwt.exceptions"),
+        (&PYJWT_INVALID_KEY, "jwt.exceptions"),
+        (&PYJWT_INVALID_ALGORITHM, "jwt.exceptions"),
+        (&PYJWT_MISSING_REQUIRED_CLAIM, "jwt.exceptions"),
+        (&PYJWK_ERROR, "jwt.exceptions"),
+        (&PYJWT_MISSING_CRYPTOGRAPHY, "jwt.exceptions"),
+        (&PYJWK_SET_ERROR, "jwt.exceptions"),
+        (&PYJWK_CLIENT_ERROR, "jwt.exceptions"),
+        (&PYJWK_CLIENT_CONNECTION_ERROR, "jwt.exceptions"),
+        (&PYJWT_INVALID_SUBJECT, "jwt.exceptions"),
+        (&PYJWT_INVALID_JTI, "jwt.exceptions"),
         (&BAD_DATA, "itsdangerous.exc"),
         (&BAD_SIGNATURE, "itsdangerous.exc"),
         (&BAD_TIME_SIGNATURE, "itsdangerous.exc"),

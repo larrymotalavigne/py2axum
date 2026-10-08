@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py2axum"
-version = "0.3.1"
+version = "0.4.0"
 description = "Ahead-of-time compiler from FastAPI + SQLAlchemy + Pydantic applications to Rust (axum), with response-level conformance testing"
 readme = "README.md"
 license = "Apache-2.0"

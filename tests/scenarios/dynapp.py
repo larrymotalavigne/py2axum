@@ -101,6 +101,59 @@ def _jwt_cases() -> list:
     return steps
 
 
+def _pyjwt_cases() -> list:
+    """Tokens built by PyJWT itself (fixed dates, or a margin of an hour around now): fixtures/dynapp/pyjwt_auth.py."""
+    import time
+    import warnings
+    from urllib.parse import quote
+
+    import jwt
+
+    warnings.filterwarnings("ignore", category=jwt.InsecureKeyLengthWarning)
+    k = "s3cret-pyjwt-0123456789abcdef-0123"
+    far, past, now = 4102444800, 946684800, int(time.time())
+    good = jwt.encode({"sub": "ada@example.com", "exp": far, "type": "access", "n": 1.5, "l": [1, "é"]}, k)
+    tokens = [
+        good,
+        jwt.encode({"sub": "ada", "exp": past}, k),
+        jwt.encode({"sub": "ada", "exp": now - 5}, k),
+        jwt.encode({"aud": "app", "iss": "idp"}, k),
+        jwt.encode({"sub": "ada"}, "other-key-0123456789abcdef-012345"),
+        jwt.encode({"sub": "ada"}, k, algorithm="HS384"),
+        jwt.encode({"sub": "ada"}, k, algorithm="HS512", headers={"kid": "k1"}),
+        jwt.encode({"sub": "ada"}, None, algorithm="none"),
+        good[:-3] + "AAA", good + "=", good + "==", good + "===", good[:-1], good + "!!", good.replace(".", ".=", 1),
+        "abc", "a.b", "a.b.c", "....", good.replace(".", "..", 1), "e30.e30.", "W10.e30.", "bm90.e30.", "_w.e30.",
+        "eyJhbGciOiJIUzI1NiJ9.WzFd." + good.rsplit(".", 1)[1],
+    ]
+    steps = [("GET", f"/pyjwt/check?token={quote(t)}", None) for t in tokens]
+    steps += [
+        ("GET", f"/pyjwt/check?token={quote(tokens[2])}&leeway=3600", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[3])}&aud=app&iss=idp", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[3])}&aud=other", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[3])}", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[3])}&aud=app&iss=nope", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[5])}&algs=HS384", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[6])}&algs=HS256&algs=HS512", None),
+        ("GET", f"/pyjwt/check?token={quote(tokens[7])}&algs=none", None),
+        ("GET", f"/pyjwt/check?token={quote(good)}&key=%22s3cret%22", None),
+        ("GET", f"/pyjwt/check?token={quote(good)}&key=", None),
+        ("POST", "/pyjwt/issue", {"sub": "ada", "roles": ["a"], "é": "ü"}),
+        ("POST", "/pyjwt/issue?alg=HS512&kid=key-1", {"sub": "ada"}),
+        ("POST", "/pyjwt/issue?alg=HS384&kid=key-1&sort=false", {"sub": "ada"}),
+        ("POST", "/pyjwt/issue?alg=none", {"sub": "ada"}),
+        ("POST", "/pyjwt/issue?alg=XX", {"sub": "ada"}),
+        ("POST", "/pyjwt/issue", {"sub": "ada", "iss": 5}),
+        ("GET", "/pyjwt/me", None, {"authorization": f"Bearer {good}"}),
+        ("GET", "/pyjwt/me", None, {"authorization": f"Bearer {tokens[1]}"}),
+        ("GET", "/pyjwt/me", None, {"authorization": "Bearer nope"}),
+        ("GET", "/pyjwt/me", None),
+        ("GET", "/pyjwt/roundtrip", None),
+        ("GET", "/pyjwt/cases", None),
+    ]
+    return steps
+
+
 def _its_cases() -> list:
     """Tokens signed by itsdangerous itself with fixed timestamps."""
     from urllib.parse import quote
@@ -344,6 +397,7 @@ STEPS: list = [
     ("GET", '/auth/maybe-creds', None, {"authorization": 'Basic x'}),
     ("GET", '/auth/maybe-creds', None, {"authorization": 'bearer y'}),
     *_jwt_cases(),
+    *_pyjwt_cases(),
     ("GET", "/env", None),
     ("GET", "/env?name=HOME", None),
     ("GET", "/env?name=", None),
@@ -573,6 +627,7 @@ STEPS: list = [
     ("GET", "/sqlm/closed/commit", None),
     ("GET", "/sqlm/closed/rollback", None),
     ("GET", "/sqlm/closed/close", None),
+    ("GET", "/sqlm/session", None),
     ("GET", "/colls/dup/a", None),
     ("GET", "/colls/dup/two/b?n=3", None),
     ("GET", "/colls/dup/two/b?n=x", None),
@@ -1006,6 +1061,24 @@ STEPS += [
                                               123456789.12345679, -0.0, 1e18, 9.2e18],
                                      "raw": [6.618213479614815e+205, 1.7976931348623157e308, 0.1, -0.0, 5e-324]}),
     ("GET", "/edges/jsonb/edge-f", None),
+    # JSONB operators: contains (a list, a dict, a scalar), contained_by, has_key, has_any, has_all (SQLAlchemy binds
+    # the list of has_any/has_all as JSONB: `jsonb ?| jsonb` does not exist, a 500 on both sides)
+    ("POST", "/edges/jsonb/jq1", {"data": {"tags": ["a", "b"], "n": 1}, "raw": None}),
+    ("POST", "/edges/jsonb/jq2", {"data": ["a", "c"], "raw": None}),
+    ("POST", "/edges/jsonb/jq3", {"data": {"tags": ["a"], "x": None}, "raw": None}),
+    ("POST", "/edges/jsonb/jq4", {"data": "a", "raw": None}),
+    ("POST", "/edges/jsonb-ops", {"op": "contains", "value": ["a"]}),
+    ("POST", "/edges/jsonb-ops", {"op": "contains", "value": {"tags": ["a"]}}),
+    ("POST", "/edges/jsonb-ops", {"op": "contains", "value": {"tags": ["b", "a"], "n": 1}}),
+    ("POST", "/edges/jsonb-ops", {"op": "contains", "value": "a"}),
+    ("POST", "/edges/jsonb-ops", {"op": "contains", "value": {"x": None}}),
+    ("POST", "/edges/jsonb-ops", {"op": "contained_by", "value": {"tags": ["a", "b"], "n": 1, "x": None}}),
+    ("POST", "/edges/jsonb-ops", {"op": "contained_by", "value": ["a", "b", "c"]}),
+    ("POST", "/edges/jsonb-ops", {"op": "has_key", "value": "tags"}),
+    ("POST", "/edges/jsonb-ops", {"op": "has_key", "value": "a"}),
+    ("POST", "/edges/jsonb-ops", {"op": "has_any", "value": ["n", "x"]}),
+    ("POST", "/edges/jsonb-ops", {"op": "has_all", "value": ["tags", "n"]}),
+    ("POST", "/edges/jsonb-ops", {"op": "has_all", "value": []}),
 ]
 
 
@@ -1116,6 +1189,77 @@ def reset(db: str) -> None:
         conn.exec_driver_sql(f"TRUNCATE {', '.join(t.name for t in Base.metadata.sorted_tables)} RESTART IDENTITY CASCADE")
     engine.dispose()
 
+# ---- raw ASGI middlewares (fixtures/dynapp/asgimw.py): stack order, response headers added and removed, framing
+# (content-length dropped), ContextVar and request.state, short-circuits, receive() wrappers, rewritten scopes,
+# exceptions around the app; starlette_context's RawContextMiddleware on every request (generated ids compared
+# by shape)
+HEADER_SHAPES = {"x-request-id": r"[0-9a-f]{32}", "x-correlation-id": r"[0-9a-f]{32}"}
+FRAMING_PREFIXES = ("/mw/",)
+_U1 = "0f4c2f2e-6f6b-4f1a-9a49-3c1d2b9e8a71"
+STEPS += [
+    ("GET", "/mw/plain", None),
+    ("GET", "/mw/inflight", None),
+    ("GET", "/mw/ctx", None),
+    ("GET", "/mw/ctx", None, {"x-rid": "abc-123"}),
+    ("GET", "/mw/ctx/change", None, {"x-rid": "r1"}),
+    ("GET", "/mw/nolength", None),
+    ("GET", "/mw/headers", None),
+    ("GET", "/mw/headers", None, {"x-strip": "x-internal"}),
+    ("GET", "/mw/headers", None, {"x-strip": "x-internal, x-public, content-type"}),
+    ("GET", "/mw/plain", None, {"x-strip": "x-mw-order"}),
+    ("GET", "/mw/plain", None, {"x-block": "send"}),
+    ("GET", "/mw/plain", None, {"x-block": "response"}),
+    ("GET", "/mw/plain", None, {"x-block": "text"}),
+    ("GET", "/mw/plain", None, {"x-block": "stream"}),
+    ("GET", "/mw/plain", None, {"x-block": "empty"}),
+    ("GET", "/tasks/1", None, {"x-block": "send"}),
+    ("POST", "/mw/body", b"hello body"),
+    ("POST", "/mw/body", b"hello body", {"x-upper": "1"}),
+    ("POST", "/mw/body", b""),
+    ("POST", "/mw/body/item", {"title": "pen", "qty": 3}),
+    ("POST", "/mw/body/item", {"title": "pen", "qty": 3}, {"x-upper": "1"}),
+    ("POST", "/mw/body/item", b"not json"),
+    ("GET", "/mw/old/thing", None),
+    ("GET", "/mw/old/caf%C3%A9", None),
+    ("GET", "/mw/old/", None),
+    ("GET", "/mw/method", None),
+    ("GET", "/mw/plain", None, {"x-upper-out": "1"}),
+    ("GET", "/mw/stream", None),
+    ("GET", "/mw/stream", None, {"x-upper-out": "1"}),
+    ("GET", "/mw/stream", None, {"x-strip": "content-type"}),
+    ("GET", "/mw/missing", None),
+    ("GET", "/mw/missing", None, {"x-upper-out": "1"}),
+    ("GET", "/mw/nothing-here", None),
+    ("GET", "/mw/raise", None, {"x-boom": "catch"}),
+    ("GET", "/mw/raise/runtime", None, {"x-boom": "catch"}),
+    ("GET", "/mw/plain", None, {"x-boom": "before"}),
+    ("GET", "/mw/plain", None, {"x-boom": "after"}),
+    ("GET", "/mw/plain", None),
+    ("GET", "/mw/raise", None),
+    ("GET", "/mw/plain", None, {"x-request-id": _U1}),
+    ("GET", "/mw/plain", None, {"x-request-id": _U1.replace("-", "").upper(), "x-correlation-id": "{" + _U1 + "}"}),
+    ("GET", "/mw/plain", None, {"x-request-id": "urn:uuid:" + _U1}),
+    ("GET", "/mw/plain", None, {"x-request-id": "not-a-uuid"}),
+    ("GET", "/mw/plain", None, {"x-correlation-id": "1234"}),
+    ("GET", "/mw/plain", None, {"x-request-id": ""}),
+    ("GET", "/tasks/1", None, {"x-request-id": "0x" + "0" * 30}),
+    ("GET", "/tasks/1", None, {"x-request-id": "+" + "a" * 31}),
+    ("GET", "/tasks/1", None, {"x-request-id": "-" + "0" * 31}),
+    ("GET", "/tasks/1", None, {"x-request-id": "-" + "0" * 30 + "1"}),
+    ("GET", "/tasks/1", None, {"x-request-id": "a_" + "b" * 30}),
+    ("GET", "/tasks/1", None, {"x-request-id": "g" * 32}),
+    ("GET", "/mw/inflight", None),
+]
+# gzip.decompress: members, padding, header flags, truncated/corrupted inputs
+_GZ = __import__("gzip").compress(b"hello gzip " * 50, mtime=0)
+_GZ2 = __import__("gzip").compress("deux é".encode(), mtime=0)
+_GZN = b"\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\x03name.txt\x00" + _GZ2[10:]
+STEPS += [("POST", "/mw/gunzip", body) for body in (
+    _GZ, _GZ + _GZ2, _GZ + b"\x00\x00" + _GZ2, _GZN, b"", b"\x1f", b"plain text", _GZ[:-3], _GZ[:20],
+    _GZ[:-8] + b"\x00\x00\x00\x00" + _GZ[-4:], _GZ[:-4] + b"\x01\x00\x00\x00", _GZ[:10] + b"\xff" * 12 + _GZ[-8:],
+    b"\x1f\x8b\x07" + _GZ[3:], _GZ + b"x",
+)]
+
 
 def normalize_text(text: str) -> str:
     """prometheus_client: the `_created` series and the exemplars hold instants, masked when they have their
@@ -1125,9 +1269,32 @@ def normalize_text(text: str) -> str:
     return _re.sub(r"(?m)^(.* # \{.*\} \S+) \d{10}\.\d+$", r"\1 <timestamp>", text)
 
 
+def _zip_untimed(b64: str) -> str:
+    """A zip written now: its DOS time and date fields (local headers, central directory) zeroed."""
+    import base64
+    import struct
+    b = bytearray(base64.b64decode(b64))
+    i = 0
+    while i + 4 <= len(b):
+        sig = bytes(b[i:i + 4])
+        if sig == b"PK\x03\x04":
+            b[i + 10:i + 14] = b"\0\0\0\0"
+            n, x = struct.unpack("<HH", b[i + 26:i + 30])
+            i += 30 + n + x + struct.unpack("<L", b[i + 18:i + 22])[0]
+        elif sig == b"PK\x01\x02":
+            b[i + 12:i + 16] = b"\0\0\0\0"
+            n, x, c = struct.unpack("<HHH", b[i + 28:i + 34])
+            i += 46 + n + x + c
+        else:
+            break
+    return base64.b64encode(bytes(b)).decode()
+
+
 def normalize(body):
     """MIME boundaries are random (email.generator): masked. prometheus_client texts: see normalize_text."""
     import re as _re
+    if isinstance(body, dict) and "zip" in body and "stored" in body:
+        body = dict(body, zip=_zip_untimed(body["zip"]), stored=_zip_untimed(body["stored"]))
     if isinstance(body, dict) and "events" in body and "metrics" in body:
         body = dict(body, metrics=normalize_text(body["metrics"]))
     if isinstance(body, dict) and "texts" in body and "om" in body:
@@ -1145,3 +1312,98 @@ def normalize(body):
     if isinstance(body, dict) and isinstance(body.get("text"), str):
         body["text"] = _re.sub(r"={15}\d{19}==", "<boundary>", body["text"])
     return body
+
+
+def _pydmore_cases() -> list:
+    """fixtures/dynapp/pydmore.py: validate_assignment with validators, min_items/max_items, File(default=[])."""
+    d = {"name": "Example.COM", "catch_all": "", "port": 25}
+    steps = [
+        ("POST", "/pydmore/domains", d),
+        ("POST", "/pydmore/domains?name=Other.org&catch_all=me@x.org&port=26", d),
+        ("POST", "/pydmore/domains?name=a..b&catch_all=nobody&port=0", d),
+        ("POST", "/pydmore/domains?name=ab&catch_all=%20%20", d),
+        ("POST", "/pydmore/domains?name=bad%20name", {"name": "ok.org", "catch_all": "x"}),
+        ("POST", "/pydmore/domains", {"name": "a..b"}),
+        ("POST", "/pydmore/domains", {"name": " ok.org ", "port": 0}),
+        ("POST", "/pydmore/orders", {"domains": ["a"]}),
+        ("POST", "/pydmore/orders", {"domains": []}),
+        ("POST", "/pydmore/orders", {"domains": ["a", "b", "c", "d"], "servers": ["1", "2", "3"], "tags": []}),
+        ("POST", "/pydmore/orders", {"domains": "x"}),
+    ]
+    for parts in ([("to", "a@b.c"), ("subject", "S")],
+                  [("to", "a@b.c"), ("files", "1.txt", "text/plain", b"abc"), ("files", "2.txt", None, b"de")],
+                  [("to", "a@b.c"), ("files", "")],
+                  [("to", "a@b.c"), ("extra", "not a file")],
+                  [("subject", "no to")]):
+        body, h = _multipart(parts)
+        steps.append(("POST", "/pydmore/compose", body, h))
+    steps.append(("POST", "/pydmore/compose", b"to=a%40b.c", {"content-type": "application/x-www-form-urlencoded"}))
+    return steps
+
+
+STEPS += _pydmore_cases()
+STEPS += [
+    ("POST", "/pydmore/notices", {"meta": {"k": [1, 2]}, "hash": "h1", "content": "hello blob"}),
+    ("POST", "/pydmore/notices", {"meta": None, "label": "info", "hash": "h1"}),
+    ("POST", "/pydmore/notices", {"label": "info"}),
+    ("POST", "/pydmore/notices", {"meta": "s", "label": "x" * 30}),
+    ("GET", "/pydmore/notices", None),
+    ("GET", "/pydmore/notices?label=info", None),
+    ("PATCH", "/pydmore/notices/2", {"a": 1}),
+    ("PATCH", "/pydmore/notices/99", {"a": 1}),
+    ("GET", "/pydmore/notices", None),
+    ("GET", "/pydmore/notices/1/blob", None),
+    ("GET", "/pydmore/notices/2/blob?how=plain", None),
+    ("GET", "/pydmore/notices/2/blob?how=top", None),
+    ("GET", "/pydmore/notices/3/blob", None),
+    ("GET", "/pydmore/notices/9/blob", None),
+    ("GET", "/pydmore/blobs/h1", None),
+    ("GET", "/pydmore/blobs/h1?undeferred=true", None),
+    ("GET", "/pydmore/blobs/nope", None),
+]
+STEPS += [
+    ("DELETE", "/pydmore/notices?pattern=%5Ein", None),
+    ("DELETE", "/pydmore/notices?pattern=NONE&flags=i", None),
+    ("DELETE", "/pydmore/notices?pattern=%5Ex&flags=g", None),
+    ("POST", "/stdmore/counter", ["10.0.0.1", "10.0.0.2", "10.0.0.1", "", "b", "10.0.0.2", "10.0.0.1"]),
+    ("POST", "/stdmore/counter", []),
+    ("GET", "/stdmore/tcp", None),
+    ("GET", "/stdmore/tcp?host=localhost", None),
+    ("GET", "/stdmore/tcp?host=nonexistent.invalid&port=25", None),
+    ("GET", "/stdmore/tcp?port=6379", None),
+    ("GET", "/stdmore/tcp?port=6379&send=PING", None),
+    ("GET", "/stdmore/tcp?host=10.255.255.1&port=25&timeout=0.2", None),
+]
+STEPS += [
+    ("GET", "/stdmore/rsa", None),
+    ("GET", "/stdmore/rsa?bits=2048", None),
+    ("GET", "/stdmore/rsa?bits=1024&e=3", None),
+    ("GET", "/stdmore/rsa?bits=1023", None),
+    ("GET", "/stdmore/rsa?e=5", None),
+]
+STEPS += [
+    ("PATCH", "/pydmore/domains", {}),
+    ("PATCH", "/pydmore/domains", {"catch_all": None}),
+    ("PATCH", "/pydmore/domains", {"name": "x", "catch_all": "a@b.c"}),
+]
+STEPS += [
+    ("GET", "/stdmore/sock", None),
+    ("GET", "/stdmore/sock?host=localhost", None),
+    ("GET", "/stdmore/sock?host=mailserver.invalid&port=587", None),
+    ("GET", "/stdmore/sock?host=10.255.255.1&port=25&timeout=0.2", None),
+    ("GET", "/stdmore/sock?port=6379", None),
+]
+STEPS += [
+    ("POST", "/stdmore/zip", {"profile.json": '{"a": 1, "b": [1, 2, 3]}' * 20, "é/notes.txt": "héllo", "empty.bin": "",
+                              "messages.csv": "id,subject\r\n1,Hello\r\n"}),
+    ("POST", "/stdmore/zip", {}),
+]
+STEPS += [
+    ("POST", "/stdmore/lines", {"text": "a\r\nb\rc\n\nd\x0be\x1cf g"}),
+    ("POST", "/stdmore/lines", {"text": "trailing\n"}),
+    ("POST", "/stdmore/lines", {"text": ""}),
+]
+STEPS += [
+    ("POST", "/pydmore/domains", {"name": "ok.org", "catch_all": " nobody "}),
+    ("POST", "/pydmore/domains?catch_all=%20nobody%20", {"name": "ok.org"}),
+]

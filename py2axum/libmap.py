@@ -19,6 +19,15 @@ def _kwvec(kw: dict[str, str]) -> str:
     return "vec![" + ", ".join(f'("{k}".to_string(), {v})' for k, v in kw.items()) + "]"
 
 
+def _engine(a, kw):
+    """`create_[async_]engine(url, ...)`: the binary's own pool; only `connect_args` (session
+    parameters, `orm::engine_connect_args`) changes what it does."""
+    ev = "".join(f"let _ = {x}; " for k, x in [(None, x) for x in a] + list(kw.items()) if k != "connect_args")
+    if "connect_args" in kw:
+        return "{ " + ev + f"{RT}::orm::engine_connect_args(&{kw['connect_args']}).map(|_| V::native({RT}::Native::Engine)) }}"
+    return "{ " + ev + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}"
+
+
 def _argv(args: list[str]) -> str:
     return "vec![" + ", ".join(args) + "]"
 
@@ -37,6 +46,30 @@ def _mcp_security(a, kw):
     return "Ok::<V, Exc>(V::None)"
 
 
+def _checked(name, a, kw, params):
+    """The keyword arguments of a call whose parameters are `params` (anything else refused)."""
+    _bind(name, a, kw, params, set(params))
+    return kw
+
+
+def _zipfile(a, kw):
+    """`ZipFile(file, "w", ...)`: writing only, the mode a literal (reading an archive is not supported)."""
+    _bind("zipfile.ZipFile", a, kw, ["file", "mode", "compression", "allowZip64", "compresslevel"],
+          {"file", "mode", "compression", "allowZip64", "compresslevel"})
+    mode = a[1] if len(a) > 1 else kw.get("mode")
+    if mode != 'V::str("w")':
+        raise ValueError('only zipfile.ZipFile(file, "w", ...) is supported (writing, the mode a literal)')
+    return f"{RT}::zipw::open(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _noargs(name, code):
+    def f(a, kw):
+        if a or kw:
+            raise ValueError(f"{name}() takes no arguments here")
+        return code
+    return f
+
+
 def _one(name):
     def f(a, kw):
         if len(a) != 1 or kw:
@@ -53,6 +86,12 @@ VALUES: dict[str, str] = {
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean")},
     "os.environ": f"{RT}::libs::environ()",
     "aio_pika.DeliveryMode.PERSISTENT": "V::Int(2)",
+    "zipfile.ZIP_STORED": "V::Int(0)",
+    "zipfile.ZIP_DEFLATED": "V::Int(8)",
+    # cryptography's serialization constants (dynrt/crypto.rs)
+    **{f"cryptography.hazmat.primitives.serialization.{c}": f'V::str("{c}")' for c in (
+        "Encoding.PEM", "Encoding.DER", "PrivateFormat.PKCS8", "PrivateFormat.TraditionalOpenSSL",
+        "PublicFormat.SubjectPublicKeyInfo", "PublicFormat.PKCS1")},
     # the HTTP client modules as values (`if aiohttp is not None`) and their patchable request methods
     "aiohttp": f'V::native({RT}::Native::Namespace("aiohttp"))',
     "httpx": f'V::native({RT}::Native::Namespace("httpx"))',
@@ -166,6 +205,8 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.GeneratorExit": "GENERATOR_EXIT",
     "binascii.Error": "BINASCII_ERROR",
     "json.JSONDecodeError": "JSON_DECODE_ERROR",
+    "gzip.BadGzipFile": "BAD_GZIP_FILE",
+    "zlib.error": "ZLIB_ERROR",
     "sqlalchemy.exc.CompileError": "COMPILE_ERROR",
     "decimal.DecimalException": "DECIMAL_EXCEPTION",
     "decimal.InvalidOperation": "DECIMAL_INVALID_OPERATION",
@@ -206,6 +247,8 @@ EXCEPTIONS: dict[str, str] = {
     **{n: "WS_EXCEPTION" for n in ("fastapi.WebSocketException", "fastapi.exceptions.WebSocketException",
                                    "starlette.exceptions.WebSocketException")},
     "fastapi.exceptions.WebSocketRequestValidationError": "WS_VALIDATION_ERROR",
+    "fastapi.exceptions.RequestValidationError": "REQUEST_VALIDATION_ERROR",
+    "fastapi.exceptions.ValidationException": "VALIDATION_EXCEPTION",
     "starlette.exceptions.HTTPException": "HTTP_EXCEPTION",
     "pydantic.ValidationError": "VALIDATION_ERROR",
     "sqlalchemy.exc.SQLAlchemyError": "SQLALCHEMY_ERROR",
@@ -252,6 +295,9 @@ EXCEPTIONS: dict[str, str] = {
     "jose.JWSError": "JWS_ERROR",
     "jose.ExpiredSignatureError": "EXPIRED_SIGNATURE_ERROR",
     "jose.JWKError": "JWK_ERROR",
+    # PyJWT: jwt.exceptions, and the names `jwt` re-exports
+    **{f"jwt.exceptions.{n}": c for n, c in (("PyJWTError", "PYJWT_ERROR"), ("InvalidTokenError", "PYJWT_INVALID_TOKEN"), ("DecodeError", "PYJWT_DECODE_ERROR"), ("InvalidSignatureError", "PYJWT_INVALID_SIGNATURE"), ("ExpiredSignatureError", "PYJWT_EXPIRED_SIGNATURE"), ("InvalidAudienceError", "PYJWT_INVALID_AUDIENCE"), ("InvalidIssuerError", "PYJWT_INVALID_ISSUER"), ("InvalidIssuedAtError", "PYJWT_INVALID_ISSUED_AT"), ("ImmatureSignatureError", "PYJWT_IMMATURE_SIGNATURE"), ("InvalidKeyError", "PYJWT_INVALID_KEY"), ("InvalidAlgorithmError", "PYJWT_INVALID_ALGORITHM"), ("MissingRequiredClaimError", "PYJWT_MISSING_REQUIRED_CLAIM"), ("PyJWKError", "PYJWK_ERROR"), ("MissingCryptographyError", "PYJWT_MISSING_CRYPTOGRAPHY"), ("PyJWKSetError", "PYJWK_SET_ERROR"), ("PyJWKClientError", "PYJWK_CLIENT_ERROR"), ("PyJWKClientConnectionError", "PYJWK_CLIENT_CONNECTION_ERROR"), ("InvalidSubjectError", "PYJWT_INVALID_SUBJECT"), ("InvalidJTIError", "PYJWT_INVALID_JTI"))},
+    **{f"jwt.{n}": c for n, c in (("PyJWTError", "PYJWT_ERROR"), ("InvalidTokenError", "PYJWT_INVALID_TOKEN"), ("DecodeError", "PYJWT_DECODE_ERROR"), ("InvalidSignatureError", "PYJWT_INVALID_SIGNATURE"), ("ExpiredSignatureError", "PYJWT_EXPIRED_SIGNATURE"), ("InvalidAudienceError", "PYJWT_INVALID_AUDIENCE"), ("InvalidIssuerError", "PYJWT_INVALID_ISSUER"), ("InvalidIssuedAtError", "PYJWT_INVALID_ISSUED_AT"), ("ImmatureSignatureError", "PYJWT_IMMATURE_SIGNATURE"), ("InvalidKeyError", "PYJWT_INVALID_KEY"), ("InvalidAlgorithmError", "PYJWT_INVALID_ALGORITHM"), ("MissingRequiredClaimError", "PYJWT_MISSING_REQUIRED_CLAIM"), ("PyJWKError", "PYJWK_ERROR"), ("PyJWKSetError", "PYJWK_SET_ERROR"), ("PyJWKClientError", "PYJWK_CLIENT_ERROR"), ("PyJWKClientConnectionError", "PYJWK_CLIENT_CONNECTION_ERROR"))},
     "cryptography.fernet.InvalidToken": "INVALID_TOKEN",
     "jinja2.TemplateNotFound": "TEMPLATE_NOT_FOUND",
     "re.error": "RE_ERROR",
@@ -366,6 +412,58 @@ def _jwt_decode(a, kw):
     algs = f"Some(&{v['algorithms']})" if "algorithms" in v else "None"
     rest = ", ".join(f"&{v[n]}" if n in v else "&V::None" for n in ("options", "audience", "issuer", "subject"))
     return f"{RT}::jose::decode_with(&{v['token']}, &{v['key']}, {algs}, {rest})"
+
+
+def _pyjwt_encode(a, kw):
+    names = ["payload", "key", "algorithm", "headers", "json_encoder", "sort_headers"]
+    v = _bind("jwt.encode", a, kw, names, set(names) - {"json_encoder"})
+    if "json_encoder" in v:
+        raise ValueError("json_encoder is not supported")
+    alg = f"Some(&{v['algorithm']})" if "algorithm" in v else "None"
+    return (f"{RT}::pyjwt::encode(&{v['payload']}, &{v['key']}, {alg}, &{v.get('headers', 'V::None')}, "
+            f"&{v.get('sort_headers', 'V::Bool(true)')})")
+
+
+def _pyjwt_decode(fn, order):
+    def tmpl(a, kw):
+        v = _bind(f"jwt.{fn}", a, kw, order, set(order) - {"verify", "detached_payload"})
+        for k in ("verify", "detached_payload"):
+            if k in v:
+                raise ValueError(f"{k} is not supported")
+        args = ", ".join(f"&{v.get(n, d)}" for n, d in (("jwt", None), ("key", 'V::str("")'), ("algorithms", "V::None"),
+                                                         ("options", "V::None"), ("audience", "V::None"), ("issuer", "V::None"),
+                                                         ("subject", "V::None"), ("leeway", "V::Int(0)")))
+        return f"{RT}::pyjwt::{fn}({args})"
+    return tmpl
+
+
+# PyJWT algorithms that need `cryptography`'s RSA/EC/EdDSA keys (not reproduced; HS*, none and unknown names are)
+PYJWT_ASYMMETRIC = {"RS256", "RS384", "RS512", "ES256", "ES256K", "ES384", "ES521", "ES512", "PS256", "PS384", "PS512", "EdDSA"}
+
+
+def pyjwt_static(name, node):
+    """Asymmetric algorithms written as literals in a PyJWT call: refused at transpile time."""
+    import ast
+
+    def lits(e):
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            return [e.value]
+        if isinstance(e, (ast.List, ast.Tuple, ast.Set)):
+            return [x.value for x in e.elts if isinstance(x, ast.Constant) and isinstance(x.value, str)]
+        return []
+    found = []
+    for k in node.keywords:
+        if k.arg in ("algorithm", "algorithms"):
+            found += lits(k.value)
+        if k.arg == "headers" and isinstance(k.value, ast.Dict):
+            found += [x for kk, vv in zip(k.value.keys, k.value.values)
+                      if isinstance(kk, ast.Constant) and kk.value == "alg" for x in lits(vv)]
+    if len(node.args) >= 3:
+        found += lits(node.args[2])
+    bad = [x for x in found if x in PYJWT_ASYMMETRIC]
+    if bad:
+        raise ValueError(f"algorithm {bad[0]!r} is not supported (HMAC HS256/HS384/HS512 and 'none' only: "
+                         "RSA/EC/EdDSA keys are not reproduced)")
 
 
 def _relativedelta(a, kw):
@@ -503,10 +601,21 @@ CALLS = {
     # python-jose (HMAC only; other options refused)
     "jose.jwt.encode": _jwt_encode,
     "jose.jwt.decode": _jwt_decode,
+    # PyJWT (HMAC and none; asymmetric algorithms refused)
+    "jwt.encode": _pyjwt_encode,
+    "jwt.decode": _pyjwt_decode("decode", ["jwt", "key", "algorithms", "options", "verify", "detached_payload",
+                                           "audience", "subject", "issuer", "leeway"]),
+    "jwt.decode_complete": _pyjwt_decode("decode_complete", ["jwt", "key", "algorithms", "options", "verify",
+                                                             "detached_payload", "audience", "issuer", "subject", "leeway"]),
+    "jwt.get_unverified_header": lambda a, kw: f"{RT}::pyjwt::get_unverified_header(&{_bind('jwt.get_unverified_header', a, kw, ['jwt'], {'jwt'})['jwt']})",
     # itsdangerous (URLSafeTimedSerializer with its default signer and serializer only)
     "itsdangerous.URLSafeTimedSerializer": _its_serializer,
     "itsdangerous.url_safe.URLSafeTimedSerializer": _its_serializer,
     # cryptography (Fernet only)
+    "cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key": lambda a, kw: (
+        f"{RT}::crypto::generate_private_key(&{_argv(a)}, &{_kwvec({k: v for k, v in _bind('generate_private_key', a, kw, ['public_exponent', 'key_size', 'backend'], {'public_exponent', 'key_size', 'backend'}).items() if k != 'backend' and k in kw})}).await"),
+    "cryptography.hazmat.primitives.serialization.NoEncryption": _noargs("NoEncryption", 'Ok::<V, Exc>(V::str("NoEncryption"))'),
+    "cryptography.hazmat.backends.default_backend": _noargs("default_backend", "Ok::<V, Exc>(V::None)"),
     "cryptography.fernet.Fernet.generate_key": lambda a, kw: f"{RT}::fernet::generate_key()",
     "cryptography.fernet.Fernet": lambda a, kw: f"{RT}::fernet::new(&{_bind('Fernet', a, kw, ['key'], {'key'})['key']})",
     # e-mail: jinja2 templates, email.mime, aiosmtplib
@@ -522,6 +631,14 @@ CALLS = {
     "unicodedata.combining": lambda a, kw: f"{RT}::stdlib::unicodedata_combining(crate::gen::UCD_UNASSIGNED, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("combining(chr): one positional argument")),
     "collections.deque": lambda a, kw: f"{RT}::deque::new(&{_argv(a)}, &{_kwvec(kw)})",
     "socket.getaddrinfo": lambda a, kw: f"{RT}::net::getaddrinfo(&{_argv(a)}, &{_kwvec(kw)})",
+    "collections.Counter": lambda a, kw: f"{RT}::ops::counter(&{_argv(a)}, &{_kwvec(kw)})",
+    "zipfile.ZipFile": lambda a, kw: _zipfile(a, kw),
+    "socket.create_connection": lambda a, kw: (
+        f"{RT}::net::create_connection(&{_argv(a)}, &{_kwvec(_checked('socket.create_connection', a, kw, ['address', 'timeout']))}).await"),
+    # uvicorn runs on uvloop when the project installs it (`uvicorn[standard]`): its error messages differ
+    "asyncio.open_connection": lambda a, kw: (
+        f"{RT}::net::open_connection(&{_argv(a)}, &{_kwvec(_checked('asyncio.open_connection', a, kw, ['host', 'port']))}, "
+        f"{str('uvloop' in LIB_VERSIONS).lower()}).await"),
     "ipaddress.ip_address": lambda a, kw: f"{RT}::net::ip_address(&{_argv(a)})",
     "ipaddress.ip_network": lambda a, kw: f"{RT}::net::ip_network(&{_argv(a)}, &{_kwvec(kw)})",
     "nh3.clean": lambda a, kw: f"{RT}::nh3::clean(&{_argv(a)}, &{_kwvec(kw)})",
@@ -570,7 +687,10 @@ CALLS = {
     # sys.settrace and the threading variants (dynrt/trace.rs; the project's functions report events)
     **{n: (lambda a, kw: f"{RT}::trace::settrace(&{_argv(a)})") for n in ("sys.settrace", "threading.settrace", "threading.settrace_all_threads")},
     "sys.gettrace": lambda a, kw: f"{RT}::trace::gettrace()",
+    "gzip.decompress": lambda a, kw: f"{RT}::stdlib::gzip_decompress(&{_argv(a)}, &{_kwvec(kw)})",
     "traceback.extract_tb": lambda a, kw: f"{RT}::trace::extract_tb(&{_argv(a)}, &{_kwvec(kw)})",
+    "traceback.format_exception": lambda a, kw: f"{RT}::trace::format_exception(cx, &{_argv(a)}, &{_kwvec(kw)})",
+    "traceback.format_exception_only": lambda a, kw: f"{RT}::trace::format_exception_only(&{_argv(a)}[0])",
     "timeit.default_timer": lambda a, kw: f"{RT}::stdlib::time_now(\"perf_counter\")",
     **{f"os.path.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::os_path(\"{n}\", &{_argv(a)})")(n)
        for n in ("exists", "isfile", "isdir", "join", "basename", "dirname", "splitext", "normpath", "abspath", "realpath")},
@@ -621,8 +741,8 @@ CALLS = {
     "sqlalchemy.future.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
     "sqlalchemy.ext.asyncio.async_sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, false)",
     "sqlalchemy.orm.sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, true)",
-    "sqlalchemy.create_engine": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}",
-    "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}",
+    "sqlalchemy.create_engine": lambda a, kw: _engine(a, kw),
+    "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: _engine(a, kw),
     # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable
     "sqlalchemy.inspect": lambda a, kw: _sa_inspect(a, kw),
     "sqlalchemy.text": lambda a, kw: f"{RT}::orm::text(&{a[0]})",
@@ -637,9 +757,10 @@ CALLS = {
     "sqlalchemy.case": lambda a, kw: f"{RT}::orm::case(&{_argv(a)}, &{_kwvec(kw)})",
     "sqlalchemy.literal": lambda a, kw: f"{RT}::orm::literal(&{a[0]})",
     "sqlalchemy.delete": lambda a, kw: f"{RT}::orm::delete(&{a[0]})",
-    "sqlalchemy.exists": lambda a, kw: f"{RT}::orm::exists(&{a[0]})",
+    "sqlalchemy.exists": lambda a, kw: f"{RT}::orm::exists(&{_argv(a)})",
     **{f"sqlalchemy.orm.{n}": (lambda n: lambda a, kw: f"{RT}::orm::loader(\"{n}\", &{a[0]})")(n)
        for n in ("selectinload", "joinedload", "subqueryload", "immediateload", "noload", "lazyload")},
+    "sqlalchemy.orm.undefer": lambda a, kw: f"{RT}::orm::undefer(&{_one('undefer')(a, kw)})",
     "sqlalchemy.desc": lambda a, kw: f"{RT}::orm::order_fn(&{a[0]}, true)",
     "sqlalchemy.asc": lambda a, kw: f"{RT}::orm::order_fn(&{a[0]}, false)",
     "sqlalchemy.nullslast": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"nulls_last\", vec![], vec![])",

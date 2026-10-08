@@ -1,6 +1,7 @@
 //! `socket.getaddrinfo` (the C library's, like CPython) and `ipaddress` (`ip_address`, `ip_network`,
 //! membership, str/repr).
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use super::ops;
 use super::v::*;
@@ -197,4 +198,296 @@ pub fn addr_repr(a: &IpAddr) -> String {
 
 pub fn net_repr(n: &(IpAddr, u8)) -> String {
     format!("IPv{}Network('{}')", if n.0.is_ipv4() { 4 } else { 6 }, net_str(n))
+}
+
+// ---------------------------------------------------------------- asyncio streams
+
+/// The socket of `asyncio.open_connection()`: its `StreamReader` and `StreamWriter` share it.
+pub struct Stream {
+    rd: tokio::sync::Mutex<Option<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
+    wr: tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>,
+    /// `writer.write()` buffers; `drain()` and the close send it
+    buf: parking_lot::Mutex<Vec<u8>>,
+    closing: std::sync::atomic::AtomicBool,
+    eof: std::sync::atomic::AtomicBool,
+    peer: V,
+    sock: V,
+}
+
+fn sockaddr(a: &std::net::SocketAddr) -> V {
+    match a {
+        std::net::SocketAddr::V4(a) => V::tuple(vec![V::str(a.ip().to_string()), V::Int(a.port() as i64)]),
+        std::net::SocketAddr::V6(a) => V::tuple(vec![
+            V::str(a.ip().to_string()),
+            V::Int(a.port() as i64),
+            V::Int(a.flowinfo() as i64),
+            V::Int(a.scope_id() as i64),
+        ]),
+    }
+}
+
+/// CPython's `OSError(errno, text)`: the subclass its errno selects, `[Errno n] text`
+fn os_error(e: &std::io::Error, text: &str) -> Exc {
+    let errno = e.raw_os_error().unwrap_or(0);
+    let class: &'static Class = match errno {
+        libc::ECONNREFUSED => &CONNECTION_REFUSED_ERROR,
+        libc::ECONNRESET => &CONNECTION_RESET_ERROR,
+        libc::ECONNABORTED => &CONNECTION_ABORTED_ERROR,
+        libc::EPIPE => &BROKEN_PIPE_ERROR,
+        libc::ETIMEDOUT => &TIMEOUT_ERROR,
+        _ => &OS_ERROR,
+    };
+    Exc::msg(class, format!("[Errno {errno}] {text}"))
+}
+
+/// `await asyncio.open_connection(host, port)`: the addresses of `getaddrinfo(host, port, type=SOCK_STREAM)`
+/// tried in order, like asyncio's `create_connection` (no happy eyeballs); one failure is raised as is,
+/// several as `OSError("Multiple exceptions: ...")` unless they all read the same. A failure reads
+/// `[Errno n] Connect call failed (addr)` under asyncio, `[Errno n] <strerror>` under uvloop (`uvloop`).
+pub async fn open_connection(args: &[V], kwargs: &[(String, V)], uvloop: bool) -> R {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !matches!(k.as_str(), "host" | "port")) {
+        return Err(Exc::type_error(format!("py2axum: asyncio.open_connection({k}=) is not supported (host, port)")));
+    }
+    let host = args.first().or_else(|| kw(kwargs, "host")).cloned().unwrap_or(V::None);
+    let port = args.get(1).or_else(|| kw(kwargs, "port")).cloned().unwrap_or(V::None);
+    let infos = getaddrinfo(&[host, port, V::Int(0), V::Int(libc::SOCK_STREAM as i64)], &[])?;
+    let mut errors: Vec<Exc> = Vec::new();
+    for info in ops::iter(&infos)? {
+        let V::Tuple(t) = &info else { continue };
+        let V::Tuple(sa) = &t[4] else { continue };
+        let ip: IpAddr = match &sa[0] {
+            V::Str(s) => s.parse().map_err(|_| Exc::runtime("getaddrinfo returned a bad address"))?,
+            _ => continue,
+        };
+        let port = match &sa[1] {
+            V::Int(p) => *p as u16,
+            _ => 0,
+        };
+        let addr = match ip {
+            IpAddr::V4(a) => std::net::SocketAddr::V4(std::net::SocketAddrV4::new(a, port)),
+            IpAddr::V6(a) => {
+                let (flow, scope) = match (sa.get(2), sa.get(3)) {
+                    (Some(V::Int(f)), Some(V::Int(s))) => (*f as u32, *s as u32),
+                    _ => (0, 0),
+                };
+                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(a, port, flow, scope))
+            }
+        };
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(s) => {
+                let peer = s.peer_addr().map(|a| sockaddr(&a)).unwrap_or(V::None);
+                let sock = s.local_addr().map(|a| sockaddr(&a)).unwrap_or(V::None);
+                let (r, w) = s.into_split();
+                let st = Arc::new(Stream {
+                    rd: tokio::sync::Mutex::new(Some(tokio::io::BufReader::new(r))),
+                    wr: tokio::sync::Mutex::new(Some(w)),
+                    buf: parking_lot::Mutex::new(Vec::new()),
+                    closing: Default::default(),
+                    eof: Default::default(),
+                    peer,
+                    sock,
+                });
+                return Ok(V::tuple(vec![V::native(Native::Stream(st.clone(), false)), V::native(Native::Stream(st, true))]));
+            }
+            Err(e) if uvloop => errors.push(os_error(&e, &strerror(e.raw_os_error().unwrap_or(0)))),
+            Err(e) => errors.push(os_error(&e, &format!("Connect call failed {}", ops::repr(&V::Tuple(sa.clone()))?))),
+        }
+    }
+    match errors.len() {
+        0 => Err(Exc::msg(&OS_ERROR, "getaddrinfo() returned empty list")),
+        1 => Err(errors.remove(0)),
+        _ => {
+            let texts: Vec<String> = errors.iter().map(|e| e.message()).collect();
+            if texts.iter().all(|t| *t == texts[0]) {
+                return Err(errors.remove(0));
+            }
+            Err(Exc::msg(&OS_ERROR, format!("Multiple exceptions: {}", texts.join(", "))))
+        }
+    }
+}
+
+async fn flush(st: &Stream) -> R<()> {
+    use tokio::io::AsyncWriteExt;
+    let data = std::mem::take(&mut *st.buf.lock());
+    let mut w = st.wr.lock().await;
+    if let (Some(w), false) = (w.as_mut(), data.is_empty()) {
+        w.write_all(&data).await.map_err(|e| os_error(&e, &e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// `StreamReader` (`writer` false) and `StreamWriter` methods
+pub async fn stream_method(st: &Arc<Stream>, writer: bool, name: &str, args: &[V]) -> R {
+    use std::sync::atomic::Ordering::SeqCst;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    match (writer, name) {
+        (true, "write") => {
+            match args.first() {
+                Some(V::Bytes(b)) => st.buf.lock().extend_from_slice(b),
+                Some(o) => return Err(Exc::type_error(format!("data argument must be a bytes-like object, not '{}'", o.type_name()))),
+                None => return Err(Exc::type_error("StreamWriter.write() missing 1 required positional argument: 'data'")),
+            }
+            Ok(V::None)
+        }
+        (true, "drain") => {
+            flush(st).await?;
+            Ok(V::None)
+        }
+        (true, "is_closing") => Ok(V::Bool(st.closing.load(SeqCst))),
+        (true, "close") => {
+            if !st.closing.swap(true, SeqCst) {
+                // the transport sends what is buffered, then closes (in the background, as asyncio)
+                let st = st.clone();
+                tokio::spawn(async move {
+                    let _ = flush(&st).await;
+                    if let Some(mut w) = st.wr.lock().await.take() {
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+                    }
+                    st.rd.lock().await.take();
+                });
+            }
+            Ok(V::None)
+        }
+        (true, "wait_closed") => {
+            if st.closing.load(SeqCst) {
+                let _ = flush(st).await;
+                if let Some(mut w) = st.wr.lock().await.take() {
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+                }
+                st.rd.lock().await.take();
+            }
+            Ok(V::None)
+        }
+        (true, "get_extra_info") => Ok(match args.first() {
+            Some(V::Str(s)) if &**s == "peername" => st.peer.clone(),
+            Some(V::Str(s)) if &**s == "sockname" => st.sock.clone(),
+            _ => args.get(1).cloned().unwrap_or(V::None),
+        }),
+        (false, "at_eof") => Ok(V::Bool(st.eof.load(SeqCst))),
+        (false, "read") => {
+            let n = match args.first() {
+                None => -1,
+                Some(V::Int(n)) => *n,
+                Some(o) => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+            };
+            let mut g = st.rd.lock().await;
+            let Some(r) = g.as_mut() else { return Ok(V::Bytes(Arc::from(&b""[..]))) };
+            let mut out = Vec::new();
+            if n < 0 {
+                r.read_to_end(&mut out).await.map_err(|e| os_error(&e, &e.to_string()))?;
+                st.eof.store(true, SeqCst);
+            } else if n > 0 {
+                out.resize(n as usize, 0);
+                let got = r.read(&mut out).await.map_err(|e| os_error(&e, &e.to_string()))?;
+                out.truncate(got);
+                if got == 0 {
+                    st.eof.store(true, SeqCst);
+                }
+            }
+            Ok(V::Bytes(Arc::from(out)))
+        }
+        (false, "readline") => {
+            let mut g = st.rd.lock().await;
+            let Some(r) = g.as_mut() else { return Ok(V::Bytes(Arc::from(&b""[..]))) };
+            let mut out = Vec::new();
+            r.read_until(b'\n', &mut out).await.map_err(|e| os_error(&e, &e.to_string()))?;
+            if !out.ends_with(b"\n") {
+                st.eof.store(true, SeqCst);
+            }
+            Ok(V::Bytes(Arc::from(out)))
+        }
+        _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", if writer { "StreamWriter" } else { "StreamReader" }))),
+    }
+}
+
+// ---------------------------------------------------------------- socket.create_connection
+
+/// A connected TCP socket of `socket.create_connection()` (closed by `close()` or leaving `with`)
+pub struct Sock {
+    stream: parking_lot::Mutex<Option<std::net::TcpStream>>,
+    peer: V,
+    local: V,
+}
+
+fn strerror(errno: i32) -> String {
+    unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }.to_string_lossy().into_owned()
+}
+
+/// `socket.create_connection((host, port), timeout=None)`: the `getaddrinfo` addresses in order, the last
+/// failure raised (CPython without `all_errors`); a connection that outlasts `timeout` is `TimeoutError("timed out")`.
+pub async fn create_connection(args: &[V], kwargs: &[(String, V)]) -> R {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !matches!(k.as_str(), "address" | "timeout" | "source_address" | "all_errors")) {
+        return Err(Exc::type_error(format!("create_connection() got an unexpected keyword argument '{k}'")));
+    }
+    let opt = |i: usize, name: &str| args.get(i).or_else(|| kw(kwargs, name)).cloned().unwrap_or(V::None);
+    if !opt(2, "source_address").is_none() || ops::truthy(&opt(3, "all_errors"))? {
+        return Err(Exc::type_error("py2axum: create_connection(source_address=, all_errors=True) is not supported"));
+    }
+    let addr = opt(0, "address");
+    let parts = ops::iter(&addr)?;
+    let [host, port] = parts.as_slice() else {
+        return Err(Exc::type_error("py2axum: create_connection() needs a (host, port) address"));
+    };
+    let timeout = match opt(1, "timeout") {
+        V::None => None,
+        V::Int(n) => Some(n as f64),
+        V::Float(f) => Some(f),
+        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer or float", o.type_name()))),
+    };
+    if timeout.is_some_and(|t| t < 0.0) {
+        return Err(Exc::value_error("Timeout value out of range"));
+    }
+    if timeout == Some(0.0) {
+        return Err(Exc::type_error("py2axum: create_connection(timeout=0) (a non-blocking socket) is not supported"));
+    }
+    let infos = getaddrinfo(&[host.clone(), port.clone(), V::Int(0), V::Int(libc::SOCK_STREAM as i64)], &[])?;
+    let mut addrs = Vec::new();
+    for info in ops::iter(&infos)? {
+        let V::Tuple(t) = &info else { continue };
+        let V::Tuple(sa) = &t[4] else { continue };
+        let (V::Str(ip), V::Int(p)) = (&sa[0], &sa[1]) else { continue };
+        let ip: IpAddr = ip.parse().map_err(|_| Exc::runtime("getaddrinfo returned a bad address"))?;
+        addrs.push(std::net::SocketAddr::new(ip, *p as u16));
+    }
+    let res = tokio::task::spawn_blocking(move || {
+        let mut last = None;
+        for a in addrs {
+            let r = match timeout {
+                None => std::net::TcpStream::connect(a),
+                Some(t) => std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs_f64(t)),
+            };
+            match r {
+                Ok(s) => return Ok(s),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last)
+    })
+    .await
+    .map_err(|e| Exc::runtime(e.to_string()))?;
+    match res {
+        Ok(s) => {
+            let peer = s.peer_addr().map(|a| sockaddr(&a)).unwrap_or(V::None);
+            let local = s.local_addr().map(|a| sockaddr(&a)).unwrap_or(V::None);
+            Ok(V::native(Native::Socket(Arc::new(Sock { stream: parking_lot::Mutex::new(Some(s)), peer, local }))))
+        }
+        Err(None) => Err(Exc::msg(&OS_ERROR, "getaddrinfo returns an empty list")),
+        Err(Some(e)) => Err(match e.raw_os_error() {
+            Some(n) => os_error(&e, &strerror(n)),
+            None if e.kind() == std::io::ErrorKind::TimedOut => Exc::msg(&TIMEOUT_ERROR, "timed out"),
+            None => Exc::msg(&OS_ERROR, e.to_string()),
+        }),
+    }
+}
+
+pub fn sock_method(s: &Arc<Sock>, name: &str) -> R {
+    match name {
+        "close" | "__exit__" => {
+            s.stream.lock().take();
+            Ok(if name == "close" { V::None } else { V::Bool(false) })
+        }
+        "getpeername" => Ok(s.peer.clone()),
+        "getsockname" => Ok(s.local.clone()),
+        _ => Err(Exc::attr_error(format!("'socket' object has no attribute '{name}'"))),
+    }
 }

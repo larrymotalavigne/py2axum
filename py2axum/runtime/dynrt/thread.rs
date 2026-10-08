@@ -467,6 +467,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         if let Native::Suppress(_) = &**n {
             return Ok(V::None);
         }
+        if let Native::Socket(_) | Native::ZipW(_) = &**n {
+            return Ok(v.clone());
+        }
     }
     super::pathio::ctx_enter(v)
 }
@@ -489,6 +492,13 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         }
         if let Native::Sentry(o) = &**n {
             return super::sentry::exit(o);
+        }
+        if let Native::Socket(s) = &**n {
+            return super::net::sock_method(s, "__exit__");
+        }
+        if let Native::ZipW(z) = &**n {
+            super::zipw::method(z, "close", &[], &[])?;
+            return Ok(V::Bool(false));
         }
         if let Native::Suppress(classes) = &**n {
             // contextlib.suppress: true when the exception is an instance of one of its classes

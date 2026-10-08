@@ -169,3 +169,23 @@ class EnumRow(Base):
     pri_val: Mapped[Priority] = mapped_column(
         SQLEnum(Priority, name="enumrow_pri_val", values_callable=lambda e: [m.value for m in e]))
     maybe: Mapped[Priority | None] = mapped_column(SQLEnum(Priority, name="enumrow_maybe"), nullable=True)
+
+
+class NoticeBlob(Base):
+    """a shared attachment content: a deferred blob, loaded by `undefer()` (fixtures/dynapp/pydmore.py)."""
+    __tablename__ = "notice_blobs"
+
+    key: Mapped[str] = mapped_column("hash", String(64), primary_key=True)
+    content: Mapped[bytes | None] = deferred(Column(LargeBinary, nullable=True))
+    refs: Mapped[int] = mapped_column(default=1)
+
+
+class Notice(Base):
+    """SQL column names other than the attributes (`Column("metadata", JSON)` as a notification log)."""
+    __tablename__ = "notices"
+
+    id: Mapped[int] = mapped_column("nid", Integer, primary_key=True)
+    extra_data: Mapped[dict | None] = Column("metadata", JSON, nullable=True)
+    label: Mapped[str] = mapped_column("lbl", String(20), default="none")
+    blob_key: Mapped[str | None] = mapped_column("blob_hash", ForeignKey("notice_blobs.hash"), nullable=True)
+    blob: Mapped[NoticeBlob | None] = relationship(lazy="noload")

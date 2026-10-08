@@ -343,6 +343,11 @@ fn no_attr(o: &RObj, name: &str) -> Exc {
 pub fn attr(o: &Arc<RObj>, name: &str) -> R {
     match (&**o, name) {
         (RObj::App, "router") => Ok(obj(RObj::AppRouter)),
+        // Starlette's `app.state`: one State for the process (set in the lifespan, read by `request.app.state`)
+        (RObj::App, "state") => {
+            static STATE: std::sync::LazyLock<Arc<super::web::ReqCell>> = std::sync::LazyLock::new(|| Arc::new(super::web::ReqCell::empty()));
+            Ok(V::native(Native::State(STATE.clone())))
+        }
         // the binary has no overrides (tests set them, a server does not): always empty
         (RObj::App, "dependency_overrides") => V::dict_from(vec![]),
         (RObj::App | RObj::AppRouter, "routes") => routes_of(app_def(), true),
@@ -428,15 +433,67 @@ pub fn add_dispatch(app: &V, dispatch: V) -> R {
 /// the stack function starts / ends collecting `app.add_middleware` calls
 pub fn begin_build() {
     *BUILD.lock() = Some(Vec::new());
+    HANDLERS.lock().clear();
 }
 
 pub fn take_built() -> Vec<Mw> {
     BUILD.lock().as_mut().map(std::mem::take).unwrap_or_default()
 }
 
+/// the exception handlers a function given the application registered (in order)
+pub fn take_handlers() -> Vec<(V, V)> {
+    std::mem::take(&mut *HANDLERS.lock())
+}
+
 pub fn end_build() {
     *BUILD.lock() = None;
 }
+
+static HANDLERS: Mutex<Vec<(V, V)>> = Mutex::new(Vec::new());
+
+fn building() -> R<()> {
+    if BUILD.lock().is_none() {
+        return Err(Exc::runtime("Cannot add middleware after an application has started"));
+    }
+    Ok(())
+}
+
+/// `app.add_middleware(RawAsgiClass, ...)` from project code: the transpiler built the instance with the
+/// slot as its `app`
+pub fn add_asgi(app: &V, inst: V, slot: Arc<super::asgi::Slot>) -> R {
+    if !matches!(app, V::Native(n) if matches!(&**n, Native::Routing(o) if matches!(&**o, RObj::App))) {
+        return Err(Exc::attr_error(format!("'{}' object has no attribute 'add_middleware'", app.type_name())));
+    }
+    building()?;
+    if let Some(b) = BUILD.lock().as_mut() {
+        b.push(Mw::Asgi(inst, slot));
+    }
+    Ok(V::None)
+}
+
+/// `@app.exception_handler(key)` in a function given the application: registers the function, returns it
+fn exception_handler_deco<'a>(_cx: &'a Cx, key: V, args: Vec<V>) -> super::BoxFut<'a> {
+    Box::pin(async move {
+        let (args, _) = super::unpack(args);
+        let [f] = &args[..] else { return Err(Exc::type_error("decorator() takes exactly one argument")) };
+        HANDLERS.lock().push((key, f.clone()));
+        Ok(f.clone())
+    })
+}
+
+/// `@app.middleware("http")` in a function given the application
+fn middleware_deco<'a>(_cx: &'a Cx, _kind: V, args: Vec<V>) -> super::BoxFut<'a> {
+    Box::pin(async move {
+        let (args, _) = super::unpack(args);
+        let [f] = &args[..] else { return Err(Exc::type_error("decorator() takes exactly one argument")) };
+        building()?;
+        if let Some(b) = BUILD.lock().as_mut() {
+            b.push(Mw::Dispatch(f.clone()));
+        }
+        Ok(f.clone())
+    })
+}
+
 
 pub async fn method(cx: &Cx, o: &Arc<RObj>, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     match (&**o, name) {
@@ -447,6 +504,28 @@ pub async fn method(cx: &Cx, o: &Arc<RObj>, name: &str, args: Vec<V>, kwargs: Ve
             matches(o, scope)
         }
         (RObj::App | RObj::AppRouter, "add_route") => add_route(args, kwargs),
+        (RObj::App, "exception_handler") => {
+            let [key] = &args[..] else {
+                return Err(Exc::type_error("Starlette.exception_handler() takes 2 positional arguments"));
+            };
+            Ok(V::native(Native::Bound(exception_handler_deco, key.clone())))
+        }
+        (RObj::App, "add_exception_handler") => {
+            let (key, f) = match (&args[..], kw(&kwargs, "exc_class_or_status_code"), kw(&kwargs, "handler")) {
+                ([k, f], None, None) => (k.clone(), f.clone()),
+                ([k], None, Some(f)) => (k.clone(), f.clone()),
+                ([], Some(k), Some(f)) => (k.clone(), f.clone()),
+                _ => return Err(Exc::type_error("Starlette.add_exception_handler() takes 3 positional arguments")),
+            };
+            HANDLERS.lock().push((key, f));
+            Ok(V::None)
+        }
+        (RObj::App, "middleware") => {
+            if !matches!(&args[..], [V::Str(s)] if &**s == "http") {
+                return Err(Exc::type_error("py2axum: only @app.middleware(\"http\") is supported"));
+            }
+            Ok(V::native(Native::Bound(middleware_deco, args[0].clone())))
+        }
         (RObj::App, "add_middleware") => {
             let _ = (cx, &kwargs);
             Err(Exc::type_error("py2axum: app.add_middleware() of a class known only at run time is not supported"))
@@ -475,6 +554,23 @@ pub fn added_is_match(path: &str) -> bool {
 
 /// `request.scope`: a snapshot of the ASGI scope (the keys the binary has; `endpoint` is None)
 pub fn scope(cx: &Cx) -> R {
+    // under a raw middleware: the scope it handed down (Starlette's router adds its keys to the same dict)
+    let passed = cx.asgi_scope.lock().clone();
+    if let Some(s @ V::Dict(_)) = passed {
+        if let (Some(node), V::Dict(m)) = (*cx.req.route.lock(), &s) {
+            let pp: Vec<(V, V)> = cx.req.path_params.lock().iter().map(|(k, v)| (V::str(k), V::str(v))).collect();
+            let pp = V::dict_from(pp)?;
+            let mut m = m.lock();
+            if !m.contains_key(&Key::Str(Arc::from("endpoint"))) {
+                m.insert(Key::Str(Arc::from("endpoint")), (V::str("endpoint"), V::None));
+            }
+            m.insert(Key::Str(Arc::from("path_params")), (V::str("path_params"), pp));
+            if matches!(node, Node::Api { .. }) {
+                m.insert(Key::Str(Arc::from("route")), (V::str("route"), obj(RObj::Node(node))));
+            }
+        }
+        return Ok(s);
+    }
     let r = &cx.req;
     let (path, query) = (super::web::unquote(&r.path), r.raw_query.clone());
     let headers: Vec<V> = r.headers.iter().map(|(k, v)| V::tuple(vec![V::Bytes(Arc::from(k.to_lowercase().as_bytes())), V::Bytes(Arc::from(v.as_bytes()))])).collect();

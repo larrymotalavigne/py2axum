@@ -10,7 +10,7 @@ docker compose -f examples/notes/docker-compose.yml up --build
 curl -s localhost:8080/notes
 
 # or by hand
-py2axum examples/notes/app --root examples/notes --backend dyn -o build/notes --name notes
+py2axum examples/notes/app --root examples/notes -o build/notes --name notes
 cargo build --release --manifest-path build/notes/Cargo.toml
 psql "$DB" -f examples/notes/schema.sql
 DATABASE_URL=$DB ./build/notes/target/release/notes
