@@ -1606,6 +1606,9 @@ pub fn unicodedata_normalize(table: &[(u32, u32)], form: &V, s: &V) -> R {
     let V::Str(s) = s else {
         return Err(Exc::type_error(format!("normalize() argument 2 must be str, not {}", arg_type(s))));
     };
+    if s.is_empty() {
+        return Ok(V::Str(s.clone())); // CPython returns an empty input before looking at the form
+    }
     let f: fn(&str) -> String = match form.as_ref() {
         "NFC" => |t| t.nfc().collect(),
         "NFD" => |t| t.nfd().collect(),

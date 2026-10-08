@@ -64,6 +64,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
     if let V::Native(n) = v {
         match &**n {
             Native::Module(m) => return (m.attr)(cx, name).await,
+            Native::Jinja(j) if name == "filters" => return Ok(V::native(Native::JinjaFilters(j.clone()))),
             Native::Tenacity(t) => return super::tenacity::attr(t, name),
             Native::RelDelta(r) => return super::reldelta::attr(r, name).ok_or_else(|| no_attr(v, name)),
             Native::Prom(p) => return super::prom::attr(p, name),
@@ -124,6 +125,9 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             (ClassKind::Model(m), _) if m.col_index(name).is_some() => Ok(V::Col(m, m.col_index(name).unwrap())),
             (ClassKind::Model(m), _) if m.rel_index(name).is_some() => Ok(orm::sql(orm::Sql::Rel(m, m.rel_index(name).unwrap()))),
             (ClassKind::Model(m), "__tablename__") => Ok(V::str(m.table)),
+            (ClassKind::Model(m), _) if matches!(find_method(m.methods, name), Some((true, _))) => {
+                Ok(V::native(Native::Property(m.methods.iter().find(|(n, _, _)| *n == name).unwrap().0)))
+            }
             (ClassKind::Model(m), _) if m.class_methods.contains(&name) => match find_method(m.methods, name) {
                 Some((_, f)) => Ok(bound(f, v.clone())),
                 None => unreachable!("class method {name} not in the method table"),
@@ -267,8 +271,9 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             }),
             Native::Url(r) => Ok(match name {
                 // Starlette's URL is built from scope["path"], which uvicorn percent-decodes
-                "path" => V::str(web::unquote(&r.path)),
-                "query" => V::str(&r.raw_query),
+                // ... then urllib's urlsplit drops every tab and newline (WHATWG)
+                "path" => V::str(web::unquote(&r.path).replace(['\t', '\r', '\n'], "")),
+                "query" => V::str(r.raw_query.replace(['\t', '\r', '\n'], "")),
                 "hostname" => r.header("host").map(|h| V::str(h.split(':').next().unwrap_or(""))).unwrap_or(V::None),
                 "scheme" => V::str("http"),
                 "netloc" => V::str(r.header("host").unwrap_or_default()),
@@ -423,8 +428,24 @@ fn bytes_method(b: &Arc<[u8]>, name: &str, args: &[V]) -> R {
             Ok(bytes(&b[start..end.max(start)]))
         }
         "startswith" | "endswith" => {
-            let pre = chars(0)?.ok_or_else(|| Exc::type_error(format!("{name} first arg must be bytes or a tuple of bytes, not NoneType")))?;
-            Ok(V::Bool(if name == "startswith" { b.starts_with(&pre) } else { b.ends_with(&pre) }))
+            let check = |p: &[u8]| if name == "startswith" { b.starts_with(p) } else { b.ends_with(p) };
+            match args.first() {
+                Some(V::Bytes(p)) => Ok(V::Bool(check(p))),
+                Some(V::Tuple(t)) => {
+                    for p in t.iter() {
+                        match p {
+                            V::Bytes(p) if check(p) => return Ok(V::Bool(true)),
+                            V::Bytes(_) => {}
+                            o => return Err(Exc::type_error(format!("a bytes-like object is required, not '{}'", o.type_name()))),
+                        }
+                    }
+                    Ok(V::Bool(false))
+                }
+                o => Err(Exc::type_error(format!(
+                    "{name} first arg must be bytes or a tuple of bytes, not {}",
+                    o.map(|o| o.type_name()).unwrap_or("NoneType")
+                ))),
+            }
         }
         "lower" => Ok(bytes(&b.to_ascii_lowercase())),
         "upper" => Ok(bytes(&b.to_ascii_uppercase())),
@@ -1124,18 +1145,23 @@ fn strs(v: &V) -> R<String> {
     }
 }
 
+/// `str.isspace()` of one character: CPython's whitespace (with U+001C..U+001F, which Rust's lacks)
+pub fn py_space(c: char) -> bool {
+    str_class(c, |t| t.space, char::is_whitespace)
+}
+
 fn py_split_ws(s: &str, maxsplit: i64) -> Vec<V> {
     let mut out = Vec::new();
-    let mut rest = s.trim_start();
+    let mut rest = s.trim_start_matches(py_space);
     while !rest.is_empty() {
         if maxsplit >= 0 && out.len() as i64 == maxsplit {
             out.push(V::str(rest));
             return out;
         }
-        match rest.find(char::is_whitespace) {
+        match rest.find(py_space) {
             Some(i) => {
                 out.push(V::str(&rest[..i]));
-                rest = rest[i..].trim_start();
+                rest = rest[i..].trim_start_matches(py_space);
             }
             None => {
                 out.push(V::str(rest));
@@ -1174,7 +1200,7 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
             };
             let pred = |c: char| match &chars {
                 Some(cs) => cs.contains(&c),
-                None => c.is_whitespace(),
+                None => py_space(c),
             };
             V::str(match name {
                 "strip" => s.trim_matches(pred),
@@ -1276,12 +1302,31 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
                 None => String::new(),
             })
         }
-        "isdigit" | "isnumeric" | "isdecimal" => V::Bool(!s.is_empty() && s.chars().all(|c| c.is_numeric())),
-        "isalpha" => V::Bool(!s.is_empty() && s.chars().all(char::is_alphabetic)),
-        "isalnum" => V::Bool(!s.is_empty() && s.chars().all(char::is_alphanumeric)),
-        "isspace" => V::Bool(!s.is_empty() && s.chars().all(char::is_whitespace)),
-        "islower" => V::Bool(s.chars().any(char::is_alphabetic) && !s.chars().any(char::is_uppercase)),
-        "isupper" => V::Bool(s.chars().any(char::is_alphabetic) && !s.chars().any(char::is_lowercase)),
+        "isdigit" => V::Bool(!s.is_empty() && s.chars().all(|c| str_class(c, |t| t.digit, char::is_numeric))),
+        "isdecimal" => V::Bool(!s.is_empty() && s.chars().all(|c| str_class(c, |t| t.decimal, |c| c.is_ascii_digit()))),
+        "isnumeric" => V::Bool(!s.is_empty() && s.chars().all(|c| str_class(c, |t| t.numeric, char::is_numeric))),
+        "isalpha" => V::Bool(!s.is_empty() && s.chars().all(|c| str_class(c, |t| t.alpha, char::is_alphabetic))),
+        // Python: isalpha or isdecimal or isdigit or isnumeric (numeric includes the other two)
+        "isalnum" => V::Bool(!s.is_empty() && s.chars().all(|c| str_class(c, |t| t.alpha, char::is_alphabetic) || str_class(c, |t| t.numeric, char::is_numeric))),
+        "isspace" => V::Bool(!s.is_empty() && s.chars().all(py_space)),
+        // CPython's unicode_islower_impl / unicode_isupper_impl: no cased character of the other kind (nor a
+        // titlecase one), at least one of this kind
+        "islower" | "isupper" => {
+            let (this, other): (fn(&StrClasses) -> &'static [(u32, u32)], fn(&StrClasses) -> &'static [(u32, u32)]) =
+                if name == "islower" { (|t| t.lower, |t| t.upper) } else { (|t| t.upper, |t| t.lower) };
+            let (fthis, fother): (fn(char) -> bool, fn(char) -> bool) =
+                if name == "islower" { (char::is_lowercase, char::is_uppercase) } else { (char::is_uppercase, char::is_lowercase) };
+            let mut cased = false;
+            let mut ok = true;
+            for c in s.chars() {
+                if str_class(c, other, fother) || str_class(c, |t| t.title, |_| false) {
+                    ok = false;
+                    break;
+                }
+                cased |= str_class(c, this, fthis);
+            }
+            V::Bool(ok && cased)
+        }
         "zfill" => {
             let w = match &args[0] {
                 V::Int(i) => *i as usize,
@@ -2357,4 +2402,35 @@ pub fn builtin_dir(v: &V) -> Option<&'static [&'static str]> {
         V::Decimal(_) => &["__abs__", "__add__", "__bool__", "__ceil__", "__class__", "__complex__", "__copy__", "__deepcopy__", "__delattr__", "__dir__", "__divmod__", "__doc__", "__eq__", "__float__", "__floor__", "__floordiv__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__int__", "__le__", "__lt__", "__mod__", "__module__", "__mul__", "__ne__", "__neg__", "__new__", "__pos__", "__pow__", "__radd__", "__rdivmod__", "__reduce__", "__reduce_ex__", "__repr__", "__rfloordiv__", "__rmod__", "__rmul__", "__round__", "__rpow__", "__rsub__", "__rtruediv__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__truediv__", "__trunc__", "adjusted", "as_integer_ratio", "as_tuple", "canonical", "compare", "compare_signal", "compare_total", "compare_total_mag", "conjugate", "copy_abs", "copy_negate", "copy_sign", "exp", "fma", "from_float", "from_number", "imag", "is_canonical", "is_finite", "is_infinite", "is_nan", "is_normal", "is_qnan", "is_signed", "is_snan", "is_subnormal", "is_zero", "ln", "log10", "logb", "logical_and", "logical_invert", "logical_or", "logical_xor", "max", "max_mag", "min", "min_mag", "next_minus", "next_plus", "next_toward", "normalize", "number_class", "quantize", "radix", "real", "remainder_near", "rotate", "same_quantum", "scaleb", "shift", "sqrt", "to_eng_string", "to_integral", "to_integral_exact", "to_integral_value"],
         _ => return None,
     })
+}
+
+
+/// The `str.is*()` classes of the translating Python's Unicode database (gen.rs `STR_CLASSES`, code point ranges):
+/// Rust's predicates follow other properties ('¾'.is_numeric() but '¾'.isdigit() is False in Python).
+pub struct StrClasses {
+    pub digit: &'static [(u32, u32)],
+    pub decimal: &'static [(u32, u32)],
+    pub numeric: &'static [(u32, u32)],
+    pub alpha: &'static [(u32, u32)],
+    pub space: &'static [(u32, u32)],
+    pub lower: &'static [(u32, u32)],
+    pub upper: &'static [(u32, u32)],
+    pub title: &'static [(u32, u32)],
+}
+
+static STR_CLASSES: std::sync::OnceLock<&'static StrClasses> = std::sync::OnceLock::new();
+
+pub fn set_str_classes(c: &'static StrClasses) {
+    let _ = STR_CLASSES.set(c);
+}
+
+fn str_class(c: char, table: fn(&StrClasses) -> &'static [(u32, u32)], fallback: fn(char) -> bool) -> bool {
+    match STR_CLASSES.get() {
+        Some(t) => {
+            let ranges = table(t);
+            let cp = c as u32;
+            ranges.binary_search_by(|&(lo, hi)| if hi < cp { std::cmp::Ordering::Less } else if lo > cp { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }).is_ok()
+        }
+        None => fallback(c),
+    }
 }

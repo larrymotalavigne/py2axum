@@ -354,14 +354,16 @@ pub fn new(args: &[V], kwargs: &[(String, V)]) -> R {
 }
 
 /// FastAPI's `decimal_encoder`: int when the exponent is >= 0, else float
-pub fn jsonable(d: &Dec) -> V {
+/// FastAPI's `decimal_encoder`: `int(d)` when the exponent is not negative, else `float(d)`. An int beyond
+/// 64 bits is an OverflowError here (docs/supported.md), never a float in its place.
+pub fn jsonable(d: &Dec) -> R {
     if d.exp >= 0 {
         match d.to_int().to_i64() {
-            Some(i) => V::Int(i),
-            None => V::Float(d.to_f64()),
+            Some(i) => Ok(V::Int(i)),
+            None => Err(Exc::msg(&OVERFLOW_ERROR, format!("py2axum: the integer {} is outside the signed 64-bit range", d.to_int()))),
         }
     } else {
-        V::Float(d.to_f64())
+        Ok(V::Float(d.to_f64()))
     }
 }
 

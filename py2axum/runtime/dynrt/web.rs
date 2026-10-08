@@ -115,18 +115,54 @@ pub async fn param(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static 
     }
 }
 
-/// FastAPI reads and JSON-decodes the body before solving dependencies.
+static RESPONSE_DUMP_JSON: AtomicBool = AtomicBool::new(true);
+
+/// FastAPI 0.130+ serializes a response_model with pydantic's `dump_json` (set by main.rs).
+pub fn set_response_dump_json(on: bool) {
+    RESPONSE_DUMP_JSON.store(on, Ordering::Relaxed);
+}
+
+fn response_dump_json() -> bool {
+    RESPONSE_DUMP_JSON.load(Ordering::Relaxed)
+}
+
+static STARLETTE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+/// The project's locked Starlette (set by main.rs): form parsing changed between versions.
+pub fn set_starlette(major: u32, minor: u32) {
+    let _ = STARLETTE.set((major, minor));
+}
+
+fn starlette() -> (u32, u32) {
+    STARLETTE.get().copied().unwrap_or((1, 7))
+}
+
+static STRICT_CONTENT_TYPE: AtomicBool = AtomicBool::new(true);
+
+/// `FastAPI(strict_content_type=...)`: its default, True since FastAPI 0.132 (set by main.rs).
+pub fn set_strict_content_type(strict: bool) {
+    STRICT_CONTENT_TYPE.store(strict, Ordering::Relaxed);
+}
+
+fn strict_content_type() -> bool {
+    STRICT_CONTENT_TYPE.load(Ordering::Relaxed)
+}
+
+/// FastAPI reads and JSON-decodes the body before solving dependencies (fastapi/routing.py): JSON when the
+/// content type is application/json or +json, or missing or empty (unless `strict_content_type`); decoded by
+/// `request.json()` (json.loads of the bytes: BOM and UTF-16/32 detected); a JSONDecodeError is a 422
+/// `json_invalid` at its character position, any other error (bad UTF-8, nesting too deep) a 400.
 pub fn read_body(cx: &Cx) -> R<Option<V>> {
     let bytes = &cx.req.body;
     if bytes.is_empty() {
         return Ok(None);
     }
-    let is_json = match cx.req.header("content-type") {
-        None => true,
+    let is_json = match cx.req.header("content-type").filter(|ct| !ct.is_empty()) {
+        None => !strict_content_type(),
         Some(ct) => {
             let main = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
             match main.split_once('/') {
-                Some(("application", sub)) => sub == "json" || sub.ends_with("+json"),
+                Some(("application", sub)) if !sub.contains('/') => sub == "json" || sub.ends_with("+json"),
                 _ => false,
             }
         }
@@ -134,42 +170,33 @@ pub fn read_body(cx: &Cx) -> R<Option<V>> {
     if !is_json {
         return Ok(Some(V::Bytes(Arc::from(&bytes[..]))));
     }
-    let text = String::from_utf8_lossy(bytes);
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(v) => Ok(Some(pyd::from_serde(&v))),
-        Err(e) => {
-            let pos = char_offset(&text, e.line(), e.column());
-            Err(Exc::validation(
-                &REQUEST_VALIDATION_ERROR,
-                vec![ErrDetail {
-                    kind: "json_invalid",
-                    loc: vec![V::str("body"), V::Int(pos as i64)],
-                    msg: "JSON decode error".into(),
-                    input: V::empty_dict(),
-                    ctx: Some(vec![("error", V::str(e.to_string()))]),
-                }],
-            ))
-        }
+    // Starlette's `request.json()` is `json.loads(body)`: any error but JSONDecodeError (undecodable
+    // bytes, RecursionError) is FastAPI's 400
+    let bad = || Exc::http(400, V::str("There was an error parsing the body"), vec![]);
+    let text = super::libs::json_text(bytes).map_err(|_| bad())?;
+    let chars: Vec<char> = text.chars().collect();
+    match super::pyjson::decode(&chars) {
+        Ok(v) => Ok(Some(v)),
+        Err(super::pyjson::Fail::Recursion(_)) => Err(bad()),
+        Err(super::pyjson::Fail::Overflow(t)) => Err(super::pyjson::overflow(&t)),
+        Err(super::pyjson::Fail::Decode(msg, pos)) => Err(Exc::validation(
+            &REQUEST_VALIDATION_ERROR,
+            vec![ErrDetail {
+                kind: "json_invalid",
+                loc: vec![V::str("body"), V::Int(pos as i64)],
+                msg: "JSON decode error".into(),
+                input: V::empty_dict(),
+                ctx: Some(vec![("error", V::str(msg))]),
+            }],
+        )),
     }
-}
-
-fn char_offset(text: &str, line: usize, column: usize) -> usize {
-    let mut cur = 1;
-    for (i, (_, c)) in text.char_indices().enumerate() {
-        if cur == line {
-            return (i + column.saturating_sub(1)).min(text.chars().count());
-        }
-        if c == '\n' {
-            cur += 1;
-        }
-    }
-    text.chars().count()
 }
 
 /// The single body parameter (not embedded): `loc = ["body", ...]`.
 pub async fn body_param(cx: &Cx, body: &Option<V>, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
     match body {
-        None => {
+        // a JSON `null` body is no body (FastAPI's _validate_value_with_model_field): missing, or the default
+        None | Some(V::None) => {
             if required {
                 errs.push(ErrDetail { kind: "missing", loc: vec![V::str("body")], msg: "Field required".into(), input: V::None, ctx: None });
                 Ok(V::None)
@@ -183,14 +210,21 @@ pub async fn body_param(cx: &Cx, body: &Option<V>, td: &'static TD, required: bo
 
 /// An embedded body parameter (several body params): `loc = ["body", name, ...]`.
 pub async fn body_field(cx: &Cx, body: &Option<V>, name: &str, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
+    // fastapi request_body_to_args: `body.get(alias)`; a body without `.get` (a list, a str...) is a missing
+    // field even when the parameter has a default; a `null` value counts as absent
+    let missing = |errs: &mut Vec<ErrDetail>| errs.push(ErrDetail { kind: "missing", loc: vec![V::str("body"), V::str(name)], msg: "Field required".into(), input: V::None, ctx: None });
     let got = match body {
-        Some(V::Dict(d)) => d.lock().get(&Key::Str(Arc::from(name))).map(|(_, v)| v.clone()),
-        _ => None,
+        Some(V::Dict(d)) => d.lock().get(&Key::Str(Arc::from(name))).map(|(_, v)| v.clone()).filter(|v| !matches!(v, V::None)),
+        None | Some(V::None) | Some(V::Bytes(_)) => None,
+        Some(_) => {
+            missing(errs);
+            return Ok(V::None);
+        }
     };
     match got {
         None => {
             if required {
-                errs.push(ErrDetail { kind: "missing", loc: vec![V::str("body"), V::str(name)], msg: "Field required".into(), input: body.clone().unwrap_or(V::None), ctx: None });
+                missing(errs);
                 Ok(V::None)
             } else {
                 Ok(default())
@@ -358,6 +392,18 @@ pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
     let bad = || Exc::http(400, V::str("There was an error parsing the body"), vec![]);
     match main.as_str() {
         "multipart/form-data" => {
+            // Starlette's MultiPartParser: no boundary parameter, then an empty one
+            let param = ct.split(';').skip(1).find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                k.trim().eq_ignore_ascii_case("boundary").then(|| v.trim().trim_matches('"').to_string())
+            });
+            match param.as_deref() {
+                None => return Err(Exc::http(400, V::str("Missing boundary in multipart."), vec![])),
+                // Starlette 1.7+ wraps python-multipart's parse error; before, it reaches FastAPI's catch-all
+                Some("") if starlette() >= (1, 7) => return Err(Exc::http(400, V::str("Invalid multipart data."), vec![])),
+                Some("") => return Err(bad()),
+                _ => {}
+            }
             let boundary = multer::parse_boundary(&ct).map_err(|_| bad())?;
             let body = cx.req.body.clone();
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(body.to_vec())) });
@@ -382,6 +428,19 @@ pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
             Ok(out)
         }
         "application/x-www-form-urlencoded" => {
+            // Starlette's FormParser limits (1.4+: max_part_size, name + value as sent; max_fields), checked
+            // field by field like python-multipart's callbacks
+            let mut fields = 0;
+            let limits = starlette() >= (1, 4);
+            for part in cx.req.body.split(|b| *b == b'&').filter(|p| !p.is_empty() && limits) {
+                if part.len() - usize::from(part.contains(&b'=')) > 1024 * 1024 {
+                    return Err(Exc::http(400, V::str("Field exceeded maximum size of 1024KB."), vec![]));
+                }
+                fields += 1;
+                if fields > 1000 {
+                    return Err(Exc::http(400, V::str("Too many fields. Maximum number of fields is 1000."), vec![]));
+                }
+            }
             Ok(form_urlencoded::parse(&cx.req.body).map(|(k, v)| (k.to_string(), FormVal::Text(v.to_string()))).collect())
         }
         _ => Ok(Vec::new()),
@@ -584,7 +643,8 @@ async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) 
         return Ok(b.body(Body::empty()).unwrap());
     }
     let content = encode(cx, &ret, model).await?;
-    Ok(json_body(status, pyd::to_json(&content, &pyd::RESPONSE, false)?, &headers))
+    let style = if model.is_some() && response_dump_json() { &pyd::DUMP_JSON } else { &pyd::RESPONSE };
+    Ok(json_body(status, pyd::to_json(&content, style, false)?, &headers))
 }
 
 fn stream_response(s: Streaming, extra: &[(String, String)]) -> Response {
@@ -613,19 +673,31 @@ fn stream_response(s: Streaming, extra: &[(String, String)]) -> Response {
 
 /// Exception escaping the endpoint -> HTTP response (FastAPI's default exception handlers).
 pub fn error_response(e: Exc) -> Response {
+    try_error_response(e).unwrap_or_else(internal_error)
+}
+
+/// FastAPI's handlers for HTTPException and RequestValidationError. Their JSONResponse fails on
+/// NaN/inf (json.dumps(allow_nan=False), in a detail or in a validation error's raw `input`): the
+/// ValueError leaves the ExceptionMiddleware, ServerErrorMiddleware answers 500 outside every other
+/// middleware.
+pub fn try_error_response(e: Exc) -> R<Response> {
     let obj = &e.0;
     if let Some((code, detail, headers)) = &e.http_info() {
         let body = V::dict_from(vec![(V::str("detail"), pyd::jsonable(detail).unwrap_or(V::None))]).unwrap();
         if no_body(*code) {
-            return Response::builder().status(*code).body(Body::empty()).unwrap();
+            return Ok(Response::builder().status(*code).body(Body::empty()).unwrap());
         }
-        return json_body(*code, pyd::to_json(&body, &pyd::RESPONSE, true).unwrap_or_default(), headers);
+        return Ok(json_body(*code, pyd::to_json(&body, &pyd::RESPONSE, true)?, headers));
     }
     if e.isinstance(&REQUEST_VALIDATION_ERROR) {
         let errs: Vec<V> = obj.errors.as_ref().map(|v| v.iter().map(|e| e.to_v()).collect()).unwrap_or_default();
         let body = V::dict_from(vec![(V::str("detail"), pyd::jsonable(&V::list(errs)).unwrap_or(V::None))]).unwrap();
-        return json_body(422, pyd::to_json(&body, &pyd::RESPONSE, true).unwrap_or_default(), &[]);
+        return Ok(json_body(422, pyd::to_json(&body, &pyd::RESPONSE, true)?, &[]));
     }
+    Ok(internal_error(e))
+}
+
+fn internal_error(e: Exc) -> Response {
     eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -781,10 +853,12 @@ pub use super::agen::{spawn_gen, Yielder};
 
 pub fn streaming_response(content: V, media_type: Option<String>, status: u16, headers: Vec<(String, String)>) -> R {
     let rx = match &content {
-        V::Native(n) => match &**n {
+        V::Native(n) if matches!(&**n, Native::Gen(_)) => match &**n {
             Native::Gen(g) => super::agen::into_channel(g.clone()),
-            _ => return Err(Exc::type_error("StreamingResponse needs an async generator")),
+            _ => unreachable!(),
         },
+        // a synchronous iterable (a list, `io.StringIO(...)`: its lines), which Starlette iterates in a
+        // thread pool; anything not iterable is its TypeError
         _ => {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let items = ops::iter(&content)?;
@@ -1164,10 +1238,8 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
         return super::asgi::to_response(&ret);
     }
     if path != "/" {
-        let alt = match path.strip_suffix('/') {
-            Some(p) => p.to_string(),
-            None => format!("{path}/"),
-        };
+        // Starlette: `path.rstrip("/")`, every trailing slash (`/tasks/%2F` decodes to `/tasks//` -> `/tasks`)
+        let alt = if path.ends_with('/') { path.trim_end_matches('/').to_string() } else { format!("{path}/") };
         if res.iter().any(|re| re.is_match(&alt)) || super::routing::added_is_match(&alt) {
             let host = cx.req.header("host").unwrap_or_default();
             let mut url = format!("http://{host}{alt}");
@@ -1312,46 +1384,116 @@ pub async fn lifespan_end(cx: &Cx, cm: V) -> R<()> {
 }
 
 static SHUTDOWN: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
+/// the signal that started the shutdown, raised again once the process is cleaned up (uvicorn's
+/// `capture_signals`): the exit status is the signal's, as for the Python server
+static SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn shutdown_tx() -> &'static tokio::sync::watch::Sender<bool> {
     SHUTDOWN.get_or_init(|| tokio::sync::watch::channel(false).0)
 }
 
+/// true once SIGTERM/SIGINT arrived (WebSocket sessions close with 1012, like uvicorn's `shutdown()`)
+pub fn shutdown_watch() -> tokio::sync::watch::Receiver<bool> {
+    shutdown_tx().subscribe()
+}
+
+/// the next SIGINT or SIGTERM; its number
+async fn next_signal() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = term.recv() => 15,
+            _ = int.recv() => 2,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        2
+    }
+}
+
 /// SIGINT or SIGTERM (what uvicorn handles): the server stops accepting and drains
 pub async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = term => {},
-    }
+    let sig = next_signal().await;
+    SIGNAL.store(sig, std::sync::atomic::Ordering::SeqCst);
     eprintln!("INFO:     Shutting down");
     let _ = shutdown_tx().send(true);
 }
 
-/// resolves PY2AXUM_SHUTDOWN_TIMEOUT seconds (default 25) after the shutdown signal
+/// resolves PY2AXUM_SHUTDOWN_TIMEOUT seconds (default 25) after the shutdown signal, or at a second signal
+/// (uvicorn's force exit)
 pub async fn shutdown_deadline() {
     let mut rx = shutdown_tx().subscribe();
-    while !*rx.borrow_and_update() {
-        if rx.changed().await.is_err() {
-            return std::future::pending().await;
-        }
+    if rx.wait_for(|v| *v).await.is_err() {
+        return std::future::pending().await;
     }
     let secs: f64 = std::env::var("PY2AXUM_SHUTDOWN_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(25.0);
-    tokio::time::sleep(std::time::Duration::from_secs_f64(secs.max(0.0))).await;
-    eprintln!("WARNING:  py2axum: shutdown timeout, open connections dropped");
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs_f64(secs.max(0.0))) => {
+            eprintln!("WARNING:  py2axum: shutdown timeout, open connections dropped");
+        }
+        _ = next_signal() => {}
+    }
+}
+
+static TASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TASKS_DONE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Held by work the shutdown waits for once the server stopped accepting (uvicorn's `server_state.tasks`):
+/// WebSocket sessions, which hyper's graceful shutdown no longer tracks once upgraded.
+pub struct TaskGuard(());
+
+impl TaskGuard {
+    pub fn new() -> Self {
+        TASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TaskGuard(())
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if TASKS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            TASKS_DONE.notify_waiters();
+        }
+    }
+}
+
+/// the server has stopped: wait for the tasks still running (bounded by the caller's deadline)
+pub async fn drain_tasks() {
+    loop {
+        let done = TASKS_DONE.notified();
+        tokio::pin!(done);
+        done.as_mut().enable();
+        if TASKS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        done.await;
+    }
+}
+
+/// The end of a graceful shutdown: the pool's connections closed (Terminate sent to PostgreSQL, not a dropped
+/// socket), then the signal raised again with its default action, so the process ends the way uvicorn's does.
+pub async fn exit_after_shutdown(pool: &sqlx::PgPool) -> ! {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pool.close()).await;
+    let sig = SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(unix)]
+    if sig != 0 {
+        unsafe extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+            fn raise(sig: i32) -> i32;
+        }
+        // SAFETY: restores SIG_DFL (0 on Linux and macOS) for the signal, then delivers it to this process
+        unsafe {
+            signal(sig, 0);
+            raise(sig);
+        }
+    }
+    std::process::exit(if sig == 0 { 0 } else { 128 + sig })
 }
 
 pub async fn task_method(cx: &Cx, t: &Arc<Task>, recv: &V, name: &str, args: &[V]) -> R {

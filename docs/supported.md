@@ -33,10 +33,11 @@ forced-streaming passes) at both ends of every range: lowest versions on Python 
 | httpx | 0.28.1 | 0.28.1 | `>=0.28.1,<0.29` |
 | aiohttp | 3.13.0 | 3.14.4 | `>=3.13.0,<3.15` |
 | mcp | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
+| asyncpg | 0.31.0 | 0.31.0 | `>=0.31.0,<0.32` |
 | Python | 3.12 | 3.14 | `>=3.12,<3.15` |
 
-`mcp` is covered by the conformance of a real MCP server (an application conformance-tested internally) rather than by the
-matrix. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
+`mcp` is covered by the conformance of a real MCP server, `asyncpg` by that of a real application on that
+driver (both conformance-tested internally), rather than by the matrix. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
 inside a range follow the project's version: CPython's messages (3.14 names the role of an unhashable dict key
 or set element and the expected input of a `math` domain error), Pydantic's (2.12 lists the expected
 characters of an invalid UUID), Starlette's `CORSMiddleware`. WebSocket routes reproduce Starlette 1.7
@@ -70,6 +71,10 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
 - Routing like Starlette: declaration order, decoded path, first match on path and method wins, then 405
   with the methods of the first path match, then a 307 redirect with/without the trailing slash, then 404.
   No implicit HEAD. The redirect uses `http://` (as uvicorn does without trusted proxy headers).
+- `--python-side` routes (and `auto`'s) are relayed to `PY2AXUM_PYTHON_URL` before the binary's middleware
+  stack: the Python application's own middlewares answer for them. Difference: state a middleware keeps in
+  memory (a rate limiter's counters...) is per process, as with several uvicorn workers: a counter shared by
+  translated and Python-side routes counts each request in one process only (e.g. `X-RateLimit-Remaining`).
 - `app.mount(path, X)` (a sub-application, `StaticFiles`, FastMCP's `streamable_http_app()`...) is not
   translated, but the app's last registrations may be mounts left to the Python side (`--python-side mount`,
   implied by `--python-side auto`): with `PY2AXUM_PYTHON_URL` set, a request under the mount's path (or the
@@ -86,8 +91,23 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
   `Form()`/`File()`/`UploadFile` (single, optional or list; multipart via `multer` or urlencoded; an empty
   string counts as absent like FastAPI; `UploadFile` in memory: `read`, `seek`, `filename`,
   `content_type`, `size`, `.file`). Errors are FastAPI's 422 bodies, byte for byte.
-- An invalid JSON body gives the same 422 `json_invalid` (type, message, position) but `ctx.error` is
-  serde_json's message rather than CPython's `json` module message (which itself varies across versions).
+- JSON bodies (and `json.loads`) are decoded as CPython's `json` does: `NaN`/`Infinity`, encodings detected
+  from the bytes (BOM, UTF-16/32), the 422 `json_invalid` with CPython's `ctx.error` and position in code
+  points (the trailing-comma messages of 3.13+), undecodable bytes as FastAPI's 400, NaN/inf in a 422's raw
+  `input` as Starlette's 500. A `\uXXXX` escape ending the text follows the newest CPython patches
+  (unterminated string; before 3.13.13/3.14.4 or so, and on 3.12, "Invalid \uXXXX escape"):
+  `PY2AXUM_PYTHON_VERSION=3.14.0` selects the older message. **Known differences:** a lone surrogate escape (`"\ud83d"`) becomes U+FFFD;
+  an integer beyond 64 bits raises `OverflowError` (500); nesting deeper than 10 000 levels is FastAPI's 400
+  (CPython's limit depends on its C stack, and FastAPI may answer 500 when it encodes a deeply nested `input`).
+- A JSON `null` body is no body (missing, or the parameter's default). A body without `Content-Type` is not
+  decoded as JSON from FastAPI 0.132 on (`strict_content_type`, its default).
+- Timestamps as Pydantic reads them (speedate): numbers and integer strings within years 0000-9999, milliseconds
+  above 2e10. **Known difference:** a numeric *string* with a fraction or an exponent above 2e10 seconds
+  (`"6.958e+16"`, `"253402300800000.0"`) is read by speedate's float-string path with its own scaling; the binary
+  applies the number's rules (an error past 9999).
+- Response status codes: uvicorn has a status line for 100..599 only and drops the connection, unanswered, for
+  any other `status_code`; the binary does the same. **Known difference:** a final 1xx status is a 500 (hyper
+  does not send an informational status as the final response).
 - `Cookie()` parameters are not supported yet.
 
 - Raw ASGI routes: `app.add_route(path, obj, methods=...)` / `app.router.add_route(...)` at module level, with
@@ -106,6 +126,10 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
 
 - `Depends(...)` with project functions and classes, sub-dependencies, the per-request cache,
   `Annotated[T, Depends(...)]` aliases, `dependencies=[...]` on routes and routers.
+- `p: Model = Depends()` with a Pydantic model (FastAPI calls the class): one query parameter per field, with its
+  type, default and `Field` constraints (`ge`, `le`, `max_length`, `pattern`...), then `Model(**fields)`.
+  Refused: a base other than `BaseModel`, validators or other decorated methods, `model_config`, aliases,
+  container fields (FastAPI reads those from the body).
 - `yield` dependencies: one `yield`, in the body or alone in a `try/finally`. The code after `yield` runs at
   the end of the request, most recent dependency first, before the session commit (FastAPI runs it after
   sending the response); on error, only `finally` blocks run. `yield` inside `try/except` is refused (FastAPI
@@ -157,7 +181,7 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
 - `CORSMiddleware` with the behaviour of the Starlette version locked by the project (`uv.lock`: 1.7 adds
   `Vary: Origin` to every response), `GZipMiddleware` (`Vary: Accept-Encoding` like Starlette),
   `BaseHTTPMiddleware` subclasses (one instance per app, built on the first request; `call_next`, mutable
-  `response.headers`), `@app.middleware("http")`, `@app.exception_handler(class | code)`.
+  `response.headers`; with or without their own `__init__`), `@app.middleware("http")`, `@app.exception_handler(class | code)`.
 - `request.cookies` (Starlette's parser), `request.client` (TCP peer), `request.url`, `request.headers`,
   `request.state`, `request.body()`/`json()`.
 - A project function given the application from the factory or the app's module (`configure(app)`) runs
@@ -174,6 +198,21 @@ does not mention are not checked. `--allow-untested-versions` translates anyway,
   `APIRoute`, as Starlette sets it); the `endpoint` of scopes is None. A 405 on an added `Route` lists
   `GET, HEAD` in that order (CPython: set order). `FastAPI(docs_url=...)` and the other `*_url` options must
   be literals for `app.routes` to be read.
+
+## Shutdown (SIGTERM, SIGINT)
+
+Measured against uvicorn 0.54 (both servers, same clients), for every generated
+binary, with or without a lifespan:
+- As uvicorn: the listening socket is closed at once (new connections are refused), idle keep-alive
+  connections are closed, in-flight requests finish and their response carries `connection: close`,
+  WebSocket sessions get a close frame 1012 and the application receives `websocket.disconnect` with code
+  1012, then the lifespan's code after `yield` runs, and the process ends by the signal it received (exit
+  status 143 for SIGTERM, uvicorn re-raises it). A second signal skips the wait (uvicorn's force exit).
+- Differences: the wait for in-flight requests and streams is bounded by `PY2AXUM_SHUTDOWN_TIMEOUT`
+  seconds (default 25; uvicorn waits without a limit unless `--timeout-graceful-shutdown`, so an endless
+  `StreamingResponse` such as an SSE feed holds it until the orchestrator's SIGKILL), after which the
+  remaining connections are dropped; the database pool is closed before the exit (PostgreSQL gets a
+  Terminate message; the Python process leaves its connections to be dropped with it).
 
 ## WebSockets
 
@@ -219,6 +258,11 @@ the conformance suite compares the handshake, the messages and the close codes w
   `validate_assignment`, `extra=`, `from_attributes`, `str_strip_whitespace`/`to_lower`/`to_upper`,
   `use_enum_values`, `model_config` as a dict or `ConfigDict`, v1 `class Config` (v1-only keys ignored like
   Pydantic v2 does).
+- An Enum member given to a scalar field (an ORM enum column read into `status: str`...) as pydantic-core takes
+  it: a `str`/`int` subclass member (`class X(str, Enum)`, `StrEnum`, `IntEnum`) is its value for `str`, `int`,
+  `float`, `bool` and `Literal` (an `int` one is `str(value)` in a `str`), a plain member is `str(value)` in a
+  `str` and its value, unchecked, in an unconstrained `int`. Difference: a plain member whose value is not an
+  integer, given to a *constrained* `int`, reports `int_parsing` where pydantic-core reports `int_parsing_size`.
 - `uuid.UUID` fields and parameters: a UUID instance, a str in the simple, hyphenated, `{braced}` or
   `urn:uuid:` form, or bytes, with pydantic-core's `uuid_type`/`uuid_parsing` errors (the messages of the
   `uuid` crate it pins); dumped as the hyphenated str.
@@ -259,6 +303,10 @@ the conformance suite compares the handshake, the messages and the close codes w
   `exclude_none` applies, `exclude_unset` does not, `repr()` shows them. The property must not await.
   Difference: with `extra="allow"`, an extra key named like a computed field shadows it on attribute access and in `model_dump_json` (Pydantic writes both keys).
   `jsonable_encoder` of an integral `Decimal` beyond 64 bits gives a float (Python: an int).
+- A `@classmethod` override of `model_validate` (called by name, `Model.model_validate(x)`) calling
+  `super().model_validate(...)` or `super(Model, cls)`: the parent's (a project model's override, else
+  BaseModel's), `cls` still the class called. `super(cls, cls)` is accepted when no project model subclasses
+  the class (else its target depends on the class called: refused).
 - A model's own `def __init__(self, **data)` calling `super().__init__(**data)`: run by `Model(...)`;
   validation from attributes (`from_attributes`, ORM objects) or of an existing instance skips it, as in
   pydantic-core. Validating such a model from a dict (request body, `model_validate(dict)`, nested), where
@@ -277,7 +325,9 @@ the conformance suite compares the handshake, the messages and the close codes w
   `Uuid`/`UUID` and `Mapped[uuid.UUID]` (read as `uuid.UUID`, a str bound to it is cast by PostgreSQL as with
   psycopg; `as_uuid=False` is refused),
   `Numeric` (`Decimal`, or float with `asdecimal=False`), `Enum` columns, `LargeBinary` (bytes), `ARRAY(String)`
-  (lists; `contains`/`contained_by`/`overlap`/`any`), `T.with_variant(V, "postgresql")` (V; other dialects' variants
+  (lists; `contains`/`contained_by`/`overlap`/`any`), `deferred(Column(...))` and `mapped_column(deferred=True)`
+  (left out of what a query loads: reading it then is a lazy load, MissingGreenlet in an async session;
+  `select(Model.col)` and `session.refresh(obj, ["col"])` read it; `undefer()` is refused), `T.with_variant(V, "postgresql")` (V; other dialects' variants
   are ignored), `col.op("...")(value)` (the value typed like the column, as SQLAlchemy does), a column type returned by a project function
   (`def _enum(cls, name): return Enum(cls, name=name, ...)`, inlined; its arguments must be literals or names),
   project `TypeDecorator`s
@@ -307,13 +357,24 @@ the conformance suite compares the handshake, the messages and the close codes w
   identical expressions built apart do not, and PostgreSQL rejects the grouping, as it does for SQLAlchemy),
   `with_for_update`,
   `update()`/`delete()` (with `synchronize_session`), `insert()` (core and postgresql dialect: several rows,
-  Python column defaults, `on_conflict_do_update(index_elements=, set_=, where=)`, `on_conflict_do_nothing`,
-  `excluded`, `returning`), `text()` with `:named` parameters, `Result.scalars/all/first/one/scalar/unique/
+  Python column defaults, `on_conflict_do_update(index_elements= | constraint=, set_=, where=)`,
+  `on_conflict_do_nothing` (a `constraint=` name SQLAlchemy would not quote),
+  `excluded`, `returning`), `text()` with `:named` parameters (and `text(...).bindparams(name=value)`, also inside
+  a `where()`), `Result.scalars/all/first/one/scalar/unique/
   mappings`, rows with attribute access (`row.total`, `_mapping`, `_asdict()`).
 - SQL typing like SQLAlchemy: arithmetic and `FILTER` keep the column type, `func.round`/`avg` untyped
   (Decimal); untyped integers are bound as int2/int4/int8 like psycopg; NUMERIC results are `Decimal`.
+- Database errors are SQLAlchemy's classes over psycopg's (`IntegrityError`, `DataError`...), their message
+  `(psycopg.errors.<class of the SQLSTATE>) <server message>` (`NumericValueOutOfRange`, `UniqueViolation`...).
+  An integer bound to an `Integer`/`SmallInteger` column is cast like SQLAlchemy's psycopg dialect does
+  (`::INTEGER`): out of range, a `DataError`. **Known difference:** `str()` of such an error stops there, without
+  SQLAlchemy's `[SQL: ...]`, `[parameters: ...]` and background-link lines (the binary's SQL is not SQLAlchemy's
+  text).
 - The PostgreSQL session time zone: sqlx forces UTC, the runtime applies the one psycopg would see
   (role/database setting, then server config, or `PY2AXUM_DB_TIMEZONE`).
+- The driver named by `DATABASE_URL` (`postgresql+psycopg://` or `postgresql+asyncpg://`): psycopg returns
+  timestamptz in the session's zone, asyncpg as `datetime.timezone.utc` (Pydantic writes `Z`); an ORM-enabled
+  `insert(Model)` without `returning` reports `rowcount` -1 over psycopg, the rows inserted over asyncpg.
 - `obj.__dict__` of a mapped object: `_sa_instance_state` then the loaded attributes (a snapshot).
 - `create_async_engine(...)` is the binary's pool (one database, `DATABASE_URL`; its options are ignored);
   `async with engine.connect() as conn` (rolled back on exit), `async with engine.begin() as conn` (committed on
@@ -349,7 +410,8 @@ the conformance suite compares the handshake, the messages and the close codes w
 ## Python semantics
 
 - Values and operators with CPython's semantics: int (64-bit: beyond is an `OverflowError`), float formatting
-  and `repr`, str methods, `%`/`format`/f-strings (presentations `d f % e g x o b` and their upper-case forms, `#`;
+  and `repr`, str methods (`isdigit`, `isdecimal`, `isnumeric`, `isalpha`, `isalnum`, `isspace` from the Unicode
+  database of the Python that transpiles), `%`/`format`/f-strings (presentations `d f % e g x o b` and their upper-case forms, `#`;
   not `n`, `c`, `=` with non-numbers), slicing, comparisons, `**`, bit operators, truthiness,
   `hash()` rules (unhashable Pydantic models and dataclasses unless frozen, `__hash__ = None`, `__eq__`
   without `__hash__`); `hash(int)` is CPython's, other hashes are stable but not CPython's (CPython
@@ -389,6 +451,12 @@ the conformance suite compares the handshake, the messages and the close codes w
   `if __name__ == "__main__":` and `if TYPE_CHECKING:` blocks are skipped. Refused: a module variable bound
   by several module-level statements when one of them is compound (`X = 1` then `try: X = f()`).
   Attributes and methods of a library object such as `prometheus_client.REGISTRY` are resolved at run time.
+  A module-level assignment to an attribute of a library the binary knows nothing of (`stripe.api_key = ...`)
+  is left to the Python side: every read or call of that library is refused already.
+  Known difference: a module-level call of a project function that does not translate (typically a logging
+  setup with handlers, formatters and filters, which the binary does not reproduce: it logs in its own
+  format) fails at startup with an `ERROR:py2axum:module global` line on stderr and the binary goes on
+  without its effects; the routes that read a global it would have set raise that error.
 - `importlib.import_module("pkg.mod")` with a literal name of a project module returns a module object
   (`getattr`/`hasattr` with run-time names, attribute calls, `__name__`). The module is compiled into the
   binary and its globals are evaluated at startup with the others (CPython: at the first import), so a
@@ -428,9 +496,8 @@ the conformance suite compares the handshake, the messages and the close codes w
 - `FastAPI(lifespan=...)` with an `async def` generator of the project (decorated with
   `@contextlib.asynccontextmanager` or not, like Starlette): the code before `yield` runs before the server
   listens (a failure prints `Application startup failed. Exiting.` and exits with code 3, like uvicorn),
-  the code after it once the server has stopped on SIGTERM/SIGINT. Differences: in-flight requests get
-  `PY2AXUM_SHUTDOWN_TIMEOUT` seconds (default 25) to finish, then their connections are dropped (uvicorn
-  waits without a limit); lifespan state (`yield {...}`) is refused.
+  the code after it once the server has stopped on SIGTERM/SIGINT (see "Shutdown"); lifespan state
+  (`yield {...}`) is refused.
 - Async generators run in lockstep with their consumer like CPython: the body starts at the first
   `__anext__`, `anext()`, `asend`, `athrow`, `aclose` (`GeneratorExit` at the `yield`, `finally` blocks run).
   `@asynccontextmanager` follows `contextlib` (exception thrown in at the `yield`, `generator didn't yield`,
@@ -574,7 +641,7 @@ read back as integral `Decimal`s.
 | bcrypt (5.0), pyotp (2.9) | same hashes and codes |
 | itsdangerous (2.2) | `URLSafeTimedSerializer` with the default signer and serializer |
 | cryptography | `Fernet` (tokens readable both ways), `Fernet.generate_key()` |
-| jinja2, aiosmtplib, email | templates (minijinja with Jinja2's output), MIME messages, SMTP sending; `Jinja2Templates(directory=)` and `TemplateResponse(request, name, context, status_code, headers, media_type)` (`request` added to the context, date `strftime`/`isoformat` callable from a template; `context_processors`, `env=` and `url_for` are not supported) |
+| jinja2, aiosmtplib, email | templates (minijinja with Jinja2's output), MIME messages, SMTP sending; `Jinja2Templates(directory=)` and `TemplateResponse(request, name, context, status_code, headers, media_type)` (`request` added to the context, date `strftime`/`isoformat` callable from a template; `env.filters[name] = f` with a project function or lambda, called synchronously during the render; `context_processors`, `env=` and `url_for` are not supported) |
 | pywebpush (2.3) | aes128gcm encryption, VAPID (py-vapid rules), `WebPushException` |
 | google-auth (2.49) | `id_token.verify_oauth2_token` / `verify_token` |
 | alembic | `alembic.config.Config` ini reading only |

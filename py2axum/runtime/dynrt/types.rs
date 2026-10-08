@@ -108,6 +108,25 @@ static TD_NONE: TD = TD::NoneT;
 static TD_LIST: TD = TD::List(None);
 static TD_DICT: TD = TD::Dict(None);
 
+/// the validator of a schema class, built once per class (a `&'static TD` made per call would leak)
+pub fn schema_td(s: &'static super::pyd::SchemaDesc) -> &'static TD {
+    static CACHE: std::sync::OnceLock<StdMutex<HashMap<usize, &'static TD>>> = std::sync::OnceLock::new();
+    let mut m = CACHE.get_or_init(Default::default).lock().unwrap();
+    m.entry(s as *const _ as usize).or_insert_with(|| Box::leak(Box::new(TD::Schema(s))))
+}
+
+/// a string made `&'static` once per distinct value (operators, separators: few distinct values, used per call)
+pub fn intern(s: &str) -> &'static str {
+    static CACHE: std::sync::OnceLock<StdMutex<std::collections::HashSet<&'static str>>> = std::sync::OnceLock::new();
+    let mut m = CACHE.get_or_init(Default::default).lock().unwrap();
+    if let Some(v) = m.get(s) {
+        return v;
+    }
+    let v: &'static str = Box::leak(s.to_string().into_boxed_str());
+    m.insert(v);
+    v
+}
+
 /// a type value as a validator (`TypeAdapter(t)` with `t` known at run time); a class's is built once
 pub fn td_of(v: &V) -> R<&'static TD> {
     let _ = (&NO_NUM, &NO_STR);
@@ -128,11 +147,7 @@ pub fn td_of(v: &V) -> R<&'static TD> {
         },
         V::None => Ok(&TD_NONE),
         V::Class(c) => match c.kind {
-            ClassKind::Schema(s) => {
-                static CACHE: std::sync::OnceLock<StdMutex<HashMap<usize, &'static TD>>> = std::sync::OnceLock::new();
-                let mut m = CACHE.get_or_init(Default::default).lock().unwrap();
-                Ok(*m.entry(s as *const _ as usize).or_insert_with(|| Box::leak(Box::new(TD::Schema(s)))))
-            }
+            ClassKind::Schema(s) => Ok(schema_td(s)),
             ClassKind::Enum(e) => {
                 static CACHE: std::sync::OnceLock<StdMutex<HashMap<usize, &'static TD>>> = std::sync::OnceLock::new();
                 let mut m = CACHE.get_or_init(Default::default).lock().unwrap();

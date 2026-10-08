@@ -13,6 +13,23 @@ from .models import Analysis, AnalysisDoc
 
 router = APIRouter(prefix="/small")
 
+# a registry filled in place by module-level statements (a letter-generator registry)
+REGISTRY: dict = {"base": lambda n: n + 1}
+for _k in ("double", "triple"):
+    REGISTRY[_k] = lambda n, _f=len(_k): n * _f
+REGISTRY["count"] = [0]
+REGISTRY["count"][0] += 5
+REGISTRY["upper"] = lambda n: str(n).upper()
+
+
+@router.get("/registry/{key}")
+async def registry(key: str, n: int = 2):
+    fn = REGISTRY.get(key)
+    if fn is None or not callable(fn):
+        return {"keys": list(REGISTRY), "count": REGISTRY["count"]}
+    return {"key": key, "value": fn(n)}
+
+
 
 @router.get("/html", response_class=HTMLResponse, include_in_schema=False)
 async def html(response: Response, name: str = "monde"):
@@ -200,3 +217,28 @@ async def pages_missing(request: Request):
 @router.get("/basic-opt")
 async def basic_opt(creds: HTTPBasicCredentials | None = Depends(_maybe_basic)):
     return None if creds is None else {"user": creds.username, "password": creds.password, "dump": creds.model_dump()}
+
+
+MAGIC = (b"\x89PNG", b"\xff\xd8")
+
+
+class Blob(BaseModel):
+    b64: str
+    note: str = ""
+
+
+@router.post("/sniff")
+async def sniff(blob: Blob):
+    """An image upload's magic-number check: bytes.startswith/endswith with a tuple of prefixes, their TypeErrors;
+    the body parameter also exercises json.loads' errors on malformed bodies (scenario)."""
+    import base64
+
+    data = base64.b64decode(blob.b64)
+    errs = []
+    for bad in ((b"x", "y"), "x", None):
+        try:
+            data.startswith(bad)
+        except TypeError as e:
+            errs.append(str(e))
+    return {"image": data.startswith(MAGIC), "jpeg_end": data.endswith((b"\xff\xd9", b"\x00")),
+            "empty": data.startswith(()), "plain": data.startswith(b"\x89"), "errs": errs}

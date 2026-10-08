@@ -6,10 +6,11 @@ from sqlalchemy import (
     JSON, BigInteger, DateTime, Enum as SQLEnum, ForeignKey, Identity, Integer, LargeBinary, Numeric, String, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy import Column
+from sqlalchemy.orm import DeclarativeBase, Mapped, deferred, mapped_column, relationship
 
 from .coltypes import EncryptedString, Money, enum_type
-from .enums import Channel, Priority, Status
+from .enums import Channel, Level, Priority, Status
 
 
 def utcnow() -> datetime:
@@ -81,6 +82,19 @@ class Secret(Base):
     token: Mapped[str | None] = mapped_column(EncryptedString(300))
 
 
+class Archive(Base):
+    """A deferred column: left out of what a query loads."""
+    __tablename__ = "archives"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(40))
+    blob: Mapped[bytes | None] = deferred(Column(LargeBinary, nullable=True))
+
+    @property
+    def short(self) -> bool:
+        return len(self.name) < 3
+
+
 class Asset(Base):
     """Column types from a project factory function."""
     __tablename__ = "assets"
@@ -136,3 +150,22 @@ class AnalysisDoc(Base):
     analysis_id: Mapped[uuid.UUID] = mapped_column(UUIDVariant, ForeignKey("analyses.id", ondelete="CASCADE"), index=True)
     ref: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     name: Mapped[str] = mapped_column(String(50))
+
+
+class EnumRow(Base):
+    """Enum columns in every SQLAlchemy flavour, read back into schemas of every kind (fixtures/dynapp/enumcols.py)."""
+    __tablename__ = "enum_rows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # a (str, Enum) stored by NAME in a native PostgreSQL enum: SQLAlchemy's default
+    pri: Mapped[Priority] = mapped_column(SQLEnum(Priority, name="enumrow_pri"))
+    # a plain Enum, by name
+    state: Mapped[Status] = mapped_column(SQLEnum(Status, name="enumrow_state"))
+    # a StrEnum in a VARCHAR (native_enum=False, length=)
+    chan: Mapped[Channel] = mapped_column(SQLEnum(Channel, native_enum=False, length=20))
+    # an IntEnum, by name
+    lvl: Mapped[Level] = mapped_column(SQLEnum(Level, name="enumrow_lvl"))
+    # stored by value (values_callable=)
+    pri_val: Mapped[Priority] = mapped_column(
+        SQLEnum(Priority, name="enumrow_pri_val", values_callable=lambda e: [m.value for m in e]))
+    maybe: Mapped[Priority | None] = mapped_column(SQLEnum(Priority, name="enumrow_maybe"), nullable=True)

@@ -321,7 +321,7 @@ async fn handle(cx: &Cx, stack: &Stack, e: Exc) -> R<Response> {
                 if super::sentry::active() {
                     super::sentry::handled_exception(cx, &e).await;
                 }
-                return Ok(web::error_response(e));
+                return web::try_error_response(e);
             }
         }
     }

@@ -141,6 +141,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.RuntimeError": "RUNTIME_ERROR",
     "builtins.AssertionError": "ASSERTION_ERROR",
     "builtins.NotImplementedError": "NOT_IMPLEMENTED_ERROR",
+    "builtins.RecursionError": "RECURSION_ERROR",
     "builtins.ZeroDivisionError": "ZERO_DIVISION_ERROR",
     "builtins.ArithmeticError": "ARITHMETIC_ERROR",
     "builtins.OverflowError": "OVERFLOW_ERROR",
@@ -639,8 +640,8 @@ CALLS = {
     "sqlalchemy.exists": lambda a, kw: f"{RT}::orm::exists(&{a[0]})",
     **{f"sqlalchemy.orm.{n}": (lambda n: lambda a, kw: f"{RT}::orm::loader(\"{n}\", &{a[0]})")(n)
        for n in ("selectinload", "joinedload", "subqueryload", "immediateload", "noload", "lazyload")},
-    "sqlalchemy.desc": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"desc\", vec![], vec![])",
-    "sqlalchemy.asc": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"asc\", vec![], vec![])",
+    "sqlalchemy.desc": lambda a, kw: f"{RT}::orm::order_fn(&{a[0]}, true)",
+    "sqlalchemy.asc": lambda a, kw: f"{RT}::orm::order_fn(&{a[0]}, false)",
     "sqlalchemy.nullslast": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"nulls_last\", vec![], vec![])",
     "sqlalchemy.nulls_last": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"nulls_last\", vec![], vec![])",
     "sqlalchemy.extract": lambda a, kw: f"{RT}::orm::extract(&{a[0]}, &{a[1]})",

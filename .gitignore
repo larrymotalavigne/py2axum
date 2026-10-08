@@ -14,3 +14,5 @@ generated/*
 storage-test/
 dist/
 *.egg-info/
+# bench/soak.py, bench/shutdown.py: server logs (the JSON results of a reference run are committed)
+bench/soak/*.log

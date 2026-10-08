@@ -136,6 +136,11 @@ pub enum Native {
     HashCtor(&'static str),
     Jinja(Arc<super::mail::Jinja>),
     JinjaTpl(super::mail::JinjaTpl),
+    /// a `@property` read on its mapped class (`Model.prop`): the property object itself (compares
+    /// unequal to anything else, so `Model.prop == True` is False, as in Python)
+    Property(&'static str),
+    /// `Environment.filters`: item assignment registers a filter
+    JinjaFilters(Arc<super::mail::Jinja>),
     Mime(Arc<super::mail::Mime>),
     Tasks(super::resp::Tasks),
     BytesIO(super::files::BytesIO),
@@ -341,6 +346,8 @@ impl V {
                 Native::Iter(_) => "iterator",
                 Native::Jinja(j) => if j.templates { "Jinja2Templates" } else { "Environment" },
                 Native::JinjaTpl(_) => "Template",
+                Native::JinjaFilters(_) => "dict",
+                Native::Property(_) => "property",
                 Native::Mime(_) => "MIMEBase",
                 Native::Tasks(_) => "BackgroundTasks",
                 Native::BytesIO(_) => "BytesIO",
@@ -709,6 +716,7 @@ builtin_exc!(ARITHMETIC_ERROR, "ArithmeticError", [EXCEPTION]);
 builtin_exc!(ZERO_DIVISION_ERROR, "ZeroDivisionError", [ARITHMETIC_ERROR]);
 builtin_exc!(OVERFLOW_ERROR, "OverflowError", [ARITHMETIC_ERROR]);
 builtin_exc!(RUNTIME_ERROR, "RuntimeError", [EXCEPTION]);
+builtin_exc!(RECURSION_ERROR, "RecursionError", [RUNTIME_ERROR]);
 builtin_exc!(ASSERTION_ERROR, "AssertionError", [EXCEPTION]);
 builtin_exc!(NOT_IMPLEMENTED_ERROR, "NotImplementedError", [RUNTIME_ERROR]);
 builtin_exc!(OS_ERROR, "OSError", [EXCEPTION]);
@@ -911,6 +919,18 @@ impl From<sqlx::Error> for Exc {
         if let sqlx::Error::Database(db) = &e {
             // psycopg's SQLSTATE class -> DBAPI exception, as SQLAlchemy wraps it
             let code = db.code().map(|c| c.to_string()).unwrap_or_default();
+            if let Some((name, base)) = super::sqlstate::lookup(&code) {
+                let class: &'static Class = match base {
+                    "IntegrityError" => &INTEGRITY_ERROR,
+                    "DataError" => &DATA_ERROR,
+                    "ProgrammingError" => &PROGRAMMING_ERROR,
+                    "NotSupportedError" => &NOT_SUPPORTED_ERROR,
+                    "InternalError" => &INTERNAL_ERROR,
+                    "DatabaseError" => &DBAPI_ERROR, // sqlalchemy.exc.DatabaseError: not a class of its own here
+                    _ => &OPERATIONAL_ERROR,
+                };
+                return Exc::msg(class, format!("(psycopg.errors.{name}) {}", db.message()));
+            }
             let (class, name): (&'static Class, &str) = match code.get(..2).unwrap_or("") {
                 "23" => (&INTEGRITY_ERROR, "IntegrityError"),
                 "22" => (&DATA_ERROR, "DataError"),

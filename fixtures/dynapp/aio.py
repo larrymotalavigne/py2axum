@@ -41,6 +41,13 @@ class CM:
         return self.suppress
 
 
+@router.get("/sleep/{ms}")
+async def sleep_route(ms: int):
+    """a request that stays in flight for `ms` milliseconds (graceful shutdown tests)"""
+    await asyncio.sleep(ms / 1000)
+    return {"slept_ms": ms}
+
+
 @router.get("/gather")
 async def gather_route():
     LOG.clear()

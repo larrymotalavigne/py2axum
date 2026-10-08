@@ -110,6 +110,9 @@ impl DateTime {
     pub fn add(&self, d: Duration) -> Self {
         DateTime { wall: self.wall + d, tz: self.tz, fold: 0 }
     }
+    pub fn checked_add(&self, d: Duration) -> Option<Self> {
+        Some(DateTime { wall: self.wall.checked_add_signed(d)?, tz: self.tz, fold: 0 })
+    }
     pub fn date(&self) -> NaiveDate {
         self.wall.date()
     }
@@ -227,12 +230,16 @@ pub enum PErr {
     RangeMinute,
     RangeSecond,
     RangeTz,
+    DateTooSmall,
+    DateTooLarge,
 }
 
 impl PErr {
     pub fn text(&self) -> &'static str {
         match self {
             PErr::TooShort => "input is too short",
+            PErr::DateTooSmall => "dates before 0000 are not supported as unix timestamps",
+            PErr::DateTooLarge => "dates after 9999 are not supported as unix timestamps",
             PErr::Extra => "unexpected extra characters at the end of the input",
             PErr::DateTimeSep => "invalid datetime separator, expected `T`, `t`, `_` or space",
             PErr::DateSep => "invalid date separator, expected `-`",
@@ -298,30 +305,63 @@ pub fn parse_date(s: &str) -> Result<NaiveDate, PErr> {
     Ok(d)
 }
 
+/// speedate's numeric timestamps: `[+-]digits` that fit an i64, or a float with a point
+/// (`[+-]digits?.digits?` with a digit, then an optional `e[+-]digits`) that stays finite; nothing else
+/// (no surrounding spaces, no exponent without a point).
 fn numeric(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() || !t.bytes().all(|c| c.is_ascii_digit() || c == b'.' || c == b'-') {
+    let b = s.as_bytes();
+    let body = b.strip_prefix(b"+").or_else(|| b.strip_prefix(b"-")).unwrap_or(b);
+    if body.is_empty() {
         return None;
     }
-    if !t.bytes().any(|c| c.is_ascii_digit()) {
+    if body.iter().all(u8::is_ascii_digit) {
+        return s.trim_start_matches('+').parse::<i64>().ok().map(|i| i as f64);
+    }
+    let (mant, exp) = match body.iter().position(|c| *c == b'e' || *c == b'E') {
+        Some(i) => (&body[..i], Some(&body[i + 1..])),
+        None => (body, None),
+    };
+    let dot = mant.iter().position(|c| *c == b'.')?;
+    let (int, frac) = (&mant[..dot], &mant[dot + 1..]);
+    if !int.iter().chain(frac).all(u8::is_ascii_digit) || int.len() + frac.len() == 0 {
         return None;
     }
-    t.parse::<f64>().ok()
+    if let Some(e) = exp {
+        let digits = e.strip_prefix(b"+").or_else(|| e.strip_prefix(b"-")).unwrap_or(e);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+    }
+    s.trim_start_matches('+').parse::<f64>().ok().filter(|f| f.is_finite())
 }
 
-/// Unix timestamp (seconds, or milliseconds above 2e10) to an aware UTC datetime.
-pub fn from_timestamp(ts: f64) -> Option<DateTime> {
+/// Unix timestamp (seconds, or milliseconds above 2e10) to an aware UTC datetime; speedate's bounds (years
+/// 0000 to 9999) checked on the seconds.
+pub fn from_timestamp(ts: f64) -> Result<DateTime, PErr> {
     let secs_f = if ts.abs() > 2e10 { ts / 1000.0 } else { ts };
     let whole = secs_f.floor();
-    let us = ((secs_f - whole) * 1e6).round() as i64;
-    let base = chrono::DateTime::from_timestamp(whole as i64, 0)?.naive_utc();
-    Some(DateTime::aware(base + Duration::microseconds(us), Tz::Utc))
+    if whole < -62_167_219_200.0 {
+        return Err(PErr::DateTooSmall);
+    }
+    if whole > 253_402_300_799.0 {
+        return Err(PErr::DateTooLarge);
+    }
+    // speedate: whole seconds rounded down, microseconds from the fraction cut off towards zero (so -1.0000001
+    // is -2 s, -6e-7 is -1 s + 1 µs), a rounded 1e6 carried into the seconds
+    let mut whole = whole as i64;
+    let mut us = ((secs_f - secs_f.trunc()).abs() * 1e6).round() as i64;
+    if us >= 1_000_000 {
+        whole += 1;
+        us -= 1_000_000;
+    }
+    let base = chrono::DateTime::from_timestamp(whole, 0).ok_or(PErr::DateTooLarge)?.naive_utc();
+    Ok(DateTime::aware(base + Duration::microseconds(us), Tz::Utc))
 }
 
 /// speedate `DateTime::parse_str` (RFC 3339 and friends, or a numeric timestamp).
 pub fn parse_datetime(s: &str) -> Result<DateTime, PErr> {
     if let Some(ts) = numeric(s) {
-        return from_timestamp(ts).ok_or(PErr::TooShort);
+        return from_timestamp(ts);
     }
     let b = s.as_bytes();
     let date = date_part(b)?;

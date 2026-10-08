@@ -30,11 +30,14 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "httpx": ("0.28.1", "0.28.1", "0.29"),
     "aiohttp": ("3.13.0", "3.14.4", "3.15"),
     "mcp": ("2.2.0", "2.2.0", "2.3"),  # MCP servers: tested through a real MCP server's lock (internal conformance)
+    "asyncpg": ("0.31.0", "0.31.0", "0.32"),  # the asyncpg driver: tested through a real application's lock
 }
+# outside the CI matrix: their range is the lock of an application conformance-tested internally
+_LOCK_ONLY = ("mcp", "asyncpg")
 PYTHON: tuple[str, str, str] = ("3.12", "3.14", "3.15")
 # libraries checked only when the analysed package imports them (module -> distributions); the framework
 # (fastapi, starlette, pydantic, pydantic-core) is always checked
-_BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlalchemy", "psycopg"),
+_BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlalchemy", "psycopg", "asyncpg"),
               "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",)}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
@@ -66,7 +69,7 @@ def in_range(name: str, version: str) -> bool:
 def pins(end: str) -> list[str]:
     """pip requirements of one end of the ranges (`min` or `max`), as the CI matrix installs them."""
     i = {"min": 0, "max": 1}[end]
-    return [f"{_EXTRAS.get(n, n)}=={v[i]}" for n, v in SUPPORTED.items() if n != "mcp"]
+    return [f"{_EXTRAS.get(n, n)}=={v[i]}" for n, v in SUPPORTED.items() if n not in _LOCK_ONLY]
 
 
 def _bump(rel: tuple, n: int) -> tuple:

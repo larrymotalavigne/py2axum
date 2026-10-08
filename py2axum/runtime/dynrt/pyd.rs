@@ -145,6 +145,11 @@ fn url_val(input: &V, spec: &'static UrlSpec, loc: &[V], e: &mut Errs) -> Option
             return None;
         }
     }
+    if s.is_empty() {
+        // pydantic-core checks emptiness before the url crate's parser
+        e.push("url_parsing", loc, "Input should be a valid URL, input is empty", input, Some(vec![("error", V::str("input is empty"))]));
+        return None;
+    }
     let mut u = match url::Url::parse(&s) {
         Ok(u) => u,
         Err(err) => {
@@ -470,6 +475,48 @@ impl Errs<'_> {
     }
 }
 
+/// An Enum member given to a scalar field (an ORM enum column read into a `str` field...), as pydantic-core
+/// does it (2.13, measured): a member of a `str` subclass (`class X(str, Enum)`, `StrEnum`) is validated as its
+/// value for `str`, `int`, `float`, `bool` and `Literal`, an `int` subclass's (`IntEnum`...) likewise except for
+/// `str`, where any other member becomes `str(value)` (lax); a plain Enum's member is its value, unchecked, for
+/// an unconstrained `int`; `float`, `bool`, `Literal` refuse it. The member stays the errors' input. None: not
+/// one of these cases, validated as usual.
+fn enum_scalar(input: &V, d: &'static EnumDesc, i: u16, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<Option<V>> {
+    let is_str = matches!(d.kind, EnumKind::Str | EnumKind::StrEnum);
+    let is_int = matches!(d.kind, EnumKind::Int | EnumKind::IntEnum);
+    let value = d.value(i);
+    let inner = match td {
+        TD::Str(_) if is_str => {
+            e.floor(STRICT);
+            value
+        }
+        TD::Str(_) => {
+            e.floor(LAX);
+            V::str(ops::str_(&value).ok()?)
+        }
+        TD::Int(_) | TD::Float(_) | TD::Bool | TD::Literal(_) if is_str || is_int => {
+            e.floor(STRICT);
+            value
+        }
+        TD::Int(c) => {
+            e.floor(LAX);
+            if c.ge.or(c.gt).or(c.le).or(c.lt).is_none() {
+                return Some(Some(value));
+            }
+            value
+        }
+        _ => return None,
+    };
+    let start = e.steps.len();
+    let out = val(&inner, td, loc, e);
+    for s in &mut e.steps[start..] {
+        if let Step::Err(x) = s {
+            x.input = input.clone();
+        }
+    }
+    Some(out)
+}
+
 fn with(loc: &[V], k: V) -> Vec<V> {
     let mut l = loc.to_vec();
     l.push(k);
@@ -608,6 +655,7 @@ async fn prepare_schema(cx: &super::Cx, input: V, desc: &'static SchemaDesc) -> 
         return Ok(data);
     }
     // the fields read from an object (from_attributes) become a dict: validation then reads the same values
+    let from_attrs = matches!(&data, V::Obj(_) | V::Inst(_));
     let map: IndexMap<Key, (V, V)> = match &data {
         V::Dict(d) => d.lock().clone(),
         V::Obj(_) | V::Inst(_) if desc.from_attributes => {
@@ -644,7 +692,27 @@ async fn prepare_schema(cx: &super::Cx, input: V, desc: &'static SchemaDesc) -> 
         }
         map.insert(key, (kv, v));
     }
-    Ok(V::Dict(Arc::new(Mutex::new(map))))
+    let d = Arc::new(Mutex::new(map));
+    if from_attrs && desc.init.is_some() {
+        mark_from_attrs(&d);
+    }
+    Ok(V::Dict(d))
+}
+
+type DictCell = Mutex<IndexMap<Key, (V, V)>>;
+
+/// The dicts `prepare_schema` built from an object's attributes, for a model with its own `__init__`:
+/// pydantic-core validates such an input attribute by attribute, without calling `__init__`.
+static FROM_ATTRS: Mutex<Vec<std::sync::Weak<DictCell>>> = Mutex::new(Vec::new());
+
+fn mark_from_attrs(d: &Arc<DictCell>) {
+    let mut m = FROM_ATTRS.lock();
+    m.retain(|w| w.strong_count() > 0);
+    m.push(Arc::downgrade(d));
+}
+
+fn is_from_attrs(d: &Arc<DictCell>) -> bool {
+    FROM_ATTRS.lock().iter().any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(d)) && w.strong_count() > 0)
 }
 
 async fn run(cx: &super::Cx, errs: &mut Vec<ErrDetail>, check: impl FnOnce(&mut Errs) -> Option<V>) -> R<Option<V>> {
@@ -782,6 +850,11 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
             return None;
         }
     }
+    if let V::Enum(d, i) = input {
+        if let Some(out) = enum_scalar(input, d, *i, td, loc, e) {
+            return out;
+        }
+    }
     match td {
         TD::Any => Some(input.clone()),
         TD::NoneT => match input {
@@ -857,7 +930,29 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 e.floor(LAX);
                 Some(V::Bool(*f == 1.0))
             }
-            V::Str(s) => match s.to_ascii_lowercase().as_str() {
+            // pydantic-core: an integral float or Decimal is read as an int (0/1 only: bool_parsing otherwise),
+            // a fractional or non-finite one is not a boolean at all (bool_type)
+            V::Float(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.223372036854775808e18 => {
+                e.push("bool_parsing", loc, "Input should be a valid boolean, unable to interpret input", input, None);
+                None
+            }
+            V::Decimal(d) if d.is_integral() => match num_traits::ToPrimitive::to_i64(&d.to_int()) {
+                Some(i @ (0 | 1)) => {
+                    e.floor(LAX);
+                    Some(V::Bool(i == 1))
+                }
+                _ => {
+                    e.push("bool_parsing", loc, "Input should be a valid boolean, unable to interpret input", input, None);
+                    None
+                }
+            },
+            V::Str(_) | V::Bytes(_) => match (match input {
+                V::Str(s) => s.to_ascii_lowercase(),
+                V::Bytes(b) => String::from_utf8_lossy(b).to_ascii_lowercase(),
+                _ => String::new(),
+            })
+            .as_str()
+            {
                 "0" | "off" | "f" | "false" | "n" | "no" => {
                     e.floor(LAX);
                     Some(V::Bool(false))
@@ -888,6 +983,10 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 V::Bool(b) => Some(*b as i64),
                 V::Int(i) => Some(*i),
                 V::Float(f) => {
+                    if f.fract() == 0.0 && f.is_finite() && f.abs() >= 9.223372036854775808e18 {
+                        e.push("int_parsing_size", loc, "Unable to parse input string as an integer, exceeded maximum size", input, None);
+                        return None;
+                    }
                     if f.fract() == 0.0 && f.is_finite() {
                         Some(*f as i64)
                     } else {
@@ -897,7 +996,10 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 }
                 V::Decimal(d) => {
                     if d.is_integral() {
-                        num_traits::ToPrimitive::to_i64(&d.to_int())
+                        match num_traits::ToPrimitive::to_i64(&d.to_int()) {
+                            Some(i) => Some(i),
+                            None => return beyond_i64(&d.to_string()),
+                        }
                     } else {
                         e.push("int_from_float", loc, "Input should be a valid integer, got a number with a fractional part", input, None);
                         return None;
@@ -907,8 +1009,20 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                     let t = s.trim().replace('_', "");
                     match t.parse::<i64>() {
                         Ok(i) => Some(i),
-                        Err(_) => match t.parse::<f64>() {
-                            Ok(f) if f.fract() == 0.0 && f.is_finite() && t.contains('.') => Some(f as i64),
+                        Err(_) if { let d = t.strip_prefix(['+', '-']).unwrap_or(&t); !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit()) } => return beyond_i64(&t),
+                        // pydantic-core: digits, then only zeros after a point ("12.000"); no exponent
+                        Err(_) => match t.split_once('.') {
+                            Some((whole, frac)) if !frac.is_empty() && frac.bytes().all(|c| c == b'0') => {
+                                let d = whole.strip_prefix(['+', '-']).unwrap_or(whole);
+                                if d.is_empty() || !d.bytes().all(|c| c.is_ascii_digit()) {
+                                    e.push("int_parsing", loc, "Input should be a valid integer, unable to parse string as an integer", input, None);
+                                    return None;
+                                }
+                                match whole.parse::<i64>() {
+                                    Ok(i) => Some(i),
+                                    Err(_) => return beyond_i64(whole),
+                                }
+                            }
                             _ => {
                                 e.push("int_parsing", loc, "Input should be a valid integer, unable to parse string as an integer", input, None);
                                 return None;
@@ -990,6 +1104,7 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 }
                 Some(V::str(s))
             }
+            // an Enum member: enum_scalar (before this match)
             _ => {
                 e.push("string_type", loc, "Input should be a valid string", input, None);
                 None
@@ -1004,6 +1119,11 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
             } => None,
             V::Str(s) => match dt::parse_datetime(s) {
                 Ok(d) => Some(V::DateTime(d)),
+                // a numeric timestamp out of speedate's years: its own message, not the date parser's
+                Err(err @ (dt::PErr::DateTooLarge | dt::PErr::DateTooSmall)) => {
+                    e.push("datetime_from_date_parsing", loc, format!("Input should be a valid datetime or date, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
+                    None
+                }
                 Err(_) => match dt::parse_date(s) {
                     Ok(d) => Some(V::DateTime(DateTime::naive(d.and_hms_opt(0, 0, 0).unwrap()))),
                     Err(err) => {
@@ -1012,8 +1132,13 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                     }
                 },
             },
-            V::Int(i) => dt::from_timestamp(*i as f64).map(V::DateTime),
-            V::Float(f) => dt::from_timestamp(*f).map(V::DateTime),
+            V::Int(_) | V::Float(_) => match dt::from_timestamp(match input { V::Int(i) => *i as f64, V::Float(f) => *f, _ => 0.0 }) {
+                Ok(d) => Some(V::DateTime(d)),
+                Err(err) => {
+                    e.push("datetime_parsing", loc, format!("Input should be a valid datetime, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
+                    None
+                }
+            },
             _ => {
                 e.push("datetime_type", loc, "Input should be a valid datetime", input, None);
                 None
@@ -1044,8 +1169,13 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                         }
                     },
                 },
-                V::Int(i) => dt::from_timestamp(*i as f64).and_then(|d| from_dt(d, e)),
-                V::Float(f) => dt::from_timestamp(*f).and_then(|d| from_dt(d, e)),
+                V::Int(_) | V::Float(_) => match dt::from_timestamp(match input { V::Int(i) => *i as f64, V::Float(f) => *f, _ => 0.0 }) {
+                    Ok(d) => from_dt(d, e),
+                    Err(err) => {
+                        e.push("date_from_datetime_parsing", loc, format!("Input should be a valid date or datetime, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
+                        None
+                    }
+                },
                 _ => {
                     e.push("date_type", loc, "Input should be a valid date", input, None);
                     None
@@ -1518,7 +1648,7 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
             return Some(input.clone()); // exact, no fields count: wins a union at once
         }
     }
-    if desc.init.is_some() && !desc.open && matches!(input, V::Dict(_)) && !SKIP_INIT.with(|s| s.replace(0) == desc as *const _ as usize) {
+    if desc.init.is_some() && !desc.open && matches!(input, V::Dict(d) if !is_from_attrs(d)) && !SKIP_INIT.with(|s| s.replace(0) == desc as *const _ as usize) {
         // pydantic-core would call the model's own __init__(**input) here (validation is synchronous here)
         FATAL.with(|f| {
             f.borrow_mut().get_or_insert(Exc::runtime(format!(
@@ -1684,6 +1814,15 @@ thread_local! {
 }
 
 /// The exception that interrupted the last validation, if any (validation itself is synchronous).
+/// A valid Python int this runtime cannot hold (docs/supported.md): the request fails (500), it is not
+/// reported as a validation error CPython would not raise.
+fn beyond_i64(text: &str) -> Option<V> {
+    FATAL.with(|f| {
+        f.borrow_mut().get_or_insert(Exc::msg(&OVERFLOW_ERROR, format!("py2axum: the integer {} is outside the signed 64-bit range", text.chars().take(40).collect::<String>())));
+    });
+    None
+}
+
 pub fn take_fatal() -> Option<Exc> {
     FATAL.with(|f| f.borrow_mut().take())
 }
@@ -2044,7 +2183,9 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
                 if inst.desc.is_private(&k) || (k.starts_with('_') && !inst.desc.open && inst.desc.extra != Extra::Allow) {
                     continue;
                 }
-                items.push((V::str(k), dump(&ev, o)?));
+                if !(o.exclude_none && ev.is_none()) {
+                    items.push((V::str(k), dump(&ev, o)?));
+                }
             }
             for (k, cv) in computed_values(inst)? {
                 if !(o.exclude_none && cv.is_none()) {
@@ -2148,7 +2289,7 @@ pub fn jsonable(v: &V) -> R {
         V::Date(d) => V::str(dt::date_iso(d)),
         V::Time(t) => V::str(dt::time_iso(t)),
         V::Delta(d) => V::Float(dt::micros(d) as f64 / 1e6),
-        V::Decimal(d) => super::decimal::jsonable(d),
+        V::Decimal(d) => super::decimal::jsonable(d)?,
         V::Native(n) if matches!(&**n, Native::PydUrl(..) | Native::Uuid(_)) => V::str(ops::str_(v)?),
         // `vars(exc)` (dict(exc) fails): HTTPException's fields, then the attributes its `__init__` set
         V::Exc(e) => {
@@ -2184,12 +2325,16 @@ pub struct JsonStyle {
     pub ensure_ascii: bool,
     pub item_sep: &'static str,
     pub key_sep: &'static str,
+    /// pydantic's `dump_json`: NaN and infinities are `null` (ser_json_inf_nan="null"), not an error
+    pub nan_null: bool,
 }
 
 /// FastAPI's JSONResponse: `json.dumps(ensure_ascii=False, separators=(",", ":"))`
-pub const RESPONSE: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":" };
+pub const RESPONSE: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false };
 /// plain `json.dumps(x)`
-pub const DUMPS: JsonStyle = JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": " };
+/// A response_model's JSON (FastAPI 0.130+: `TypeAdapter.dump_json`, compact, non-ASCII kept)
+pub const DUMP_JSON: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: true };
+pub const DUMPS: JsonStyle = JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false };
 
 fn write_str(out: &mut String, s: &str, st: &JsonStyle) {
     out.push('"');
@@ -2237,6 +2382,10 @@ fn write(out: &mut String, v: &V, st: &JsonStyle, default_str: bool) -> R<()> {
         V::Decimal(_) => return Err(Exc::type_error("Object of type Decimal is not JSON serializable")),
         V::Float(f) => {
             if !f.is_finite() {
+                if st.nan_null {
+                    out.push_str("null");
+                    return Ok(());
+                }
                 return Err(Exc::value_error("Out of range float values are not JSON compliant"));
             }
             out.push_str(&ops::float_repr(*f))
@@ -2300,11 +2449,9 @@ pub fn from_serde(v: &serde_json::Value) -> V {
     }
 }
 
-/// `json.loads`
+/// `json.loads` (CPython's decoder, dynrt/pyjson.rs)
 pub fn loads(s: &str) -> R {
-    serde_json::from_str::<serde_json::Value>(s)
-        .map(|v| from_serde(&v))
-        .map_err(|e| Exc::msg(&JSON_DECODE_ERROR, format!("Expecting value: {e}")))
+    super::pyjson::loads(s)
 }
 
 pub fn tz_utc() -> V {

@@ -92,7 +92,7 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let status = |i: usize, d: u16| -> R<u16> {
         match arg(args, kwargs, i, "status_code") {
             None => Ok(d),
-            Some(V::Int(s)) => Ok(*s as u16),
+            Some(V::Int(s)) => Ok(status_u16(*s)),
             Some(o) => Err(Exc::type_error(format!("status_code must be an int, not {}", o.type_name()))),
         }
     };
@@ -125,7 +125,7 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             let body: Vec<u8> = match (&content, json) {
                 (None, false) => vec![],
                 // Starlette: json.dumps(content, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                (c, true) => super::pyd::to_json(c.as_ref().unwrap_or(&V::None), &super::pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":" }, false)?.into_bytes(),
+                (c, true) => super::pyd::to_json(c.as_ref().unwrap_or(&V::None), &super::pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false }, false)?.into_bytes(),
                 (Some(V::Bytes(b)), _) => b.to_vec(),
                 (Some(V::Str(s)), _) => s.as_bytes().to_vec(),
                 (Some(o), _) => return Err(Exc::type_error(format!("py2axum: {kind} content must be str or bytes, not {}", o.type_name()))),
@@ -290,7 +290,7 @@ pub fn attr(r: &Arc<RespObj>, name: &str) -> R {
 pub fn set_status(r: &RespObj, v: &V) -> R<()> {
     match v {
         V::Int(i) => {
-            *r.status.lock() = *i as u16;
+            *r.status.lock() = status_u16(*i);
             Ok(())
         }
         _ => Err(Exc::type_error("status_code must be an int")),
@@ -298,8 +298,19 @@ pub fn set_status(r: &RespObj, v: &V) -> R<()> {
 }
 
 /// The returned response object, sent as Starlette would.
+/// A status kept as given while it fits (0 stands for any other value: never a valid status, never a
+/// truncated one that would look valid).
+fn status_u16(s: i64) -> u16 {
+    u16::try_from(s).ok().filter(|s| *s <= 999).unwrap_or(0)
+}
+
 pub fn into_response(r: &RespObj) -> R<Response> {
     let status = *r.status.lock();
+    if !(100..=599).contains(&status) {
+        // uvicorn (httptools) has a status line for 100..599 only: any other status is a KeyError on the first
+        // send and the connection is dropped without an answer. A panic in the handler drops it the same way.
+        panic!("py2axum: status code outside 100..599: no status line, the connection is dropped (as uvicorn does)");
+    }
     let mut headers = r.headers.lock().clone();
     let body = match &r.body {
         RespBody::Raw(b) => {

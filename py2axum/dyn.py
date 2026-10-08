@@ -11,6 +11,7 @@ Unsupported constructs raise `TranspileError` with file:line, as everywhere else
 from __future__ import annotations
 
 import ast
+import functools
 import copy
 import json
 import re
@@ -36,9 +37,20 @@ BUILTIN_FUNCS = {
 BUILTIN_TYPES = {"str", "int", "float", "bool", "dict", "list", "tuple", "set", "frozenset", "bytes", "object"}
 
 
+_RS_SPECIAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+
+
 def rs(s: str) -> str:
-    """A Rust string literal."""
-    return json.dumps(s, ensure_ascii=False)
+    """A Rust string literal (JSON's escapes are Rust's, but for control characters: `\\u{1c}`, not `\\u001c`)."""
+    if not _RS_SPECIAL.search(s):
+        return json.dumps(s, ensure_ascii=False)
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if 0xD800 <= o <= 0xDFFF:
+            raise ValueError(f"a lone surrogate (\\u{o:04x}) cannot be held in a Rust string: {s[:40]!r}")
+        out.append(json.dumps(ch, ensure_ascii=False)[1:-1] if o >= 0x20 or ch in "\n\r\t" else f"\\u{{{o:x}}}")
+    return '"' + "".join(out) + '"'
 
 
 def rs_marked(s: str) -> str:
@@ -1320,7 +1332,7 @@ class Project:
                         for x in ast.walk(stmt.value):
                             if isinstance(x, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "schema" for k in x.keys):
                                 raise self.err(f"model {sym.name}: __table_args__ schema is not supported", stmt, csym.module)
-                    elif isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] in {"Column", "mapped_column"}:
+                    elif isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] in {"Column", "mapped_column", "deferred"}:
                         cols.append(self.column(n, None, stmt.value, csym.module, stmt))
                     elif isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] == "relationship":
                         info.rels_raw.append((n, None, stmt.value, csym.module))
@@ -1661,7 +1673,15 @@ class Project:
 
     def column(self, name: str, ann, call, module: str, stmt) -> dict:
         col = {"name": name, "ty": None, "nullable": None, "pk": False, "default": None, "server_default": False,
-               "onupdate": None, "fk": None, "autoincrement": True}
+               "onupdate": None, "fk": None, "autoincrement": True, "deferred": False}
+        if isinstance(call, ast.Call) and isinstance(self.resolve(module, call.func), Ext) and \
+                self.resolve(module, call.func).dotted in {"sqlalchemy.orm.deferred", "sqlalchemy.orm.strategy_options.deferred"}:
+            # `deferred(Column(...))`: left out of the entity's loaded state (read, then unloaded)
+            if len(call.args) != 1 or call.keywords or not isinstance(call.args[0], ast.Call):
+                raise self.err(f"column {name}: only deferred(Column(...)) is supported (no group, raiseload or "
+                               "extra columns)", call, module)
+            col["deferred"] = True
+            call = call.args[0]
         optional = False
         if ann is not None:
             if not (isinstance(ann, ast.Subscript) and (dotted(ann.value) or "").split(".")[-1] == "Mapped"):
@@ -1814,6 +1834,8 @@ class Project:
                     col["server_default"] = True
                 elif kw.arg == "onupdate":
                     col["onupdate"] = self.col_default(kw.value, module, name)
+                elif kw.arg == "deferred":
+                    col["deferred"] = bool(literal(kw.value, self.src(module)))
                 elif kw.arg == "autoincrement":
                     col["autoincrement"] = bool(literal(kw.value, self.src(module)))
                     col["autoincrement_set"] = True
@@ -2549,11 +2571,25 @@ class Project:
         return runners[key]
 
     def global_value(self, sym: Sym) -> str:
+        # call-graph node of the global: every reader reaches the functions its value queues (a lambda
+        # `lambda: f()` stored by a module-level loop), even when an earlier reader compiled it
+        if self.cur is not None:
+            self.edges.setdefault(self.cur, set()).add(("global", sym))
+        if sym not in self.globals:
+            prev, self.cur = self.cur, ("global", sym)
+            try:
+                return self._global_value(sym)
+            finally:
+                self.cur = prev
+        return self.globals[sym]
+
+    def _global_value(self, sym: Sym) -> str:
         if sym not in self.globals:
             name = f"g_{mod_ident(sym.module)}__{ident(sym.name)}"
             node = self.ix.definition(sym)
             if isinstance(node, (ast.Try, ast.If, ast.For, ast.While, ast.With)) and not import_guard(node):
                 runner = self.stmt_runner(sym.module, node)
+                self.edges.setdefault(("global", sym), set()).add(("modst", runner))
                 self.globals[sym] = name
                 i = stmt_bindings(node).index(sym.name)
                 self.items.append(
@@ -2617,11 +2653,14 @@ class Project:
         """A module-level `def` with project decorators: `d1(d2(f))` built once at startup (decorator
         expressions evaluated top to bottom, then applied bottom-up, like CPython at import)."""
         dec = self.__dict__.setdefault("decorated", {})
+        if self.cur is not None:
+            self.edges.setdefault(self.cur, set()).add(("decorated", sym))
         if sym not in dec:
             name = f"gd_{mod_ident(sym.module)}__{ident(sym.name)}"
             dec[sym] = name
             node = self.fn_node(sym)
             fc = FnCompiler(self, sym.module, None, name)
+            prev, self.cur = self.cur, ("decorated", sym)
             try:
                 decos = [mcp_tool_decorator(self, fc, sym, node, d) or fc.expr(d) for d in node.decorator_list]
                 val = raw_fn_value(self, sym)
@@ -2645,6 +2684,8 @@ class Project:
             except TranspileError:
                 del dec[sym]
                 raise
+            finally:
+                self.cur = prev
         return dec[sym]
 
     def drain(self) -> None:
@@ -4092,6 +4133,49 @@ class FnCompiler:
             kwargs = f"vec![{fixed}]"
         return args, kwargs
 
+    # BaseModel's class methods the runtime implements on a schema class
+    BASEMODEL_CLASS_METHODS = {"model_validate", "model_validate_json", "model_json_schema"}
+
+    def super_classmethod(self, node: ast.Call) -> str | None:
+        """`super().m(...)` / `super(Cls, cls).m(...)` in a @classmethod of a Pydantic model: the parent's class
+        method, `cls` still bound to the class called (a project parent's override, else BaseModel's)."""
+        f = node.func
+        sup = f.value
+        if self.node is None or self.p.cur is None or "." not in self.p.cur[0].name or f.attr == "__init__":
+            return None
+        if "classmethod" not in {dotted(d) for d in self.node.decorator_list}:
+            return None
+        csym = Sym(self.p.cur[0].module, self.p.cur[0].name.split(".")[0])
+        if csym not in self.p.fe.schema_syms:
+            return None
+        first = self.node.args.args[0].arg if self.node.args.args else None
+        if sup.args and not (len(sup.args) == 2 and isinstance(sup.args[0], ast.Name) and sup.args[0].id in {csym.name, first}
+                             and isinstance(sup.args[1], ast.Name) and sup.args[1].id == first):
+            raise self.err(f"only `super()` or `super({csym.name}, {first})` is supported in a class method", sup)
+        if sup.args and sup.args[0].id == first:
+            # `super(cls, cls)`: the parent of the class called, the defining class's only if nothing subclasses it
+            subs = [s.name for s, d in self.p.fe.schema_syms.items()
+                    if any(self.p.resolve(s.module, b) == csym for b in d.bases)]
+            if subs:
+                raise self.err(f"`super({first}, {first})` in {csym.name}, which {', '.join(sorted(subs))} subclass: "
+                               "the parent depends on the class called (write `super()`)", sup)
+        me = f"v_{ident(first)}"
+        t = self.p.resolve(csym.module, self.p.ix.definition(csym).bases[0])
+        if isinstance(t, Sym) and t in self.p.fe.schema_syms:
+            pdef = self.p.ix.definition(t)
+            for stmt in pdef.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == f.attr:
+                    if "classmethod" not in {dotted(d) for d in stmt.decorator_list}:
+                        raise self.err(f"super().{f.attr}(): {t.name}.{f.attr} is not a class method", node)
+                    return self.project_call(Sym(t.module, f"{t.name}.{f.attr}"), stmt, node, False, prefix=[f"{me}.clone()"])
+        elif not is_ext(t, "pydantic.BaseModel"):
+            raise self.err(f"super().{f.attr}(): the parent of {csym.name} is not supported", node)
+        if f.attr not in self.BASEMODEL_CLASS_METHODS:
+            raise self.err(f"super().{f.attr}() in a class method: only {', '.join(sorted(self.BASEMODEL_CLASS_METHODS))} "
+                           "of BaseModel are supported", node)
+        args, kwargs = self.dyn_args(node)
+        return self.q(f"{RT}::methods::call_method(cx, &{me}, {rs(f.attr)}, {args}, {kwargs}).await")
+
     def super_init(self, node: ast.Call) -> str | None:
         """`super().__init__(...)` in the `__init__` of a project class."""
         f = node.func
@@ -4103,6 +4187,9 @@ class FnCompiler:
             for a in node.args:
                 self.expr(a)
             return "V::None"
+        cm = self.super_classmethod(node)
+        if cm is not None:
+            return cm
         if f.value.args or f.attr != "__init__" or self.node is None or self.p.cur is None or "." not in self.p.cur[0].name:
             raise self.err("only `super().__init__(...)` inside a method is supported", node)
         csym = Sym(self.p.cur[0].module, self.p.cur[0].name.split(".")[0])
@@ -4517,6 +4604,13 @@ class FnCompiler:
                     self.expr(a)
                 return self.q(f"Err::<V, Exc>(Exc::type_error({rs(msg)}))")
             init = info.__dict__.get("init")
+            if init is None and self.p.is_http_middleware(sym):
+                # BaseHTTPMiddleware.__init__(app, dispatch=None) inherited: the stack calls `dispatch` itself
+                if len(node.args) + len(node.keywords) != 1 or any(k.arg != "app" for k in node.keywords):
+                    raise self.err(f"{sym.name}(app): only the application argument is supported "
+                                   "(BaseHTTPMiddleware's dispatch= is not)", node)
+                self.expr(node.args[0] if node.args else node.keywords[0].value)
+                return f"{RT}::pyd::object_new(&{info.rust})"
             if init is None:
                 if node.args or node.keywords:
                     raise self.err(f"{sym.name}() takes no arguments", node)
@@ -4939,6 +5033,69 @@ class RouteBuilder:
             variant = "HttpBasic(None)"
         return variant, auto_error
 
+    # Field() options that constrain the value (FastAPI reads them from the model's signature, as `Annotated`
+    # metadata); the others only document it
+    CLASS_DEP_CONS = {"ge", "gt", "le", "lt", "min_length", "max_length", "pattern", "multiple_of", "strict",
+                      "allow_inf_nan", "max_digits", "decimal_places"}
+    CLASS_DEP_DOC = {"description", "title", "examples", "deprecated", "json_schema_extra"}
+
+    def class_dependency(self, sym: Sym, src: str) -> Sym:
+        """`p: Model = Depends()`: FastAPI calls the class, its parameters read from the model's signature: one
+        query parameter per field (type, default, Field constraints), then `Model(**fields)`. Compiled as that
+        function, written next to the class. Refused: a base other than BaseModel, validators (a ValueError
+        would surface as a pydantic ValidationError, not a 422), aliases, non-scalar fields (body in FastAPI)."""
+        name = f"__py2axum_depends_{sym.name}"
+        m = self.p.ix.module(sym.module)
+        if name in m.defs:
+            return Sym(sym.module, name)
+        cls = self.p.fe.schema_syms[sym]
+        msrc = self.p.src(sym.module)
+        if len(cls.bases) != 1 or not is_ext(self.p.resolve(sym.module, cls.bases[0]), "pydantic.BaseModel") or cls.keywords:
+            raise TranspileError(f"{sym.name}: a class dependency must subclass BaseModel directly", cls, msrc)
+        params, names = [], []
+        for st in cls.body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.decorator_list:
+                raise TranspileError(f"{sym.name}: a class dependency with validators or decorated methods is not supported", st, msrc)
+            if isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "model_config" for t in st.targets):
+                raise TranspileError(f"{sym.name}: model_config on a class dependency is not supported", st, msrc)
+            if not (isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)):
+                continue
+            ann_t = (dotted(st.annotation) or "").split(".")[-1]
+            if ann_t == "ClassVar" or (isinstance(st.annotation, ast.Subscript) and (dotted(st.annotation.value) or "").split(".")[-1] in {"ClassVar", "Annotated"}):
+                raise TranspileError(f"{sym.name}.{st.target.id}: only plain annotations are supported in a class dependency", st, msrc)
+            for n in ast.walk(st.annotation):
+                if isinstance(n, ast.Name) and n.id in {"list", "List", "dict", "Dict", "set", "Set", "tuple", "Tuple"}:
+                    raise TranspileError(f"{sym.name}.{st.target.id}: a container field of a class dependency is a body "
+                                         "parameter in FastAPI: not supported", st, msrc)
+            default, cons = None, []
+            v = st.value
+            if isinstance(v, ast.Call) and (dotted(v.func) or "").split(".")[-1] == "Field":
+                if v.args:
+                    default = v.args[0]
+                for kw in v.keywords:
+                    if kw.arg == "default":
+                        default = kw.value
+                    elif kw.arg in self.CLASS_DEP_CONS:
+                        cons.append(f"{kw.arg}={ast.unparse(kw.value)}")
+                    elif kw.arg not in self.CLASS_DEP_DOC:
+                        raise TranspileError(f"{sym.name}.{st.target.id}: Field({kw.arg}=) is not supported in a class dependency", kw, msrc)
+                if isinstance(default, ast.Constant) and default.value is Ellipsis:
+                    default = None
+            elif v is not None:
+                default = v
+            ann = ast.unparse(st.annotation)
+            p = f"{st.target.id}: Annotated[{ann}, Query({', '.join(cons)})]" if cons else f"{st.target.id}: {ann}"
+            params.append(p + (f" = {ast.unparse(default)}" if default is not None else ""))
+            names.append(st.target.id)
+        code = (f"def {name}(*, {', '.join(params)}):\n" if params else f"def {name}():\n") + \
+            f"    return {sym.name}({', '.join(f'{n}={n}' for n in names)})\n"
+        fn = ast.parse(code).body[0]
+        for n in ast.walk(fn):
+            if "lineno" in n._attributes:
+                n.lineno, n.end_lineno, n.col_offset, n.end_col_offset = cls.lineno, cls.lineno, 0, 0
+        m.defs[name] = fn
+        return Sym(sym.module, name)
+
     def params(self, fn, module: str, path_names: set[str], for_dep: bool = False) -> list[RParam]:
         out: list[RParam] = []
         src = self.p.src(module)
@@ -4991,7 +5148,14 @@ class RouteBuilder:
                 continue
             if dep_call is not None:
                 if not dep_call.args:
-                    raise TranspileError(f"{fn.name}: Depends() without a callable is only supported for AsyncSession", arg, src)
+                    cls_t = self.p.resolve(amod, ann, ascope) if ann is not None else None
+                    if not (isinstance(cls_t, Sym) and cls_t in self.p.fe.schema_syms):
+                        raise TranspileError(f"{fn.name}: Depends() without a callable is only supported for AsyncSession "
+                                             "and Pydantic models", arg, src)
+                    if dep_call.keywords:
+                        raise TranspileError("Depends() options are not supported on a class dependency", dep_call, src)
+                    out.append(RParam(name, "dep", dep=self.class_dependency(cls_t, src)))
+                    continue
                 t = self.p.resolve(dmod, dep_call.args[0], dscope)
                 sec = self.security_scheme(t, src) if isinstance(t, Sym) else None
                 if sec is not None:
@@ -5613,7 +5777,7 @@ def emit_descriptors(p: Project) -> list[str]:
             cols.append(
                 f"{RT}::orm::ColDesc {{ name: {rs(c['name'])}, ty: {RT}::orm::ColTy::{c['ty']}, nullable: {str(c['nullable']).lower()}, "
                 f"pk: {str(c['pk']).lower()}, autoincrement: {str(c['autoincrement']).lower()}, default: {d}, "
-                f"server_default: {str(c['server_default']).lower()}, onupdate: {u} }}"
+                f"server_default: {str(c['server_default']).lower()}, onupdate: {u}, deferred: {str(c['deferred']).lower()} }}"
             )
         methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
         b = lambda x: str(bool(x)).lower()  # noqa: E731
@@ -5844,7 +6008,7 @@ tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync"
 futures-util = "0.3"
 sqlx = {{ version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "json", "uuid"] }}
 serde = {{ version = "1", features = ["derive"] }}
-serde_json = {{ version = "1", features = ["preserve_order"] }}
+serde_json = {{ version = "1", features = ["preserve_order", "float_roundtrip"] }}
 form_urlencoded = "1"
 chrono = {{ version = "0.4", default-features = false, features = ["std", "clock"] }}
 chrono-tz = "0.10"
@@ -5906,7 +6070,9 @@ fn env_or(key: &str, default: &str) -> String {{
 
 #[tokio::main]
 async fn main() {{
-    let database_url = env_or("DATABASE_URL", "postgresql://postgres@127.0.0.1/postgres")
+    let database_url = env_or("DATABASE_URL", "postgresql://postgres@127.0.0.1/postgres");
+    dynrt::orm::set_driver(&database_url);
+    let database_url = database_url
         .replace("postgresql+psycopg://", "postgresql://")
         .replace("postgresql+asyncpg://", "postgresql://");
     let pool_size: u32 = env_or("DB_POOL_SIZE", "32").parse().expect("DB_POOL_SIZE");
@@ -5927,6 +6093,10 @@ async fn main() {{
     let app = Arc::new(dynrt::AppState {{ pool, expire_on_commit: {expire}, autoflush: {autoflush}, commit_after: {commit}, sync_session: {sync} }});
     dynrt::set_root(app.clone());
     dynrt::set_python({pymajor}, {pyminor});
+    dynrt::web::set_strict_content_type({strict_ct});
+    dynrt::web::set_starlette({starlette_major}, {starlette_minor});
+    dynrt::web::set_response_dump_json({dump_json});
+    dynrt::methods::set_str_classes(&gen::STR_CLASSES);
     dynrt::set_pydantic("{pydantic}");
     dynrt::sentry::set_sdk("{sentry_sdk}", {multipart});
     gen::register_classes();
@@ -5959,33 +6129,28 @@ async fn main() {{
     let addr = format!("{{}}:{{}}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     eprintln!("listening on http://{{addr}}");
+    let pool = app.pool.clone();
     let serve = axum::serve(listener, router.with_state(app).into_make_service_with_connect_info::<std::net::SocketAddr>());
-    match lifespan {{
-        // sentry_sdk initialised: SIGTERM stops the server gracefully and the queued events are sent (the
-        // atexit integration of the Python SDK)
-        None if dynrt::sentry::active() => {{
-            tokio::select! {{
-                r = serve.with_graceful_shutdown(dynrt::web::shutdown_signal()) => r.expect("server"),
-                _ = dynrt::web::shutdown_deadline() => {{}}
-            }}
-            dynrt::sentry::shutdown();
-            std::process::exit(0);
-        }}
-        None => serve.await.expect("server"),
-        Some(cm) => {{
-            // in-flight requests finish (bounded: an endless stream would hold the shutdown forever)
-            tokio::select! {{
-                r = serve.with_graceful_shutdown(dynrt::web::shutdown_signal()) => r.expect("server"),
-                _ = dynrt::web::shutdown_deadline() => {{}}
-            }}
-            if let Err(e) = dynrt::web::lifespan_end(&lcx, cm).await {{
-                eprintln!("ERROR:    {{:?}}\nERROR:    Application shutdown failed. Exiting.", e);
-            }}
-            dynrt::sentry::shutdown();
-            // like the interpreter: the process ends here (threads still using the runtime included)
-            std::process::exit(0);
+    // SIGTERM/SIGINT, as uvicorn: no new connection, idle keep-alive connections closed, in-flight requests
+    // finished (bounded: an endless stream would hold the shutdown forever), WebSocket sessions closed (1012)
+    tokio::select! {{
+        r = async {{
+            serve.with_graceful_shutdown(dynrt::web::shutdown_signal()).await?;
+            dynrt::web::drain_tasks().await;
+            Ok::<(), std::io::Error>(())
+        }} => r.expect("server"),
+        _ = dynrt::web::shutdown_deadline() => {{}}
+    }}
+    // FastAPI(lifespan=...): the code after `yield`
+    if let Some(cm) = lifespan {{
+        if let Err(e) = dynrt::web::lifespan_end(&lcx, cm).await {{
+            eprintln!("ERROR:    {{:?}}\nERROR:    Application shutdown failed. Exiting.", e);
         }}
     }}
+    // sentry_sdk initialised: the queued events are sent (the atexit integration of the Python SDK)
+    dynrt::sentry::shutdown();
+    // like the interpreter: the process ends here (threads still using the runtime included)
+    dynrt::web::exit_after_shutdown(&pool).await
 }}
 """
 
@@ -6308,6 +6473,16 @@ def target_python(root) -> tuple[int, int]:
         if (cand / ".git").exists():
             break
     return sys.version_info[:2]
+
+
+def fastapi_at_least(root, version: tuple[int, int]) -> bool:
+    v = locked_version(root, "fastapi") or "0.142"
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:2]) >= version
+
+
+def fastapi_strict_content_type(root) -> bool:
+    """FastAPI 0.132+ does not decode a body without Content-Type as JSON (`strict_content_type`, True by default)."""
+    return fastapi_at_least(root, (0, 132))
 
 
 def locked_version(root, name: str) -> str | None:
@@ -6674,6 +6849,53 @@ def factory_sentry_init(p: "Project", fe: Frontend) -> None:
                 p.__dict__.setdefault("modst", set()).add(name)
 
 
+@functools.lru_cache(maxsize=None)
+def _mapped_roots() -> frozenset[str]:
+    from . import libmap
+    tables = (libmap.VALUES, libmap.EXCEPTIONS, libmap.CALLS, libmap.NAMESPACE_CALLS)
+    return frozenset({k.split(".")[0] for t in tables for k in t} | {"sentry_sdk"})
+
+
+def unmapped_library(t) -> bool:
+    """A third-party library the runtime maps nothing of (not the standard library)."""
+    import sys
+    if not isinstance(t, Ext):
+        return False
+    root = t.dotted.split(".")[0]
+    return root not in _mapped_roots() and root not in sys.stdlib_module_names
+
+
+def _store_bases(st: ast.stmt) -> list[ast.expr]:
+    """The objects an assignment stores into (`a.b["k"] = v` -> `a`)."""
+    out = []
+    for t in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+        while isinstance(t, (ast.Subscript, ast.Attribute)):
+            t = t.value
+        out.append(t)
+    return out
+
+
+def link_mutated_globals(p: "Project", module: str, st: ast.stmt, node) -> None:
+    """A module-level statement that fills a global in place (`REG[k] = lambda: f()`, `REG.update(...)`):
+    the routes reading that global reach what the statement queued (a function that does not translate
+    then blocks them, like one the global's own value calls)."""
+    names = set()
+    for n in walk_scope(st):
+        base = None
+        if isinstance(n, (ast.Subscript, ast.Attribute)) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            base = n.value
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            base = n.func.value  # a method call may mutate its receiver
+        while isinstance(base, (ast.Subscript, ast.Attribute)):
+            base = base.value
+        if isinstance(base, ast.Name):
+            names.add(base.id)
+    for name in sorted(names - set(stmt_bindings(st, handlers=True))):
+        sym = p.ix.resolve(module, name)
+        if isinstance(sym, Sym):
+            p.edges.setdefault(("global", sym), set()).add(node)
+
+
 def module_statements(p: "Project", fe: Frontend) -> None:
     """Module-level call statements (`INI.set_main_option(...)`, `logger.setLevel(...)`) of the modules the
     translation uses, compiled to run at startup in their place among the module's globals."""
@@ -6691,6 +6913,26 @@ def module_statements(p: "Project", fe: Frontend) -> None:
                 t = p.resolve(m.name, f)
                 if isinstance(t, Ext) and t.dotted in DDL_ONLY_CALLS:
                     continue  # `Index(Model.col, ...)`: attaches to the table's DDL, compiled with create_all
+            elif isinstance(st, (ast.Assign, ast.AugAssign)) and any(
+                    isinstance(t, (ast.Subscript, ast.Attribute)) for t in (st.targets if isinstance(st, ast.Assign) else [st.target])):
+                # `REG["k"] = ...`, `obj.attr = ...`: fills a global in place (the plain names it binds are globals)
+                if any(fe._is_app(m.name, b) for b in _store_bases(st)):
+                    continue  # `app.state.x = ...`: the frontend's
+                if all(unmapped_library(p.resolve(m.name, b)) for b in _store_bases(st)):
+                    # `stripe.api_key = ...`: configures a library the runtime does not know, so no native code can
+                    # read it (any use of the library is refused where it occurs); the routes using it run
+                    # --python-side, where the module runs as written
+                    continue
+                cls = next((t for t in (st.targets if isinstance(st, ast.Assign) else [st.target])
+                            if isinstance(t, ast.Attribute) and isinstance(p.resolve(m.name, t.value), Sym)
+                            and isinstance(p.ix.definition(p.resolve(m.name, t.value)), ast.ClassDef)), None)
+                if cls is not None:
+                    e = TranspileError(f"assigning the class attribute `{ast.unparse(cls)}` at module level is not supported "
+                                       "(class attributes are read as declared): set it in the class body", st, p.src(m.name))
+                    if not p.collect:
+                        raise e
+                    fe.global_errors.append(e)
+                    continue
             elif not isinstance(st, (ast.For, ast.While, ast.If, ast.With, ast.Try)) or import_guard(st) or startup_skipped(st):
                 continue
             elif any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -6698,7 +6940,7 @@ def module_statements(p: "Project", fe: Frontend) -> None:
                 continue  # registrations: the frontend's
             else:
                 try:
-                    p.stmt_runner(m.name, st)
+                    link_mutated_globals(p, m.name, st, ("modst", p.stmt_runner(m.name, st)))
                 except TranspileError as e:
                     if not p.collect:
                         raise
@@ -6709,6 +6951,7 @@ def module_statements(p: "Project", fe: Frontend) -> None:
             p.cur = ("modst", name)
             try:
                 fc.block([st])
+                link_mutated_globals(p, m.name, st, ("modst", name))
             except TranspileError as e:
                 if not p.collect:
                     raise
@@ -7147,6 +7390,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     if any(isinstance(n, (ast.Import, ast.ImportFrom)) and "unicodedata" in ast.unparse(n)
            for m in list(proj.ix.modules.values()) for n in ast.walk(m.tree)):
         proj.items.append(ucd_unassigned())
+    proj.items.append(str_classes())
     gen = [
         "// Generated by py2axum (dyn backend) from the FastAPI project. Do not edit.",
         "#![allow(unused_mut, unused_variables, unused_imports, unreachable_code, dead_code, non_snake_case, unused_parens, unused_labels, unused_assignments, non_upper_case_globals, clippy::all)]",
@@ -7193,6 +7437,9 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     pyver = target_python(fe.index.root)
     (out_dir / "src" / "main.rs").write_text(MAIN.format(expire=b(expire), autoflush=b(autoflush), commit=b(commit), sync=b(sync), layers=layers,
                                                          pymajor=pyver[0], pyminor=pyver[1],
+                                                         strict_ct=b(fastapi_strict_content_type(fe.index.root)),
+                                                         starlette_major=starlette_version(proj)[0], starlette_minor=starlette_version(proj)[1],
+                                                         dump_json=b(fastapi_at_least(fe.index.root, (0, 130))),
                                                          pydantic=".".join((locked_version(fe.index.root, "pydantic") or "2.13").split(".")[:2]),
                                                           sentry_sdk=locked_version(fe.index.root, "sentry-sdk") or "2.71.0",
                                                           multipart=b(locked_version(fe.index.root, "python-multipart") is not None),
@@ -7236,6 +7483,30 @@ def runtime_attr_names() -> set[str]:
                 names |= set(re.findall(ident, table))
         _RUNTIME_ATTRS = names
     return _RUNTIME_ATTRS
+
+
+@functools.lru_cache(maxsize=1)
+def str_classes() -> str:
+    """`str.isdigit/isdecimal/isnumeric/isalpha/isspace/islower/isupper` (and the titlecase letters) of the
+    translating Python, as code point ranges: Rust's
+    char predicates follow other Unicode properties ('¾' is numeric there, not a digit in Python; U+001C is
+    a Python space)."""
+    import unicodedata
+
+    def ranges(pred) -> str:
+        out, start = [], None
+        for cp in range(0x110001):
+            ok = cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF and pred(chr(cp))
+            if ok and start is None:
+                start = cp
+            elif not ok and start is not None:
+                out.append(f"({start:#x}, {cp - 1:#x})")
+                start = None
+        return "&[" + ", ".join(out) + "]"
+    fields = ", ".join(f"{k}: {ranges(getattr(str, 'is' + k))}" for k in ("digit", "decimal", "numeric", "alpha", "space", "lower", "upper"))
+    fields += f", title: {ranges(lambda c: unicodedata.category(c) == 'Lt')}"
+    return (f"/// Unicode {unicodedata.unidata_version} (the translating Python): the str.is*() classes\n"
+            f"pub static STR_CLASSES: {RT}::methods::StrClasses = {RT}::methods::StrClasses {{ {fields} }};")
 
 
 def ucd_unassigned() -> str:

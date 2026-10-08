@@ -43,3 +43,12 @@ class CountingMiddleware(BaseHTTPMiddleware):
         response.headers["X-Key"] = key
         response.headers["X-Seen"] = "counting"
         return response
+
+
+class StampMiddleware(BaseHTTPMiddleware):
+    """No __init__: BaseHTTPMiddleware's (app, dispatch=None) is the one called."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers["X-Stamp"] = request.method.lower()
+        return response

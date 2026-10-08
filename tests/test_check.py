@@ -109,3 +109,23 @@ def test_untested_version_refused(tmp_path, capsys):
     assert main([str(pkg), "--root", str(tmp_path), "--report", str(tmp_path / "r.md")]) == 0
     report = json.loads((tmp_path / "r.json").read_text())
     assert any("fastapi 0.99.1" in g["erreur"] for g in report["bloquants_globaux"])
+
+
+def test_unmapped_library_setting(tmp_path, capsys):
+    """`stripe.api_key = ...` at module level: the library is unknown to the binary, so every read or call of
+    it is refused already; the setting itself does not block the application (it stays Python's)."""
+    pkg = write_project(tmp_path)
+    (pkg / "pay.py").write_text("import os\n\nimport stripe\n\nstripe.api_key = os.getenv('STRIPE_KEY')\n\n\n"
+                                "def customers():\n    return stripe.Customer.list(limit=1)\n")
+    main_py = pkg / "main.py"
+    main_py.write_text(main_py.read_text().replace(
+        "app = create_app()\n",
+        "app = create_app()\n\n\n@app.get('/pay')\ndef pay():\n    from proj.pay import customers\n    return customers()\n"))
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto")
+    assert rc == 0 and not data["global"]
+    pay = next(r for r in data["routes"] if r["path"] == "/pay")
+    assert pay["status"] == "python-side" and "stripe.Customer.list()" in pay["reason"]
+    # a library the map does know (json) is still refused
+    (pkg / "pay.py").write_text("import json\n\njson.encoder = None\n\n\ndef customers():\n    return 1\n")
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto")
+    assert rc == 1 and any("json.encoder" in g["error"] for g in data["global"])

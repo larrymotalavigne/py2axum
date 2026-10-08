@@ -21,7 +21,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.8"
-tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }}
+tokio = {{ version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }}
 futures-util = "0.3"
 sqlx = {{ version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }}
 serde = {{ version = "1", features = ["derive"] }}
@@ -454,7 +454,7 @@ async fn main() {{
     for ddl in models::CREATE_TABLES {{
         sqlx::query(ddl).execute(&pool).await.expect("create tables");
     }}
-    let state = AppState {{ pool, http: reqwest::Client::new() }};
+    let state = AppState {{ pool: pool.clone(), http: reqwest::Client::new() }};
 
     let table: std::sync::Arc<Vec<(&'static str, regex::Regex, Router)>> = std::sync::Arc::new(vec![
 {chr(10).join(route_lines)}
@@ -468,7 +468,12 @@ async fn main() {{
     let addr = format!("{{}}:{{}}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     eprintln!("listening on http://{{addr}}");
-    axum::serve(listener, app).await.expect("server");
+    // SIGTERM/SIGINT as uvicorn: no new connection, in-flight requests finished (bounded), pool closed
+    tokio::select! {{
+        r = axum::serve(listener, app).with_graceful_shutdown(rt::shutdown_signal()) => r.expect("server"),
+        _ = rt::shutdown_deadline() => {{}}
+    }}
+    rt::exit_after_shutdown(&pool).await
 }}
 """
 

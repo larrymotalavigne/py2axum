@@ -5,6 +5,52 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-10-08
+
+- An Enum member given to a scalar field is validated as pydantic-core does: an ORM enum column read into
+  `status: str` answered 500 (`string_type`) where Python returned the member's value (found in production). A
+  `str`/`int` subclass member is its value for `str`, `int`, `float`, `bool` and `Literal` (an `int` one is
+  `str(value)` in a `str`); a plain member is `str(value)` in a `str`, its value unchecked in an unconstrained `int`.
+- Graceful shutdown in every generated binary (it only existed with a lifespan or `sentry_sdk`; otherwise
+  SIGTERM killed in-flight requests): as uvicorn 0.54, new connections refused, idle keep-alive connections
+  closed, in-flight requests finished with `connection: close`, WebSocket sessions closed with 1012 on both
+  sides, a second signal forces the exit, and the process ends by the signal it received (status 143, uvicorn
+  re-raises it; it was 0). The pool is closed before the exit.
+- Memory leaked at every call (dyn backend), found by the endurance test: an MCP `tools/call` (its arguments'
+  validator), `column.op("...")(value)` (the operator) and `json.dumps(separators=...)` (the separators). Each
+  is now built once per distinct value; a test forbids `Box::leak` outside those caches.
+- `bench/bench.py --target dynapp --compare`: a performance guard comparing a generated binary with a reference.
+- Differential testing (`tests/difftest.py`, extra `difftest`): `replay` replays traffic recorded on the Python app
+  (`py2axum.record`, an optional ASGI recorder writing anonymised JSONL) against both servers from the same
+  database snapshot, with ddmin minimisation; `gen` generates valid and invalid requests from the OpenAPI schema
+  (schemathesis 4 + hypothesis, fixed seed) plus a corpus of edge cases per operation.
+- asyncpg (0.31) as the database driver, read from `DATABASE_URL`; `on_conflict_do_nothing/update(constraint=)`.
+- `BaseHTTPMiddleware` without its own `__init__`; `deferred()` columns; Jinja2 `env.filters[name] = f`;
+  `p: Model = Depends()` (one query parameter per field); `text(...).bindparams()`; `super()` in a model's
+  classmethod; `aiosmtplib.send(sender=, recipients=)`; `desc("label")` and labels in GROUP BY / ORDER BY;
+  `update(...).returning(Model)` refreshes the session's objects; `session.refresh()` keeps loaded relationships;
+  `StreamingResponse` over a synchronous iterable.
+
+### Fixed
+
+- A route reading a module global filled by a function that does not translate (a registry filled in place by
+  module-level statements: a loop, `REG[k] = lambda: f()`) was reported native and the error lost: it is now
+  blocked (`--python-side auto` moves it). Module-level item and attribute assignments run at startup; an
+  assignment to an unmapped library's attribute (`stripe.api_key = ...`) stays on the Python side.
+- Request bodies decoded as CPython's `json.loads` does (BOM, UTF-16/32, NaN, exact positions and messages,
+  too deep nesting); a `null` body is absent; FastAPI's `strict_content_type`; Starlette's form limits and
+  multipart error message follow the locked Starlette version (1.4, 1.7); Starlette's redirect slashes.
+- Pydantic: bool from float/Decimal/bytes, int from str, `int_parsing_size` and `bool_type` beyond 64 bits,
+  timestamps parsed as speedate does, empty URL; `exclude_none` on extras; `response_model` serialised through
+  `dump_json` (NaN and infinities become `null`).
+- Dates: years 1–9999 (`OverflowError`), `timedelta.days`, `date()`/`datetime()` checks and messages of CPython
+  3.12/3.14; `format()` of `-0.0`, `nan`, `inf`; Python whitespace U+001C–U+001F; `str.is*()` from the
+  translating Python's Unicode data; paths containing NUL.
+- SQL: an integer out of the column's range raises `DataError` as psycopg does, the exact psycopg class per
+  SQLSTATE, `tuple_(...).in_(...)` without a cast; JSON columns keep float round-trips.
+- `request.url.path` without tabs and newlines; AMQP names validated as pamqp does (no panic); a status code
+  outside 100–599 drops the connection as uvicorn does.
+
 ## [0.3.0] — 2026-10-08
 
 - `py2axum check <package>`: every route marked native, python-side or refused with the reason at `file:line`,

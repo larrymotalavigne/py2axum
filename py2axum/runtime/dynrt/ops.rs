@@ -148,8 +148,8 @@ pub fn add(a: &V, b: &V) -> R {
             V::list(v)
         }
         (V::Tuple(x), V::Tuple(y)) => V::tuple(x.iter().chain(y.iter()).cloned().collect()),
-        (V::DateTime(d), V::Delta(t)) | (V::Delta(t), V::DateTime(d)) => V::DateTime(d.add(*t)),
-        (V::Date(d), V::Delta(t)) | (V::Delta(t), V::Date(d)) => V::Date(*d + Duration::days(t.num_days())),
+        (V::DateTime(d), V::Delta(t)) | (V::Delta(t), V::DateTime(d)) => V::DateTime(dt_in_range(d.checked_add(*t))?),
+        (V::Date(d), V::Delta(t)) | (V::Delta(t), V::Date(d)) => V::Date(date_plus_days(*d, td_days(t))?),
         (V::Delta(x), V::Delta(y)) => V::Delta(*x + *y),
         _ => match (int_of(a), int_of(b)) {
             (Some(x), Some(y)) => V::Int(x.checked_add(y).ok_or_else(overflow)?),
@@ -172,7 +172,7 @@ pub fn sub(a: &V, b: &V) -> R {
         return orm::sql_binop(a, "-", b);
     }
     Ok(match (a, b) {
-        (V::DateTime(d), V::Delta(t)) => V::DateTime(d.add(-*t)),
+        (V::DateTime(d), V::Delta(t)) => V::DateTime(dt_in_range(d.checked_add(-*t))?),
         (V::DateTime(x), V::DateTime(y)) => {
             if x.tz.is_some() != y.tz.is_some() {
                 return Err(Exc::type_error("can't subtract offset-naive and offset-aware datetimes"));
@@ -180,7 +180,8 @@ pub fn sub(a: &V, b: &V) -> R {
             V::Delta(x.utc() - y.utc())
         }
         (V::Date(x), V::Date(y)) => V::Delta(*x - *y),
-        (V::Date(d), V::Delta(t)) => V::Date(*d - Duration::days(t.num_days())),
+        // date.__sub__: `self + timedelta(-other.days)`
+        (V::Date(d), V::Delta(t)) => V::Date(date_plus_days(*d, -td_days(t))?),
         (V::Delta(x), V::Delta(y)) => V::Delta(*x - *y),
         (V::Set(x), V::Set(y)) => {
             let y = y.lock();
@@ -1127,6 +1128,12 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
     let ty = chars.get(i).copied();
     let numeric = matches!(v, V::Int(_) | V::Float(_) | V::Bool(_));
     let mut body = match (ty, v) {
+        // CPython: "nan"/"inf" (upper case for F, E, G), the sign handled below; no '%' suffix scaling
+        (Some(c @ ('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%')), V::Float(x)) if !x.is_finite() => {
+            let t = if x.is_nan() { "nan" } else { "inf" };
+            let t = if c.is_ascii_uppercase() { t.to_ascii_uppercase() } else { t.to_string() };
+            if c == '%' { t + "%" } else { t }
+        }
         (Some('d'), _) if int_of(v).is_some() => int_of(v).unwrap().abs().to_string(),
         (Some('f') | Some('F'), _) if num(v).is_some() => format!("{:.*}", prec.unwrap_or(6), num(v).unwrap().abs()),
         (Some('%'), _) if num(v).is_some() => format!("{:.*}%", prec.unwrap_or(6), num(v).unwrap().abs() * 100.0),
@@ -1163,7 +1170,11 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         }
         body = grouped + &rest;
     }
-    let negative = num(v).map(|x| x < 0.0).unwrap_or(false);
+    // a float's sign bit: format(-0.0, ".2f") == "-0.00" (NaN has no sign in CPython's formatting)
+    let negative = match v {
+        V::Float(x) => x.is_sign_negative() && !x.is_nan(),
+        _ => num(v).map(|x| x < 0.0).unwrap_or(false),
+    };
     let sign_s = if numeric {
         if negative {
             "-"
@@ -1504,6 +1515,7 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
         match &**n {
             Native::Deque(d) => return super::deque::setitem(d, k, val),
             Native::Mime(m) => return super::mail::mime_setitem(m, k, &val),
+            Native::JinjaFilters(j) => return super::mail::add_filter(j, k, val),
             Native::RespHeaders(r) => return super::resp::headers_setitem(&r.headers, k, &val),
             Native::CellHeaders(c) => return super::resp::headers_setitem(&c.headers, k, &val),
             _ => {}
@@ -1651,4 +1663,32 @@ pub fn dt_value(d: DateTime) -> V {
 /// `scheme://host` of a request as Starlette builds it from the scope (plain HTTP: the binary terminates no TLS)
 pub fn request_origin(r: &super::web::ReqCell) -> String {
     format!("http://{}", r.header("host").unwrap_or_else(|| "127.0.0.1".into()))
+}
+
+
+/// `timedelta.days`: whole days rounded down (`timedelta(hours=-1).days == -1`).
+fn td_days(t: &Duration) -> i64 {
+    match t.num_microseconds() {
+        Some(us) => us.div_euclid(86_400_000_000),
+        None => t.num_days() - i64::from(*t < Duration::days(t.num_days())),
+    }
+}
+
+fn date_out_of_range() -> Exc {
+    Exc::msg(&OVERFLOW_ERROR, "date value out of range")
+}
+
+/// CPython's dates stop at years 1 and 9999 (chrono's go much further).
+fn date_plus_days(d: chrono::NaiveDate, days: i64) -> R<chrono::NaiveDate> {
+    use chrono::Datelike;
+    let r = Duration::try_days(days).and_then(|n| d.checked_add_signed(n)).ok_or_else(date_out_of_range)?;
+    if (1..=9999).contains(&r.year()) { Ok(r) } else { Err(date_out_of_range()) }
+}
+
+fn dt_in_range(d: Option<DateTime>) -> R<DateTime> {
+    use chrono::Datelike;
+    match d {
+        Some(d) if (1..=9999).contains(&d.wall.year()) => Ok(d),
+        _ => Err(date_out_of_range()),
+    }
 }

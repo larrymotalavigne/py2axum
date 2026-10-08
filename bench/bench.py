@@ -6,6 +6,10 @@ axum one Tokio thread per core. On a large machine, set SERVER_CPUS / PG_CPUS / 
 is pinned and all three share the machine.
 
 usage: python bench/bench.py [--duration 10s] [--conns 128]
+       python bench/bench.py --target dynapp --duration 5s --compare bench/perf_reference.json --table perf.md
+         the generated fixtures/dynapp binary alone (DYNAPP_BIN, default generated/dynapp_axum/...), compared
+         with a reference measured on the same machine: a drop of more than --tolerance (30 %) on any endpoint
+         makes the exit status 1 (CI: a warning, the runners are shared and noisy)
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import os
 import signal
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -27,7 +32,7 @@ LOAD_CPUS = os.environ.get("LOAD_CPUS")
 
 def cpu_count(spec: str | None) -> int:
     if not spec:
-        return len(os.sched_getaffinity(0))
+        return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     n = 0
     for part in spec.split(","):
         a, _, b = part.partition("-")
@@ -59,6 +64,26 @@ SERVERS = {
     },
 }
 
+# --target dynapp: the dyn backend's reference app, seeded by seed_dynapp (60 tasks, 10 projects of 5 tasks)
+DYNAPP_PORT = int(os.environ.get("DYNAPP_PORT", "8090"))
+DYNAPP = {
+    "axum dynapp": {
+        "port": DYNAPP_PORT,
+        "cmd": os.environ.get("DYNAPP_BIN", "generated/dynapp_axum/target/release/dynapp_axum"),
+        "env": {"PORT": str(DYNAPP_PORT), "TOKIO_WORKER_THREADS": str(WORKERS), "DB_POOL_SIZE": "32"},
+    },
+}
+DYNAPP_ENDPOINTS = {
+    "GET /tasks/{id} (1 SELECT)": ["--rand-regex-url", "/tasks/([1-5][0-9]|[1-9])"],
+    "GET /tasks?priority=low (20 rows)": ["/tasks?priority=low"],
+    "GET /projects/{id} (selectinload)": ["--rand-regex-url", "/projects/[1-9]"],
+    "POST /describe (validation)": [
+        "/describe", "-m", "POST", "-H", "content-type: application/json",
+        "-d", '{"title": "t", "priority": "high", "tags": ["a", "b"], "channel": "mail"}',
+    ],
+    "GET /tasks/0 (404)": ["/tasks/0"],
+}
+
 ENDPOINTS = {
     "GET /health (JSON)": ["/health"],
     "GET /users/{id} (1 SELECT)": ["--rand-regex-url", "/users/[1-9][0-9]{0,3}"],
@@ -84,6 +109,32 @@ def seed() -> None:
     sh(f"psql {DB} -qc 'VACUUM ANALYZE users'")
 
 
+def seed_dynapp(port: int) -> None:
+    """the schema by SQLAlchemy (as tests/scenarios/dynapp.py), the rows through the API"""
+    from sqlalchemy import create_engine, text
+
+    import sys
+    sys.path.insert(0, str(ROOT))
+    from fixtures.dynapp.models import Base
+
+    engine = create_engine(DB.replace("postgresql://", "postgresql+psycopg://", 1))
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        names = ", ".join(t.name for t in Base.metadata.sorted_tables)
+        conn.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
+    engine.dispose()
+
+    def post(path: str, body: dict) -> None:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(),
+                                     {"content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+
+    for i in range(60):
+        post("/tasks", {"title": f"task {i}", "priority": "low" if i % 3 == 0 else "high", "tags": ["a"] * (i % 3)})
+    for i in range(10):
+        post("/projects", {"name": f"project {i}", "owner": f"owner {i}", "tasks": [f"pt {i}.{j}" for j in range(5)]})
+
+
 def pin_postgres() -> None:
     if not PG_CPUS:
         return
@@ -92,11 +143,13 @@ def pin_postgres() -> None:
         subprocess.run(["taskset", "-apc", PG_CPUS, p], capture_output=True)
 
 
-def wait_up(port: int) -> None:
+def wait_up(port: int, path: str = "/health") -> None:
     for _ in range(150):
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+            urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=1)
             return
+        except urllib.error.HTTPError:
+            return  # it answers
         except Exception:
             time.sleep(0.2)
     raise RuntimeError(f"server on :{port} did not start")
@@ -111,6 +164,9 @@ def tree_pids(pid: int) -> list[int]:
 
 def mem_mb(pid: int, field: str) -> float:
     """Sum a /proc status field (VmRSS = current, VmHWM = peak) over the whole process tree."""
+    if not Path("/proc").is_dir():  # macOS: current RSS only
+        import psutil
+        return sum(psutil.Process(p).memory_info().rss for p in tree_pids(pid)) / 2**20
     total = 0
     for p in tree_pids(pid):
         try:
@@ -145,20 +201,54 @@ def oha(port: int, args: list[str], duration: str, conns: int) -> dict:
     }
 
 
+def compare(results: dict, ref_path: Path, tolerance: float) -> tuple[str, bool]:
+    """markdown table of each endpoint against the reference; True when one dropped beyond the tolerance"""
+    ref = json.loads(ref_path.read_text()) if ref_path.exists() else {"servers": {}}
+    rows = ["| server | endpoint | req/s | reference | change | p99 ms | reference p99 | |",
+            "|---|---|---:|---:|---:|---:|---:|---|"]
+    bad = False
+    for name, srv in results["servers"].items():
+        refs = ref["servers"].get(name, {}).get("endpoints", {})
+        for ep, m in srv["endpoints"].items():
+            r = refs.get(ep)
+            if r is None:
+                rows.append(f"| {name} | {ep} | {m['rps']:.0f} | – | – | {m['p99_ms']:.2f} | – | no reference |")
+                continue
+            change = m["rps"] / r["rps"] - 1
+            flag = "ok" if change >= -tolerance else f"**below -{tolerance:.0%}**"
+            if m["ok_ratio"] < 0.999:
+                flag += f" (only {m['ok_ratio']:.1%} 2xx/expected)"
+            bad |= change < -tolerance
+            rows.append(f"| {name} | {ep} | {m['rps']:.0f} | {r['rps']:.0f} | {change:+.1%} | {m['p99_ms']:.2f} | "
+                        f"{r['p99_ms']:.2f} | {flag} |")
+        rows.append(f"| {name} | memory | {srv['rss_idle_mb']:.0f} MB idle, {srv['rss_peak_mb']:.0f} MB peak | | | | | |")
+    return "\n".join(rows) + "\n", bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration", default="10s")
     ap.add_argument("--conns", type=int, default=64)
+    ap.add_argument("--target", choices=["app", "dynapp"], default="app",
+                    help="app: the typed backend's app against FastAPI; dynapp: the dyn backend's binary alone")
+    ap.add_argument("--out", default=str(ROOT / "bench" / "results.json"))
+    ap.add_argument("--compare", help="reference results (same format as --out)")
+    ap.add_argument("--tolerance", type=float, default=0.30)
+    ap.add_argument("--table", help="write the comparison as a markdown table")
     args = ap.parse_args()
 
     pin_postgres()
-    results: dict = {"config": {"server_cpus": SERVER_CPUS, "workers": WORKERS, "duration": args.duration,
-                                "conns": args.conns, "cpus_available": len(os.sched_getaffinity(0))}, "servers": {}}
+    results: dict = {"config": {"target": args.target, "server_cpus": SERVER_CPUS, "workers": WORKERS,
+                                "duration": args.duration, "conns": args.conns,
+                                "cpus_available": cpu_count(None)}, "servers": {}}
     only = os.environ.get("ONLY")
-    for name, cfg in SERVERS.items():
+    servers, endpoints = (DYNAPP, DYNAPP_ENDPOINTS) if args.target == "dynapp" else (SERVERS, ENDPOINTS)
+    probe = "/tasks/0" if args.target == "dynapp" else "/health"
+    for name, cfg in servers.items():
         if only and only.lower() not in name.lower():
             continue
-        seed()
+        if args.target == "app":
+            seed()
         env = {**os.environ, **cfg["env"]}
         proc = subprocess.Popen(
             pinned(SERVER_CPUS, ["sh", "-c", f"exec {cfg['cmd']}"]),
@@ -166,13 +256,18 @@ def main() -> None:
             start_new_session=True,
         )
         try:
-            wait_up(cfg["port"])
+            wait_up(cfg["port"], probe)
+            if args.target == "dynapp":
+                seed_dynapp(cfg["port"])
             time.sleep(1)
             idle = mem_mb(proc.pid, "VmRSS")
-            oha(cfg["port"], ["/health"], "3s", args.conns)  # warm-up
+            oha(cfg["port"], [probe], "3s", args.conns)  # warm-up
             per = {}
-            for ep, ep_args in ENDPOINTS.items():
+            for ep, ep_args in endpoints.items():
                 per[ep] = oha(cfg["port"], ep_args, args.duration, args.conns)
+                if args.target == "dynapp" and "(404)" in ep:
+                    codes = per[ep]["codes"]
+                    per[ep]["ok_ratio"] = codes.get("404", 0) / (sum(codes.values()) or 1)
                 print(f"{name:20} {ep:30} {per[ep]['rps']:>10.0f} req/s  p99 {per[ep]['p99_ms']:7.2f} ms  "
                       f"ok {per[ep]['ok_ratio']:.3f}", flush=True)
             peak = mem_mb(proc.pid, "VmHWM")
@@ -180,11 +275,19 @@ def main() -> None:
             print(f"{name:20} mémoire: {idle:.0f} Mo au repos, {peak:.0f} Mo en pic", flush=True)
         finally:
             os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=20)
+            proc.wait(timeout=40)
             time.sleep(1)
-    out = ROOT / "bench" / "results.json"
+    out = Path(args.out)
     out.write_text(json.dumps(results, indent=2, ensure_ascii=False))
     print(f"\nwrote {out}")
+    if args.compare:
+        table, bad = compare(results, Path(args.compare), args.tolerance)
+        print("\n" + table)
+        if args.table:
+            Path(args.table).write_text(table)
+        if bad:
+            print(f"throughput below the reference by more than {args.tolerance:.0%} (see the table)")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

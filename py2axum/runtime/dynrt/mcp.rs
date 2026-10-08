@@ -638,7 +638,7 @@ async fn call_tool(cx: &Cx, s: &Arc<Server>, name: &str, arguments: Option<V>) -
     };
     let args = pre_parse(spec, &args)?;
     let mut errs = Vec::new();
-    let td: &'static TD = Box::leak(Box::new(TD::Schema(spec.args)));
+    let td = super::types::schema_td(spec.args);
     let inst = pyd::validate(cx, &args, td, &[], &mut errs).await?;
     let Some(inst) = inst.filter(|_| errs.is_empty()) else {
         let text = pyd::error_str(spec.args.name, &errs);

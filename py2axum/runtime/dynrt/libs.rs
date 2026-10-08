@@ -135,7 +135,7 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
     let mut sort_keys = false;
     let mut indent: Option<String> = None;
     let seps_given = kwargs.iter().any(|(k, _)| k == "separators");
-    let mut style = pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": " };
+    let mut style = pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false };
     for (k, v) in kwargs {
         match k.as_str() {
             "default" => {
@@ -161,9 +161,8 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
             }
             "separators" => {
                 let parts = ops::iter(v)?;
-                let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-                style.item_sep = leak(ops::str_(&parts[0])?);
-                style.key_sep = leak(ops::str_(&parts[1])?);
+                style.item_sep = super::types::intern(&ops::str_(&parts[0])?);
+                style.key_sep = super::types::intern(&ops::str_(&parts[1])?);
             }
             _ => return Err(Exc::type_error(format!("json.dumps({k}=) is not supported"))),
         }
@@ -313,7 +312,14 @@ pub fn datetime_new(args: &[V], kwargs: &[(String, V)]) -> R {
         vals[i] = Some(v.clone());
     }
     let g = |i: usize, d: i64| -> R<i64> { vals[i].as_ref().map(as_i).unwrap_or(Ok(d)) };
-    let date = NaiveDate::from_ymd_opt(g(0, 1)? as i32, g(1, 1)? as u32, g(2, 1)? as u32).ok_or_else(|| Exc::value_error("day is out of range for month"))?;
+    let date = super::methods::ymd(g(0, 1)?, g(1, 1)?, g(2, 1)?)?;
+    let new = super::python() >= (3, 14);
+    for (i, name, max) in [(3, "hour", 23), (4, "minute", 59), (5, "second", 59), (6, "microsecond", 999_999)] {
+        let x = g(i, 0)?;
+        if !(0..=max).contains(&x) {
+            return Err(Exc::value_error(if new { format!("{name} must be in 0..{max}, not {x}") } else { format!("{name} must be in 0..{max}") }));
+        }
+    }
     let time = NaiveTime::from_hms_micro_opt(g(3, 0)? as u32, g(4, 0)? as u32, g(5, 0)? as u32, g(6, 0)? as u32).ok_or_else(|| Exc::value_error("time out of range"))?;
     let tz = match &vals[7] {
         Some(v) => tz_of(v)?,
@@ -331,7 +337,7 @@ pub fn date_new(args: &[V], kwargs: &[(String, V)]) -> R {
         let i = ["year", "month", "day"].iter().position(|n| n == k).ok_or_else(|| Exc::type_error(format!("'{k}' is an invalid keyword argument")))?;
         v[i] = as_i(x)?;
     }
-    NaiveDate::from_ymd_opt(v[0] as i32, v[1] as u32, v[2] as u32).map(V::Date).ok_or_else(|| Exc::value_error("day is out of range for month"))
+    super::methods::ymd(v[0], v[1], v[2]).map(V::Date)
 }
 
 /// `datetime.time(hour=0, minute=0, second=0, microsecond=0)` (naive; tzinfo/fold refused)
@@ -520,16 +526,15 @@ pub fn strftime(wall: &NaiveDateTime, offset: Option<i32>, tzname: Option<String
 /// `json.loads(s)`: str, or bytes decoded as `json.detect_encoding` does (UTF-8 with or without BOM,
 /// UTF-16/32 by BOM or by the position of the zero bytes).
 pub fn json_loads(s: &V) -> R {
-    let b = match s {
-        V::Str(t) => {
-            if t.starts_with('\u{feff}') {
-                return Err(Exc::msg(&JSON_DECODE_ERROR, "Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"));
-            }
-            return pyd::loads(t);
-        }
-        V::Bytes(b) => b.clone(),
-        o => return Err(Exc::type_error(format!("the JSON object must be str, bytes or bytearray, not {}", o.type_name()))),
-    };
+    match s {
+        V::Str(t) => pyd::loads(t),
+        V::Bytes(b) => pyd::loads(&json_text(b)?),
+        o => Err(Exc::type_error(format!("the JSON object must be str, bytes or bytearray, not {}", o.type_name()))),
+    }
+}
+
+/// The text `json.loads(b)` decodes from bytes (`json.detect_encoding`), or its UnicodeDecodeError.
+pub fn json_text(b: &[u8]) -> R<String> {
     let (enc, skip): (&str, usize) = if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
         ("utf-8", 3)
     } else if b.starts_with(&[0xFF, 0xFE, 0, 0]) {
@@ -576,7 +581,7 @@ pub fn json_loads(s: &V) -> R {
                 .ok_or_else(bad)?
         }
     };
-    pyd::loads(&text)
+    Ok(text)
 }
 
 pub fn getenv(key: &V, default: Option<&V>) -> R {

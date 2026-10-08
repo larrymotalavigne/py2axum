@@ -1,4 +1,5 @@
 """dyn backend: constructions outside the subset are refused with file:line, never approximated."""
+import json
 import textwrap
 
 import pytest
@@ -184,6 +185,7 @@ def test_sync_session_dependency_rejected(tmp_path, capsys, maker, dep, param, m
         ("codes: Mapped[list] = mapped_column(JSON().with_variant(ARRAY(Integer), 'postgresql'))", "only ARRAY(String) is supported"),
         ("@hybrid_property\n    def double(self):\n        return self.id * 2", "decorator @hybrid_property is not supported"),
         ("@validates('name')\n    def check(self, key, value):\n        return value", "decorator @validates('name') is not supported"),
+        ("blob: Mapped[bytes] = deferred(Column(LargeBinary), group='g')", "only deferred(Column(...)) is supported"),
     ],
 )
 def test_model_declaration_rejected(tmp_path, capsys, decl, message):
@@ -193,7 +195,7 @@ def test_model_declaration_rejected(tmp_path, capsys, decl, message):
     models = textwrap.dedent(MODELS).replace("{rel}", decl).replace(
         "from sqlalchemy import ForeignKey, String",
         "from sqlalchemy import JSON, ForeignKey, Integer, String\nfrom sqlalchemy.dialects.postgresql import ARRAY\n"
-        "from sqlalchemy.orm import column_property, validates\n"
+        "from sqlalchemy import Column, LargeBinary\nfrom sqlalchemy.orm import column_property, deferred, validates\n"
         "from sqlalchemy.ext.hybrid import hybrid_property")
     (pkg / "models.py").write_text(models)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
@@ -1696,3 +1698,152 @@ def test_factory_sentry_init_not_blamed_for_route_errors(tmp_path, capsys):
     err = capsys.readouterr().err
     assert code == 0, err
     assert "app factory statement" not in err
+
+
+def _letters_project(tmp_path, letters: str, views: str):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "letters.py").write_text(letters)
+    (pkg / "views.py").write_text(textwrap.dedent(views))
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        from fastapi import FastAPI
+
+        from .views import router
+
+
+        def create_app():
+            app = FastAPI()
+            app.include_router(router)
+            return app
+
+
+        app = create_app()
+    '''))
+    return pkg
+
+
+_STYLED = 'import reportlab.lib.styles\n\n\ndef styled():\n    return reportlab.lib.styles.ParagraphStyle("x")\n\n\n'
+
+
+@pytest.mark.parametrize("fill", [
+    # filled in place by a module-level loop (a letter-generator registry)
+    'GENERATORS = {}\nfor _k in ("pdf",):\n    GENERATORS[_k] = lambda: styled()\n',
+    # filled by a module-level method call
+    'GENERATORS = {}\nGENERATORS.update({"pdf": lambda: styled()})\n',
+    # a module-level item assignment (a registry entry assigned by key)
+    'GENERATORS = {}\nGENERATORS["pdf"] = lambda: styled()\n',
+    # its own value: the second route reading it reaches styled() too
+    'GENERATORS = {"pdf": lambda: styled()}\n',
+])
+def test_global_filled_with_untranslatable_function_blocks_readers(tmp_path, capsys, fill):
+    """A function that does not translate, reachable only through a lambda stored in a module global,
+    blocks every route reading that global (refused with file:line, moved by --python-side auto)."""
+    pkg = _letters_project(tmp_path, _STYLED + fill, '''
+        from fastapi import APIRouter
+
+        from .letters import GENERATORS
+
+        router = APIRouter()
+
+
+        @router.get("/ok")
+        async def ok():
+            return {"n": len(GENERATORS)}
+
+
+        @router.get("/pdf")
+        async def pdf():
+            return {"s": str(GENERATORS["pdf"]())}
+    ''')
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "letters.py:5: library call `reportlab.lib.styles.ParagraphStyle()` is not supported" in err
+    rep = tmp_path / "rep.md"
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--report", str(rep)]) == 0
+    data = json.loads(rep.with_suffix(".json").read_text())
+    status = {r["path"]: r["status"] for r in data["routes"]}
+    # reading the global may call what it holds: both readers are blocked, as the build refuses them
+    assert status == {"/ok": "bloquée", "/pdf": "bloquée"}, status
+
+
+def test_module_level_class_attribute_assignment_rejected(tmp_path, capsys):
+    """`C.x = 7` at module level: class attributes are read as declared, the new value would be ignored."""
+    pkg = _letters_project(tmp_path, "class C:\n    x = 1\n\n\nC.x = 7\nGENERATORS = {'pdf': C.x}\n", '''
+        from fastapi import APIRouter
+
+        from .letters import GENERATORS
+
+        router = APIRouter()
+
+
+        @router.get("/pdf")
+        async def pdf():
+            return GENERATORS
+    ''')
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert "letters.py:5: assigning the class attribute `C.x` at module level is not supported" in capsys.readouterr().err
+
+
+def test_module_level_assignment_to_an_unmapped_library_is_left_to_python(tmp_path, capsys):
+    """`stripe.api_key = ...` at module level: the runtime maps nothing of stripe, no native code can read it, the
+    statement is not run at startup (the routes using stripe are refused or --python-side)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        import os
+
+        import stripe
+        from fastapi import FastAPI
+
+        stripe.api_key = os.environ.get("STRIPE_API_KEY", "")
+        app = FastAPI()
+
+
+        @app.get("/x")
+        async def x():
+            return {"ok": True}
+    '''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "classes, param, message",
+    [
+        ("class P(BaseModel):\n    page: int = 1\n\n    @field_validator('page')\n    @classmethod\n"
+         "    def v(cls, x):\n        return x\n", "p: P = Depends()", "a class dependency with validators"),
+        ("class P(BaseModel):\n    ids: list[int] = []\n", "p: P = Depends()", "a container field of a class dependency"),
+        ("class P(BaseModel):\n    page: int = Field(1, alias='p')\n", "p: P = Depends()", "Field(alias=) is not supported in a class dependency"),
+        ("class B(BaseModel):\n    page: int = 1\n\n\nclass P(B):\n    size: int = 2\n", "p: P = Depends()",
+         "a class dependency must subclass BaseModel directly"),
+        ("class P(BaseModel):\n    page: int = 1\n", "p: P = Depends(use_cache=False)", "Depends() options are not supported on a class dependency"),
+    ],
+)
+def test_class_dependency_rejected(tmp_path, capsys, classes, param, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import Depends, FastAPI\nfrom pydantic import BaseModel, Field, field_validator\n\napp = FastAPI()\n\n\n"
+        f"{classes}\n\n@app.get('/x')\nasync def x({param}):\n    return p\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+def test_super_cls_cls_with_subclass_rejected(tmp_path, capsys):
+    """`super(cls, cls)` targets the parent of the class called: with a subclass, not the defining class's."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\n\n"
+        "class A(BaseModel):\n    n: int\n\n    @classmethod\n    def model_validate(cls, obj, **kw):\n"
+        "        return super(cls, cls).model_validate(obj, **kw)\n\n\nclass B(A):\n    pass\n\n\n"
+        "@app.post('/x')\nasync def x(body: dict):\n    return A.model_validate(body)\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "`super(cls, cls)` in A, which B subclass" in err
+    assert "main.py:" in err

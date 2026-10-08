@@ -142,6 +142,17 @@ fn absolute(p: &str) -> String {
 
 pub fn path_method(p: &str, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let flag = |k: &str, i: usize| -> R<bool> { kw(kwargs, k).or(args.get(i)).map(ops::truthy).transpose().map(|b| b.unwrap_or(false)) };
+    if p.contains('\0') {
+        // CPython: the predicates answer False, a system call refuses the path (ValueError)
+        match name {
+            "exists" | "is_file" | "is_dir" => return Ok(V::Bool(false)),
+            "resolve" => return Err(Exc::value_error("lstat: embedded null character in path")),
+            "mkdir" => return Err(Exc::value_error("mkdir: embedded null character in path")),
+            "unlink" => return Err(Exc::value_error("unlink: embedded null character in path")),
+            "read_bytes" | "read_text" | "write_bytes" | "write_text" => return Err(Exc::value_error("embedded null byte")),
+            _ => {}
+        }
+    }
     match name {
         "exists" => Ok(V::Bool(std::fs::metadata(p).is_ok())),
         "is_file" => Ok(V::Bool(std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))),
@@ -247,6 +258,9 @@ pub struct File {
 /// `open(file, mode="r", encoding=None)` (utf-8 text, no newline translation)
 pub fn open(args: &[V], kwargs: &[(String, V)]) -> R {
     let p = fspath(args.first().or_else(|| kw(kwargs, "file")).ok_or_else(|| Exc::type_error("open() missing required argument 'file' (pos 1)"))?)?;
+    if p.contains('\0') {
+        return Err(Exc::value_error("embedded null byte"));
+    }
     let mode = match args.get(1).or_else(|| kw(kwargs, "mode")) {
         None => "r".to_string(),
         Some(m) => ops::str_(m)?,

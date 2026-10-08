@@ -97,7 +97,7 @@ fn vapid_header(key: &p256::SecretKey, claims: &V) -> R<String> {
     let mut sorted: Vec<(String, V)> = c.into_iter().map(|(k, v)| Ok((ops::str_(&k)?, v))).collect::<R<_>>()?;
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
     let body = V::dict_from(sorted.into_iter().map(|(k, v)| (V::str(k), v)).collect())?;
-    let json = super::pyd::to_json(&body, &super::pyd::JsonStyle { ensure_ascii: true, item_sep: ",", key_sep: ":" }, false)?;
+    let json = super::pyd::to_json(&body, &super::pyd::JsonStyle { ensure_ascii: true, item_sep: ",", key_sep: ":", nan_null: false }, false)?;
     let token = format!("{}.{}", B64URL.encode(br#"{"typ":"JWT","alg":"ES256"}"#), B64URL.encode(json.as_bytes()));
     let sk = p256::ecdsa::SigningKey::from(key.clone());
     let sig: p256::ecdsa::Signature = sk.sign(token.as_bytes());

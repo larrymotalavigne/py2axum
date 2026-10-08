@@ -1,0 +1,63 @@
+{
+  "config": {
+    "target": "dynapp",
+    "server_cpus": null,
+    "workers": 16,
+    "duration": "5s",
+    "conns": 32,
+    "cpus_available": 16
+  },
+  "servers": {
+    "axum dynapp": {
+      "endpoints": {
+        "GET /tasks/{id} (1 SELECT)": {
+          "rps": 14373.448704642657,
+          "p50_ms": 0.641327,
+          "p99_ms": 70.621166,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 72554
+          }
+        },
+        "GET /tasks?priority=low (20 rows)": {
+          "rps": 5218.235001265212,
+          "p50_ms": 1.156526,
+          "p99_ms": 83.16229799999999,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 26378
+          }
+        },
+        "GET /projects/{id} (selectinload)": {
+          "rps": 8538.191620028125,
+          "p50_ms": 1.096997,
+          "p99_ms": 72.323605,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 42676
+          }
+        },
+        "POST /describe (validation)": {
+          "rps": 33341.85112334832,
+          "p50_ms": 0.129876,
+          "p99_ms": 1.870055,
+          "ok_ratio": 1.0,
+          "codes": {
+            "200": 168678
+          }
+        },
+        "GET /tasks/0 (404)": {
+          "rps": 19659.138006880054,
+          "p50_ms": 0.462922,
+          "p99_ms": 70.026493,
+          "ok_ratio": 1.0,
+          "codes": {
+            "404": 99524
+          }
+        }
+      },
+      "rss_idle_mb": 22.7421875,
+      "rss_peak_mb": 39.9375
+    }
+  }
+}

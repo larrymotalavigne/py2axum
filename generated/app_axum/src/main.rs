@@ -36,7 +36,7 @@ async fn main() {
             .expect("create tables");
     }
     let state = AppState {
-        pool,
+        pool: pool.clone(),
         http: reqwest::Client::new(),
     };
 
@@ -119,5 +119,10 @@ async fn main() {
     let addr = format!("{}:{}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     eprintln!("listening on http://{addr}");
-    axum::serve(listener, app).await.expect("server");
+    // SIGTERM/SIGINT as uvicorn: no new connection, in-flight requests finished (bounded), pool closed
+    tokio::select! {
+        r = axum::serve(listener, app).with_graceful_shutdown(rt::shutdown_signal()) => r.expect("server"),
+        _ = rt::shutdown_deadline() => {}
+    }
+    rt::exit_after_shutdown(&pool).await
 }

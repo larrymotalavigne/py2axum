@@ -104,6 +104,14 @@ async def upsert(db: DbDep):
     ).returning(Membership.note)
     kept = (await db.execute(same)).scalar()
     r3 = await db.execute(pg_insert(Membership).values(owner_id=o.id, role="b", note="zzz").on_conflict_do_nothing(index_elements=["owner_id", "role"]))
+    # a named constraint (ON CONFLICT ON CONSTRAINT), several rows, one of them new
+    r4 = await db.execute(pg_insert(Membership).values([{"owner_id": o.id, "role": "b"}, {"owner_id": o.id, "role": "e"}])
+                          .on_conflict_do_nothing(constraint="memberships_pkey"))
+    try:
+        pg_insert(Membership).values(owner_id=o.id, role="f").on_conflict_do_nothing(constraint="memberships_pkey", index_elements=["role"])
+        both = None
+    except ValueError as e:
+        both = str(e)
     rows = (await db.execute(pg_insert(Ticket).values(code="u1", data={"k": [1]}, raw=None).returning(Ticket.code, Ticket.data))).all()
     sel = (await db.execute(
         select(Membership.role, case((Membership.note == None, literal("none")), else_=Membership.note).label("n"))  # noqa: E711
@@ -111,7 +119,7 @@ async def upsert(db: DbDep):
     )).all()
     await db.commit()
     check = (await db.execute(text("SELECT raw IS NULL, json_typeof(raw) FROM tickets WHERE code = 'u1'"))).all()
-    return {"r1": r1.rowcount, "bad": bad, "m": [m.role, m.note], "kept": kept, "r3": r3.rowcount, "rows": [list(r) for r in rows],
+    return {"r1": r1.rowcount, "bad": bad, "m": [m.role, m.note], "kept": kept, "r3": r3.rowcount, "r4": r4.rowcount, "both": both, "rows": [list(r) for r in rows],
             "sel": [list(r) for r in sel], "check": [list(r) for r in check]}
 
 

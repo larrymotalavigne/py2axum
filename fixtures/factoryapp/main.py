@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from fixtures.factoryapp.middleware import CountingMiddleware, SecurityHeadersMiddleware
+from fixtures.factoryapp.middleware import CountingMiddleware, SecurityHeadersMiddleware, StampMiddleware
 from fixtures.factoryapp.observe import install_observability, introspect, router as shop
 
 
@@ -43,6 +43,7 @@ def create_app(observed: bool = True) -> FastAPI:
     app = FastAPI()
 
     # last added = outermost: CORS, then the counter, then the security headers
+    app.add_middleware(StampMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     if not settings.TESTING:
         app.add_middleware(CountingMiddleware, tier="strict")

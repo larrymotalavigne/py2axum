@@ -24,19 +24,21 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import BadPayload, BadSignature, BadTimeSignature, SignatureExpired, URLSafeTimedSerializer
 from datetime import UTC, datetime
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import ExpiredSignatureError, JWTError, jwt
 from jose.exceptions import JWTClaimsError
 from sqlalchemy import String, and_, cast, extract, func, select, text, update
+from sqlalchemy import asc as sa_asc, desc as sa_desc
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
-from . import aio, amqp, apiv, bgloop, colls, composite, ddl, decos, dunders, extras, lazyimp, libs, life, mounted, outbound, pk, prom, rds, retrying, small, sqlmore, tracing, wsock
+from . import aio, amqp, apiv, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, lazyimp, libs, life, mounted, outbound, pk, prom, rds, retrying, small, sqlmore, tracing, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
-from .models import Asset, Owner, Project, Secret, Task
+from .models import Archive, Asset, Owner, Project, Secret, Task
+from .paging import ArchiveOut, AsText, Cond, LoudNamed, Named, PageParams, Tagged
 from pydantic import ValidationError
 
 from .schemas import (
@@ -46,6 +48,7 @@ from .schemas import (
 app = FastAPI(lifespan=life.lifespan)
 app.include_router(libs.router)
 app.include_router(ddl.router)
+app.include_router(enumcols.router)
 app.include_router(decos.router)
 app.include_router(composite.router)
 app.include_router(dunders.router)
@@ -65,6 +68,7 @@ app.include_router(outbound.router)
 app.include_router(apiv.router, prefix=apiv.settings.API_PREFIX, dependencies=[Depends(apiv.require_user)])
 app.include_router(tracing.router)
 app.include_router(small.router)
+app.include_router(edges.router)
 app.include_router(wsock.router)
 
 
@@ -719,6 +723,108 @@ async def add_secret(body: dict, db: DbDep):
     return {"id": sec.id, "token": sec.token}
 
 
+@app.get("/paged")
+async def paged(p: PageParams = Depends(), again: PageParams = Depends()):
+    """Class dependency: each field a query parameter (Field constraints included), cached per request."""
+    return {"p": p, "same": p is again, "dump": p.model_dump()}
+
+
+@app.post("/validated")
+async def validated(body: dict):
+    """model_validate overrides calling the parent's (BaseModel's or the project parent's) through super()."""
+    loud = LoudNamed.model_validate({"id": body["id"], "name": body["name"]})
+    texts = [AsText(kind=c) for c in Cond]
+    try:
+        AsText(kind="k", short=Cond.SENDER)
+    except ValueError as exc:
+        texts.append({"error": exc.errors(include_url=False)[0]["type"]})
+    return {"tagged": Tagged.model_validate(body), "named": Named.model_validate(body),
+            "loud": loud, "loud_type": type(loud).__name__, "texts": texts}
+
+
+@app.post("/tasks/{task_id}/returning")
+async def update_returning(task_id: int, body: dict, db: DbDep):
+    """ORM UPDATE ... RETURNING: the returned entity is the session's object, refreshed with the new row."""
+    before = await db.get(Task, task_id)
+    old = before.title if before else None
+    row = (await db.execute(update(Task).where(Task.id == task_id).values(title=body["title"]).returning(Task))).scalar_one_or_none()
+    cols = (await db.execute(update(Task).where(Task.id == task_id).values(revision="r").returning(Task.id, Task.title))).all()
+    out = {"old": old, "same": row is before, "title": row.title if row else None,
+           "loaded": before.title if before else None, "cols": [list(c) for c in cols]}
+    await db.commit()
+    return out
+
+
+@app.get("/archives-report")
+async def archives_report(db: DbDep):
+    """A @property read on the mapped class is the property object (`== True` is False: WHERE false);
+    label references by name (`desc("n")`); a labelled expression in GROUP BY and ORDER BY."""
+    flagged = (await db.execute(select(func.count(Archive.id)).where(Archive.short == True))).scalar()  # noqa: E712
+    day = func.date_trunc("day", Task.created_at).label("day")
+    days = (await db.execute(select(day, func.count(Task.id).label("n")).group_by(day).order_by(day))).all()
+    titles = (await db.execute(select(Task.title, func.count(Task.id).label("total")).group_by(Task.title)
+                               .order_by(sa_desc("total"), sa_asc("title")))).all()
+    return {"flagged": flagged, "days": len(days), "titles": [list(r) for r in titles]}
+
+
+@app.get("/export.csv")
+async def export_csv(direct: bool = False):
+    """StreamingResponse over a synchronous iterator: io.StringIO yields its lines."""
+    if direct:
+        return StreamingResponse(io.StringIO("x\ny\nz"), media_type="text/plain")
+    out = io.StringIO()
+    out.write("a,b\r\n1,2\r\n")
+    out.seek(0)
+    return StreamingResponse(out, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=x.csv"})
+
+
+@app.post("/archives")
+async def add_archive(body: dict, db: DbDep):
+    """deferred(): a value set on a new object stays readable after the flush (it is in memory)."""
+    a = Archive(name=body["name"], blob=body["blob"].encode())
+    db.add(a)
+    await db.flush()
+    out = {"id": a.id, "blob": a.blob.decode()}
+    await db.commit()
+    return out
+
+
+@app.get("/archives/{archive_id}")
+async def get_archive(archive_id: int, db: DbDep):
+    """Loaded without its deferred column; selected explicitly, or refreshed by name, it is read."""
+    a = await db.get(Archive, archive_id)
+    if a is None:
+        raise HTTPException(status_code=404, detail="no archive")
+    rows = (await db.execute(select(Archive.blob).where(Archive.id == archive_id))).scalars().all()
+    loaded = "blob" in a.__dict__
+    await db.refresh(a, ["blob"])
+    return {"name": a.name, "loaded": loaded, "column": [r.decode() for r in rows], "refreshed": a.blob.decode()}
+
+
+@app.get("/archives/{archive_id}/out", response_model=ArchiveOut)
+async def archive_out(archive_id: int, db: DbDep):
+    """Validated from the ORM object (its __init__ not called), then returned as is."""
+    return ArchiveOut.model_validate(await db.get(Archive, archive_id))
+
+
+@app.get("/projects/{project_id}/refreshed")
+async def project_refreshed(project_id: int, db: DbDep):
+    """session.refresh(obj): its columns reloaded; a lazy relationship already loaded (through a
+    selectinload() option) stays loaded, as in SQLAlchemy."""
+    p = (await db.execute(select(Project).where(Project.id == project_id).options(selectinload(Project.tasks)))).scalar_one_or_none()
+    if p is None:
+        raise HTTPException(status_code=404, detail="no project")
+    await db.refresh(p)
+    return {"loaded": "tasks" in p.__dict__, "tasks": sorted(t.id for t in p.tasks)}
+
+
+@app.get("/archives/{archive_id}/lazy")
+async def lazy_archive(archive_id: int, db: DbDep):
+    """Reading the deferred column of a loaded object: a lazy load, impossible in an async session (500)."""
+    a = await db.get(Archive, archive_id)
+    return {"blob": a.blob.decode()}
+
+
 @app.get("/secrets/{secret_id}")
 async def get_secret(secret_id: int, db: DbDep):
     sec = await db.get(Secret, secret_id)
@@ -1030,6 +1136,8 @@ async def resp_background(tasks: BackgroundTasks):
 
 TEMPLATES = Path(__file__).parent / "templates" / "email"
 jinja = Environment(loader=FileSystemLoader(str(TEMPLATES)), autoescape=select_autoescape(["html", "xml"]))
+jinja.filters["money"] = lambda v: f"{v:,.2f}"
+jinja.filters["shout"] = lambda s, n=1: s.upper() + "!" * n
 
 
 @app.get("/mail/render")
@@ -1039,6 +1147,12 @@ async def mail_render(name: str = "Ada <&'\">", db: DbDep = None):
         frontend_url="https://x.example", name=name, amount=12.5, active=True, nothing=None,
         items=[{"label": "a<b", "value": 1}, {"label": "c", "value": 2.0}], task=task)
     return {"html": html}
+
+
+@app.get("/mail/filters")
+async def mail_filters(name: str = "Ada <&>", amount: float = 1234567.891):
+    """Filters registered on the environment (`env.filters[name] = f`): their str output is escaped."""
+    return {"html": jinja.get_template("filters.html").render(name=name, amount=amount)}
 
 
 @app.get("/mail/build")
@@ -1059,15 +1173,19 @@ async def mail_build():
 
 
 @app.post("/mail/send")
-async def mail_send(to: str = "ada@example.com"):
+async def mail_send(to: str = "ada@example.com", envelope: bool = False):
     msg = MIMEMultipart("alternative")
     msg["From"] = formataddr(("Équipe", "noreply@example.com"))
     msg["To"] = to
     msg["Subject"] = "Test d'envoi"
     msg.attach(MIMEText("<p>héllo</p>", "html", "utf-8"))
     try:
-        await aiosmtplib.send(msg, hostname="127.0.0.1", port=int(os.getenv("DYNAPP_SMTP_PORT", "8025")),
-                              use_tls=False, start_tls=False, timeout=5)
+        port = int(os.getenv("DYNAPP_SMTP_PORT", "8025"))
+        if envelope:
+            await aiosmtplib.send(msg, hostname="127.0.0.1", port=port, use_tls=False, start_tls=False, timeout=5,
+                                  sender="bounce@example.com", recipients=[to, "copy@example.com"])
+        else:
+            await aiosmtplib.send(msg, hostname="127.0.0.1", port=port, use_tls=False, start_tls=False, timeout=5)
         return {"sent": True}
     except Exception as e:
         return {"sent": False}

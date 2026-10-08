@@ -824,3 +824,57 @@ pub async fn starlette_vary(mut r: axum::response::Response) -> axum::response::
     }
     r
 }
+
+// ---------------------------------------------------------------- graceful shutdown (as uvicorn)
+
+/// the signal that started the shutdown, raised again at the end (uvicorn's `capture_signals`)
+static SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static STOPPING: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+async fn next_signal() -> i32 {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = term.recv() => 15,
+        _ = int.recv() => 2,
+    }
+}
+
+/// SIGTERM or SIGINT: the server stops accepting, closes idle connections and finishes in-flight requests
+pub async fn shutdown_signal() {
+    SIGNAL.store(next_signal().await, std::sync::atomic::Ordering::SeqCst);
+    eprintln!("INFO:     Shutting down");
+    STOPPING.notify_one();
+}
+
+/// PY2AXUM_SHUTDOWN_TIMEOUT seconds (default 25) after the signal, or a second signal (uvicorn's force exit)
+pub async fn shutdown_deadline() {
+    STOPPING.notified().await;
+    let secs: f64 = std::env::var("PY2AXUM_SHUTDOWN_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(25.0);
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs_f64(secs.max(0.0))) => {
+            eprintln!("WARNING:  py2axum: shutdown timeout, open connections dropped");
+        }
+        _ = next_signal() => {}
+    }
+}
+
+/// the pool closed (Terminate sent to PostgreSQL), then the signal raised again with its default action
+pub async fn exit_after_shutdown(pool: &sqlx::PgPool) -> ! {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pool.close()).await;
+    let sig = SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+    if sig != 0 {
+        unsafe extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+            fn raise(sig: i32) -> i32;
+        }
+        // SAFETY: restores SIG_DFL (0 on Linux and macOS) for the signal, then delivers it to this process
+        unsafe {
+            signal(sig, 0);
+            raise(sig);
+        }
+    }
+    std::process::exit(if sig == 0 { 0 } else { 128 + sig })
+}

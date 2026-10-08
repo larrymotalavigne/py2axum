@@ -11,7 +11,8 @@ use super::v::*;
 // ---------------------------------------------------------------- Jinja2
 
 pub struct Jinja {
-    env: minijinja::Environment<'static>,
+    /// written by `env.filters[name] = f` (module level, before any render)
+    env: parking_lot::RwLock<minijinja::Environment<'static>>,
     /// the FileSystemLoader's search path (TemplateNotFound's message)
     search: Option<String>,
     /// a Starlette `Jinja2Templates` (its env), not a bare `jinja2.Environment`
@@ -61,7 +62,7 @@ fn markupsafe(s: &str) -> String {
 
 /// `jinja2.Environment(loader=FileSystemLoader(dir), autoescape=select_autoescape([...]) | bool)`
 pub fn environment(kwargs: &[(String, V)]) -> R {
-    Ok(V::native(Native::Jinja(Arc::new(Jinja { search: search_path(kwargs)?, env: build_env(kwargs)?, templates: false }))))
+    Ok(V::native(Native::Jinja(Arc::new(Jinja { search: search_path(kwargs)?, env: parking_lot::RwLock::new(build_env(kwargs)?), templates: false }))))
 }
 
 fn build_env(kwargs: &[(String, V)]) -> R<minijinja::Environment<'static>> {
@@ -113,7 +114,7 @@ pub fn templates(args: &[V], kwargs: &[(String, V)]) -> R {
     let dir = args.first().or_else(|| kwargs.first().map(|(_, v)| v)).filter(|v| !v.is_none())
         .ok_or_else(|| Exc::type_error("py2axum: Jinja2Templates() needs directory="))?;
     let kw = [("loader".into(), fs_loader(dir)?), ("autoescape".into(), select_autoescape(None)?)];
-    Ok(V::native(Native::Jinja(Arc::new(Jinja { search: search_path(&kw)?, env: build_env(&kw)?, templates: true }))))
+    Ok(V::native(Native::Jinja(Arc::new(Jinja { search: search_path(&kw)?, env: parking_lot::RwLock::new(build_env(&kw)?), templates: true }))))
 }
 
 fn search_path(kwargs: &[(String, V)]) -> R<Option<String>> {
@@ -135,7 +136,8 @@ fn not_found(j: &Jinja, name: &str, e: minijinja::Error) -> Exc {
 }
 
 fn render_template(j: &Jinja, name: &str, ctx: Vec<(String, minijinja::Value)>) -> R<String> {
-    let tpl = j.env.get_template(name).map_err(|e| not_found(j, name, e))?;
+    let env = j.env.read();
+    let tpl = env.get_template(name).map_err(|e| not_found(j, name, e))?;
     tpl.render(minijinja::Value::from_iter(ctx)).map_err(|e| Exc::runtime(format!("jinja2: {e}")))
 }
 
@@ -180,7 +182,7 @@ pub fn jinja_method(j: &Arc<Jinja>, name: &str, args: &[V], kwargs: &[(String, V
         "TemplateResponse" if j.templates => template_response(j, args, kwargs),
         "get_template" => {
             let n = ops::str_(args.first().ok_or_else(|| Exc::type_error("get_template() missing 'name'"))?)?;
-            j.env.get_template(&n).map_err(|e| not_found(j, &n, e))?;
+            j.env.read().get_template(&n).map_err(|e| not_found(j, &n, e))?;
             Ok(V::native(Native::JinjaTpl(JinjaTpl { env: j.clone(), name: n })))
         }
         _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", if j.templates { "Jinja2Templates" } else { "Environment" }))),
@@ -220,8 +222,32 @@ impl minijinja::value::Object for Obj {
     }
 }
 
+/// `env.filters[name] = f`: a filter calling the translated function, synchronously like Jinja2 (a
+/// function that awaits cannot run in the middle of a render).
+pub fn add_filter(j: &Arc<Jinja>, name: &V, f: V) -> R<()> {
+    let name = ops::str_(name)?;
+    let fname = name.clone();
+    j.env.write().add_filter(name, move |value: minijinja::Value, rest: minijinja::value::Rest<minijinja::Value>| {
+        let err = |m: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m);
+        let mut args = vec![from_jinja(&value).map_err(err)?];
+        for a in rest.iter() {
+            args.push(from_jinja(a).map_err(err)?);
+        }
+        let cx = super::root_cx();
+        match futures_util::FutureExt::now_or_never(super::methods::call_value(&cx, &f, args, vec![])) {
+            Some(Ok(v)) => Ok(to_jinja(&v)),
+            Some(Err(e)) => Err(err(e.message())),
+            None => Err(err(format!("py2axum: the Jinja2 filter {fname} awaited during a render"))),
+        }
+    });
+    Ok(())
+}
+
 fn from_jinja(v: &minijinja::Value) -> Result<V, String> {
     use minijinja::value::ValueKind;
+    if let Some(o) = v.downcast_object_ref::<Obj>() {
+        return Ok(o.0.clone());
+    }
     Ok(match v.kind() {
         ValueKind::Undefined | ValueKind::None => V::None,
         ValueKind::Bool => V::Bool(v.is_true()),
@@ -264,7 +290,8 @@ pub fn tpl_method(t: &JinjaTpl, name: &str, args: &[V], kwargs: &[(String, V)]) 
             for (k, v) in kwargs {
                 ctx.push((k.clone(), to_jinja(v)));
             }
-            let tpl = t.env.env.get_template(&t.name).map_err(|e| Exc::runtime(e.to_string()))?;
+            let env = t.env.env.read();
+            let tpl = env.get_template(&t.name).map_err(|e| Exc::runtime(e.to_string()))?;
             let ctx = minijinja::Value::from_iter(ctx);
             tpl.render(ctx).map(V::str).map_err(|e| Exc::runtime(format!("jinja2: {e}")))
         }
@@ -632,7 +659,8 @@ fn addresses(field: &str) -> Vec<String> {
 }
 
 /// `await aiosmtplib.send(message, hostname=, port=, username=, password=, use_tls=, start_tls=,
-/// timeout=, validate_certs=)`: envelope from Sender/From and To/Cc/Bcc (Bcc removed), like aiosmtplib.
+/// timeout=, validate_certs=, sender=, recipients=)`: envelope from `sender=`/`recipients=` when given, else
+/// from Sender/From and To/Cc/Bcc; Bcc removed either way, like aiosmtplib.
 pub async fn smtp_send(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::transport::smtp::client::{Tls, TlsParameters};
@@ -644,7 +672,7 @@ pub async fn smtp_send(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
         },
         _ => return Err(Exc::type_error("py2axum: aiosmtplib.send() needs an email.mime message")),
     };
-    let allowed = ["hostname", "port", "username", "password", "use_tls", "start_tls", "timeout", "validate_certs"];
+    let allowed = ["hostname", "port", "username", "password", "use_tls", "start_tls", "timeout", "validate_certs", "sender", "recipients"];
     if let Some((k, _)) = kwargs.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
         return Err(Exc::type_error(format!("py2axum: aiosmtplib.send({k}=) is not supported")));
     }
@@ -678,17 +706,32 @@ pub async fn smtp_send(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
         builder = builder.credentials(Credentials::new(ops::str_(&u)?, ops::str_(&p)?));
     }
     let transport = builder.build();
-    let from = get_header(&msg, "Sender").or_else(|| get_header(&msg, "From")).ok_or_else(|| smtp_err("No From header".into()))?;
+    let from = match get("sender") {
+        Some(s) => ops::str_(&s)?,
+        None => {
+            let h = get_header(&msg, "Sender").or_else(|| get_header(&msg, "From")).ok_or_else(|| smtp_err("No From header".into()))?;
+            addresses(&h).into_iter().next().ok_or_else(|| smtp_err("No valid sender".into()))?
+        }
+    };
     let mut rcpts = Vec::new();
-    for h in ["To", "Cc", "Bcc"] {
-        for (k, v) in msg.headers.lock().iter() {
-            if k.eq_ignore_ascii_case(h) {
-                rcpts.extend(addresses(v));
+    match get("recipients") {
+        Some(V::Str(r)) => rcpts.push(r.to_string()),
+        Some(r) => {
+            for x in ops::iter(&r)? {
+                rcpts.push(ops::str_(&x)?);
+            }
+        }
+        None => {
+            for h in ["To", "Cc", "Bcc"] {
+                for (k, v) in msg.headers.lock().iter() {
+                    if k.eq_ignore_ascii_case(h) {
+                        rcpts.extend(addresses(v));
+                    }
+                }
             }
         }
     }
     msg.headers.lock().retain(|(k, _)| !k.eq_ignore_ascii_case("Bcc"));
-    let from = addresses(&from).into_iter().next().ok_or_else(|| smtp_err("No valid sender".into()))?;
     let parse = |a: &str| a.parse::<lettre::Address>().map_err(|e| smtp_err(e.to_string()));
     let envelope = lettre::address::Envelope::new(Some(parse(&from)?), rcpts.iter().map(|a| parse(a)).collect::<R<Vec<_>>>()?)
         .map_err(|e| smtp_err(e.to_string()))?;

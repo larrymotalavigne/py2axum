@@ -4,7 +4,7 @@
 //!   application (101, 403 when it closes first, 500 when it fails or returns before, or its denial
 //!   response), an I/O task reading the socket while the queue is empty and writing in order; the
 //!   application ending without `websocket.close` drops the connection (the client sees 1006), a close
-//!   frame waits for the client's reply (10 s);
+//!   frame waits for the client's reply (10 s); on SIGTERM, close 1012 to both sides (uvicorn's `shutdown()`);
 //! - Starlette's `WebSocket` (1.7): client/application states, `receive`/`send` (ASGI dicts), `accept`,
 //!   `receive_text/bytes/json`, `send_text/bytes/json`, `close`, `iter_*`, `send_denial_response`, and the
 //!   HTTPConnection attributes.
@@ -404,6 +404,8 @@ async fn io(socket: WebSocket, s: Arc<Session>, mut out: mpsc::UnboundedReceiver
     let (mut sink, mut stream) = socket.split();
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut app_done = false;
+    let _guard = super::web::TaskGuard::new();
+    let mut shutdown = super::web::shutdown_watch();
     loop {
         let can_read = s.queue.lock().is_empty() || s.close_sent.load(Ordering::SeqCst);
         tokio::select! {
@@ -453,6 +455,15 @@ async fn io(socket: WebSocket, s: Arc<Session>, mut out: mpsc::UnboundedReceiver
                 }
             },
             _ = s.drained.notified(), if !can_read => {}
+            // SIGTERM: uvicorn's `shutdown()` - `websocket.disconnect` 1012 to the application, a close frame
+            // 1012 to the client, the transport closed without waiting for its reply
+            _ = async { let _ = shutdown.wait_for(|v| *v).await; } => {
+                if deadline.is_none() && !s.close_sent.load(Ordering::SeqCst) {
+                    s.push(In::Disconnect(1012, None));
+                    let _ = sink.send(Message::Close(Some(CloseFrame { code: 1012, reason: "".into() }))).await;
+                }
+                break;
+            }
             _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => break,
         }
     }
@@ -550,7 +561,9 @@ pub async fn serve(app: Arc<super::AppState>, req: axum::extract::Request, route
     let _ = cx.ws.set(V::native(Native::WebSocket(s.clone())));
     let run = route.run;
     let task_s = s.clone();
+    let guard_task = super::web::TaskGuard::new();
     tokio::spawn(async move {
+        let _guard = guard_task;
         let r = match super::web::run_ws_route(&cx, run).await {
             Ok(()) => Ok(()),
             Err(e) => handle(&cx, e).await,

@@ -372,8 +372,8 @@ pub async fn send(c: &Client, method: &str, args: &[V], kwargs: &[(String, V)]) 
             }
             "json" if !v.is_none() => {
                 let style = match c.kind {
-                    Kind::Httpx | Kind::Requests => pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":" },
-                    Kind::Aiohttp => pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": " },
+                    Kind::Httpx | Kind::Requests => pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false },
+                    Kind::Aiohttp => pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false },
                 };
                 body = Some((pyd::to_json(v, &style, false)?.into_bytes(), "application/json"));
             }

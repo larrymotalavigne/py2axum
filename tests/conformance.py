@@ -10,7 +10,6 @@ Scenarios live in tests/scenarios/<name>.py and define:
   reset(db)   bring the database (DATABASE_URL) back to the scenario's initial state
   normalize   optional: body -> body, for differences proven not to be semantic
   normalize_text  optional: text -> text, the same for bodies that are not JSON
-  HEADER_MASKS, COOKIE_MASKS, FILE_MASKS  optional: middleware headers, cookies, file headers to mask
 
 Generated instants (`created_at`, ...) cannot match between two runs: every ISO-8601 datetime the
 client did not send is replaced by its *shape* (digits -> 9), so the format (Z vs offset, fraction
@@ -121,58 +120,75 @@ def mask_file(scenario, value: str | None) -> str | None:
     return value
 
 
+def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str = DB, on_response=None) -> dict | None:
+    """Play one step on one server and return what is compared (None for a SQL fixture step, run on `db`).
+    `on_response(r)` sees the raw response first (tests/difftest.py learns the credentials it hands out)."""
+    method, path, payload = step[:3]
+    if method == "WS":
+        return ws_step(base, step)
+    if method == "SQL":
+        # a fixture the HTTP API cannot create (a paid plan, a tenant's password...): the same
+        # statement on the shared database before the next request, nothing compared
+        import psycopg
+
+        with psycopg.connect(db.replace("postgresql+psycopg://", "postgresql://")) as conn:
+            conn.execute(path)
+        return None
+    normalize = getattr(scenario, "normalize", lambda body: body)
+    headers = dict(step[3]) if len(step) > 3 else {}
+    if isinstance(payload, bytes):
+        kw = {"content": payload, "headers": {**J, **headers}}
+    elif payload is None:
+        kw = {"headers": headers}
+    else:
+        kw = {"content": json.dumps(payload), "headers": {**J, **headers}}
+    try:
+        r = c.request(method, path, **kw)
+    except (httpx.ReadError, httpx.RemoteProtocolError):
+        # uvicorn closes a keep-alive connection after an unhandled 500: the request was
+        # sent on a dead connection and never reached the server, send it again
+        try:
+            r = c.request(method, path, **kw)
+        except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+            # the server drops this very request without answering (a status uvicorn has no line for)
+            return {"req": f"{method} {path}", "error": type(e).__name__}
+    if on_response is not None:
+        on_response(r)
+    ctype = r.headers.get("content-type", "").split(";")[0]
+    try:
+        body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
+    except ValueError:
+        body = getattr(scenario, "normalize_text", lambda text: text)(r.text)
+    if method not in ("GET", "HEAD") and getattr(scenario, "SETTLE", 0):
+        # FastAPI commits a `yield` session dependency after sending the response: let it land
+        # before the next request reads (the reference is racy otherwise, the binary is not)
+        time.sleep(scenario.SETTLE)
+    return {"req": f"{method} {path}", "status": r.status_code, "ctype": ctype,
+            "encoding": r.headers.get("content-encoding"), "allow": r.headers.get("allow"),
+            # a redirect to the server itself: its own address differs between the two
+            "location": (r.headers.get("location") or "").replace(base, "<base>") or None,
+            "www_authenticate": r.headers.get("www-authenticate"),
+            "cookies": [mask_cookie(scenario, re.sub(r"expires=[^;]+", "expires=<date>", c)) for c in r.headers.get_list("set-cookie")],
+            "file": [mask_file(scenario, r.headers.get(h)) for h in ("content-disposition", "etag", "last-modified", "accept-ranges")],
+            # middlewares: CORS, security headers, rate limiting...
+            "mw": {k: "<masked>" if k in getattr(scenario, "HEADER_MASKS", ()) else ", ".join(r.headers.get_list(k))
+                   for k in sorted(set(r.headers.keys())) if k.startswith(MW_HEADER_PREFIXES)},
+            "body": mask_datetimes(body, sent)}
+
+
+def client(base: str) -> httpx.Client:
+    return httpx.Client(base_url=base, timeout=10, headers={"accept-encoding": "gzip"})
+
+
 def run(base: str, scenario) -> list[dict]:
     scenario.reset(DB)
     sent = sent_datetimes(scenario.STEPS)
-    normalize = getattr(scenario, "normalize", lambda body: body)
     out = []
-    with httpx.Client(base_url=base, timeout=10, headers={"accept-encoding": "gzip"}) as c:
+    with client(base) as c:
         for step in scenario.STEPS:
-            method, path, payload = step[:3]
-            if method == "WS":
-                out.append(ws_step(base, step))
-                continue
-            if method == "SQL":
-                # a fixture the HTTP API cannot create (a paid plan, a tenant's password...): the same
-                # statement on the shared database before the next request, nothing compared
-                import psycopg
-
-                with psycopg.connect(DB.replace("postgresql+psycopg://", "postgresql://")) as conn:
-                    conn.execute(path)
-                continue
-            headers = dict(step[3]) if len(step) > 3 else {}
-            if isinstance(payload, bytes):
-                kw = {"content": payload, "headers": {**J, **headers}}
-            elif payload is None:
-                kw = {"headers": headers}
-            else:
-                kw = {"content": json.dumps(payload), "headers": {**J, **headers}}
-            try:
-                r = c.request(method, path, **kw)
-            except (httpx.ReadError, httpx.RemoteProtocolError):
-                # uvicorn closes a keep-alive connection after an unhandled 500: the request was
-                # sent on a dead connection and never reached the server, send it again
-                r = c.request(method, path, **kw)
-            ctype = r.headers.get("content-type", "").split(";")[0]
-            try:
-                body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
-            except ValueError:
-                body = getattr(scenario, "normalize_text", lambda text: text)(r.text)
-            if method not in ("GET", "HEAD") and getattr(scenario, "SETTLE", 0):
-                # FastAPI commits a `yield` session dependency after sending the response: let it land
-                # before the next request reads (the reference is racy otherwise, the binary is not)
-                time.sleep(scenario.SETTLE)
-            out.append({"req": f"{method} {path}", "status": r.status_code, "ctype": ctype,
-                        "encoding": r.headers.get("content-encoding"), "allow": r.headers.get("allow"),
-                        # a redirect to the server itself: its own address differs between the two
-                        "location": (r.headers.get("location") or "").replace(base, "<base>") or None,
-                        "www_authenticate": r.headers.get("www-authenticate"),
-                        "cookies": [mask_cookie(scenario, re.sub(r"expires=[^;]+", "expires=<date>", c)) for c in r.headers.get_list("set-cookie")],
-                        "file": [mask_file(scenario, r.headers.get(h)) for h in ("content-disposition", "etag", "last-modified", "accept-ranges")],
-                        # middlewares: CORS, security headers, rate limiting...
-                        "mw": {k: "<masked>" if k in getattr(scenario, "HEADER_MASKS", ()) else ", ".join(r.headers.get_list(k))
-                               for k in sorted(set(r.headers.keys())) if k.startswith(MW_HEADER_PREFIXES)},
-                        "body": mask_datetimes(body, sent)})
+            got = exchange(c, base, scenario, step, sent)
+            if got is not None:
+                out.append(got)
     return out
 
 
@@ -188,6 +204,11 @@ def no_encoding(r: dict) -> dict:
     return dict(r, encoding=None, mw=mw)
 
 
+def identical(a: dict, b: dict, ignore_encoding: bool = False) -> bool:
+    ka, kb = (no_encoding(a), no_encoding(b)) if ignore_encoding else (a, b)
+    return json.dumps(ka, ensure_ascii=False) == json.dumps(kb, ensure_ascii=False)  # key order too
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
@@ -201,11 +222,10 @@ def main() -> int:
     ref, cand = run(ref_url, scenario), run(cand_url, scenario)
     failures = 0
     for a, b in zip(ref, cand):
-        ka, kb = (no_encoding(a), no_encoding(b)) if ignore_encoding else (a, b)
-        same = json.dumps(ka, ensure_ascii=False) == json.dumps(kb, ensure_ascii=False)  # key order too
+        same = identical(a, b, ignore_encoding)
         failures += not same
         mark = "ok  " if same else "DIFF"
-        print(f"{mark} {a['status']:>3} {a['req']}")
+        print(f"{mark} {a.get('status', '---'):>3} {a['req']}")
         if not same:
             print(f"     ref:  {json.dumps(a, ensure_ascii=False)}")
             print(f"     cand: {json.dumps(b, ensure_ascii=False)}")

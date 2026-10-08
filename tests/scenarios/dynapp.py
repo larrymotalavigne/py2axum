@@ -198,6 +198,7 @@ STEPS: list = [
     ("GET", "/tasks?status=open", None),
     ("GET", "/tasks/1", None),
     ("GET", "/tasks/99", None),
+    ("GET", "/tasks/2147483648", None),  # beyond INTEGER: DataError, as psycopg casts the parameter
     ("POST", "/tasks/1/status", {"status": "done"}),
     ("POST", "/tasks/1/status", {"status": "done"}),
     ("POST", "/tasks/1/status", {"status": "DONE"}),
@@ -354,6 +355,54 @@ STEPS: list = [
     ("GET", "/dataclass?role=viewer", None),
     ("GET", "/dataclass?role=admin", None),
     *_its_cases(),
+    ("GET", "/paged", None),
+    ("GET", "/paged?page=2&page_size=5&q=abc&exact=true", None),
+    ("GET", "/paged?page=0&page_size=101", None),
+    ("GET", "/paged?page=abc&q=toolong&exact=maybe", None),
+    ("POST", "/validated", {"id": 3, "name": " Ada "}),
+    ("POST", "/validated", {"id": "x", "name": "Ada"}),
+    ("POST", "/archives", {"name": "a", "blob": "deferred bytes"}),
+    ("GET", "/archives-report", None),
+    ("GET", "/archives/1/out", None),
+    ("GET", "/projects/1/refreshed", None),
+    ("GET", "/export.csv", None),
+    ("GET", "/export.csv?direct=true", None),
+    # malformed JSON bodies: json.JSONDecodeError's position (in characters) and message, in loc and ctx
+    ("POST", "/archives", ''.encode()),
+    ("POST", "/archives", ' '.encode()),
+    ("POST", "/archives", 'not json'.encode()),
+    ("POST", "/archives", '{'.encode()),
+    ("POST", "/archives", '{"a"'.encode()),
+    ("POST", "/archives", '{"a":'.encode()),
+    ("POST", "/archives", '{"a":1'.encode()),
+    ("POST", "/archives", '{"a":1,'.encode()),
+    ("POST", "/archives", '{"a":1,}'.encode()),
+    ("POST", "/archives", '{a:1}'.encode()),
+    ("POST", "/archives", '{"a" 1}'.encode()),
+    ("POST", "/archives", '{"a":1 "b":2}'.encode()),
+    ("POST", "/archives", '['.encode()),
+    ("POST", "/archives", '[1'.encode()),
+    ("POST", "/archives", '[1,'.encode()),
+    ("POST", "/archives", '[1,]'.encode()),
+    ("POST", "/archives", '[1 2]'.encode()),
+    ("POST", "/archives", '"abc'.encode()),
+    ("POST", "/archives", '"a\\x"'.encode()),
+    ("POST", "/archives", '"a\\u12g4"'.encode()),
+    ("POST", "/archives", '"a\tb"'.encode()),
+    ("POST", "/archives", '1 2'.encode()),
+    ("POST", "/archives", '{"a":1}x'.encode()),
+    ("POST", "/archives", '-'.encode()),
+    ("POST", "/archives", '01'.encode()),
+    ("POST", "/archives", '1.'.encode()),
+    ("POST", "/archives", 'tru'.encode()),
+    ("POST", "/archives", '[-]'.encode()),
+    ("POST", "/archives", '{"a":[1,{"b":}]}'.encode()),
+    ("POST", "/archives", '\ufeff{}'.encode()),
+    ("POST", "/archives", '{"é":"ü",}'.encode()),
+    ("POST", "/archives", '{"a":1}\n\n x'.encode()),
+    ("GET", "/archives/1", None),
+    ("GET", "/archives/1/lazy", None),
+    ("GET", "/archives/9", None),
     ("POST", "/secrets", {"label": "totp", "token": "JBSWY3DPEHPK3PXP"}),
     ("POST", "/secrets", {"label": "empty", "token": ""}),
     ("POST", "/secrets", {"label": "none"}),
@@ -407,8 +456,11 @@ STEPS: list = [
     ("POST", "/resp/background", None),
     ("GET", "/gendep/events", None),
     ("GET", "/mail/render", None),
+    ("GET", "/mail/filters", None),
+    ("GET", "/mail/filters?name=x&amount=0.5", None),
     ("GET", "/mail/build", None),
-    ("POST", "/mail/send?to=nobody@example.com", None),  # no SMTP server in the scenario: the error path
+    ("POST", "/mail/send?to=nobody@example.com", None),
+    ("POST", "/mail/send?to=nobody@example.com&envelope=true", None),  # no SMTP server in the scenario: the error path
     ("POST", "/stdlib", {"text": "<LOC> https://a.fr/x </loc><loc>b</loc> le 05/10/2026 et 31/12/1999"}),
     ("POST", "/stdlib", {"text": "rien"}),
     ("GET", "/sqlx", None),
@@ -603,6 +655,7 @@ STEPS: list = [
     ("GET", "/life/ctxvar/isolated", None),
     ("GET", "/life/cancel", None),
     # coroutine objects (fixtures/dynapp/aio.py)
+    ("GET", "/aio/sleep/20", None),
     ("GET", "/aio/gather", None),
     ("GET", "/aio/coro", None),
     ("GET", "/aio/acm", None),
@@ -615,6 +668,16 @@ STEPS: list = [
     ("POST", "/composite/tickets", None),
     ("POST", "/composite/upsert", None),
     ("GET", "/composite/adapter", None),
+    # bytes.startswith(tuple) (fixtures/dynapp/small.py), then json.loads on malformed bodies: CPython's
+    # messages and code-point positions, NaN/inf in a 422 (JSONResponse refuses them: 500), BOM, UTF-16
+    ("POST", "/small/sniff", {"b64": "iVBORw0KGgo="}),
+    ("POST", "/small/sniff", {"b64": "/9j/2Q=="}),
+    *[("POST", "/small/sniff", body) for body in [
+        b"", b"{", b"[1,]", b'{"b64":"x",}', b'{"b64" "x"}', b"{1:2}", b'{"b64":"a\\x"}', b'{"b64":"\\u12"}',
+        b"01", b"-", b"NaN", b'{"b64": Infinity}', b"tru", b'{"b64":"a\nb"}',
+        b'\xef\xbb\xbf{"b64": "AA=="}', b'\xff\xfe{\x00}\x00', b"\xc3\x28", b'{"b64": "AA==", "b64": "iVBO"}',
+        b'"\\ud83d\\ude00"', b"[1]x", b'{"b64": "\xc3\xa9"}  x',
+    ]],
     ("GET", "/composite/mappings", None),
     # project decorators (fixtures/dynapp/decos.py)
     ("GET", "/decos/fetch", None),
@@ -665,6 +728,7 @@ STEPS: list = [
     ("GET", "/libs/formatdate", None),
     ("GET", "/libs/smalllibs", None),
     ("GET", "/libs/unicodedata", None),
+    ("GET", "/libs/unicodedata?s=", None),  # CPython returns "" before checking the form
     ("GET", "/libs/jsonfmt", None),
     ("GET", "/libs/datereplace", None),
     ("POST", "/libs/lastpositive", {"items": []}),
@@ -702,6 +766,7 @@ STEPS: list = [
     ("POST", "/libs/bill", {"qty": 3, "unit": "12.50"}),
     ("POST", "/libs/bill", {"qty": 10, "unit": 11, "note": "rush", "extra": [1]}),
     ("POST", "/libs/bill", {"qty": 1, "unit": "1", "other": 99}),
+    ("POST", "/libs/bill", {"qty": 0, "unit": 0.0, "": None, "x": None}),  # exclude_none drops None extras
     ("POST", "/libs/bill", {"qty": "x"}),
     ("POST", "/libs/bill-echo", {"qty": 9, "unit": "12", "note": "n"}),
     ("POST", "/libs/decimal-in", {"amount": 1}),
@@ -760,6 +825,25 @@ STEPS: list = [
     ("POST", "/libs/urls", {"site": "http://" + "a" * 2100 + ".com"}),
     ("GET", "/libs/urllib?s=%F0%9F%8C%9E%20x%3B%3A%40%26%3D%2B%24%2C", None),
     # Base.metadata.create_all compiled at translation time (fixtures/dynapp/ddl.py): the catalog after each run
+    # Enum columns of every SQLAlchemy flavour read into str / Enum / Literal / use_enum_values / int / float / bool
+    ("POST", "/enumcols", {"pri": "high", "state": "done", "chan": "sms", "lvl": 2, "pri_val": "low", "maybe": None}),
+    ("POST", "/enumcols", {"pri": "low", "state": "open", "chan": "mail", "lvl": 1, "pri_val": "medium", "maybe": "high"}),
+    ("GET", "/enumcols/raw", None),
+    ("GET", "/enumcols/1/str", None),
+    ("GET", "/enumcols/1/enum", None),
+    ("GET", "/enumcols/1/use", None),
+    ("GET", "/enumcols/1/literal", None),
+    ("GET", "/enumcols/1/numbers", None),
+    ("GET", "/enumcols/1/short", None),
+    ("GET", "/enumcols/1/validate", None),
+    ("GET", "/enumcols/2/str", None),
+    ("GET", "/enumcols/2/enum", None),
+    ("GET", "/enumcols/2/use", None),
+    ("GET", "/enumcols/2/literal", None),
+    ("GET", "/enumcols/2/numbers", None),
+    ("GET", "/enumcols/2/short", None),
+    ("GET", "/enumcols/2/validate", None),
+    ("GET", "/enumcols/3/str", None),
     ("POST", "/ddl/fresh", None),
     ("POST", "/ddl/again", None),
     ("POST", "/ddl/partial", None),
@@ -767,6 +851,12 @@ STEPS: list = [
     ("POST", "/ddl/fresh", None),
     # small ATOM apps (fixtures/dynapp/small.py)
     ("GET", "/small/html?name=<b>", None),
+    ("GET", "/small/registry/base", None),
+    ("GET", "/small/registry/double?n=4", None),
+    ("GET", "/small/registry/triple?n=4", None),
+    ("GET", "/small/registry/upper?n=7", None),
+    ("GET", "/small/registry/count", None),
+    ("GET", "/small/registry/nope", None),
     ("GET", "/small/html-kinds/bytes", None),
     ("GET", "/small/html-kinds/none", None),
     ("GET", "/small/html-kinds/obj", None),
@@ -829,6 +919,95 @@ STEPS: list = [
     ("GET", "/small/pages-missing", None),
 ]
 
+# fixtures/dynapp/edges.py: what tests/difftest.py found (generation from the OpenAPI). Bodies as FastAPI decodes
+# them: CPython's json module (BOM, UTF-16, NaN, positions and messages), `null` = no body, strict content type
+FORM_CT = {"content-type": "application/x-www-form-urlencoded"}
+DEEP = b"[" * 12000 + b"]" * 12000  # deeper than the decoder's limit
+STEPS += [
+    ("POST", "/edges/model", b"null"),
+    ("POST", "/edges/opt", b"null"),
+    ("POST", "/edges/opt", b'{"name": "a"}'),
+    ("POST", "/edges/embed", b"null"),
+    ("POST", "/edges/embed", b"[1, 2]"),
+    ("POST", "/edges/embed", b'"text"'),
+    ("POST", "/edges/embed", b'{"item": null, "k": null}'),
+    ("POST", "/edges/embed", b'{"item": {"name": "a"}}'),
+    ("POST", "/edges/model", b'\xef\xbb\xbf{"name": "bom"}'),
+    ("POST", "/edges/model", '{"name": "utf16"}'.encode("utf-16")),
+    ("POST", "/edges/model", '{"name": "utf16le"}'.encode("utf-16-le")),
+    ("POST", "/edges/model", b'{"name": "\xff"}'),
+    ("POST", "/edges/model", b'{"name": "x"}', {"content-type": ""}),
+    ("POST", "/edges/model", b'{"name": "x"}', {"content-type": "text/plain"}),
+    ("POST", "/edges/model", b'{"name": "x"}', {"content-type": "application/vnd.api+json; charset=utf-8"}),
+    ("POST", "/edges/model", b'{"name": NaN}'),
+    ("POST", "/edges/model", b'{"name": "x", "n": 1e309}'),
+    ("POST", "/edges/model", b'{"name": "x", "n": -0.0, "flag": 2.0}'),
+    ("POST", "/edges/model", b'{"name": "x", "flag": 0.5}'),
+    ("POST", "/edges/model", b'{"name": "a", "n": 1, "name": "b"}'),
+    # (nested deeper than the decoder's limit: CPython's depends on its C stack, docs/supported.md; see /edges/loads)
+    *[("POST", "/edges/model", t) for t in (b"{", b'{"name": "a",}', b"[1,]", b'{"name" 1}', b'{"name": "a\\x"}',
+                                            b'"\\u12"', b'{"name": "a\nb"}', b"01", b"  ", b'{"a": 1}x',
+                                            b'\n\n  {"name": }')],  # a lone surrogate: docs/supported.md
+    # json.loads in the application: CPython's values and messages
+    *[("POST", "/edges/loads", t, {"content-type": "text/plain"}) for t in (
+        b'{"a": [1, 2.5, -0.0, 1e2, "\\ud83d\\ude00", "\\u00e9"], "c": 0, "c": [], "b": null}', b'[NaN]', b"[-Infinity, 1e400]", b"{",
+        b"[1,]", b'{"k": tru}', b'\xef\xbb\xbf[]', DEEP)],
+    ("GET", "/edges/bool", None),
+    ("GET", "/edges/loop", None),
+    ("GET", "/edges/strclass", None),
+    ("GET", "/edges/tuple-in", None),
+    ("GET", "/edges/dates", None),
+    ("GET", "/edges/fmt", None),
+    ("GET", "/edges/nul/a%00b", None),
+    ("GET", "/edges/nul/fixed.pdf", None),
+    ("GET", "/edges/inf", None),
+    ("GET", "/edges/inf?x=1.5", None),
+    # numbers beyond 64 bits: int_parsing_size (a 422), bool_type
+    ("POST", "/edges/model", {"name": "x", "n": 9.3e18}),
+    ("POST", "/edges/model", {"name": "x", "n": -9.223372036854775808e18, "flag": 9.2e18}),
+    ("POST", "/edges/model", {"name": "x", "flag": -1.37e158}),
+    # speedate's numeric strings: a float needs its point, an int must fit 64 bits, no spaces
+    *[("GET", f"/edges/types?dt={v}", None) for v in ("1.0e3", "1.e3", "5e3", ".5", "-.5", "%2B1.5e3", "1.5e400",
+                                                      "12345678901234567890", "%201700000000%20")],
+    ("GET", "/owners-cls/slug?q=%1Fa%1C%20b%1E", None),  # U+001C..U+001F are Python whitespace
+    ("GET", "/ws/urlpath/%0Ax%09y", None),  # request.url.path: urlsplit drops tabs and newlines
+    ("POST", "/libs/urls", {"site": ""}),  # pydantic-core: "input is empty" before the url parser
+    ("POST", "/amqp/roundtrip/a;b", None),  # pamqp refuses the queue name (ValueError, 500) before sending
+    ("POST", "/amqp/roundtrip/" + "q" * 250, None),  # 263 characters: "Max length exceeded for queue"
+    ("POST", "/amqp/roundtrip/" + "q" * 236 + "%C3%A9", None),  # 250 characters, 256 bytes: pamqp's TypeError
+    # uvicorn has status lines for 100..599 only: any other status drops the connection unanswered
+    ("GET", "/libs/status/599", None),
+    ("GET", "/libs/status/600", None),
+    ("GET", "/libs/status/99", None),
+    ("GET", "/libs/status/65736", None),  # not 200 once truncated to 16 bits
+    # int from a string: only zeros after the point; timestamps within years 0000-9999 (speedate)
+    *[("GET", f"/edges/types?i={v}", None) for v in ("12.0", "12.000", "-0.0", "12.", "12.5", "1e3", "1.8446742972109271e%2B19", "%2012%20", "1_000")],
+    *[("GET", f"/edges/types?d={v}&dt={v}", None) for v in ("100000000000000000", "-100000000000000000", "253402300800000", "86400", "0")],
+    *[("POST", "/edges/stamp", {"d": v, "dt": v}) for v in (1e17, -1e17, 4255305914356606.0, 253402300799999, 86400.0, 1700000000.5)],
+    # speedate's fraction: cut off towards zero, rounded to the microsecond, carried
+    *[("POST", "/edges/stamp", {"dt": v}) for v in (-1e-175, -6e-7, -4e-7, 5e-7, 1.9999999, -1.0000001, -1.9999999,
+                                                     -0.9999999, -2.25, -1700000000.1234567, 1700000000.9999996)],
+    ("POST", "/edges/stamp", {"d": -1e-175}),
+    # Starlette's form limits: a field over 1 MiB (name + value as sent), more than 1000 fields; multipart boundary
+    ("POST", "/edges/form", b"username=" + b"x" * (1024 * 1024 - 8), FORM_CT),
+    ("POST", "/edges/form", b"username=" + b"x" * (1024 * 1024 - 7), FORM_CT),
+    ("POST", "/edges/form", b"&".join([b"username=a"] * 1000), FORM_CT),
+    ("POST", "/edges/form", b"&".join([b"username=a"] * 1001), FORM_CT),
+    ("POST", "/edges/form", b"username=a&&&password=b&", FORM_CT),
+    ("POST", "/edges/upload", b"--x\r\n", {"content-type": "multipart/form-data"}),
+    ("POST", "/edges/upload", b"--x\r\n", {"content-type": "multipart/form-data; boundary="}),
+    # SQLAlchemy's psycopg dialect casts the parameter (`::INTEGER`): out of range, a DataError (500)
+    ("GET", "/tasks/2147483648", None),
+    # Starlette strips every trailing slash before its redirect: /tasks/%2F -> /tasks// -> /tasks
+    ("GET", "/tasks/%2F", None),
+    # a float read back from JSON/JSONB columns keeps its shortest repr (serde_json float_roundtrip)
+    # (JSONB writes 6.6e+205 back as an 206-digit integer: CPython reads an int, the binary a float, docs/supported.md)
+    ("POST", "/edges/jsonb/edge-f", {"data": [6.618213479614815e-205, 0.1, 1e-7, 5e-324, 2.2250738585072014e-308,
+                                              123456789.12345679, -0.0, 1e18, 9.2e18],
+                                     "raw": [6.618213479614815e+205, 1.7976931348623157e308, 0.1, -0.0, 5e-324]}),
+    ("GET", "/edges/jsonb/edge-f", None),
+]
+
 
 # fixtures/dynapp/wsock.py: WebSocket routes (tests/conformance.py ws_step), then what the server saw
 LOG = ("GET", "/ws/log", None)
@@ -884,6 +1063,12 @@ STEPS += [
     ("GET", "/ws/urlpath/caf%C3%A9%20x?q=%20", None),
     ("GET", "/ws/urlpath/caf%C3%A9%20x%2Fy", None),
     LOG,
+]
+
+# last: they rename task 2
+STEPS += [
+    ("POST", "/tasks/2/returning", {"title": "Renamed by RETURNING"}),
+    ("POST", "/tasks/999/returning", {"title": "nobody"}),
 ]
 
 
@@ -959,14 +1144,4 @@ def normalize(body):
         body = {k: _unpickled(v) for k, v in body.items()}
     if isinstance(body, dict) and isinstance(body.get("text"), str):
         body["text"] = _re.sub(r"={15}\d{19}==", "<boundary>", body["text"])
-    return _normalize(body)
-
-
-def _normalize(body):
-    """Known, documented difference (README): the decoder message of a `json_invalid` error comes from
-    CPython's json module (and changes between Python versions); type, msg and loc are compared."""
-    if isinstance(body, dict) and isinstance(body.get("detail"), list):
-        for e in body["detail"]:
-            if isinstance(e, dict) and e.get("type") == "json_invalid" and "ctx" in e:
-                e["ctx"] = {"error": "<decoder message>"}
     return body

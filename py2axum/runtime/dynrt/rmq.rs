@@ -91,7 +91,7 @@ fn table(v: &V) -> R<FieldTable> {
     let mut t = FieldTable::default();
     if let V::Dict(d) = v {
         for (_, (k, x)) in d.lock().iter() {
-            t.insert(ShortString::from(ops::str_(k)?), value(x)?);
+            t.insert(short(ops::str_(k)?)?, value(x)?);
         }
     }
     Ok(t)
@@ -164,7 +164,7 @@ fn properties(m: &AMsg) -> R<BasicProperties> {
         p = p.with_headers(table(&m.headers)?);
     }
     for (k, v) in &m.props {
-        let s = || -> R<ShortString> { Ok(ShortString::from(ops::str_(v)?)) };
+        let s = || -> R<ShortString> { short(ops::str_(v)?) };
         let int = || -> R<u8> {
             match v {
                 V::Int(i) => Ok(*i as u8),
@@ -233,7 +233,8 @@ pub async fn chan_method(c: &Arc<AChan>, name: &str, args: &[V], kwargs: &[(Stri
                 Some(a @ V::Dict(_)) => table(a)?,
                 _ => FieldTable::default(),
             };
-            let q = c.ch.queue_declare(ShortString::from(qname), opts, arguments).await.map_err(|e| amqp_err(e, false))?;
+            pamqp_name("queue", &qname)?;
+            let q = c.ch.queue_declare(short(qname)?, opts, arguments).await.map_err(|e| amqp_err(e, false))?;
             Ok(V::native(Native::AmqpQueue(c.clone(), q.name().as_str().to_string())))
         }
         "close" => {
@@ -271,9 +272,10 @@ pub async fn publish(c: &Arc<AChan>, exchange: &str, args: &[V], kwargs: &[(Stri
         }
     }
     let props = properties(&msg)?;
+    pamqp_name("exchange", exchange)?;
     let confirm = c
         .ch
-        .basic_publish(ShortString::from(exchange.to_string()), ShortString::from(key), BasicPublishOptions::default(), &msg.body, props)
+        .basic_publish(short(exchange.to_string())?, short(key)?, BasicPublishOptions::default(), &msg.body, props)
         .await
         .map_err(|e| amqp_err(e, false))?;
     confirm.await.map_err(|e| amqp_err(e, false))?;
@@ -284,7 +286,8 @@ pub async fn publish(c: &Arc<AChan>, exchange: &str, args: &[V], kwargs: &[(Stri
 pub async fn queue_get(c: &Arc<AChan>, queue: &str, kwargs: &[(String, V)]) -> R {
     let no_ack = kw(kwargs, "no_ack").map(ops::truthy).transpose()?.unwrap_or(false);
     let fail = kw(kwargs, "fail").map(ops::truthy).transpose()?.unwrap_or(true);
-    let got = c.ch.basic_get(ShortString::from(queue.to_string()), BasicGetOptions { no_ack }).await.map_err(|e| amqp_err(e, false))?;
+    pamqp_name("queue", queue)?;
+    let got = c.ch.basic_get(short(queue.to_string())?, BasicGetOptions { no_ack }).await.map_err(|e| amqp_err(e, false))?;
     match got {
         Some(m) => {
             let (body, props, routing_key) = (m.delivery.data.clone(), m.delivery.properties.clone(), m.delivery.routing_key.as_str().to_string());
@@ -329,4 +332,27 @@ pub async fn incoming_method(m: &Arc<AIncoming>, name: &str) -> R {
         }
         _ => Err(Exc::attr_error(format!("'IncomingMessage' object has no attribute '{name}'"))),
     }
+}
+
+
+/// pamqp validates names before sending a frame (`Frame.validate`): at most 256 (127) characters of
+/// `^[a-zA-Z0-9-_.:@#,/+ ]*$`, a ValueError otherwise (the server never sees the request).
+fn pamqp_name(what: &str, name: &str) -> R<()> {
+    // Basic.Publish checks its exchange against 127, the queue frames against 256
+    if name.chars().count() > if what == "exchange" { 127 } else { 256 } {
+        return Err(Exc::value_error(format!("Max length exceeded for {what}")));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@#,/+ ".contains(c)) {
+        return Err(Exc::value_error(format!("Invalid value for {what}")));
+    }
+    Ok(())
+}
+
+/// pamqp's `short_string` encoder: at most 255 UTF-8 bytes, a TypeError otherwise (lapin would panic).
+fn short(s: impl Into<String>) -> R<ShortString> {
+    let s: String = s.into();
+    if s.len() > 255 {
+        return Err(Exc::type_error("string exceeds maximum length of 255 bytes"));
+    }
+    Ok(ShortString::from(s))
 }
