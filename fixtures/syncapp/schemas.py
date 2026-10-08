@@ -43,3 +43,13 @@ class ReviewRead(BaseModel):
 class BookFull(BookRead):
     author: AuthorRead
     reviews: list[ReviewRead]
+
+
+class BookTitled(BookRead):
+    author_name: str | None = None
+    shout: str | None = None
+
+
+class BookList(BaseModel):
+    items: list[BookFull]
+    total: int

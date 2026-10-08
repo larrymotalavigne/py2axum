@@ -12,6 +12,10 @@ use super::v::*;
 
 pub struct Jinja {
     env: minijinja::Environment<'static>,
+    /// the FileSystemLoader's search path (TemplateNotFound's message)
+    search: Option<String>,
+    /// a Starlette `Jinja2Templates` (its env), not a bare `jinja2.Environment`
+    pub templates: bool,
 }
 
 pub struct JinjaTpl {
@@ -57,6 +61,10 @@ fn markupsafe(s: &str) -> String {
 
 /// `jinja2.Environment(loader=FileSystemLoader(dir), autoescape=select_autoescape([...]) | bool)`
 pub fn environment(kwargs: &[(String, V)]) -> R {
+    Ok(V::native(Native::Jinja(Arc::new(Jinja { search: search_path(kwargs)?, env: build_env(kwargs)?, templates: false }))))
+}
+
+fn build_env(kwargs: &[(String, V)]) -> R<minijinja::Environment<'static>> {
     let mut env = minijinja::Environment::new();
     env.set_keep_trailing_newline(false);
     for (k, v) in kwargs {
@@ -94,17 +102,88 @@ pub fn environment(kwargs: &[(String, V)]) -> R {
         }
         Ok(())
     });
-    Ok(V::native(Native::Jinja(Arc::new(Jinja { env }))))
+    Ok(env)
 }
 
-pub fn jinja_method(j: &Arc<Jinja>, name: &str, args: &[V]) -> R {
+/// `Jinja2Templates(directory=...)`: `Environment(loader=FileSystemLoader(directory), autoescape=select_autoescape())`
+pub fn templates(args: &[V], kwargs: &[(String, V)]) -> R {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "directory") {
+        return Err(Exc::type_error(format!("py2axum: Jinja2Templates({k}=) is not supported")));
+    }
+    let dir = args.first().or_else(|| kwargs.first().map(|(_, v)| v)).filter(|v| !v.is_none())
+        .ok_or_else(|| Exc::type_error("py2axum: Jinja2Templates() needs directory="))?;
+    let kw = [("loader".into(), fs_loader(dir)?), ("autoescape".into(), select_autoescape(None)?)];
+    Ok(V::native(Native::Jinja(Arc::new(Jinja { search: search_path(&kw)?, env: build_env(&kw)?, templates: true }))))
+}
+
+fn search_path(kwargs: &[(String, V)]) -> R<Option<String>> {
+    match kwargs.iter().find(|(k, _)| k == "loader").and_then(|(_, v)| marker(v, "\u{0}loader")) {
+        Some(d) => Ok(Some(ops::str_(d)?)),
+        None => Ok(None),
+    }
+}
+
+/// `jinja2.TemplateNotFound` as FileSystemLoader raises it
+fn not_found(j: &Jinja, name: &str, e: minijinja::Error) -> Exc {
+    if e.kind() != minijinja::ErrorKind::TemplateNotFound {
+        return Exc::msg(&TEMPLATE_NOT_FOUND, e.to_string());
+    }
+    match &j.search {
+        Some(p) => Exc::msg(&TEMPLATE_NOT_FOUND, format!("{} not found in search path: {}", ops::str_repr(name), ops::str_repr(p))),
+        None => Exc::msg(&TEMPLATE_NOT_FOUND, name.to_string()),
+    }
+}
+
+fn render_template(j: &Jinja, name: &str, ctx: Vec<(String, minijinja::Value)>) -> R<String> {
+    let tpl = j.env.get_template(name).map_err(|e| not_found(j, name, e))?;
+    tpl.render(minijinja::Value::from_iter(ctx)).map_err(|e| Exc::runtime(format!("jinja2: {e}")))
+}
+
+/// `templates.TemplateResponse(request, name, context=None, status_code=200, headers=None, media_type=None)`
+fn template_response(j: &Jinja, args: &[V], kwargs: &[(String, V)]) -> R {
+    const NAMES: [&str; 6] = ["request", "name", "context", "status_code", "headers", "media_type"];
+    let mut slots: Vec<Option<V>> = vec![None; NAMES.len()];
+    if args.len() > NAMES.len() {
+        return Err(Exc::type_error("TemplateResponse() takes at most 6 positional arguments"));
+    }
+    for (i, a) in args.iter().enumerate() {
+        slots[i] = Some(a.clone());
+    }
+    for (k, v) in kwargs {
+        let i = NAMES.iter().position(|n| n == k).ok_or_else(|| Exc::type_error(format!("py2axum: TemplateResponse({k}=) is not supported")))?;
+        if slots[i].replace(v.clone()).is_some() {
+            return Err(Exc::type_error(format!("TemplateResponse() got multiple values for argument '{k}'")));
+        }
+    }
+    let request = slots[0].clone().ok_or_else(|| Exc::type_error("TemplateResponse() missing 1 required positional argument: 'request'"))?;
+    let name = ops::str_(slots[1].as_ref().ok_or_else(|| Exc::type_error("TemplateResponse() missing 1 required positional argument: 'name'"))?)?;
+    let mut ctx: Vec<(String, minijinja::Value)> = Vec::new();
+    match &slots[2] {
+        None | Some(V::None) => {}
+        Some(V::Dict(d)) => {
+            for (k, v) in d.lock().values() {
+                ctx.push((ops::str_(k)?, to_jinja(v)));
+            }
+        }
+        Some(o) => return Err(Exc::type_error(format!("py2axum: TemplateResponse(context=) must be a dict, not {}", o.type_name()))),
+    }
+    if !ctx.iter().any(|(k, _)| k == "request") {
+        ctx.push(("request".into(), to_jinja(&request)));
+    }
+    let content = render_template(j, &name, ctx)?;
+    let rest: Vec<V> = slots[3..].iter().map(|v| v.clone().unwrap_or(V::None)).collect();
+    super::resp::new("HTMLResponse", &[vec![V::str(content)], rest].concat(), &[])
+}
+
+pub fn jinja_method(j: &Arc<Jinja>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     match name {
+        "TemplateResponse" if j.templates => template_response(j, args, kwargs),
         "get_template" => {
             let n = ops::str_(args.first().ok_or_else(|| Exc::type_error("get_template() missing 'name'"))?)?;
-            j.env.get_template(&n).map_err(|e| Exc::msg(&TEMPLATE_NOT_FOUND, if e.kind() == minijinja::ErrorKind::TemplateNotFound { n.clone() } else { e.to_string() }))?;
+            j.env.get_template(&n).map_err(|e| not_found(j, &n, e))?;
             Ok(V::native(Native::JinjaTpl(JinjaTpl { env: j.clone(), name: n })))
         }
-        _ => Err(Exc::attr_error(format!("'Environment' object has no attribute '{name}'"))),
+        _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", if j.templates { "Jinja2Templates" } else { "Environment" }))),
     }
 }
 
@@ -130,6 +209,29 @@ impl minijinja::value::Object for Obj {
     fn render(self: &Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&ops::str_(&self.0).unwrap_or_default())
     }
+    /// dates: `strftime`/`isoformat`... (synchronous methods only)
+    fn call_method(self: &Arc<Self>, _: &minijinja::State, method: &str, args: &[minijinja::Value]) -> Result<minijinja::Value, minijinja::Error> {
+        let err = |m: String| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, m);
+        if !matches!(self.0, V::Date(_) | V::DateTime(_)) {
+            return Err(minijinja::Error::from(minijinja::ErrorKind::UnknownMethod));
+        }
+        let args: Vec<V> = args.iter().map(from_jinja).collect::<Result<_, _>>().map_err(err)?;
+        super::methods::value_method_sync(&self.0, method, &args).map(|v| to_jinja(&v)).map_err(|e| err(e.message()))
+    }
+}
+
+fn from_jinja(v: &minijinja::Value) -> Result<V, String> {
+    use minijinja::value::ValueKind;
+    Ok(match v.kind() {
+        ValueKind::Undefined | ValueKind::None => V::None,
+        ValueKind::Bool => V::Bool(v.is_true()),
+        ValueKind::Number => match i64::try_from(v.clone()) {
+            Ok(i) => V::Int(i),
+            Err(_) => V::Float(f64::try_from(v.clone()).map_err(|e| e.to_string())?),
+        },
+        ValueKind::String => V::str(v.as_str().unwrap_or_default()),
+        _ => return Err("py2axum: only str, number, bool and None arguments are passed to a method from a template".into()),
+    })
 }
 
 fn to_jinja(v: &V) -> minijinja::Value {
@@ -144,7 +246,8 @@ fn to_jinja(v: &V) -> minijinja::Value {
         V::Tuple(t) => Value::from(t.iter().map(to_jinja).collect::<Vec<_>>()),
         V::Dict(d) => Value::from_iter(d.lock().values().map(|(k, x)| (ops::str_(k).unwrap_or_default(), to_jinja(x)))),
         // dates, enums, decimals...: rendered as str() in Python
-        V::Date(_) | V::DateTime(_) | V::Time(_) | V::Delta(_) | V::Enum(..) => Value::from(ops::str_(v).unwrap_or_default()),
+        V::Time(_) | V::Delta(_) | V::Enum(..) => Value::from(ops::str_(v).unwrap_or_default()),
+        // dates keep their methods (`{{ d.strftime('%Y') }}`), rendered as str()
         other => Value::from_object(Obj(other.clone())),
     }
 }
@@ -175,16 +278,19 @@ pub enum MimeKind {
     Multipart(String),
     Text { sub: String, charset: String, body: String },
     App { sub: String, data: Vec<u8> },
+    /// `MIMEBase(maintype, subtype)`: its payload is set by `set_payload` (and `encoders.encode_base64`)
+    Base,
 }
 
 pub struct Mime {
     kind: MimeKind,
     headers: Mutex<Vec<(String, String)>>,
     parts: Mutex<Vec<V>>,
+    payload: Mutex<Option<V>>,
 }
 
 fn mime(kind: MimeKind, headers: Vec<(String, String)>) -> V {
-    V::native(Native::Mime(Arc::new(Mime { kind, headers: Mutex::new(headers), parts: Mutex::new(Vec::new()) })))
+    V::native(Native::Mime(Arc::new(Mime { kind, headers: Mutex::new(headers), parts: Mutex::new(Vec::new()), payload: Mutex::new(None) })))
 }
 
 fn kw<'a>(kwargs: &'a [(String, V)], name: &str) -> Option<&'a V> {
@@ -236,6 +342,15 @@ pub fn mime_new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
                     ("Content-Transfer-Encoding".into(), "base64".into()),
                 ],
             ))
+        }
+        "MIMEBase" => {
+            let main = ops::str_(argv(args, kwargs, 0, "_maintype").ok_or_else(|| Exc::type_error("MIMEBase.__init__() missing 2 required positional arguments: '_maintype' and '_subtype'"))?)?;
+            let sub = ops::str_(argv(args, kwargs, 1, "_subtype").ok_or_else(|| Exc::type_error("MIMEBase.__init__() missing 1 required positional argument: '_subtype'"))?)?;
+            let mut ctype = format!("{main}/{sub}");
+            for (k, v) in kwargs.iter().filter(|(k, _)| k != "_maintype" && k != "_subtype" && k != "policy") {
+                ctype += &format!("; {}", format_param(&k.replace('_', "-"), &ops::str_(v)?));
+            }
+            Ok(mime(MimeKind::Base, vec![("Content-Type".into(), ctype), ("MIME-Version".into(), "1.0".into())]))
         }
         _ => Err(Exc::type_error(format!("py2axum: email.mime {kind} is not supported"))),
     }
@@ -302,6 +417,13 @@ pub fn mime_method(m: &Arc<Mime>, name: &str, args: &[V], kwargs: &[(String, V)]
                 value += &format!("; {}", format_param(&k.replace('_', "-"), &ops::str_(v)?));
             }
             m.headers.lock().push((hname, value));
+            Ok(V::None)
+        }
+        "set_payload" if matches!(m.kind, MimeKind::Base) => {
+            if args.len() > 1 || !kwargs.is_empty() {
+                return Err(Exc::type_error("py2axum: set_payload(payload) only (no charset)"));
+            }
+            *m.payload.lock() = Some(args.first().cloned().ok_or_else(|| Exc::type_error("set_payload() missing 1 required positional argument: 'payload'"))?);
             Ok(V::None)
         }
         "as_string" | "as_bytes" => {
@@ -408,6 +530,11 @@ fn render_with(m: &Arc<Mime>, folded: bool) -> String {
         MimeKind::Text { charset, body, .. } if charset == "us-ascii" => out += body,
         MimeKind::Text { body, .. } => out += &b64_lines(body.as_bytes()),
         MimeKind::App { data, .. } => out += &b64_lines(data),
+        MimeKind::Base => match &*m.payload.lock() {
+            Some(V::Str(s)) => out += s,
+            Some(V::Bytes(b)) => out += &String::from_utf8_lossy(b),
+            _ => {}
+        },
     }
     out
 }
@@ -572,4 +699,24 @@ pub async fn smtp_send(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     let resp = transport.send_raw(&envelope, raw.as_bytes()).await.map_err(|e| smtp_err(e.to_string()))?;
     // aiosmtplib returns ({recipient: response}, message): enough for callers that ignore it
     Ok(V::tuple(vec![V::empty_dict(), V::str(resp.message().collect::<Vec<_>>().join("\n"))]))
+}
+
+/// `email.encoders.encode_base64(msg)`: the payload base64-encoded (76-column lines), and its header
+pub fn encode_base64(msg: &V) -> R {
+    let m = match msg {
+        V::Native(n) => match &**n {
+            Native::Mime(m) => m.clone(),
+            _ => return Err(Exc::type_error("py2axum: encode_base64() of a non-message")),
+        },
+        _ => return Err(Exc::type_error("py2axum: encode_base64() of a non-message")),
+    };
+    let data = match &*m.payload.lock() {
+        Some(V::Bytes(b)) => b.to_vec(),
+        // CPython: get_payload(decode=True) is None, base64.encodebytes(None) raises
+        None => return Err(Exc::type_error("expected bytes-like object, not NoneType")),
+        Some(_) => return Err(Exc::type_error("py2axum: encode_base64() of a str payload is not supported")),
+    };
+    *m.payload.lock() = Some(V::str(b64_lines(&data)));
+    m.headers.lock().push(("Content-Transfer-Encoding".into(), "base64".into()));
+    Ok(V::None)
 }

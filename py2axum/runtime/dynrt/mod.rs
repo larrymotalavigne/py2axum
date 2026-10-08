@@ -6,6 +6,7 @@ pub mod aio;
 pub mod asgi;
 pub mod auth;
 pub mod decimal;
+pub mod deque;
 pub mod dt;
 pub mod http;
 pub mod ini;
@@ -15,12 +16,16 @@ pub mod thread;
 pub mod types;
 pub mod sysmon;
 pub mod mail;
+pub mod nh3;
+pub mod net;
 pub mod resp;
 pub mod pathio;
 pub mod pickle;
 pub mod rds;
 pub mod rmq;
 pub mod tenacity;
+pub mod reldelta;
+pub mod xmld;
 pub mod prom;
 pub mod routing;
 pub mod trace;
@@ -36,9 +41,11 @@ pub mod ops;
 pub mod orm;
 pub mod pyd;
 pub mod rawasgi;
+pub mod sentry;
 pub mod v;
 pub mod web;
 pub mod webpush;
+pub mod ws;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -79,6 +86,12 @@ pub struct CxInner {
     pub ctxvars: parking_lot::Mutex<std::collections::HashMap<usize, V>>,
     /// the scope given to a raw ASGI app serving this request (`Request(scope, receive)`)
     pub asgi_scope: parking_lot::Mutex<Option<V>>,
+    /// the WebSocket of a WebSocket route's connection (`ws::current`)
+    pub ws: std::sync::OnceLock<V>,
+    /// sentry_sdk: the request's isolation scope (the import's for a root context)
+    pub sentry: std::sync::OnceLock<Arc<sentry::Iso>>,
+    /// the exceptions being handled (`except` blocks entered, innermost last): `sys.exc_info()`
+    pub handling: parking_lot::Mutex<Vec<Exc>>,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -96,6 +109,9 @@ impl CxInner {
             in_trace: std::sync::atomic::AtomicBool::new(false),
             ctxvars: parking_lot::Mutex::new(std::collections::HashMap::new()),
             asgi_scope: parking_lot::Mutex::new(None),
+            ws: std::sync::OnceLock::new(),
+            sentry: std::sync::OnceLock::new(),
+            handling: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -422,7 +438,7 @@ pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, cas
 /// pydantic-settings' complex fields (decoded as JSON): containers and models; `Some(true)` for a union
 /// with such a member, whose JSON errors are tolerated.
 fn settings_complex(td: &pyd::TD) -> Option<bool> {
-    match td {
+    match td.bare() {
         pyd::TD::Dict(_) | pyd::TD::List(_) | pyd::TD::Set(_) | pyd::TD::Tuple(_) | pyd::TD::Schema(_) => Some(false),
         pyd::TD::Optional(t) => settings_complex(t).map(|_| true),
         pyd::TD::Union(ts) => ts.iter().any(|t| settings_complex(t).is_some()).then_some(true),
@@ -469,9 +485,33 @@ pub fn pydantic() -> &'static str {
     PYDANTIC.get().map(|s| s.as_str()).unwrap_or("2.13")
 }
 
+/// The project's pydantic is older than major.minor (behaviours that changed between the supported versions).
+pub fn pydantic_before(major: u32, minor: u32) -> bool {
+    let mut it = pydantic().split('.').map(|x| x.parse::<u32>().unwrap_or(0));
+    (it.next().unwrap_or(2), it.next().unwrap_or(13)) < (major, minor)
+}
+
 pub fn root_cx() -> Cx {
     let app = ROOT.get().expect("py2axum runtime not initialised").clone();
-    Arc::new(CxInner::new(app, web::ReqCell::empty()))
+    let cx = Arc::new(CxInner::new(app, web::ReqCell::empty()));
+    let _ = cx.sentry.set(sentry::main_iso());
+    cx
+}
+
+/// An `except` block being run: its exception is the one `sys.exc_info()` sees until the block ends.
+pub struct Handling(Cx);
+
+impl Handling {
+    pub fn new(cx: &Cx, e: &Exc) -> Handling {
+        cx.handling.lock().push(e.clone());
+        Handling(cx.clone())
+    }
+}
+
+impl Drop for Handling {
+    fn drop(&mut self) {
+        self.0.handling.lock().pop();
+    }
 }
 
 

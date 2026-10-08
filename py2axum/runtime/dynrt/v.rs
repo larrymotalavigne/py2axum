@@ -62,6 +62,10 @@ pub struct ModDesc {
 
 pub enum Native {
     Request(Arc<web::ReqCell>),
+    /// Starlette's `WebSocket` (dynrt/ws.rs)
+    WebSocket(Arc<super::ws::Session>),
+    /// `websocket.iter_text()` / `iter_bytes()` / `iter_json()`: "text", "bytes" or "json"
+    WsIter(Arc<super::ws::Session>, String),
     Headers(Arc<web::ReqCell>),
     State(Arc<web::ReqCell>),
     Url(Arc<web::ReqCell>),
@@ -86,6 +90,14 @@ pub enum Native {
     HttpClient(Arc<super::http::Client>),
     HttpResp(Arc<super::http::Resp>),
     HttpTimeout(super::http::Timeout),
+    /// `collections.deque`
+    Deque(Arc<super::deque::Deque>),
+    /// `string.Template(text)`
+    Template(String),
+    /// `ipaddress.ip_address(...)`
+    IpAddr(std::net::IpAddr),
+    /// `ipaddress.ip_network(...)`: network address, prefix length
+    IpNet(std::net::IpAddr, u8),
     /// `httpx.BasicAuth(user, password)`: its `Authorization` header value
     HttpBasicAuth(String),
     HttpUrl(String),
@@ -93,6 +105,10 @@ pub enum Native {
     Row(Arc<Vec<Arc<str>>>, Arc<Vec<V>>),
     /// `await session.begin_nested()`
     Savepoint(orm::Session, String),
+    /// `await session.connection()`: the session's connection (`close()` hands it back to the pool)
+    SessConn(orm::Session),
+    /// `dateutil.relativedelta.relativedelta(...)`
+    RelDelta(super::reldelta::RelDelta),
     /// `urllib.parse.urlparse(...)` / `urlsplit(...)`
     UrlParts(Arc<super::stdlib::UrlParts>),
     /// a pydantic URL (`RedisDsn`...): (type name, parsed URL)
@@ -206,6 +222,8 @@ pub enum Native {
     Coro(Mutex<Option<super::BoxFut<'static>>>),
     /// `asyncio.Semaphore` / `asyncio.Lock`
     Sem(Arc<super::aio::Sem>),
+    /// sentry_sdk objects: integrations, scopes (see `sentry`)
+    Sentry(Arc<super::sentry::Obj>),
 }
 
 pub struct PyFn {
@@ -232,7 +250,7 @@ impl V {
     pub fn dict_from(items: Vec<(V, V)>) -> R {
         let mut m = IndexMap::new();
         for (k, v) in items {
-            m.insert(Key::of(&k)?, (k, v));
+            m.insert(Key::dict_key(&k)?, (k, v));
         }
         Ok(V::Dict(Arc::new(Mutex::new(m))))
     }
@@ -275,6 +293,8 @@ impl V {
             V::Decimal(_) => "decimal.Decimal",
             V::Native(n) => match &**n {
                 Native::Request(_) => "Request",
+                Native::WebSocket(_) => "WebSocket",
+                Native::WsIter(..) => "async_generator",
                 Native::Headers(_) => "Headers",
                 Native::State(_) => "State",
                 Native::Url(_) => "URL",
@@ -293,9 +313,15 @@ impl V {
                 Native::HttpClient(_) => "AsyncClient",
                 Native::HttpResp(_) => "Response",
                 Native::HttpTimeout(_) => "Timeout",
+                Native::Deque(_) => "deque",
+                Native::Template(_) => "Template",
+                Native::IpAddr(a) => if a.is_ipv4() { "IPv4Address" } else { "IPv6Address" },
+                Native::IpNet(a, _) => if a.is_ipv4() { "IPv4Network" } else { "IPv6Network" },
                 Native::HttpBasicAuth(_) => "BasicAuth",
                 Native::HttpUrl(_) => "URL",
                 Native::Savepoint(..) => "AsyncSessionTransaction",
+                Native::SessConn(_) => "AsyncConnection",
+                Native::RelDelta(_) => "relativedelta",
                 Native::Row(..) => "Row",
                 Native::UrlParts(u) => if u.parse { "ParseResult" } else { "SplitResult" },
                 Native::Record(n, _) => n,
@@ -313,7 +339,7 @@ impl V {
                 Native::Hmac(_) => "HMAC",
                 Native::HashCtor(_) => "builtin_function_or_method",
                 Native::Iter(_) => "iterator",
-                Native::Jinja(_) => "Environment",
+                Native::Jinja(j) => if j.templates { "Jinja2Templates" } else { "Environment" },
                 Native::JinjaTpl(_) => "Template",
                 Native::Mime(_) => "MIMEBase",
                 Native::Tasks(_) => "BackgroundTasks",
@@ -351,6 +377,7 @@ impl V {
                 Native::Module(_) => "module",
                 Native::Tenacity(t) => super::tenacity::type_name(t),
                 Native::Prom(p) => super::prom::type_name(p),
+                Native::Sentry(o) => super::sentry::type_name(o),
                 Native::Routing(o) => super::routing::type_name(o),
                 Native::TraceFrame(_) => "frame",
                 Native::TraceCode(_) => "code",
@@ -399,6 +426,28 @@ pub enum Key {
 }
 
 impl Key {
+    /// a dict key: from Python 3.14, an unhashable one names its type and role
+    /// (`cannot use 'mod.X' as a dict key (unhashable type: 'X')`)
+    pub fn dict_key(v: &V) -> R<Key> {
+        Key::in_role(v, "dict key")
+    }
+    pub fn set_elem(v: &V) -> R<Key> {
+        Key::in_role(v, "set element")
+    }
+    fn in_role(v: &V, role: &str) -> R<Key> {
+        Key::of(v).map_err(|e| {
+            let msg = e.message();
+            if super::python() >= (3, 14) && std::ptr::eq(e.0.class, &TYPE_ERROR) && msg.starts_with("unhashable type: ") {
+                let qual = match v {
+                    V::Inst(o) => o.desc.class.qualname,
+                    _ => v.type_name(),
+                };
+                Exc::type_error(format!("cannot use '{qual}' as a {role} ({msg})"))
+            } else {
+                e
+            }
+        })
+    }
     pub fn of(v: &V) -> R<Key> {
         Ok(match v {
             V::None => Key::None,
@@ -470,6 +519,22 @@ pub enum EV {
     Float(f64),
     Bool(bool),
     None,
+    Tuple(&'static [EV]),
+    List(&'static [EV]),
+}
+
+impl EV {
+    pub fn to_v(&self) -> V {
+        match self {
+            EV::Str(s) => V::str(*s),
+            EV::Int(n) => V::Int(*n),
+            EV::Float(f) => V::Float(*f),
+            EV::Bool(b) => V::Bool(*b),
+            EV::None => V::None,
+            EV::Tuple(t) => V::tuple(t.iter().map(EV::to_v).collect()),
+            EV::List(l) => V::list(l.iter().map(EV::to_v).collect()),
+        }
+    }
 }
 
 pub struct EnumDesc {
@@ -485,13 +550,7 @@ pub struct EnumDesc {
 
 impl EnumDesc {
     pub fn value(&self, i: u16) -> V {
-        match &self.members[i as usize].1 {
-            EV::Str(s) => V::str(*s),
-            EV::Int(n) => V::Int(*n),
-            EV::Float(f) => V::Float(*f),
-            EV::Bool(b) => V::Bool(*b),
-            EV::None => V::None,
-        }
+        self.members[i as usize].1.to_v()
     }
     pub fn member_name(&self, i: u16) -> &'static str {
         self.members[i as usize].0
@@ -509,7 +568,7 @@ impl EnumDesc {
 
 /// Enum lookup by value is type-strict: `2` does not match `"2"`.
 fn same_kind(a: &V, b: &V) -> bool {
-    matches!((a, b), (V::Str(_), V::Str(_)) | (V::Int(_), V::Int(_)) | (V::Float(_), V::Float(_)) | (V::Bool(_), V::Bool(_)) | (V::None, V::None) | (V::Int(_), V::Float(_)) | (V::Float(_), V::Int(_)))
+    matches!((a, b), (V::Tuple(_), V::Tuple(_)) | (V::List(_), V::List(_)) | (V::Str(_), V::Str(_)) | (V::Int(_), V::Int(_)) | (V::Float(_), V::Float(_)) | (V::Bool(_), V::Bool(_)) | (V::None, V::None) | (V::Int(_), V::Float(_)) | (V::Float(_), V::Int(_)))
 }
 
 pub enum ClassKind {
@@ -530,6 +589,8 @@ pub struct ExcDesc {
     pub methods: &'static [(&'static str, bool, super::pyd::MethodFn)],
     /// the methods that are `async def`s (a call not awaited is a coroutine)
     pub async_methods: &'static [&'static str],
+    /// `__module__` (the module defining the class)
+    pub module: &'static str,
 }
 
 pub type ClsAttr = for<'a> fn(&'a super::Cx) -> super::BoxFut<'a>;
@@ -663,6 +724,12 @@ builtin_exc!(QUEUE_FULL, "QueueFull", [EXCEPTION]);
 builtin_exc!(QUEUE_EMPTY, "QueueEmpty", [EXCEPTION]);
 builtin_exc!(HTTP_EXCEPTION, "HTTPException", [EXCEPTION]);
 builtin_exc!(REQUEST_VALIDATION_ERROR, "RequestValidationError", [VALUE_ERROR]);
+// Starlette / FastAPI WebSockets (dynrt/ws.rs); ClientDisconnected is uvicorn's (an OSError)
+builtin_exc!(WS_DISCONNECT, "WebSocketDisconnect", [EXCEPTION]);
+builtin_exc!(WS_DISCONNECTED, "WebSocketDisconnected", [RUNTIME_ERROR]);
+builtin_exc!(WS_EXCEPTION, "WebSocketException", [EXCEPTION]);
+builtin_exc!(WS_VALIDATION_ERROR, "WebSocketRequestValidationError", [EXCEPTION]);
+builtin_exc!(CLIENT_DISCONNECTED, "ClientDisconnected", [OS_ERROR]);
 builtin_exc!(VALIDATION_ERROR, "ValidationError", [VALUE_ERROR]);
 builtin_exc!(SQLALCHEMY_ERROR, "SQLAlchemyError", [EXCEPTION]);
 builtin_exc!(DBAPI_ERROR, "DBAPIError", [SQLALCHEMY_ERROR]);
@@ -680,6 +747,9 @@ builtin_exc!(MISSING_GREENLET, "MissingGreenlet", [SQLALCHEMY_ERROR]);
 builtin_exc!(INVALID_REQUEST_ERROR, "InvalidRequestError", [SQLALCHEMY_ERROR]);
 builtin_exc!(OBJECT_DELETED_ERROR, "ObjectDeletedError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(ARGUMENT_ERROR, "ArgumentError", [SQLALCHEMY_ERROR]);
+builtin_exc!(CIRCULAR_DEPENDENCY_ERROR, "CircularDependencyError", [SQLALCHEMY_ERROR]);
+builtin_exc!(EXPAT_ERROR, "ExpatError", [EXCEPTION]);
+builtin_exc!(RESOURCE_CLOSED_ERROR, "ResourceClosedError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(JOSE_ERROR, "JOSEError", [EXCEPTION]);
 builtin_exc!(JWS_ERROR, "JWSError", [JOSE_ERROR]);
 builtin_exc!(JWT_ERROR, "JWTError", [JOSE_ERROR]);
@@ -698,6 +768,8 @@ builtin_exc!(SMTP_EXCEPTION, "SMTPException", [EXCEPTION]);
 builtin_exc!(RE_ERROR, "error", [EXCEPTION]);
 builtin_exc!(IMPORT_ERROR, "ImportError", [EXCEPTION]);
 builtin_exc!(MODULE_NOT_FOUND_ERROR, "ModuleNotFoundError", [IMPORT_ERROR]);
+// importlib.metadata.PackageNotFoundError (args = the name, `str()` = its message)
+builtin_exc!(PACKAGE_NOT_FOUND, "PackageNotFoundError", [MODULE_NOT_FOUND_ERROR]);
 builtin_exc!(FROZEN_INSTANCE_ERROR, "FrozenInstanceError", [ATTRIBUTE_ERROR]);
 builtin_exc!(CSV_ERROR, "Error", [EXCEPTION]);
 builtin_exc!(BINASCII_ERROR, "Error", [VALUE_ERROR]);
@@ -722,6 +794,7 @@ builtin_exc!(HTTPX_TOO_MANY_REDIRECTS, "TooManyRedirects", [HTTPX_REQUEST_ERROR]
 builtin_exc!(HTTPX_DECODING_ERROR, "DecodingError", [HTTPX_REQUEST_ERROR]);
 builtin_exc!(HTTPX_STATUS_ERROR, "HTTPStatusError", [HTTPX_HTTP_ERROR]);
 builtin_exc!(HTTPX_INVALID_URL, "InvalidURL", [EXCEPTION]);
+builtin_exc!(SOCKET_GAIERROR, "gaierror", [OS_ERROR]);
 // requests, pywebpush, py-vapid
 builtin_exc!(REQUESTS_EXCEPTION, "RequestException", [OS_ERROR]);
 builtin_exc!(REQUESTS_CONNECTION_ERROR, "ConnectionError", [REQUESTS_EXCEPTION]);
@@ -818,6 +891,10 @@ impl Exc {
                 _ => String::new(),
             };
             return format!("WebPushException: {msg}{extra}");
+        }
+        if std::ptr::eq(self.0.class, &PACKAGE_NOT_FOUND) && args.len() == 1 {
+            // PackageNotFoundError.__str__
+            return format!("No package metadata was found for {}", super::ops::str_(&args[0]).unwrap_or_default());
         }
         match args.len() {
             0 => String::new(),

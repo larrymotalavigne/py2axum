@@ -103,6 +103,27 @@ def delete_author(author_id: int, db: Db):
     return {"deleted": author_id}
 
 
+# ---- self-referential relationship (remote_side=)
+@app.put("/authors/{author_id}/mentor/{mentor_id}")
+def set_mentor(author_id: int, mentor_id: int, db: Db):
+    author = db.get(Author, author_id)
+    if author is None:
+        raise HTTPException(status_code=404, detail="Author not found")
+    author.mentor = db.get(Author, mentor_id)
+    db.commit()
+    return {"id": author.id, "mentor_id": author.mentor_id}
+
+
+@app.get("/authors/{author_id}/mentor")
+def read_mentor(author_id: int, db: Db):
+    author = db.get(Author, author_id)
+    if author is None:
+        raise HTTPException(status_code=404, detail="Author not found")
+    return {"mentor": author.mentor.name if author.mentor else None,
+            "mentees": sorted(a.name for a in author.mentees),
+            "pupils": [a.name for a in author.pupils]}
+
+
 # ---- the legacy Query API (session.query)
 from sqlalchemy import func  # noqa: E402
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound  # noqa: E402
@@ -211,3 +232,73 @@ def by_label(label: str, db: Db):
         out["op"] = type(e).__name__
         db.rollback()
     return out
+
+
+# ---- constructions of a real application: an ORM @property in a response model, a model built from ORM
+# objects, a SQL expression shared by the columns and GROUP BY, a synchronous session awaited
+from sqlalchemy import select  # noqa: E402
+
+from .schemas import BookList, BookTitled  # noqa: E402
+
+FIRST = func.substr(Book.title, 1, 1)
+
+
+@app.get("/books/{book_id}/titled", response_model=BookTitled)
+def titled(book_id: int, db: Db):
+    return db.get(Book, book_id)
+
+
+@app.get("/booklist", response_model=BookList)
+def booklist(db: Db):
+    books = db.query(Book).order_by(Book.id).all()
+    return BookList(items=books, total=len(books))
+
+
+@app.get("/q/initials")
+def initials(db: Db):
+    rows = db.query(FIRST.label("i"), func.count(Book.id).label("n")).group_by(FIRST).order_by(FIRST).all()
+    out = {"shared": [[r.i, r.n] for r in rows]}
+    try:  # two expressions built apart: two parameters, PostgreSQL refuses the GROUP BY
+        db.query(func.substr(Book.title, 1, 1), func.count(Book.id)).group_by(func.substr(Book.title, 1, 1)).all()
+        out["apart"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        out["apart"] = type(e).__name__
+        db.rollback()
+    return out
+
+
+async def awaited_lookup(db, book_id: int):
+    result = await db.execute(select(Book).where(Book.id == book_id))
+    return result.scalar_one_or_none()
+
+
+@app.get("/books/{book_id}/awaited")
+async def awaited(book_id: int, db: Db):
+    try:
+        await awaited_lookup(db, book_id)
+        return {"ok": True}
+    except TypeError as e:
+        return {"error": str(e)}
+
+
+@app.get("/when")
+def when():
+    from datetime import date, datetime
+
+    d = datetime(2026, 3, 4, 5, 6, 7)
+    return {"fmt": f"{d:%d/%m à %H:%M}", "date": f"{date(2026, 1, 2):%Y}", "plain": f"{d}",
+            "has": [hasattr(d, "isoformat"), hasattr(d, "nope"), hasattr(date(2026, 1, 2), "strftime")],
+            "iso": d.isoformat() if hasattr(d, "isoformat") else str(d)}
+
+
+class Patterns:
+    WORDS = ["a", "b"]
+
+    @staticmethod
+    def joined() -> str:
+        return "-".join(Patterns.WORDS)
+
+
+@app.get("/classattr")
+def classattr():
+    return {"joined": Patterns.joined(), "n": len(Patterns.WORDS)}

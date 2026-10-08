@@ -39,6 +39,22 @@ class Child(Option):
     tags: list[str] = []
 
 
+class Strict(BaseModel):
+    """No extras."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["a", "b"] | None = Field(None, description="Kind")
+    n: int = Field(10, ge=1, le=20)
+
+
+class Loose(Strict):
+    model_config = ConfigDict(extra="allow")
+
+
+class Ignored(Option):
+    model_config = ConfigDict(extra="ignore")
+
+
 class Holder(BaseModel):
     child: Child
     maybe: Option | None = None
@@ -162,3 +178,13 @@ def test_unsupported_rejected(tmp_path, sig, message):
         SchemaGen(proj).arguments(proj.ix.definition(Sym("bad.tools", "t")), "bad.tools")
     assert message in e.value.msg
     assert "tools.py:" in e.value.render()
+
+
+@pytest.mark.parametrize("name", ["Option", "Child", "Holder", "Strict", "Loose", "Ignored"])
+def test_model_schema_matches_pydantic(project, name):
+    """`Model.model_json_schema()`."""
+    fe, proj, _ = project
+    sys.path.insert(0, str(fe.ix.root) if hasattr(fe, "ix") else "")
+    mod = importlib.import_module("jsproj.schemas")
+    got = SchemaGen(proj).model(Sym("jsproj.schemas", name))
+    assert json.dumps(got) == json.dumps(getattr(mod, name).model_json_schema())

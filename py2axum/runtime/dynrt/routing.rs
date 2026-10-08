@@ -24,6 +24,8 @@ pub enum Node {
     Starlette { path: &'static str, pattern: &'static str, name: &'static str },
     /// an `APIRoute`: its path within its router (the router's prefix included, not the include prefixes)
     Api { path: &'static str, pattern: &'static str, methods: &'static [&'static str], name: &'static str },
+    /// an `APIWebSocketRoute` (`@app.websocket`): matches the `websocket` scope only
+    Ws { path: &'static str, pattern: &'static str, name: &'static str },
     /// `include_router(router, prefix=...)`
     Included { prefix: &'static str, router: &'static RouterDef },
 }
@@ -185,6 +187,8 @@ fn included_match(prefix: &str, r: &RouterDef, path: &str, method: &str) -> M {
                     M::None
                 }
             }
+            // the request being matched is an HTTP one
+            Node::Ws { .. } => M::None,
             Node::Included { prefix: p2, router } => {
                 // under the including router's own prefix, as `APIRouter.include_router` adds them
                 included_match(&format!("{prefix}{}{}", r.prefix, super::web::runtime_prefix(p2)), router, path, method)
@@ -217,6 +221,31 @@ fn params(re: &regex::Regex, path: &str) -> R {
 
 /// `route.matches(scope)` -> `(Match, child_scope)`
 fn matches(o: &Arc<RObj>, scope: &V) -> R {
+    if let RObj::Node(Node::Ws { pattern, .. }) = &**o {
+        // WebSocketRoute.matches: the `websocket` scope only, FULL on the path
+        let d = |k: &str| -> R<Option<V>> {
+            match scope {
+                V::Dict(d) => Ok(d.lock().get(&Key::of(&V::str(k))?).map(|(_, v)| v.clone())),
+                o => Err(Exc::type_error(format!("py2axum: matches() expects a scope dict, not {}", o.type_name()))),
+            }
+        };
+        if d("type")?.as_ref().and_then(|t| t.as_str().map(String::from)).as_deref() == Some("websocket") {
+            let path = match d("path")? {
+                Some(V::Str(s)) => s.to_string(),
+                _ => return Err(Exc::new(&KEY_ERROR, vec![V::str("path")])),
+            };
+            let re = regex(pattern);
+            if re.is_match(&path) {
+                let child = V::dict_from(vec![
+                    (V::str("endpoint"), V::None),
+                    (V::str("path_params"), params(&re, &path)?),
+                    (V::str("route"), V::native(Native::Routing(o.clone()))),
+                ])?;
+                return Ok(V::tuple(vec![match_value(M::Full), child]));
+            }
+        }
+        return Ok(V::tuple(vec![match_value(M::None), V::empty_dict()]));
+    }
     let Some((path, method)) = route_path(scope)? else {
         return Ok(V::tuple(vec![match_value(M::None), V::empty_dict()]));
     };
@@ -287,6 +316,7 @@ pub fn type_name(o: &RObj) -> &'static str {
         RObj::AppRouter | RObj::Router(_) => "APIRouter",
         RObj::Node(Node::Starlette { .. }) | RObj::Added(_) => "Route",
         RObj::Node(Node::Api { .. }) => "APIRoute",
+        RObj::Node(Node::Ws { .. }) => "APIWebSocketRoute",
         RObj::Node(Node::Included { .. }) => "_IncludedRouter",
     }
 }
@@ -299,6 +329,7 @@ pub fn isinstance(v: &V, class: &str) -> bool {
         "starlette.routing.BaseRoute" => matches!(&**o, RObj::Node(_) | RObj::Added(_)),
         "starlette.routing.Route" => matches!(&**o, RObj::Node(Node::Starlette { .. } | Node::Api { .. }) | RObj::Added(_)),
         "fastapi.routing.APIRoute" => matches!(&**o, RObj::Node(Node::Api { .. })),
+        "starlette.routing.WebSocketRoute" | "fastapi.routing.APIWebSocketRoute" => matches!(&**o, RObj::Node(Node::Ws { .. })),
         "fastapi.FastAPI" | "starlette.applications.Starlette" => matches!(&**o, RObj::App),
         "fastapi.APIRouter" | "starlette.routing.Router" => matches!(&**o, RObj::AppRouter | RObj::Router(_)),
         _ => false,
@@ -319,8 +350,8 @@ pub fn attr(o: &Arc<RObj>, name: &str) -> R {
         (RObj::Router(r), "routes") => routes_of(r, false),
         (RObj::Router(r), "prefix") => Ok(V::str(r.prefix)),
         (RObj::Node(Node::Included { router, .. }), "original_router") => Ok(obj(RObj::Router(router))),
-        (RObj::Node(Node::Api { path, .. } | Node::Starlette { path, .. }), "path" | "path_format") => Ok(V::str(path)),
-        (RObj::Node(Node::Api { name, .. } | Node::Starlette { name, .. }), "name") => Ok(V::str(name)),
+        (RObj::Node(Node::Api { path, .. } | Node::Starlette { path, .. } | Node::Ws { path, .. }), "path" | "path_format") => Ok(V::str(path)),
+        (RObj::Node(Node::Api { name, .. } | Node::Starlette { name, .. } | Node::Ws { name, .. }), "name") => Ok(V::str(name)),
         (RObj::Node(Node::Api { methods, .. }), "methods") => method_set(methods),
         (RObj::Node(Node::Starlette { .. }), "methods") => method_set(&["GET", "HEAD"]),
         (RObj::Added(a), "path" | "path_format") => Ok(V::str(&a.path)),

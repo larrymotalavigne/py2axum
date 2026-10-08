@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -109,3 +110,29 @@ class Ticket(Base):
     data = mapped_column(JSONB(none_as_null=True), nullable=True)
     raw = mapped_column(JSON, nullable=True)
     owner_id = mapped_column(ForeignKey("owners.id"), nullable=True)
+
+
+# coproscan's shape: Uuid primary keys drawn by uuid.uuid4, a Uuid foreign key, JSONB with a sqlite variant
+from sqlalchemy import Uuid  # noqa: E402
+from sqlalchemy.types import JSON as SAJSON  # noqa: E402
+
+UUIDVariant = Uuid(as_uuid=True)
+JSONVariant = JSONB().with_variant(SAJSON(), "sqlite")
+
+
+class Analysis(Base):
+    __tablename__ = "analyses"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDVariant, primary_key=True, default=uuid.uuid4)
+    address: Mapped[str] = mapped_column(String(100))
+    findings: Mapped[dict | None] = mapped_column(JSONVariant, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AnalysisDoc(Base):
+    __tablename__ = "analysis_docs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDVariant, primary_key=True, default=uuid.uuid4)
+    analysis_id: Mapped[uuid.UUID] = mapped_column(UUIDVariant, ForeignKey("analyses.id", ondelete="CASCADE"), index=True)
+    ref: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    name: Mapped[str] = mapped_column(String(50))

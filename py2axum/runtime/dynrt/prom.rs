@@ -1061,7 +1061,9 @@ async fn metric_method(cx: &Cx, m: &Arc<Metric>, name: &str, args: Vec<V>, kwarg
             let a = bind(&q("state"), &["state"], 1, args, kwargs)?;
             m.check_observable()?;
             let s = a[0].clone().unwrap();
-            let i = m.states.iter().position(|x| Some(x.as_str()) == s.as_str()).ok_or_else(|| Exc::value_error(format!("{} is not in list", ops::repr(&s).unwrap_or_default())))?;
+            let i = m.states.iter().position(|x| Some(x.as_str()) == s.as_str()).ok_or_else(|| {
+                Exc::value_error(if super::python() >= (3, 14) { "list.index(x): x not in list".to_string() } else { format!("{} is not in list", ops::repr(&s).unwrap_or_default()) })
+            })?;
             m.st.lock().state = i;
             Ok(V::None)
         }

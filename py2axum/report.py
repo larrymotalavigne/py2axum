@@ -22,65 +22,65 @@ from .frontend import Frontend
 from .ir import TranspileError
 
 
-# dyn compiler message -> construction label. Order matters (first match wins).
-ERROR_CLASSES: list[tuple[str, str]] = [
-    (r"library call `([a-zA-Z0-9_]+)\.?[^`]*\(\)` is not supported", "lib \\1"),
-    (r"library value `([a-zA-Z0-9_]+)[^`]*` is not supported", "lib \\1"),
-    (r"middleware (\S+) is not supported", "middleware \\1"),
-    (r"method \.(\w+)\(\) is not implemented by the runtime", "méthode .\\1() absente du runtime (500 exécution)"),
-    (r"\.(\w+)\((\w+)=\) is not supported \(only", ".\\1(\\2=) (500 exécution)"),
-    (r"attribute \.(\w+) is not provided by the runtime", "attribut .\\1 absent du runtime (500 exécution)"),
-    (r"@app\.(\w+)\(\.\.\.\) is not supported", "@app.\\1"),
-    (r"app\.(\w+)\(\.\.\.\) is not supported", "app.\\1()"),
-    (r"FastAPI\(lifespan=", "lifespan (à déclarer --python-side)"),
-    (r"include_router: cannot resolve", "include_router non résolu"),
-    (r"syntax error", "erreur de syntaxe"),
-    (r"coroutine `.*` is not awaited", "coroutine non attendue (create_task/gather)"),
-    (r"decorator @(\S+) on", "décorateur @\\1"),
-    (r"(Cookie|Form|File)\(\) parameters", "paramètre \\1()"),
-    (r"dependency `.*` must be a project function", "dépendance externe (Depends(objet))"),
-    (r"generator dependencies", "dépendance générateur"),
-    (r"only exception classes are supported", "classe projet (hors modèle/schéma/exception)"),
-    (r"is not a Pydantic model \(enums", "type Enum ou classe non Pydantic"),
-    (r"unsupported type annotation `(?:[\w.]*\.)?(UUID|Decimal|EmailStr|HttpUrl|SecretStr|AnyUrl)", "type \\1"),
-    (r"unsupported type annotation", "annotation de type non supportée"),
-    (r"column .*: unsupported column type `(?:[\w.]*\.)?(\w+)", "colonne \\1"),
-    (r"column .*: (callable/SQL defaults|only onupdate)", "défaut de colonne calculé"),
-    (r"column .*: cannot infer", "colonne sans type"),
-    (r"inheritance between mapped classes", "héritage de modèles"),
-    (r"abstract models", "modèle abstrait"),
-    (r"exactly one primary key", "clé primaire composite"),
-    (r"@(model_validator|computed_field|field_serializer|model_serializer)", "Pydantic @\\1"),
-    (r"only mode='after' field validators", "validateur Pydantic mode before/wrap"),
-    (r"class `Config`", "Pydantic v1 Config"),
-    (r"model_config (\w+)= is not supported", "model_config \\1="),
-    (r"class attribute `.*` is not supported", "attribut de classe de schéma"),
-    (r"unsupported option (\w+)= in", "option \\1="),
-    (r"unsupported route option (\w+)=", "option de route \\1="),
-    (r"unsupported statement `(\w+)`", "instruction \\1"),
-    (r"`global`/`nonlocal`", "global/nonlocal"),
-    (r"starred assignment|`\*`/`\*\*` expansion", "expansion */** non supportée"),
-    (r"unsupported exception class", "classe d'exception externe"),
-    (r"builtin `(\w+)\(\)` is not supported", "builtin \\1()"),
-    (r"unsupported await", "await non supporté"),
-    (r"is not a constant", "valeur non constante"),
-    (r"needs a type annotation", "paramètre sans annotation"),
-    (r"must be a module-level function", "endpoint imbriqué"),
-    (r"unsupported expression", "expression non supportée"),
-    (r"with/else|for/else|while/else", "boucle avec else"),
-    (r"break/continue across try/finally", "break/continue à travers finally"),
-    (r"unknown name", "nom inconnu"),
-    (r"module .* has no attribute", "attribut de module introuvable"),
-    (r"erreur interne", "erreur interne du transpileur"),
+# dyn compiler message -> construction label (French for the internal report, English for `check`).
+# Order matters (first match wins).
+ERROR_CLASSES: list[tuple[str, str, str]] = [
+    (r"library call `([a-zA-Z0-9_]+)\.?[^`]*\(\)` is not supported", "lib \\1", "library \\1"),
+    (r"library value `([a-zA-Z0-9_]+)[^`]*` is not supported", "lib \\1", "library \\1"),
+    (r"middleware (\S+) is not supported", "middleware \\1", "middleware \\1"),
+    (r"method \.(\w+)\(\) is not implemented by the runtime", "méthode .\\1() absente du runtime (500 exécution)", "method .\\1() not in the runtime"),
+    (r"\.(\w+)\((\w+)=\) is not supported \(only", ".\\1(\\2=) (500 exécution)", ".\\1(\\2=)"),
+    (r"attribute \.(\w+) is not provided by the runtime", "attribut .\\1 absent du runtime (500 exécution)", "attribute .\\1 not in the runtime"),
+    (r"@app\.(\w+)\(\.\.\.\) is not supported", "@app.\\1", "@app.\\1"),
+    (r"app\.(\w+)\(\.\.\.\) is not supported", "app.\\1()", "app.\\1()"),
+    (r"FastAPI\(lifespan=", "lifespan (à déclarer --python-side)", "lifespan"),
+    (r"include_router: cannot resolve", "include_router non résolu", "unresolved include_router"),
+    (r"syntax error", "erreur de syntaxe", "syntax error"),
+    (r"coroutine `.*` is not awaited", "coroutine non attendue (create_task/gather)", "coroutine not awaited"),
+    (r"decorator @(\S+) on", "décorateur @\\1", "decorator @\\1"),
+    (r"(Cookie|Form|File)\(\) parameters", "paramètre \\1()", "\\1() parameter"),
+    (r"dependency `.*` must be a project function", "dépendance externe (Depends(objet))", "non-project dependency"),
+    (r"generator dependencies", "dépendance générateur", "generator dependency"),
+    (r"only exception classes are supported", "classe projet (hors modèle/schéma/exception)", "project class"),
+    (r"is not a Pydantic model \(enums", "type Enum ou classe non Pydantic", "Enum or non-Pydantic type"),
+    (r"unsupported type annotation `(?:[\w.]*\.)?(UUID|Decimal|EmailStr|HttpUrl|SecretStr|AnyUrl)", "type \\1", "type \\1"),
+    (r"unsupported type annotation", "annotation de type non supportée", "type annotation"),
+    (r"column .*: unsupported column type `(?:[\w.]*\.)?(\w+)", "colonne \\1", "column type \\1"),
+    (r"column .*: (callable/SQL defaults|only onupdate)", "défaut de colonne calculé", "computed column default"),
+    (r"column .*: cannot infer", "colonne sans type", "untyped column"),
+    (r"inheritance between mapped classes", "héritage de modèles", "model inheritance"),
+    (r"abstract models", "modèle abstrait", "abstract model"),
+    (r"exactly one primary key", "clé primaire composite", "composite primary key"),
+    (r"@(model_validator|computed_field|field_serializer|model_serializer)", "Pydantic @\\1", "Pydantic @\\1"),
+    (r"only mode='after' field validators", "validateur Pydantic mode before/wrap", "Pydantic validator mode"),
+    (r"class `Config`", "Pydantic v1 Config", "Pydantic v1 Config"),
+    (r"model_config (\w+)= is not supported", "model_config \\1=", "model_config \\1="),
+    (r"class attribute `.*` is not supported", "attribut de classe de schéma", "schema class attribute"),
+    (r"unsupported option (\w+)= in", "option \\1=", "option \\1="),
+    (r"unsupported route option (\w+)=", "option de route \\1=", "route option \\1="),
+    (r"unsupported statement `(\w+)`", "instruction \\1", "statement \\1"),
+    (r"`global`/`nonlocal`", "global/nonlocal", "global/nonlocal"),
+    (r"starred assignment|`\*`/`\*\*` expansion", "expansion */** non supportée", "*/** expansion"),
+    (r"unsupported exception class", "classe d'exception externe", "library exception class"),
+    (r"builtin `(\w+)\(\)` is not supported", "builtin \\1()", "builtin \\1()"),
+    (r"unsupported await", "await non supporté", "await"),
+    (r"is not a constant", "valeur non constante", "non-constant value"),
+    (r"needs a type annotation", "paramètre sans annotation", "unannotated parameter"),
+    (r"must be a module-level function", "endpoint imbriqué", "nested endpoint"),
+    (r"unsupported expression", "expression non supportée", "expression"),
+    (r"with/else|for/else|while/else", "boucle avec else", "loop with else"),
+    (r"unknown name", "nom inconnu", "unknown name"),
+    (r"module .* has no attribute", "attribut de module introuvable", "missing module attribute"),
+    (r"erreur interne", "erreur interne du transpileur", "internal transpiler error"),
 ]
 
 
-def classify(e: TranspileError) -> tuple[str, str]:
-    for pat, label in ERROR_CLASSES:
+def classify(e: TranspileError, english: bool = False) -> tuple[str, str]:
+    for pat, label, en in ERROR_CLASSES:
         m = re.search(pat, e.msg)
         if m:
-            return m.expand(label), "x"
-    return "autre : " + re.sub(r"`[^`]*`", "`…`", e.msg)[:80], "other"
+            return m.expand(en if english else label), "x"
+    return ("other: " if english else "autre : ") + re.sub(r"`[^`]*`", "`…`", e.msg)[:80], "other"
 
 
 @dataclass

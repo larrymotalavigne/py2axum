@@ -23,7 +23,7 @@ import aiosmtplib
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from itsdangerous import BadPayload, BadSignature, BadTimeSignature, SignatureExpired, URLSafeTimedSerializer
 from datetime import UTC, datetime
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import ExpiredSignatureError, JWTError, jwt
@@ -33,7 +33,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
-from . import aio, amqp, apiv, bgloop, colls, composite, decos, dunders, lazyimp, libs, life, outbound, pk, prom, rds, retrying, tracing
+from . import aio, amqp, apiv, bgloop, colls, composite, ddl, decos, dunders, extras, lazyimp, libs, life, mounted, outbound, pk, prom, rds, retrying, small, sqlmore, tracing, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Asset, Owner, Project, Secret, Task
@@ -45,6 +45,7 @@ from .schemas import (
 
 app = FastAPI(lifespan=life.lifespan)
 app.include_router(libs.router)
+app.include_router(ddl.router)
 app.include_router(decos.router)
 app.include_router(composite.router)
 app.include_router(dunders.router)
@@ -57,10 +58,27 @@ app.include_router(amqp.router)
 app.include_router(lazyimp.router)
 app.include_router(colls.router)
 app.include_router(retrying.router)
+app.include_router(sqlmore.router)
+app.include_router(extras.router)
 app.include_router(prom.router)
 app.include_router(outbound.router)
 app.include_router(apiv.router, prefix=apiv.settings.API_PREFIX, dependencies=[Depends(apiv.require_user)])
 app.include_router(tracing.router)
+app.include_router(small.router)
+app.include_router(wsock.router)
+
+
+@app.exception_handler(wsock.WsBoom)
+async def ws_boom(websocket, exc):
+    """an application exception handler on a WebSocket route: called with the WebSocket"""
+    await websocket.close(code=4500, reason=str(exc))
+
+
+@app.websocket("/ws-app/{room}", name="room")
+async def ws_room(websocket: WebSocket, room: str):
+    await websocket.accept()
+    await websocket.send_text(f"room {room}")
+    await websocket.close()
 
 oauth2 = OAuth2PasswordBearer(tokenUrl="/token")
 maybe_oauth2 = OAuth2PasswordBearer("/token", auto_error=False)
@@ -1123,8 +1141,21 @@ async def sql_features(db: DbDep, prio: str | None = None):
     if prio:
         filters.append(Task.priority == Priority(prio))
     filtered = (await db.execute(select(func.count()).select_from(select(Task.id).where(and_(*filters)).subquery()))).scalar_one()
+    # the latest task of each project: join(subquery, on) (the "greatest-n-per-group" pattern)
+    latest_sq = (
+        select(Task.project_id, func.max(Task.id).label("max_id"))
+        .where(Task.project_id.is_not(None))
+        .group_by(Task.project_id)
+        .subquery()
+    )
+    latest = (await db.execute(
+        select(Task)
+        .join(latest_sq, (Task.project_id == latest_sq.c.project_id) & (Task.id == latest_sq.c.max_id))
+        .order_by(Task.id)
+    )).scalars().all()
     return {"n_high": n_high, "per_project": [list(r) for r in per_project], "has": has, "any": anyp,
-            "year_ok": [y > 2000 for y in years], "cast": casted, "filtered": filtered}
+            "year_ok": [y > 2000 for y in years], "cast": casted, "filtered": filtered,
+            "latest": [[t.id, t.project_id] for t in latest]}
 
 
 @app.post("/tasks/{task_id}/tag")
@@ -1176,6 +1207,21 @@ async def batch2(db: DbDep):
     reader = csv.reader(["h1,h2\n", "a,b\n", "c,d\n"])
     headers = next(reader)
     out["csv"] = [headers, [row for row in reader]]
+    out["kw_builtins"] = [list(enumerate("ab", start=2)), sum([1, 2], start=10), round(2.675, ndigits=2), int("ff", base=16)]
+    zips = [list(zip([1, 2], "ab", strict=True))]
+    for a in (([1], [1, 2]), ([1, 2], [1]), ([1], [1], [1, 2]), ([1, 2], [1, 2], [1])):
+        try:
+            zip(*a, strict=True)
+            list(zip(*a, strict=True))
+        except ValueError as e:
+            zips.append(str(e))
+    out["zip_strict"] = zips
+    now_d = datetime(2026, 1, 5).date()
+    out["hasattr_builtin"] = [hasattr(datetime(2026, 1, 5), "date"), hasattr(now_d, "date"), hasattr("x", "casefold"),
+                              hasattr([], "append"), hasattr({}, "nope"), hasattr(1.5, "is_integer")]
+    # items without newline (text.splitlines()): one record each, a quoted field continues on the next item
+    out["csv_lines"] = [list(csv.reader("A;B\r\n1;2\n\n3;\"x\ny\"".strip().splitlines(), delimiter=";")),
+                        list(csv.reader(['a,"b', 'c"', "", "d"])), [r for r in csv.DictReader(["k,v", "1,2"])]]
     w = Window(1, 2)
     try:
         w.start = 5
@@ -1197,3 +1243,13 @@ async def batch2(db: DbDep):
 async def token_login(form: OAuth2PasswordRequestForm = Depends()):
     return {"user": form.username, "pw_len": len(form.password), "scopes": form.scopes,
             "grant": form.grant_type, "cid": form.client_id}
+
+
+@app.get("/mounted/native")
+async def mounted_native():
+    """Translated, under the prefix of the mount below: GET stays in the binary, other methods go to the mount."""
+    return {"side": "route"}
+
+
+# last registration: left to the Python side (--python-side mount), see mounted.py
+app.mount("/mounted", mounted.sub)

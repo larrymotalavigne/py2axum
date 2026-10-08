@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py2axum"
-version = "0.2.0"
+version = "0.3.0"
 description = "Ahead-of-time compiler from FastAPI + SQLAlchemy + Pydantic applications to Rust (axum), with response-level conformance testing"
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,7 +29,21 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-conformance = ["httpx>=0.27", "fastapi>=0.115", "uvicorn[standard]>=0.30", "sqlalchemy[asyncio]>=2.0", "psycopg[binary]>=3.2", "pydantic[email]>=2.9"]
+# the library ranges py2axum is tested on (py2axum/versions.py, docs/supported.md); a project locking a version
+# outside them is refused (--allow-untested-versions overrides)
+conformance = [
+    "fastapi>=0.137.0,<0.143",
+    "starlette>=1.0.0,<1.8",
+    "pydantic[email]>=2.12.0,<2.14",
+    "pydantic-core>=2.41.1,<2.47",
+    "pydantic-settings>=2.11.0,<2.16",
+    "sqlalchemy[asyncio]>=2.0.44,<2.2",
+    "psycopg[binary]>=3.2.12,<3.4",
+    "httpx>=0.28.1,<0.29",
+    "aiohttp>=3.13.0,<3.15",
+    "mcp>=2.2.0,<2.3",
+    "uvicorn[standard]>=0.30",
+]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]

@@ -65,7 +65,8 @@ otherwise it answers 404 and your ingress routes them.
 
 `--python-side auto` finds those routes for you: a first pass compiles every route without stopping, then
 every path whose route does not translate (its own code or a function it reaches) is left to Python, along
-with raw `add_route` routes with a literal path. Each moved path is printed with the error that blocked it:
+with raw `add_route` routes with a literal path and the app's last `app.mount()`s (`--python-side mount`: the
+requests under the mount that no translated route fully matches). Each moved path is printed with the error that blocked it:
 
 ```
 python-side (auto): /assistant/chat (POST chat) — app/tools.py:61: method .model_json_schema() is not

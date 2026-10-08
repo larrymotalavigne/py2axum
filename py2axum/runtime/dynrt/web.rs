@@ -93,7 +93,7 @@ pub async fn param(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static 
         "path" => cx.req.path_params.lock().iter().find(|(k, _)| k == alias).map(|(_, v)| V::str(v)),
         "header" => cx.req.header(alias).map(V::str),
         _ => {
-            if matches!(td, TD::List(_)) || matches!(td, TD::Optional(TD::List(_))) {
+            if matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_))) {
                 let vals: Vec<V> = cx.req.query.iter().filter(|(k, _)| k == alias).map(|(_, v)| V::str(v)).collect();
                 if vals.is_empty() { None } else { Some(V::list(vals)) }
             } else {
@@ -232,7 +232,9 @@ pub static CREDENTIALS: pyd::SchemaDesc = pyd::SchemaDesc {
     slots: &[],
     settings: None,
     init: None,
+    private: &[],
     computed: &[],
+    json_schema: None,
 };
 
 pub enum Security {
@@ -240,12 +242,81 @@ pub enum Security {
     OAuth2Bearer,
     /// `HTTPBearer()`: HTTPAuthorizationCredentials
     HttpBearer,
+    /// `HTTPBasic(realm=...)`: HTTPBasicCredentials
+    HttpBasic(Option<&'static str>),
+}
+
+static BASIC_CLASS: Class = Class { name: "HTTPBasicCredentials", qualname: "HTTPBasicCredentials", bases: &[], kind: ClassKind::Schema(&BASIC) };
+/// `fastapi.security.HTTPBasicCredentials` (a Pydantic model: `.username`, `.password`)
+pub static BASIC: pyd::SchemaDesc = pyd::SchemaDesc {
+    name: "HTTPBasicCredentials",
+    class: &BASIC_CLASS,
+    fields: &[
+        pyd::FieldDesc { name: "username", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
+        pyd::FieldDesc { name: "password", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
+    ],
+    from_attributes: false,
+    extra: pyd::Extra::Ignore,
+    validators: &[],
+    validate_assignment: false,
+    populate_by_name: false,
+    methods: &[],
+    open: false,
+    model_after: &[],
+    before: &[],
+    model_before: &[],
+    has_before: false,
+    frozen: false,
+    post_init: None,
+    hash: pyd::HashKind::Unhashable,
+    dataclass: false,
+    async_methods: &[],
+    slots: &[],
+    settings: None,
+    init: None,
+    private: &[],
+    computed: &[],
+    json_schema: None,
+};
+
+/// `HTTPBasic.__call__`: a missing or non-Basic header is a 401 (None without auto_error); a payload that
+/// is not base64 of ASCII `user:password` is a 401 whatever auto_error says.
+fn http_basic(cx: &Cx, realm: Option<&str>, auto_error: bool) -> R {
+    let challenge = match realm {
+        Some(r) => format!("Basic realm=\"{r}\""),
+        None => "Basic".into(),
+    };
+    let denied = || Err(Exc::http(401, V::str("Not authenticated"), vec![("WWW-Authenticate".into(), challenge.clone())]));
+    let authorization = cx.req.header("authorization").unwrap_or_default();
+    let (scheme, param) = authorization.split_once(' ').unwrap_or((&authorization, ""));
+    if authorization.is_empty() || !scheme.eq_ignore_ascii_case("basic") {
+        return if auto_error { denied() } else { Ok(V::None) };
+    }
+    let param = param.trim();
+    if !param.is_ascii() {
+        return denied();
+    }
+    let Ok(data) = super::stdlib::b64dec(param.as_bytes(), false) else { return denied() };
+    if !data.is_ascii() {
+        return denied();
+    }
+    let data = String::from_utf8(data).unwrap_or_default();
+    let Some((user, password)) = data.split_once(':') else { return denied() };
+    Ok(V::Inst(Arc::new(pyd::Inst {
+        desc: &BASIC,
+        vals: Mutex::new(vec![V::str(user), V::str(password)]),
+        set: Mutex::new(vec![true, true]),
+        extra: Mutex::new(IndexMap::new()),
+    })))
 }
 
 /// A security scheme used as a dependency, as FastAPI 0.142 calls it: `Authorization` header split on
 /// the first space (`get_authorization_scheme_param`), 401 `Not authenticated` with `WWW-Authenticate:
 /// Bearer`, or None when `auto_error=False`.
 pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
+    if let Security::HttpBasic(realm) = kind {
+        return http_basic(cx, realm, auto_error);
+    }
     let authorization = cx.req.header("authorization").unwrap_or_default();
     let present = !authorization.is_empty();
     let (scheme, param) = authorization.split_once(' ').unwrap_or((&authorization, ""));
@@ -253,6 +324,7 @@ pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
     let ok = match kind {
         Security::OAuth2Bearer => present && scheme.eq_ignore_ascii_case("bearer"),
         Security::HttpBearer => present && !scheme.is_empty() && !param.is_empty() && scheme.eq_ignore_ascii_case("bearer"),
+        Security::HttpBasic(_) => unreachable!(),
     };
     if !ok {
         if auto_error {
@@ -268,6 +340,7 @@ pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
             set: Mutex::new(vec![true, true]),
             extra: Mutex::new(IndexMap::new()),
         })),
+        Security::HttpBasic(_) => unreachable!(),
     })
 }
 
@@ -326,7 +399,7 @@ fn form_value(v: &FormVal) -> V {
 pub async fn form_field(cx: &Cx, form: &[(String, FormVal)], alias: &str, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
     let loc = vec![V::str("body"), V::str(alias)];
     let vals: Vec<&FormVal> = form.iter().filter(|(k, _)| k == alias).map(|(_, v)| v).collect();
-    let raw = if matches!(td, TD::List(_)) || matches!(td, TD::Optional(TD::List(_))) {
+    let raw = if matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_))) {
         if vals.is_empty() { None } else { Some(V::list(vals.iter().map(|v| form_value(v)).collect())) }
     } else {
         match vals.last() {
@@ -393,6 +466,17 @@ pub struct Streaming {
 
 pub type GenRx = tokio::sync::mpsc::Receiver<V>;
 
+/// FastAPI validates the returned value itself: an instance of the response model's own class is kept
+/// (its private attributes with it); other instances go through their dump.
+fn prepare_for(v: &V, td: &'static TD) -> R {
+    match (v, td) {
+        (V::Inst(i), TD::Schema(d)) if std::ptr::eq(i.desc, *d) => Ok(v.clone()),
+        (V::Inst(i), TD::Optional(TD::Schema(d))) if std::ptr::eq(i.desc, *d) => Ok(v.clone()),
+        (V::List(l), TD::List(Some(inner))) => Ok(V::list(l.lock().clone().iter().map(|x| prepare_for(x, inner)).collect::<R<Vec<_>>>()?)),
+        _ => prepare(v),
+    }
+}
+
 fn prepare(v: &V) -> R {
     Ok(match v {
         V::Inst(_) => pyd::dump(v, pyd::DumpOpts { by_alias: true, ..Default::default() })?,
@@ -420,6 +504,66 @@ fn no_body(status: u16) -> bool {
 
 /// Endpoint return value -> response (response_model validation + Pydantic JSON, or jsonable_encoder).
 pub async fn respond(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) -> R<Response> {
+    respond_as(cx, ret, model, Some(status), None).await
+}
+
+/// Same, with the route's `response_class=` (`cls` = its class name, None = JSONResponse) and its
+/// `status_code=` (None = not given: the class default, 307 for RedirectResponse). FastAPI builds
+/// `response_class(content, status_code=..., background=...)` from the encoded value, empties the body
+/// for a no-body status, then appends the `response` parameter's headers.
+pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Option<u16>, cls: Option<&'static str>) -> R<Response> {
+    let Some(cls) = cls.filter(|c| *c != "JSONResponse") else {
+        return respond_json(cx, ret, model, status.unwrap_or(200)).await;
+    };
+    if let V::Native(n) = &ret {
+        if matches!(&**n, Native::RespObj(_) | Native::Streaming(_)) {
+            return respond_json(cx, ret, model, status.unwrap_or(200)).await;
+        }
+    }
+    if cls == "StreamingResponse" {
+        return Err(Exc::runtime("py2axum: response_class=StreamingResponse with an endpoint that does not return a response is not supported"));
+    }
+    let content = encode(cx, &ret, model).await?;
+    let mut kwargs = Vec::new();
+    if let Some(st) = cx.resp.status.lock().or(status) {
+        kwargs.push(("status_code".to_string(), V::Int(st as i64)));
+    }
+    let key = if cls == "RedirectResponse" { "url" } else if cls == "FileResponse" { "path" } else { "content" };
+    let obj = super::resp::new(cls, &[], &[vec![(key.to_string(), content)], kwargs].concat())?;
+    let V::Native(n) = &obj else { unreachable!() };
+    let Native::RespObj(r) = &**n else { unreachable!() };
+    let st = *r.status.lock();
+    if no_body(st) {
+        if let super::resp::RespBody::Bytes(_) = &r.body {
+            let r2 = super::resp::RespObj { status: parking_lot::Mutex::new(st), headers: parking_lot::Mutex::new(r.headers.lock().clone()),
+                                            body: super::resp::RespBody::Bytes(vec![]), media: r.media.clone() };
+            r2.headers.lock().extend(cx.resp.headers.lock().iter().cloned());
+            return super::resp::into_response(&r2);
+        }
+    }
+    r.headers.lock().extend(cx.resp.headers.lock().iter().cloned());
+    super::resp::into_response(r)
+}
+
+/// `serialize_response`: the response_model's JSON dump, or jsonable_encoder.
+async fn encode(cx: &Cx, ret: &V, model: Option<&'static TD>) -> R<V> {
+    match model {
+        Some(td) => {
+            let prepared = prepare_for(ret, td)?;
+            let mut errs = Vec::new();
+            match pyd::validate(cx, &prepared, td, &[V::str("response")], &mut errs).await? {
+                Some(v) => pyd::dump(&v, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() }),
+                _ => {
+                    let detail: Vec<String> = errs.iter().map(|e| format!("{}: {}", e.kind, e.msg)).collect();
+                    Err(Exc::runtime(format!("ResponseValidationError: {}", detail.join("; "))))
+                }
+            }
+        }
+        None => pyd::jsonable(ret),
+    }
+}
+
+async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) -> R<Response> {
     if let V::Native(n) = &ret {
         // a Response object is sent as is (no serialization, the `response` parameter is not merged)
         if let Native::RespObj(r) = &**n {
@@ -439,20 +583,7 @@ pub async fn respond(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) -
         }
         return Ok(b.body(Body::empty()).unwrap());
     }
-    let content = match model {
-        Some(td) => {
-            let prepared = prepare(&ret)?;
-            let mut errs = Vec::new();
-            match pyd::validate(cx, &prepared, td, &[V::str("response")], &mut errs).await? {
-                Some(v) => pyd::dump(&v, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() })?,
-                _ => {
-                    let detail: Vec<String> = errs.iter().map(|e| format!("{}: {}", e.kind, e.msg)).collect();
-                    return Err(Exc::runtime(format!("ResponseValidationError: {}", detail.join("; "))));
-                }
-            }
-        }
-        None => pyd::jsonable(&ret)?,
-    };
+    let content = encode(cx, &ret, model).await?;
     Ok(json_body(status, pyd::to_json(&content, &pyd::RESPONSE, false)?, &headers))
 }
 
@@ -617,6 +748,23 @@ pub async fn run_teardowns(cx: &Cx, ok: bool) {
 }
 
 /// A request future dropped (client gone): the pending generators are released, not leaked.
+/// Run a WebSocket route: FastAPI's `websocket_session` closes the dependencies' exit stack once the
+/// endpoint returns (the session dependency commits there); an exception escapes after it.
+pub async fn run_ws_route(cx: &Cx, run: super::ws::WsRunFn) -> R<()> {
+    let _guard = TeardownGuard(Some(cx.clone()));
+    if let Err(e) = run(cx).await {
+        run_teardowns(cx, false).await;
+        return Err(e);
+    }
+    run_teardowns(cx, true).await;
+    if let Some(V::Session(s)) = cx.session.get() {
+        if cx.app.commit_after {
+            s.commit().await?;
+        }
+    }
+    Ok(())
+}
+
 struct TeardownGuard(Option<Cx>);
 
 impl Drop for TeardownGuard {
@@ -747,7 +895,23 @@ fn min_level() -> i32 {
     })
 }
 
-pub fn log(name: &str, method: &str, args: &[V]) -> R {
+/// `Logger.<level>(msg, *args, exc_info=, extra=, stack_info=, stacklevel=)`: printed on stderr when the
+/// level passes PY2AXUM_LOG_LEVEL, then handed to Sentry's logging integration (when initialised; its
+/// future is boxed so that the common path stays small).
+pub async fn log(cx: &Cx, name: &str, method: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    if method == "isEnabledFor" {
+        return Ok(V::Bool(args.first().and_then(|a| if let V::Int(i) = a { Some(*i) } else { None }).unwrap_or(0) >= min_level() as i64));
+    }
+    if let Some(rec) = log_print(cx, name, method, args, kwargs)? {
+        Box::pin(super::sentry::log_record(cx, &rec.0, rec.1, &rec.2, &rec.3, &rec.4, rec.5, rec.6)).await;
+    }
+    Ok(V::None)
+}
+
+/// A record for Sentry: logger, level, msg, args, formatted message, exception, extra.
+type LogRec = (String, i64, V, Vec<V>, String, Option<Exc>, Option<V>);
+
+fn log_print(cx: &Cx, name: &str, method: &str, args: &[V], kwargs: &[(String, V)]) -> R<Option<LogRec>> {
     if method == "log" {
         // Logger.log(level, msg, *args): the standard levels (CPython names others "Level N")
         let m = match args.first() {
@@ -759,7 +923,7 @@ pub fn log(name: &str, method: &str, args: &[V]) -> R {
             Some(V::Int(l)) => return Err(Exc::type_error(format!("py2axum: logging at level {l} is not supported (standard levels only)"))),
             _ => return Err(Exc::type_error("level must be an integer")),
         };
-        return log(name, m, &args[1..]);
+        return log_print(cx, name, m, &args[1..], kwargs);
     }
     let (level_name, level) = match method {
         "debug" => ("DEBUG", 10),
@@ -768,26 +932,59 @@ pub fn log(name: &str, method: &str, args: &[V]) -> R {
         "error" | "exception" => ("ERROR", 40),
         "critical" | "fatal" => ("CRITICAL", 50),
         // logger configuration: the binary's log level comes from PY2AXUM_LOG_LEVEL (documented)
-        "setLevel" | "addHandler" | "removeHandler" | "addFilter" | "removeFilter" => return Ok(V::None),
-        "isEnabledFor" => return Ok(V::Bool(args.first().and_then(|a| if let V::Int(i) = a { Some(*i) } else { None }).unwrap_or(0) >= min_level() as i64)),
+        "setLevel" | "addHandler" | "removeHandler" | "addFilter" | "removeFilter" => return Ok(None),
         _ => return Err(Exc::attr_error(format!("'Logger' object has no attribute '{method}'"))),
     };
+    let mut exc_info = if method == "exception" { Some(V::Bool(true)) } else { None };
+    let mut extra = None;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "exc_info" => exc_info = Some(v.clone()),
+            "extra" => extra = Some(v.clone()),
+            "stack_info" | "stacklevel" => {}
+            _ => return Err(Exc::type_error(format!("Logger._log() got an unexpected keyword argument '{k}'"))),
+        }
+    }
     if level < min_level() {
-        return Ok(V::None);
+        return Ok(None);
     }
     let msg = match args.split_first() {
         None => String::new(),
         Some((fmt, rest)) => {
             let f = ops::str_(fmt)?;
-            if rest.is_empty() {
-                f
-            } else {
-                ops::percent_format(&f, &V::tuple(rest.to_vec()))?
+            match rest {
+                [] => f,
+                // a single non-empty mapping is the record's args (`log.info("%(a)s", {"a": 1})`)
+                [d @ V::Dict(m)] if !m.lock().is_empty() => ops::percent_format(&f, d)?,
+                _ => ops::percent_format(&f, &V::tuple(rest.to_vec()))?,
             }
         }
     };
     eprintln!("{level_name}:{name}:{msg}");
-    Ok(V::None)
+    if !super::sentry::active() {
+        return Ok(None);
+    }
+    let exc = match &exc_info {
+        Some(V::Exc(e)) => Some(e.clone()),
+        Some(V::Tuple(t)) if t.len() == 3 => match &t[1] {
+            V::Exc(e) => Some(e.clone()),
+            _ => None,
+        },
+        Some(v) if ops::truthy(v)? => cx.handling.lock().last().cloned(),
+        _ => None,
+    };
+    let extra = match extra {
+        Some(V::Dict(m)) => {
+            let items: Vec<(V, V)> = m.lock().values().filter(|(k, _)| !k.as_str().is_some_and(|s| s.starts_with('_'))).cloned().collect();
+            Some(V::dict_from(items)?)
+        }
+        _ => None,
+    };
+    let (fmt, rest) = match args.split_first() {
+        Some((f, r)) => (f.clone(), r.to_vec()),
+        None => (V::str(""), vec![]),
+    };
+    Ok(Some((name.to_string(), level as i64, fmt, rest, msg, exc, extra)))
 }
 
 pub fn dep_cache_get(cx: &Cx, key: &'static str) -> Option<V> {
@@ -815,6 +1012,12 @@ pub struct RouteDef {
     pub run: RunFn,
     /// its `APIRoute` in the route tree (`request.scope["route"]`)
     pub node: Option<&'static super::routing::Node>,
+    /// the route's path (runtime prefix markers included): Sentry's transaction name
+    pub path: &'static str,
+    /// the handler: `file.py:line`, function, module (Sentry's `py2axum.source` and frame)
+    pub src: (&'static str, &'static str, &'static str),
+    /// a `def` endpoint (FastAPI runs it in a thread, in a copy of the context)
+    pub sync_endpoint: bool,
 }
 
 static ROUTE_RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
@@ -860,7 +1063,7 @@ pub fn runtime_prefix(prefix: &str) -> String {
     out
 }
 
-fn route_regex(pattern: &str) -> regex::Regex {
+pub fn route_regex(pattern: &str) -> regex::Regex {
     let mut pat = pattern.to_string();
     if let Some(ps) = PREFIXES.get() {
         for (i, p) in ps.iter().enumerate() {
@@ -920,12 +1123,25 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
                     .collect();
                 *cx.req.path_params.lock() = pp;
                 *cx.req.route.lock() = r.node;
-                return run_route(cx, r.run).await;
+                if !super::sentry::active() {
+                    return run_route(cx, r.run).await;
+                }
+                super::sentry::route_matched(cx, runtime_prefix(r.path), Some(r.src), true);
+                if !r.sync_endpoint {
+                    return run_route(cx, r.run).await;
+                }
+                let saved = super::sentry::context_enter(cx);
+                let res = run_route(cx, r.run).await;
+                super::sentry::context_exit(cx, saved);
+                return res;
             }
             partial.get_or_insert(r);
         }
     }
     if let Some(r) = partial {
+        if super::sentry::active() {
+            super::sentry::route_matched(cx, runtime_prefix(r.path), Some(r.src), false);
+        }
         return Err(Exc::http(405, V::str("Method Not Allowed"), vec![("allow".into(), r.method.into())]));
     }
     // routes added at run time (`app.add_route`) come after the declared ones
@@ -938,6 +1154,9 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
             None => vec![],
         };
         *cx.req.path_params.lock() = pp;
+        if super::sentry::active() {
+            super::sentry::route_matched(cx, a.path.clone(), None, true);
+        }
         if super::rawasgi::is_asgi_app(&a.endpoint) {
             return super::rawasgi::serve(cx, &a.endpoint).await;
         }
@@ -967,6 +1186,19 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
     Err(Exc::http(404, V::str("Not Found"), vec![]))
 }
 
+/// A route that `route` would run (path and method): declared, then added at run time.
+pub fn full_match(raw_path: &str, method: &str, routes: &'static [RouteDef]) -> bool {
+    let res = ROUTE_RES.get_or_init(|| routes.iter().map(|r| route_regex(r.pattern)).collect());
+    let path = unquote(raw_path);
+    if routes.iter().zip(res).any(|(r, re)| r.method == method && re.is_match(&path)) {
+        return true;
+    }
+    if routes.iter().zip(res).any(|(_, re)| re.is_match(&path)) {
+        return false; // `route` would answer 405 without looking at the added routes: Python decides
+    }
+    matches!(super::routing::added_match(&path, method), Some((_, true)))
+}
+
 pub async fn not_found() -> Response {
     json_body(404, r#"{"detail":"Not Found"}"#.to_string(), &[])
 }
@@ -987,6 +1219,23 @@ pub struct Task {
     /// `task.cancel()`: the coroutine stops at its current await (its future is dropped)
     cancel: tokio::sync::Notify,
     cancelled: std::sync::atomic::AtomicBool,
+    /// its exception was read (`await task`): otherwise asyncio logs it when the task is collected
+    retrieved: AtomicBool,
+    cx: Cx,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        if self.retrieved.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(Err(e)) = self.result.lock().take() {
+            if !e.isinstance(&CANCELLED_ERROR) {
+                eprintln!("ERROR:asyncio:Task exception was never retrieved: {:?}", e);
+                super::sentry::task_never_retrieved(self.cx.clone(), e);
+            }
+        }
+    }
 }
 
 /// `await task`: its result (or exception) once it has finished
@@ -994,6 +1243,7 @@ pub async fn task_result(t: &Arc<Task>) -> R {
     loop {
         let wait = t.finished.notified();
         if let Some(r) = t.result.lock().clone() {
+            t.retrieved.store(true, Ordering::Relaxed);
             return r;
         }
         wait.await;
@@ -1014,6 +1264,8 @@ pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
         finished: tokio::sync::Notify::new(),
         cancel: tokio::sync::Notify::new(),
         cancelled: std::sync::atomic::AtomicBool::new(false),
+        retrieved: AtomicBool::new(false),
+        cx: cx.clone(),
     });
     let tv = V::native(Native::Task(task.clone()));
     let (cx2, tv2) = (cx.clone(), tv.clone());
@@ -1022,11 +1274,6 @@ pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
             r = fut => r,
             _ = task.cancel.notified() => Err(Exc::new(&CANCELLED_ERROR, vec![])),
         };
-        if let Err(e) = &r {
-            if !e.isinstance(&CANCELLED_ERROR) {
-                eprintln!("ERROR:asyncio:Task exception was never retrieved: {:?}", e);
-            }
-        }
         *task.result.lock() = Some(r);
         // done before anyone waiting on the result runs again
         let callbacks = {

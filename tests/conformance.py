@@ -5,10 +5,12 @@ content-encoding and JSON bodies must match byte for byte, key order included.
 usage: python tests/conformance.py REF_URL CAND_URL [--scenario app] [--ignore-encoding]
 
 Scenarios live in tests/scenarios/<name>.py and define:
-  STEPS       list of (method, path, payload[, headers]); payload = None, bytes or a JSON value
+  STEPS       list of (method, path, payload[, headers]); payload = None, bytes or a JSON value;
+              method "WS": a WebSocket connection, payload = its script (see ws_step)
   reset(db)   bring the database (DATABASE_URL) back to the scenario's initial state
   normalize   optional: body -> body, for differences proven not to be semantic
   normalize_text  optional: text -> text, the same for bodies that are not JSON
+  HEADER_MASKS, COOKIE_MASKS, FILE_MASKS  optional: middleware headers, cookies, file headers to mask
 
 Generated instants (`created_at`, ...) cannot match between two runs: every ISO-8601 datetime the
 client did not send is replaced by its *shape* (digits -> 9), so the format (Z vs offset, fraction
@@ -52,7 +54,7 @@ def sent_datetimes(steps) -> set[str]:
     found: set[str] = set()
     for step in steps:
         payload = step[2]
-        text = payload.decode(errors="replace") if isinstance(payload, bytes) else json.dumps(payload)
+        text = payload.decode(errors="replace") if isinstance(payload, bytes) else json.dumps(payload, default=repr)
         found.update(DATETIME.findall(text + " " + step[1]))
     return found
 
@@ -67,6 +69,58 @@ def mask_cookie(scenario, cookie: str) -> str:
     return cookie
 
 
+def ws_step(base: str, step) -> dict:
+    """A WebSocket connection played from a script: ("send", str | bytes), ("recv", n), ("close"[, code,
+    reason]), ("sleep", s). Compared: the handshake status (with the body and content type of a refusal),
+    the accepted subprotocol, the `x-` headers, the messages received, the close code and reason received
+    (1006: the connection dropped without a close frame). `compression=None`: the binary does not
+    implement permessage-deflate (docs/supported.md), the client asks neither server for it."""
+    from websockets.exceptions import ConnectionClosed, InvalidStatus
+    from websockets.sync.client import connect
+
+    path, script = step[1], step[2]
+    headers = dict(step[3]) if len(step) > 3 else {}
+    subprotocols = headers.pop("subprotocols", None)
+    out: dict = {"req": f"WS {path}"}
+    got: list = []
+    try:
+        with connect(base.replace("http://", "ws://", 1) + path, additional_headers=headers, subprotocols=subprotocols,
+                     compression=None, open_timeout=5, close_timeout=3) as ws:
+            out.update(status=101, subprotocol=ws.subprotocol,
+                       headers={k.lower(): v for k, v in ws.response.headers.raw_items() if k.lower().startswith("x-")})
+            try:
+                for act in script:
+                    if act[0] == "send":
+                        ws.send(act[1])
+                    elif act[0] == "recv":
+                        for _ in range(act[1]):
+                            m = ws.recv(timeout=3)
+                            got.append(["bytes", m.hex()] if isinstance(m, bytes) else ["text", m])
+                    elif act[0] == "close":
+                        ws.close(*act[1:])
+                    elif act[0] == "sleep":
+                        time.sleep(act[1])
+            except ConnectionClosed:
+                pass
+            except TimeoutError:
+                got.append(["timeout"])
+    except InvalidStatus as e:
+        r = e.response
+        out.update(status=r.status_code, ctype=r.headers.get("content-type"), body=r.body.decode(errors="replace"),
+                   headers={k.lower(): v for k, v in r.headers.raw_items() if k.lower().startswith("x-")})
+        return out
+    out.update(msgs=got, closed=[ws.close_code, ws.close_reason])
+    time.sleep(0.15)  # what the server does after the connection (its log) lands before the next step
+    return out
+
+
+def mask_file(scenario, value: str | None) -> str | None:
+    """FILE_MASKS: (pattern, replacement) on the file headers (a timestamp in a download's file name...)."""
+    for pat, repl in getattr(scenario, "FILE_MASKS", []) if value else []:
+        value = re.sub(pat, repl, value)
+    return value
+
+
 def run(base: str, scenario) -> list[dict]:
     scenario.reset(DB)
     sent = sent_datetimes(scenario.STEPS)
@@ -75,6 +129,17 @@ def run(base: str, scenario) -> list[dict]:
     with httpx.Client(base_url=base, timeout=10, headers={"accept-encoding": "gzip"}) as c:
         for step in scenario.STEPS:
             method, path, payload = step[:3]
+            if method == "WS":
+                out.append(ws_step(base, step))
+                continue
+            if method == "SQL":
+                # a fixture the HTTP API cannot create (a paid plan, a tenant's password...): the same
+                # statement on the shared database before the next request, nothing compared
+                import psycopg
+
+                with psycopg.connect(DB.replace("postgresql+psycopg://", "postgresql://")) as conn:
+                    conn.execute(path)
+                continue
             headers = dict(step[3]) if len(step) > 3 else {}
             if isinstance(payload, bytes):
                 kw = {"content": payload, "headers": {**J, **headers}}
@@ -103,7 +168,7 @@ def run(base: str, scenario) -> list[dict]:
                         "location": (r.headers.get("location") or "").replace(base, "<base>") or None,
                         "www_authenticate": r.headers.get("www-authenticate"),
                         "cookies": [mask_cookie(scenario, re.sub(r"expires=[^;]+", "expires=<date>", c)) for c in r.headers.get_list("set-cookie")],
-                        "file": [r.headers.get(h) for h in ("content-disposition", "etag", "last-modified", "accept-ranges")],
+                        "file": [mask_file(scenario, r.headers.get(h)) for h in ("content-disposition", "etag", "last-modified", "accept-ranges")],
                         # middlewares: CORS, security headers, rate limiting...
                         "mw": {k: "<masked>" if k in getattr(scenario, "HEADER_MASKS", ()) else ", ".join(r.headers.get_list(k))
                                for k in sorted(set(r.headers.keys())) if k.startswith(MW_HEADER_PREFIXES)},

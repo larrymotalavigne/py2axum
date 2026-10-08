@@ -136,6 +136,28 @@ def transpile(tmp_path: Path, handler: str) -> None:
             ''',
             "needs a response_model",
         ),
+        (
+            '''
+            from fastapi import WebSocket
+            @app.websocket("/ws")
+            async def ws(websocket: WebSocket):
+                await websocket.accept()
+            ''',
+            "@app.websocket(...) is not supported by the typed backend (use --backend dyn)",
+        ),
+        (
+            '''
+            from fastapi import APIRouter, WebSocket
+            router = APIRouter()
+
+            @router.websocket("/ws")
+            async def ws(websocket: WebSocket):
+                await websocket.accept()
+
+            app.include_router(router)
+            ''',
+            "@router.websocket(...) is not supported by the typed backend (use --backend dyn)",
+        ),
     ],
 )
 def test_rejected_with_location(tmp_path, handler, message):

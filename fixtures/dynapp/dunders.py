@@ -106,6 +106,21 @@ async def hashing():
         ("bag", lambda: len({Bag(1), Bag(1)})),
         ("key", lambda: len({Key(1), Key(1), Key(2)})),
         ("frozen", lambda: len({Frozen(a=1), Frozen(a=1), Frozen(a=2)})),
+        # Python 3.14 names the role of the unhashable value (dict key, set element), not everywhere
+        ("tuple_key", lambda: {(1, [2]): 1}),
+        ("in_set", lambda: [1] in {1}),
+        ("in_dict", lambda: [1] in {1: 2}),
+        ("get", lambda: {1: 2}.get([1])),
+        ("getitem", lambda: {1: 2}[[1]]),
+        ("set_call", lambda: set([[1]])),
+        ("add", lambda: {1}.add([1])),
+        ("discard", lambda: {1}.discard([1])),
+        ("isdisjoint", lambda: {1}.isdisjoint([[1]])),
+        ("issubset", lambda: {1}.issubset([[1]])),
+        ("intersection_update", lambda: {1}.intersection_update([[1]])),
+        ("difference_update", lambda: {1}.difference_update([[1]])),
+        ("fromkeys", lambda: dict.fromkeys([[1]])),
+        ("hash", lambda: hash([1])),
     ]:
         out[name] = _try(f)
     return out
@@ -235,7 +250,11 @@ async def builtins_route():
     xs = [3, 0, 5, None, 2]
     return {
         "math": [round(math.radians(180), 12), math.degrees(math.pi), round(math.sin(1), 15), math.cos(0), round(math.atan2(1, 2), 15),
-                 round(math.sqrt(2), 15), math.hypot(3, 4), math.copysign(2, -0.0), math.isfinite(1.0), _try(lambda: math.asin(2))],
+                 round(math.sqrt(2), 15), math.hypot(3, 4), math.copysign(2, -0.0), math.isfinite(1.0), _try(lambda: math.asin(2)),
+                 # Python 3.14 says which input was expected
+                 _try(lambda: math.sqrt(-1)), _try(lambda: math.log(0)), _try(lambda: math.log(-1, 2)), _try(lambda: math.log10(0)),
+                 _try(lambda: math.log2(-2)), _try(lambda: math.acos(-2.5)), _try(lambda: math.cos(float("inf"))),
+                 _try(lambda: math.tan(float("-inf"))), _try(lambda: math.pow(0, -1))],
         "today": type(datetime.today()).__name__,
         "filter": [list(filter(None, xs)), list(filter(lambda x: x is not None and x > 1, xs))],
         "map": [list(map(str, [1, 2])), list(map(lambda a, b: a + b, [1, 2, 3], [10, 20]))],

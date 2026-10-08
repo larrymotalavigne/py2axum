@@ -1,6 +1,7 @@
 """py2axum: transpile a FastAPI + SQLAlchemy + Pydantic + aiohttp package to a Rust/axum project.
 
 usage: python -m py2axum <python package dir> -o <output dir> [--name crate_name] [--root DIR]
+       python -m py2axum check <python package dir> [--root DIR] [--json] [--fail-under PCT]
        python -m py2axum <python package dir> --report report.md [--root DIR]   (+ report.json)
 """
 from __future__ import annotations
@@ -15,6 +16,11 @@ from .ir import TranspileError
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["check"]:
+        from .check import main as check
+
+        return check(argv[1:])
     ap = argparse.ArgumentParser(prog="py2axum", description=__doc__.splitlines()[0])
     ap.add_argument("package", type=Path, help="directory of the FastAPI application package")
     ap.add_argument("-o", "--out", type=Path, help="output directory for the Rust project")
@@ -22,19 +28,30 @@ def main(argv: list[str] | None = None) -> int:
                     help="import root, like sys.path (default: parent of the package)")
     ap.add_argument("--backend", choices=["auto", "typed", "dyn"], default="auto",
                     help="typed: static Rust (narrow subset); dyn: dynamic values (real projects); auto: typed, else dyn")
-    ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan",
-                    help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan); "
-                         "auto: every route that does not translate")
+    ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
+                    help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
+                         "mount: the app's last app.mount(), which gets every request no translated route fully matches); "
+                         "auto: every route that does not translate, and such mounts")
     ap.add_argument("--report", type=Path, default=None,
                     help="coverage report (Markdown + JSON) instead of generating: never stops at the first error")
     ap.add_argument("--name", default=None, help="crate name (default: <package>_axum)")
     ap.add_argument("--no-stream", action="store_true", help="buffer list responses instead of streaming them")
+    ap.add_argument("--allow-untested-versions", action="store_true",
+                    help="translate even if the project locks library versions outside the tested ranges")
     args = ap.parse_args(argv)
+    from .versions import check_project
+
+    bad = [] if args.allow_untested_versions else check_project(args.root or args.package.resolve().parent, args.package)
+    if bad and not args.report:
+        for msg, file, line in bad:
+            print(f"error: {file}:{line}: {msg}", file=sys.stderr)
+        return 1
     if args.report:
         from .report import aggregate, build, write
 
         result = build(args.package, args.root, stream=not args.no_stream,
                        python_side=tuple(args.python_side) or ("lifespan",))
+        result["global"] += [("version hors fourchette", f"{file}:{line}: {msg}") for msg, file, line in bad]
         write(result, args.report)
         agg = aggregate(result["routes"])
         print(f"report {args.report} (+ .json): {agg['traduites']}/{agg['total']} routes translated", file=sys.stderr)
@@ -101,11 +118,16 @@ def auto_python_side(package: Path, root: Path | None, python_side: set[str]) ->
               file=sys.stderr)
         return None
     moved: dict[str, tuple[str, TranspileError]] = {p: ("raw route", e) for p, e in fe.auto_side.items()}
+    if fe.__dict__.get("mount_fallback"):
+        moved["mount"] = ("app.mount", None)
     for info, errs in per_route:
         if errs and info["path"] not in moved:
             moved[info["path"]] = (f"{info['method'].upper()} {info['func']}", errs[0])
     for path, (what, e) in sorted(moved.items()):
-        print(f"python-side (auto): {path} ({what}) — {e.render()}", file=sys.stderr)
+        if e is None:
+            print(f"python-side (auto): {what} — requests no translated route fully matches", file=sys.stderr)
+        else:
+            print(f"python-side (auto): {path} ({what}) — {e.render()}", file=sys.stderr)
     return set(moved)
 
 

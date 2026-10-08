@@ -490,10 +490,29 @@ class Frontend:
     def _is_app(self, module: str, node: ast.AST) -> bool:
         return isinstance(node, ast.Name) and node.id in self.app_vars.get(module, ())
 
+    def _asgi_class(self, module: str, func: ast.AST) -> bool:
+        """A project class whose `__call__(self, scope, receive, send)` makes its instances ASGI applications."""
+        t = self.index.resolve_expr(module, func)
+        d = self.index.definition(t) if isinstance(t, Sym) else None
+        if not isinstance(d, ast.ClassDef):
+            return False
+        for f in d.body:
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == "__call__":
+                return [a.arg for a in f.args.args[1:]] == ["scope", "receive", "send"]
+        return False
+
     def _middlewares(self) -> Gzip | None:
         gzip = None
         for m in self.index.package_modules():
             file = str(m.path)
+            for node in m.tree.body:
+                # `app = QuotaMiddleware(api)`: the server runs the wrapper, the binary would serve the bare app
+                if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                        and any(self._is_app(m.name, a) for a in [*node.value.args, *(k.value for k in node.value.keywords)])
+                        and self._asgi_class(m.name, node.value.func)):
+                    self._global(TranspileError(
+                        f"the application wrapped in an ASGI class (`{ast.unparse(node.value)}`) is not supported: "
+                        "the binary would serve it without the wrapper", node, file))
             for node in ast.walk(m.tree):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                     owner, attr = node.func.value, node.func.attr
@@ -503,7 +522,7 @@ class Frontend:
                         except TranspileError as e:
                             self._global(e)
                     elif attr in {"add_exception_handler", "mount", "add_route", "add_api_route",
-                                  "add_websocket_route"} and (
+                                  "add_websocket_route", "add_api_websocket_route"} and (
                         self._is_app(m.name, owner)
                         or (isinstance(owner, ast.Attribute) and self._is_app(m.name, owner.value))
                     ):
@@ -513,9 +532,12 @@ class Frontend:
                         if (
                             isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
                             and self._is_app(m.name, d.func.value)
-                            and d.func.attr in {"exception_handler", "middleware", "on_event", "websocket"}
+                            and d.func.attr in {"exception_handler", "middleware", "on_event", "websocket", "websocket_route"}
                         ):
-                            self._global(TranspileError(f"@app.{d.func.attr}(...) is not supported", d, file))
+                            msg = f"@app.{d.func.attr}(...) is not supported"
+                            if d.func.attr == "websocket":
+                                msg += " by the typed backend (use --backend dyn)"
+                            self._global(TranspileError(msg, d, file))
         return gzip
 
     def _middleware(self, call: ast.Call, file: str) -> Gzip:
@@ -677,6 +699,10 @@ class Frontend:
             for fn in ast.walk(m.tree):
                 if not isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)):
                     continue
+                ws = self._ws_decorator(fn, m.name, parents)
+                if ws is not None and ws[1] is not None:
+                    self._global(TranspileError("@router.websocket(...) is not supported by the typed backend "
+                                                "(use --backend dyn)", ws[0], file))
                 found = self._route_decorator(fn, m.name, parents)
                 if found is None:
                     continue
@@ -709,6 +735,20 @@ class Frontend:
         found = None
         for d in fn.decorator_list:
             if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS):
+                continue
+            if self._is_app(module, d.func.value):
+                found = (d, None)
+                continue
+            t = self.index.resolve_expr(module, d.func.value, _enclosing_fn(fn, parents))
+            if isinstance(t, Sym) and t in self.routers:
+                found = (d, t)
+        return found
+
+    def _ws_decorator(self, fn, module: str, parents) -> tuple[ast.Call, Sym | None] | None:
+        """`@app.websocket(...)` -> (decorator, None); `@router.websocket(...)` -> (decorator, router)."""
+        found = None
+        for d in fn.decorator_list:
+            if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "websocket"):
                 continue
             if self._is_app(module, d.func.value):
                 found = (d, None)

@@ -31,6 +31,25 @@ pub async fn await_value(v: V) -> R {
     fut.await
 }
 
+/// The call in `await obj.method(...)` on a value known only at run time: a synchronous `Session`'s
+/// methods return plain values, so CPython runs the call, then fails on the `await` (the effects stay).
+pub async fn call_method_awaited(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    let sync = matches!(recv, V::Session(s) if s.is_sync());
+    let v = call_method(cx, recv, name, args, kwargs).await?;
+    if !sync {
+        return Ok(v); // awaited by the caller (`await_value`)
+    }
+    let ty = match &v {
+        V::Result(_) => "ChunkedIteratorResult",
+        other => other.type_name(),
+    };
+    Err(Exc::type_error(if super::python() >= (3, 14) {
+        format!("'{ty}' object can't be awaited")
+    } else {
+        format!("object {ty} can't be used in 'await' expression")
+    }))
+}
+
 pub fn is_async_fn(f: &V) -> bool {
     match f {
         V::Native(n) => match &**n {
@@ -198,6 +217,10 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
             let Native::Acm(g) = &**n else { unreachable!() };
             super::agen::acm_exit(g, exc).await
         }
+        V::Session(s) if exc.is_none() && s.commits_on_exit() => {
+            s.commit().await?;
+            Ok(V::Bool(false))
+        }
         V::Native(n) if matches!(&**n, Native::AmqpConn(_)) => {
             let Native::AmqpConn(c) = &**n else { unreachable!() };
             super::rmq::conn_method(c, "close", &[]).await?;
@@ -212,21 +235,15 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
 
 /// the items of an async iterator (`[x async for x in it]`): a project async generator, a runtime one
 pub async fn collect(cx: &Cx, it: V) -> R {
-    let _ = cx;
     if let V::Native(n) = &it {
         if let Native::AsyncItems(items) = &**n {
             return Ok(V::list(items.lock().take().unwrap_or_default()));
         }
-        if let Native::Gen(g) = &**n {
-            let mut out = Vec::new();
-            loop {
-                match g.asend(V::None).await {
-                    Ok(v) => out.push(v),
-                    Err(e) if e.isinstance(&STOP_ASYNC_ITERATION) => return Ok(V::list(out)),
-                    Err(e) => return Err(e),
-                }
-            }
-        }
     }
-    Err(Exc::type_error(format!("'async for' requires an object with __aiter__ method, got {}", it.type_name())))
+    let ai = super::agen::aiter(cx, &it).await?;
+    let mut out = Vec::new();
+    while let Some(v) = super::agen::anext_opt(cx, &ai).await? {
+        out.push(v);
+    }
+    Ok(V::list(out))
 }

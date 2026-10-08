@@ -147,6 +147,7 @@ pub fn td_of(v: &V) -> R<&'static TD> {
 /// the value of a validator's type (what `get_args` returns for its members)
 pub fn td_value(td: &'static TD) -> V {
     match td {
+        TD::Len(t, _, _) => td_value(t),
         TD::Any => V::native(Native::ExtType("typing.Any")),
         TD::NoneT => V::native(Native::Type("NoneType")),
         TD::Bool => V::native(Native::Type("bool")),
@@ -172,7 +173,7 @@ pub fn get_args(args: &[V]) -> R {
     let [t] = args else { return Err(Exc::type_error("get_args() takes 1 positional argument")) };
     let V::Native(n) = t else { return Ok(V::tuple(vec![])) };
     let Native::TypeExpr(td, _) = &**n else { return Ok(V::tuple(vec![])) };
-    Ok(V::tuple(match td {
+    Ok(V::tuple(match td.bare() {
         TD::List(Some(x)) | TD::Set(Some(x)) => vec![td_value(x)],
         TD::Tuple(Some(x)) => vec![td_value(x), V::native(Native::Type("Ellipsis"))],
         TD::Dict(Some((k, x))) => vec![td_value(k), td_value(x)],
@@ -188,7 +189,7 @@ pub fn get_origin(args: &[V]) -> R {
     let [t] = args else { return Err(Exc::type_error("get_origin() takes 1 positional argument")) };
     let V::Native(n) = t else { return Ok(V::None) };
     let Native::TypeExpr(td, _) = &**n else { return Ok(V::None) };
-    Ok(match td {
+    Ok(match td.bare() {
         TD::List(Some(_)) => V::native(Native::Type("list")),
         TD::Set(Some(_)) => V::native(Native::Type("set")),
         TD::Tuple(Some(_)) => V::native(Native::Type("tuple")),

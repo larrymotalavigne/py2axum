@@ -20,3 +20,16 @@ class Channel(enum.StrEnum):
 class Level(enum.IntEnum):
     ONE = 1
     TWO = 2
+
+
+class Group(enum.Enum):
+    """List and tuple values: a plain enum keeps them as they are."""
+    TEXT = ["street", "city"]
+    GEO = ["lat", "lon"]
+    PAIR = (1, "a")
+
+
+class Relation(str, enum.Enum):
+    """A str mixin calls str(*value): a one-element tuple is its string."""
+    MASTER = ("MASTER",)
+    CHILD = ("CHILD",)

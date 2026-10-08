@@ -203,9 +203,49 @@ pub fn as_gen(v: &V) -> Option<Arc<AGen>> {
 
 /// `anext(it)` (awaited)
 pub async fn anext(it: &V) -> R {
+    if let V::Native(n) = it {
+        if let Native::WsIter(s, kind) = &**n {
+            return super::ws::iter_next(s, kind).await?.ok_or_else(stop);
+        }
+    }
     match as_gen(it) {
         Some(g) => g.asend(V::None).await,
         None => Err(Exc::type_error(format!("'{}' object is not an async iterator", it.type_name()))),
+    }
+}
+
+/// `async for x in it`: `aiter(it)`; an async generator (and `websocket.iter_*()`) is its own iterator,
+/// a project object calls its `__aiter__`
+pub async fn aiter(cx: &Cx, it: &V) -> R {
+    match it {
+        V::Native(n) if matches!(&**n, Native::Gen(_) | Native::WsIter(..) | Native::AsyncItems(_)) => Ok(it.clone()),
+        V::Inst(_) => super::methods::call_method(cx, it, "__aiter__", vec![], vec![]).await,
+        o => Err(Exc::type_error(format!("'async for' requires an object with __aiter__ method, got {}", o.type_name()))),
+    }
+}
+
+/// the next item of an `async for` (None once StopAsyncIteration is raised)
+pub async fn anext_opt(cx: &Cx, it: &V) -> R<Option<V>> {
+    let r = match it {
+        V::Native(n) if matches!(&**n, Native::WsIter(..)) => {
+            let Native::WsIter(s, kind) = &**n else { unreachable!() };
+            return super::ws::iter_next(s, kind).await;
+        }
+        V::Native(n) if matches!(&**n, Native::Gen(_)) => anext(it).await,
+        V::Native(n) if matches!(&**n, Native::AsyncItems(_)) => {
+            let Native::AsyncItems(items) = &**n else { unreachable!() };
+            let mut g = items.lock();
+            return Ok(match g.as_mut() {
+                Some(v) if !v.is_empty() => Some(v.remove(0)),
+                _ => None,
+            });
+        }
+        _ => super::methods::call_method(cx, it, "__anext__", vec![], vec![]).await,
+    };
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.isinstance(&STOP_ASYNC_ITERATION) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

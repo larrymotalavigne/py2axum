@@ -90,9 +90,27 @@ fn log_exc(e: &Exc) {
 /// The ASGI application: one request through the whole stack.
 static PYTHON_SIDE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
 
+/// `--python-side mount`: the prefixes of the app's last `app.mount()`s, left in Python
+static MOUNTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+
 /// The paths left to the Python application (`--python-side`): relayed to `PY2AXUM_PYTHON_URL` when set.
-pub fn set_python_side(paths: &[&'static str]) {
+/// `mounts`: the app ends with `app.mount()`s left in Python, so a request under one of their prefixes that
+/// no translated route fully matches goes there too (Starlette's router: the mount's full match beats an
+/// earlier partial one, so a 405 or a HEAD on a GET route reaches the mounted app; the prefix itself is
+/// relayed as well, for the 307 to `prefix/`).
+pub fn set_python_side(paths: &[&'static str], mounts: &[&'static str]) {
     let _ = PYTHON_SIDE.set(paths.to_vec());
+    let _ = MOUNTS.set(mounts.to_vec());
+}
+
+/// under a mount left in Python (`scope["path"]`, decoded, like Starlette's `Mount`)
+fn under_mount(raw_path: &str) -> bool {
+    let Some(ms) = MOUNTS.get() else { return false };
+    if ms.is_empty() {
+        return false;
+    }
+    let path = web::unquote(raw_path);
+    ms.iter().any(|m| path.starts_with(&format!("{m}/")) || (!m.is_empty() && path == *m))
 }
 
 /// a route pattern (`/items/{id}`, `{p:path}`) or a mount prefix matching the request path
@@ -100,6 +118,9 @@ fn python_side(path: &str) -> bool {
     let Some(pats) = PYTHON_SIDE.get() else { return false };
     let segs: Vec<&str> = path.trim_end_matches('/').split('/').collect();
     pats.iter().any(|p| {
+        // a router prefix read from the settings (`\x01n\x01` marker), known once the globals are set
+        let resolved = if p.contains('\u{1}') { Some(super::web::runtime_prefix(p)) } else { None };
+        let p = resolved.as_deref().unwrap_or(p);
         if path.starts_with(&format!("{}/", p.trim_end_matches('/'))) && !p.contains('{') {
             return true; // under a mounted application
         }
@@ -153,10 +174,35 @@ async fn proxy(upstream: &str, req: axum::extract::Request) -> Response {
     }
 }
 
-pub async fn app(app: Arc<super::AppState>, req: axum::extract::Request, routes: &'static [RouteDef], stack_fn: StackFn) -> Response {
+pub async fn app(
+    app: Arc<super::AppState>,
+    req: axum::extract::Request,
+    routes: &'static [RouteDef],
+    ws_routes: &'static [super::ws::WsRouteDef],
+    stack_fn: StackFn,
+) -> Response {
+    // a WebSocket handshake: the scope `websocket` (the HTTP middlewares let it through; never relayed
+    // to the Python side)
+    if super::ws::is_upgrade(&req) {
+        if let Err(e) = STACK.get_or_try_init(|| async move { stack_fn(&super::root_cx()).await.map(Arc::new) }).await {
+            log_exc(&e);
+            return plain_500();
+        }
+        return super::ws::serve(app, req, ws_routes, ws_handle).await;
+    }
     if python_side(req.uri().path()) {
         if let Ok(up) = std::env::var("PY2AXUM_PYTHON_URL") {
             return proxy(&up, req).await;
+        }
+    }
+    if under_mount(req.uri().path()) {
+        if let Ok(up) = std::env::var("PY2AXUM_PYTHON_URL") {
+            // the stack registers the routes `app.add_route` adds: built before matching
+            if STACK.get_or_try_init(|| async move { stack_fn(&super::root_cx()).await.map(Arc::new) }).await.is_ok()
+                && !web::full_match(req.uri().path(), req.method().as_str(), routes)
+            {
+                return proxy(&up, req).await;
+            }
         }
     }
     let client = req
@@ -184,10 +230,22 @@ pub async fn app(app: Arc<super::AppState>, req: axum::extract::Request, routes:
         }
     };
     let cx: Cx = Arc::new(CxInner::new(app, cell));
-    match chain(&cx, &stack, 0, routes).await {
+    // sentry_sdk's FastAPI integration (SentryAsgiMiddleware): nothing to do while it is not initialised
+    let traced = super::sentry::active() && super::sentry::request_start(&cx).await;
+    let r = match chain(&cx, &stack, 0, routes).await {
         Ok(r) => r,
-        Err(e) => server_error(&cx, &stack, e).await,
+        Err(e) => {
+            let r = server_error(&cx, &stack, e.clone()).await;
+            if traced {
+                super::sentry::unhandled(&cx, &e).await;
+            }
+            r
+        }
+    };
+    if traced {
+        super::sentry::request_end(&cx, r.status().as_u16()).await;
     }
+    r
 }
 
 type RespFut<'a> = Pin<Box<dyn Future<Output = R<Response>> + Send + 'a>>;
@@ -218,7 +276,10 @@ pub struct Next {
 
 /// `await call_next(request)`: the response of the inner stack; an exception escaping it is raised here.
 pub async fn call_next(cx: &Cx, n: &Next) -> R {
-    let r = chain(cx, &n.stack, n.i, n.routes).await?;
+    let saved = super::sentry::context_enter(cx);
+    let r = chain(cx, &n.stack, n.i, n.routes).await;
+    super::sentry::context_exit(cx, saved);
+    let r = r?;
     Ok(super::resp::from_response(r))
 }
 
@@ -257,17 +318,68 @@ async fn handle(cx: &Cx, stack: &Stack, e: Exc) -> R<Response> {
                 break;
             }
             if std::ptr::eq(c, &HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
+                if super::sentry::active() {
+                    super::sentry::handled_exception(cx, &e).await;
+                }
                 return Ok(web::error_response(e));
             }
         }
     }
     match found {
         Some(h) => {
+            if super::sentry::active() {
+                super::sentry::handled_exception(cx, &e).await;
+            }
             let ret = super::methods::call_value(cx, &h, vec![super::request(cx), V::Exc(e)], vec![]).await?;
             to_response(&ret)
         }
         None => Err(e),
     }
+}
+
+/// ExceptionMiddleware on a WebSocket route: a handler by status code, else by the exception's MRO,
+/// called with `(websocket, exc)`, its response sent on the connection; FastAPI's defaults for
+/// HTTPException / RequestValidationError (a JSON response), WebSocketRequestValidationError (close
+/// 1008) and Starlette's for WebSocketException (close with its code and reason). Without one the
+/// exception escapes (ServerErrorMiddleware lets the `websocket` scope through).
+fn ws_handle(cx: &Cx, e: Exc) -> Pin<Box<dyn Future<Output = R<()>> + Send + '_>> {
+    Box::pin(async move {
+        use super::ws;
+        let Some(stack) = STACK.get().cloned() else { return Err(e) };
+        let mut found: Option<V> = None;
+        if let Some((code, ..)) = &e.http_info() {
+            found = stack.handlers.iter().find(|(k, _)| matches!(k, HKey::Status(s) if s == code)).map(|(_, h)| h.clone());
+        }
+        if found.is_none() {
+            let mut classes = Vec::new();
+            mro(e.0.class, &mut classes);
+            for c in classes {
+                if let Some((_, h)) = stack.handlers.iter().find(|(k, _)| matches!(k, HKey::Class(x) if std::ptr::eq(*x, c))) {
+                    found = Some(h.clone());
+                    break;
+                }
+                if std::ptr::eq(c, &HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
+                    let Some(s) = ws::session(cx) else { return Err(e) };
+                    return ws::send_raw_response(&s, web::error_response(e)).await;
+                }
+                if std::ptr::eq(c, &WS_EXCEPTION) {
+                    let attr = |k: &str| e.0.attrs.lock().get(k).cloned().unwrap_or(V::None);
+                    return ws::close_with(cx, attr("code"), attr("reason")).await;
+                }
+                if std::ptr::eq(c, &WS_VALIDATION_ERROR) {
+                    let errs: Vec<V> = e.0.errors.as_ref().map(|v| v.iter().map(|x| x.to_v()).collect()).unwrap_or_default();
+                    return ws::close_with(cx, V::Int(1008), super::pyd::jsonable(&V::list(errs))?).await;
+                }
+            }
+        }
+        match found {
+            Some(h) => {
+                let ret = super::methods::call_value(cx, &h, vec![ws::current(cx)?, V::Exc(e)], vec![]).await?;
+                ws::handler_response(cx, &ret).await
+            }
+            None => Err(e),
+        }
+    })
 }
 
 /// ServerErrorMiddleware: the `Exception` handler's response (it bypasses the user middlewares), the

@@ -39,7 +39,24 @@ STEPS: list = [
     ("GET", "/labels/blue", None),
     ("GET", "/labels/red", None),
     ("GET", "/labels/none", None),
+    ("PUT", "/authors/2/mentor/1", None),
+    ("PUT", "/authors/1/mentor/1", None),
+    ("PUT", "/authors/9/mentor/1", None),
+    ("GET", "/authors/1/mentor", None),
+    ("GET", "/authors/2/mentor", None),
+    ("PUT", "/authors/2/mentor/9", None),
+    ("GET", "/authors/1/mentor", None),
+    ("GET", "/authors/2/mentor", None),
+    ("GET", "/books/1/titled", None),
+    ("GET", "/books/3/titled", None),
+    ("GET", "/booklist", None),
+    ("GET", "/q/initials", None),
+    ("GET", "/books/1/awaited", None),
+    ("GET", "/when", None),
+    ("GET", "/classattr", None),
     ("POST", "/authors", {"name": "Temp"}),
+    ("PUT", "/authors/3/mentor/1", None),
+    ("GET", "/authors/1/mentor", None),
     ("DELETE", "/authors/3", None),
     ("DELETE", "/authors/3", None),
 ]
@@ -54,5 +71,8 @@ def reset(db: str) -> None:
     engine = create_engine(db.replace("postgresql://", "postgresql+psycopg://", 1))
     Base.metadata.create_all(engine)  # once; afterwards only emptied (servers cache their plans)
     with engine.begin() as conn:
+        # added to an existing fixture table after its creation (create_all leaves existing tables alone)
+        conn.exec_driver_sql("ALTER TABLE authors ADD COLUMN IF NOT EXISTS mentor_id INTEGER "
+                             "REFERENCES authors(id) ON DELETE SET NULL")
         conn.exec_driver_sql(f"TRUNCATE {', '.join(t.name for t in Base.metadata.sorted_tables)} RESTART IDENTITY CASCADE")
     engine.dispose()

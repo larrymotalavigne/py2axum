@@ -18,7 +18,7 @@ def generate(out: Path, seed: str, *args: str) -> dict[str, bytes]:
 
 @pytest.mark.parametrize("args", [
     ("app", "--name", "app_axum"),
-    ("fixtures/dynapp", "--root", ".", "--backend", "dyn", "--name", "dynapp_axum"),
+    ("fixtures/dynapp", "--root", ".", "--backend", "dyn", "--python-side", "mount", "--name", "dynapp_axum"),
 ], ids=["typed", "dyn"])
 def test_same_output_whatever_the_hash_seed(tmp_path, args):
     a = generate(tmp_path / "a", "0", *args)

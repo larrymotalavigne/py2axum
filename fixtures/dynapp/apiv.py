@@ -1,4 +1,6 @@
 """Routers mounted under prefixes read from the settings at startup (overridable by the environment)."""
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from starlette.routing import Match
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +29,12 @@ admin = APIRouter()
 @router.get("/whoami")
 async def whoami(user: str = Depends(require_user)):
     return {"user": user, "prefix": settings.API_PREFIX}
+
+
+@router.get("/whois")
+async def whois(remote: Annotated[str | None, Header(alias="Remote-User")] = None):
+    """Annotated metadata with the default after `=`."""
+    return {"remote": remote}
 
 
 @router.get("/probe")

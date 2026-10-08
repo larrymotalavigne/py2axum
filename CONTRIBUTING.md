@@ -26,7 +26,7 @@ Conformance suites need PostgreSQL (and Redis and RabbitMQ for `dynapp`):
 ```bash
 createdb py2axum_dyn
 export DATABASE_URL=postgresql://postgres@127.0.0.1/py2axum_dyn
-python -m py2axum fixtures/dynapp --root . --backend dyn --python-side '/dunders/proxied/{name}' \
+python -m py2axum fixtures/dynapp --root . --backend dyn --python-side '/dunders/proxied/{name}' --python-side mount \
     -o generated/dynapp_axum --name dynapp_axum
 (cd generated/dynapp_axum && RUSTFLAGS="-D warnings" cargo build --release)
 python -c "from tests.scenarios import dynapp; dynapp.reset('$DATABASE_URL')"

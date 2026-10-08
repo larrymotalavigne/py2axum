@@ -58,12 +58,19 @@ VALUES: dict[str, str] = {
     "httpx": f'V::native({RT}::Native::Namespace("httpx"))',
     "aiohttp.ClientSession._request": f'{RT}::http::request_fn("aiohttp")',
     "httpx.AsyncClient.request": f'{RT}::http::request_fn("httpx")',
+    # starlette.websockets.WebSocketState (dynrt/ws.rs)
+    **{f"{m}.WebSocketState": f"V::Class(&{RT}::ws::CLS_WS_STATE)" for m in ("starlette.websockets", "fastapi.websockets")},
+    **{f"{m}.WebSocketState.{n}": f"V::Enum(&{RT}::ws::ENUM_WS_STATE, {i})" for m in ("starlette.websockets", "fastapi.websockets")
+       for i, n in enumerate(("CONNECTING", "CONNECTED", "DISCONNECTED", "RESPONSE"))},
     # starlette.routing.Match and the routing classes (dynrt/routing.rs)
     "starlette.routing.Match": f"V::Class(&{RT}::routing::CLS_MATCH)",
     **{f"starlette.routing.Match.{n}": f"V::Enum(&{RT}::routing::ENUM_MATCH, {i})" for i, n in enumerate(("NONE", "PARTIAL", "FULL"))},
     **{n: f'V::native({RT}::Native::ExtType("{c}"))' for n, c in (
         ("starlette.routing.Route", "starlette.routing.Route"), ("starlette.routing.BaseRoute", "starlette.routing.BaseRoute"),
-        ("fastapi.routing.APIRoute", "fastapi.routing.APIRoute"), ("fastapi.APIRoute", "fastapi.routing.APIRoute"))},
+        ("fastapi.routing.APIRoute", "fastapi.routing.APIRoute"), ("fastapi.APIRoute", "fastapi.routing.APIRoute"),
+        ("starlette.routing.WebSocketRoute", "starlette.routing.WebSocketRoute"),
+        ("fastapi.routing.APIWebSocketRoute", "fastapi.routing.APIWebSocketRoute"),
+        ("fastapi.APIWebSocketRoute", "fastapi.routing.APIWebSocketRoute"))},
     # prometheus_client 0.26 (dynrt/prom.rs)
     **{f"prometheus_client.{n}": f'{RT}::prom::value("{n}")' for n in ("REGISTRY", "GC_COLLECTOR", "PLATFORM_COLLECTOR", "PROCESS_COLLECTOR")},
     "prometheus_client.CONTENT_TYPE_LATEST": 'V::str("text/plain; version=1.0.0; charset=utf-8")',
@@ -151,6 +158,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.UnicodeDecodeError": "UNICODE_DECODE_ERROR",
     "builtins.ImportError": "IMPORT_ERROR",
     "builtins.ModuleNotFoundError": "MODULE_NOT_FOUND_ERROR",
+    "importlib.metadata.PackageNotFoundError": "PACKAGE_NOT_FOUND",
     "builtins.FileExistsError": "FILE_EXISTS_ERROR",
     "builtins.PermissionError": "PERMISSION_ERROR",
     "builtins.IsADirectoryError": "IS_A_DIRECTORY_ERROR",
@@ -172,6 +180,7 @@ EXCEPTIONS: dict[str, str] = {
     "requests.ConnectionError": "REQUESTS_CONNECTION_ERROR",
     "requests.exceptions.ConnectionError": "REQUESTS_CONNECTION_ERROR",
     "json.decoder.JSONDecodeError": "JSON_DECODE_ERROR",
+    "socket.gaierror": "SOCKET_GAIERROR",
     **{f"httpx.{n}": f"HTTPX_{c}" for n, c in (
         ("HTTPError", "HTTP_ERROR"), ("RequestError", "REQUEST_ERROR"), ("TransportError", "TRANSPORT_ERROR"),
         ("TimeoutException", "TIMEOUT_EXCEPTION"), ("ConnectTimeout", "CONNECT_TIMEOUT"), ("ReadTimeout", "READ_TIMEOUT"),
@@ -189,6 +198,13 @@ EXCEPTIONS: dict[str, str] = {
     "asyncio.QueueEmpty": "QUEUE_EMPTY",
     "fastapi.HTTPException": "HTTP_EXCEPTION",
     "fastapi.exceptions.HTTPException": "HTTP_EXCEPTION",
+    # WebSockets (dynrt/ws.rs)
+    **{n: "WS_DISCONNECT" for n in ("fastapi.WebSocketDisconnect", "fastapi.websockets.WebSocketDisconnect",
+                                    "starlette.websockets.WebSocketDisconnect")},
+    "starlette.websockets.WebSocketDisconnected": "WS_DISCONNECTED",
+    **{n: "WS_EXCEPTION" for n in ("fastapi.WebSocketException", "fastapi.exceptions.WebSocketException",
+                                   "starlette.exceptions.WebSocketException")},
+    "fastapi.exceptions.WebSocketRequestValidationError": "WS_VALIDATION_ERROR",
     "starlette.exceptions.HTTPException": "HTTP_EXCEPTION",
     "pydantic.ValidationError": "VALIDATION_ERROR",
     "sqlalchemy.exc.SQLAlchemyError": "SQLALCHEMY_ERROR",
@@ -201,6 +217,11 @@ EXCEPTIONS: dict[str, str] = {
     "sqlalchemy.exc.NotSupportedError": "NOT_SUPPORTED_ERROR",
     "sqlalchemy.exc.NoResultFound": "NO_RESULT_FOUND",
     "sqlalchemy.exc.InvalidRequestError": "INVALID_REQUEST_ERROR",
+    "sqlalchemy.exc.CircularDependencyError": "CIRCULAR_DEPENDENCY_ERROR",
+    "sqlalchemy.exc.ResourceClosedError": "RESOURCE_CLOSED_ERROR",
+    "xml.parsers.expat.ExpatError": "EXPAT_ERROR",
+    "xml.parsers.expat.error": "EXPAT_ERROR",
+    "pyexpat.ExpatError": "EXPAT_ERROR",
     "builtins.EOFError": "EOF_ERROR",
     "pickle.PickleError": "PICKLE_ERROR",
     "aio_pika.exceptions.AMQPError": "AMQP_ERROR",
@@ -290,7 +311,17 @@ def _http_exc(a, kw):
     return f"{RT}::http_exc(&{status}, {detail}, &{headers})"
 
 
+def _sa_inspect(a, kw):
+    # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable
+    if len(a) != 1 or set(kw) != {"raiseerr"} or kw.get("raiseerr") != "V::Bool(false)":
+        raise ValueError("only inspect(x, raiseerr=False) is supported (state.unloaded, state.mapper.column_attrs)")
+    return f"{RT}::orm::inspect(&{a[0]})"
+
+
 def _json_dumps(a, kw):
+    for k in kw:
+        if k not in ("default", "ensure_ascii", "separators", "sort_keys", "indent"):
+            raise ValueError(f"json.dumps({k}=) is not supported (default=str, ensure_ascii, separators, sort_keys, indent)")
     return f"{RT}::libs::json_dumps(&{a[0]}, &{_kwvec(kw)})"
 
 
@@ -322,11 +353,6 @@ def _getenv(name, a, kw):
     return f"{RT}::libs::getenv(&{v['key']}, {d})"
 
 
-def _sentry_noop(a, kw):
-    vals = list(a) + [kw[k] for k in kw]
-    return "{ " + "".join(f"let _ = {v}; " for v in vals) + "Ok::<V, Exc>(V::None) }"
-
-
 def _jwt_encode(a, kw):
     v = _bind("jwt.encode", a, kw, ["claims", "key", "algorithm"], {"claims", "key", "algorithm"})
     alg = f"Some(&{v['algorithm']})" if "algorithm" in v else "None"
@@ -341,7 +367,22 @@ def _jwt_decode(a, kw):
     return f"{RT}::jose::decode_with(&{v['token']}, &{v['key']}, {algs}, {rest})"
 
 
+def _relativedelta(a, kw):
+    allowed = {"years", "months", "weeks", "days", "hours", "minutes", "seconds", "microseconds"}
+    if a:
+        raise ValueError("relativedelta(dt1, dt2) is not supported (relative keyword arguments only)")
+    for k in kw:
+        if k not in allowed:
+            raise ValueError(f"relativedelta({k}=) is not supported (only {', '.join(sorted(allowed))})")
+    return f"{RT}::reldelta::new(&{_argv(a)}, &{_kwvec(kw)})"
+
+
 CALLS = {
+    # python-dateutil 2.9 (dynrt/reldelta.rs)
+    "dateutil.relativedelta.relativedelta": _relativedelta,
+    # xmltodict 1.0 (dynrt/xmld.rs): default options, namespaces; dict_constructor= has no effect (dicts)
+    "xmltodict.parse": lambda a, kw: (_bind("xmltodict.parse", a, kw, ["xml_input"], {"xml_input", "process_namespaces", "namespaces", "dict_constructor"})
+                                       and f"{RT}::xmld::parse(&{_argv(a)}, &{_kwvec(kw)})"),
     # outgoing HTTP: httpx 0.28, aiohttp 3.14 (the version goes in the User-Agent)
     "httpx.AsyncClient": lambda a, kw: f"{RT}::http::client(\"httpx\", \"{LIB_VERSIONS.get('httpx', '0.28.1')}\", &{_argv(a)}, &{_kwvec(kw)})",
     "aiohttp.ClientSession": lambda a, kw: f"{RT}::http::client(\"aiohttp\", \"{LIB_VERSIONS.get('aiohttp', '3.14.3')}\", &{_argv(a)}, &{_kwvec(kw)})",
@@ -465,13 +506,28 @@ CALLS = {
     "itsdangerous.URLSafeTimedSerializer": _its_serializer,
     "itsdangerous.url_safe.URLSafeTimedSerializer": _its_serializer,
     # cryptography (Fernet only)
+    "cryptography.fernet.Fernet.generate_key": lambda a, kw: f"{RT}::fernet::generate_key()",
     "cryptography.fernet.Fernet": lambda a, kw: f"{RT}::fernet::new(&{_bind('Fernet', a, kw, ['key'], {'key'})['key']})",
     # e-mail: jinja2 templates, email.mime, aiosmtplib
     "jinja2.Environment": lambda a, kw: f"{RT}::mail::environment(&{_kwvec(kw)})" if not a else (_ for _ in ()).throw(ValueError("pass keyword arguments")),
+    **{f"{m}.templating.Jinja2Templates": lambda a, kw: f"{RT}::mail::templates(&{_argv(a)}, &{_kwvec(kw)})" for m in ("fastapi", "starlette")},
     "jinja2.FileSystemLoader": lambda a, kw: f"{RT}::mail::fs_loader(&{_bind('FileSystemLoader', a, kw, ['searchpath'], {'searchpath'})['searchpath']})",
     "jinja2.select_autoescape": lambda a, kw: f"{RT}::mail::select_autoescape({('Some(&' + _bind('select_autoescape', a, kw, ['enabled_extensions'], {'enabled_extensions'})['enabled_extensions'] + ')') if (a or kw) else 'None'})",
     **{f"email.mime.{m}.{c}": (lambda c: lambda a, kw: f"{RT}::mail::mime_new(\"{c}\", &{_argv(a)}, &{_kwvec(kw)})")(c)
-       for m, c in (("multipart", "MIMEMultipart"), ("text", "MIMEText"), ("application", "MIMEApplication"))},
+       for m, c in (("multipart", "MIMEMultipart"), ("text", "MIMEText"), ("application", "MIMEApplication"), ("base", "MIMEBase"))},
+    "email.encoders.encode_base64": lambda a, kw: f"{RT}::mail::encode_base64(&{a[0]})",
+    # positional-only in CPython: keywords are a TypeError there, refused here
+    "unicodedata.normalize": lambda a, kw: f"{RT}::stdlib::unicodedata_normalize(crate::gen::UCD_UNASSIGNED, &{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("normalize(form, unistr): two positional arguments")),
+    "unicodedata.combining": lambda a, kw: f"{RT}::stdlib::unicodedata_combining(crate::gen::UCD_UNASSIGNED, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("combining(chr): one positional argument")),
+    "collections.deque": lambda a, kw: f"{RT}::deque::new(&{_argv(a)}, &{_kwvec(kw)})",
+    "socket.getaddrinfo": lambda a, kw: f"{RT}::net::getaddrinfo(&{_argv(a)}, &{_kwvec(kw)})",
+    "ipaddress.ip_address": lambda a, kw: f"{RT}::net::ip_address(&{_argv(a)})",
+    "ipaddress.ip_network": lambda a, kw: f"{RT}::net::ip_network(&{_argv(a)}, &{_kwvec(kw)})",
+    "nh3.clean": lambda a, kw: f"{RT}::nh3::clean(&{_argv(a)}, &{_kwvec(kw)})",
+    "nh3.clean_text": lambda a, kw: f"{RT}::nh3::clean_text(&{_argv(a)}, &{_kwvec(kw)})",
+    "nh3.escape": lambda a, kw: f"{RT}::nh3::clean_text(&{_argv(a)}, &{_kwvec(kw)})",
+    "nh3.is_html": lambda a, kw: f"{RT}::nh3::is_html(&{_argv(a)})",
+    "string.Template": lambda a, kw: f"{RT}::stdlib::template_new(&{_argv(a)}, &{_kwvec(kw)})",
     "html.escape": lambda a, kw: f"{RT}::stdlib::html_escape(&{_argv(a)}, &{_kwvec(kw)})",
     "email.utils.formataddr": lambda a, kw: f"{RT}::mail::formataddr(&{a[0]})",
     "email.utils.formatdate": lambda a, kw: f"{RT}::mail::formatdate(&{_argv(a)}, &{_kwvec(kw)})",
@@ -531,15 +587,10 @@ CALLS = {
     # os (read-only environment)
     "os.getenv": lambda a, kw: _getenv("os.getenv", a, kw),
     "os.environ.get": lambda a, kw: _getenv("os.environ.get", a, kw),
-    # sentry_sdk: the binary behaves as an SDK that was never initialised (no DSN): calls do nothing and
-    # return None; their arguments are still evaluated (README)
-    **{f"sentry_sdk.{n}": _sentry_noop for n in (
-        "init", "set_tag", "set_tags", "set_user", "set_context", "set_extra", "capture_message",
-        "capture_exception", "add_breadcrumb")},
     # logging / asyncio
     "logging.basicConfig": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + "Ok::<V, Exc>(V::None) }",
     # module-level functions: the root logger
-    **{f"logging.{n}": (lambda n: lambda a, kw: f"{RT}::web::log(\"root\", \"{n}\", &{_argv(a)})")(n)
+    **{f"logging.{n}": (lambda n: lambda a, kw: f"{RT}::web::log(cx, \"root\", \"{n}\", &{_argv(a)}, &{_kwvec(kw)}).await")(n)
        for n in ("debug", "info", "warning", "error", "exception", "critical", "log")},
     "logging.getLogger": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::Logger(std::sync::Arc::from({RT}::ops::str_(&{a[0] if a else 'V::str(\"root\")'})?.as_str()))))",
     "asyncio.Queue": lambda a, kw: f"Ok::<V, Exc>({RT}::web::AQueue::new(match &{a[0] if a else kw.get('maxsize', 'V::Int(0)')} {{ V::Int(i) => *i as usize, _ => 0 }}))",
@@ -559,6 +610,10 @@ CALLS = {
     "fastapi.exceptions.HTTPException": _http_exc,
     "starlette.exceptions.HTTPException": _http_exc,
     "fastapi.responses.StreamingResponse": _stream,
+    **{n: lambda a, kw: f"{RT}::ws::disconnect_exc({_argv(a)}, {_kwvec(kw)})"
+       for n in ("fastapi.WebSocketDisconnect", "fastapi.websockets.WebSocketDisconnect", "starlette.websockets.WebSocketDisconnect")},
+    **{n: lambda a, kw: f"{RT}::ws::ws_exception({_argv(a)}, {_kwvec(kw)})"
+       for n in ("fastapi.WebSocketException", "fastapi.exceptions.WebSocketException", "starlette.exceptions.WebSocketException")},
     "starlette.responses.StreamingResponse": _stream,
     # SQLAlchemy core
     "sqlalchemy.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
@@ -567,6 +622,8 @@ CALLS = {
     "sqlalchemy.orm.sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, true)",
     "sqlalchemy.create_engine": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}",
     "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}",
+    # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable
+    "sqlalchemy.inspect": lambda a, kw: _sa_inspect(a, kw),
     "sqlalchemy.text": lambda a, kw: f"{RT}::orm::text(&{a[0]})",
     "sqlalchemy.orm.aliased": lambda a, kw: f"{RT}::orm::aliased(&{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("aliased(Model) only")),
     "sqlalchemy.tuple_": lambda a, kw: f"{RT}::orm::tuple_({_argv(a)})",

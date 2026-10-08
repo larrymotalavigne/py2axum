@@ -104,3 +104,10 @@ pub fn method(f: &Fernet, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         _ => Err(Exc::attr_error(format!("'Fernet' object has no attribute '{name}'"))),
     }
 }
+
+/// `Fernet.generate_key()`: 32 random bytes, URL-safe base64
+pub fn generate_key() -> R {
+    let mut k = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut k);
+    Ok(V::Bytes(Arc::from(base64::engine::general_purpose::URL_SAFE.encode(k).into_bytes())))
+}

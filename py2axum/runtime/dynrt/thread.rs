@@ -461,6 +461,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         if let Native::Prom(p) = &**n {
             return super::prom::enter(v, p);
         }
+        if let Native::Sentry(o) = &**n {
+            return super::sentry::enter(o);
+        }
         if let Native::Suppress(_) = &**n {
             return Ok(V::None);
         }
@@ -483,6 +486,9 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         }
         if let Native::Prom(p) = &**n {
             return super::prom::exit(p, exc.as_ref());
+        }
+        if let Native::Sentry(o) = &**n {
+            return super::sentry::exit(o);
         }
         if let Native::Suppress(classes) = &**n {
             // contextlib.suppress: true when the exception is an instance of one of its classes

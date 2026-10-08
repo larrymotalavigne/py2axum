@@ -759,24 +759,47 @@ fn parse_rows(lines: Vec<String>, d: &Dialect) -> R<Vec<Vec<String>>> {
     Ok(rows)
 }
 
-fn source_lines(src: &V) -> R<Vec<String>> {
+/// The rows of a csv source. An iterable of strings that is not a file (`text.splitlines()`): CPython ends
+/// the record at the end of each item, newline or not, unless a quoted field is still open (the next item
+/// then continues it, nothing inserted); an empty item is an empty row.
+fn source_rows(src: &V, d: &Dialect) -> R<Vec<Vec<String>>> {
+    // (reading a StringIO's lines consumes it: once)
     if let Some(l) = iter_lines(src) {
-        return l.iter().map(ops::str_).collect();
+        return parse_rows(l.iter().map(ops::str_).collect::<R<_>>()?, d);
     }
-    ops::iter(src)?.iter().map(ops::str_).collect()
+    let mut rows = Vec::new();
+    let mut buf = String::new();
+    for item in ops::iter(src)? {
+        buf.push_str(&ops::str_(&item)?);
+        if buf.chars().filter(|c| *c == d.quotechar).count() % 2 == 1 {
+            continue;
+        }
+        if buf.is_empty() {
+            rows.push(Vec::new());
+        } else {
+            if !buf.ends_with('\n') && !buf.ends_with('\r') {
+                buf.push('\n');
+            }
+            rows.extend(parse_rows(vec![std::mem::take(&mut buf)], d)?);
+        }
+    }
+    if !buf.is_empty() {
+        rows.extend(parse_rows(vec![buf], d)?);
+    }
+    Ok(rows)
 }
 
 /// `csv.reader(lines)`: the rows (lists of str)
 pub fn reader(args: &[V], kwargs: &[(String, V)]) -> R {
     let d = dialect(kwargs)?;
-    let rows = parse_rows(source_lines(args.first().ok_or_else(|| Exc::type_error("reader() missing 'csvfile'"))?)?, &d)?;
+    let rows = source_rows(args.first().ok_or_else(|| Exc::type_error("reader() missing 'csvfile'"))?, &d)?;
     Ok(V::native(Native::Iter(Mutex::new(rows.into_iter().map(|r| V::list(r.into_iter().map(V::str).collect())).collect()))))
 }
 
 /// `csv.DictReader(f, fieldnames=None, restkey=None, restval=None)`: the rows as dicts, blank rows skipped
 pub fn dict_reader(args: &[V], kwargs: &[(String, V)]) -> R {
     let d = dialect(kwargs)?;
-    let mut rows = parse_rows(source_lines(args.first().ok_or_else(|| Exc::type_error("DictReader() missing 'f'"))?)?, &d)?.into_iter();
+    let mut rows = source_rows(args.first().ok_or_else(|| Exc::type_error("DictReader() missing 'f'"))?, &d)?.into_iter();
     let names: Vec<String> = match args.get(1).or_else(|| kw(kwargs, "fieldnames")).filter(|v| !v.is_none()) {
         Some(n) => ops::iter(n)?.iter().map(ops::str_).collect::<R<_>>()?,
         None => loop {
@@ -842,6 +865,14 @@ fn num(v: &V) -> R<f64> {
 pub fn math(name: &str, args: &[V]) -> R {
     let a = |i: usize| args.get(i).ok_or_else(|| Exc::type_error(format!("math.{name}() missing argument"))).and_then(num);
     let domain = || Exc::value_error("math domain error");
+    // Python 3.14 says which input was expected (pow and fmod keep "math domain error")
+    let expected = |what: &str, x: Option<f64>| {
+        if super::python() < (3, 14) {
+            return domain();
+        }
+        let got = x.map(|x| format!(", got {}", super::ops::repr(&V::Float(x)).unwrap_or_default())).unwrap_or_default();
+        Exc::value_error(format!("expected {what}{got}"))
+    };
     Ok(match name {
         "ceil" | "floor" | "trunc" => {
             if let Some(V::Int(i)) = args.first() {
@@ -856,7 +887,8 @@ pub fn math(name: &str, args: &[V]) -> R {
         "pow" => {
             let (x, y) = (a(0)?, a(1)?);
             let r = x.powf(y);
-            if r.is_nan() && !x.is_nan() && !y.is_nan() {
+            // 0 ** negative: C sets EDOM (Rust returns inf)
+            if (r.is_nan() && !x.is_nan() && !y.is_nan()) || (x == 0.0 && y < 0.0 && y.is_finite()) {
                 return Err(domain());
             }
             V::Float(r)
@@ -864,21 +896,27 @@ pub fn math(name: &str, args: &[V]) -> R {
         "sqrt" => {
             let x = a(0)?;
             if x < 0.0 {
-                return Err(domain());
+                return Err(expected("a nonnegative input", Some(x)));
             }
             V::Float(x.sqrt())
         }
         "log" => {
             let x = a(0)?;
             if x <= 0.0 {
-                return Err(domain());
+                return Err(expected("a positive input", None));
             }
             match args.get(1) {
                 Some(b) => V::Float(x.ln() / num(b)?.ln()),
                 None => V::Float(x.ln()),
             }
         }
-        "log10" => V::Float(a(0)?.log10()),
+        "log10" => {
+            let x = a(0)?;
+            if x <= 0.0 {
+                return Err(expected("a positive input", None));
+            }
+            V::Float(x.log10())
+        }
         "exp" => V::Float(a(0)?.exp()),
         "fabs" => V::Float(a(0)?.abs()),
         "isclose" => {
@@ -902,13 +940,16 @@ pub fn math(name: &str, args: &[V]) -> R {
                 "atan" => x.atan(),
                 _ => {
                     if x <= 0.0 {
-                        return Err(domain());
+                        return Err(expected("a positive input", None));
                     }
                     x.log2()
                 }
             };
             if r.is_nan() && !x.is_nan() {
-                return Err(domain());
+                return Err(match name {
+                    "asin" | "acos" => expected("a number in range from -1 up to 1", Some(x)),
+                    _ => expected("a finite input", Some(x)),
+                });
             }
             V::Float(r)
         }
@@ -1352,7 +1393,7 @@ fn b64enc(data: &[u8]) -> Vec<u8> {
 }
 
 /// `binascii.a2b_base64(s, strict_mode=validate)` as CPython 3.13 decodes
-fn b64dec(s: &[u8], strict: bool) -> R<Vec<u8>> {
+pub fn b64dec(s: &[u8], strict: bool) -> R<Vec<u8>> {
     let err = |m: String| Exc::msg(&BINASCII_ERROR, m);
     let val = |c: u8| B64.iter().position(|&x| x == c);
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
@@ -1539,5 +1580,167 @@ pub fn html_escape(args: &[V], kwargs: &[(String, V)]) -> R {
     if quote {
         out = out.replace('"', "&quot;").replace('\'', "&#x27;");
     }
+    Ok(V::str(out))
+}
+
+/// A code point the translating Python's `unicodedata` does not know (`UCD_UNASSIGNED` of the generated
+/// crate, sorted ranges): CPython leaves it alone (no decomposition, class 0, composes with nothing), whatever
+/// the newer tables of unicode-normalization say
+fn ucd_unassigned(table: &[(u32, u32)], c: char) -> bool {
+    let c = c as u32;
+    table.binary_search_by(|&(lo, hi)| if hi < c { std::cmp::Ordering::Less } else if lo > c { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }).is_ok()
+}
+
+/// The type in CPython's "argument must be X, not Y" messages (`_PyArg_BadArgument`: None, not NoneType)
+fn arg_type(v: &V) -> &'static str {
+    if v.is_none() { "None" } else { v.type_name() }
+}
+
+/// `unicodedata.normalize(form, unistr)`; an unassigned code point (`ucd_unassigned`) is a stable starter that
+/// composes with nothing: the text around it normalizes independently
+pub fn unicodedata_normalize(table: &[(u32, u32)], form: &V, s: &V) -> R {
+    use unicode_normalization::UnicodeNormalization;
+    let V::Str(form) = form else {
+        return Err(Exc::type_error(format!("normalize() argument 1 must be str, not {}", arg_type(form))));
+    };
+    let V::Str(s) = s else {
+        return Err(Exc::type_error(format!("normalize() argument 2 must be str, not {}", arg_type(s))));
+    };
+    let f: fn(&str) -> String = match form.as_ref() {
+        "NFC" => |t| t.nfc().collect(),
+        "NFD" => |t| t.nfd().collect(),
+        "NFKC" => |t| t.nfkc().collect(),
+        "NFKD" => |t| t.nfkd().collect(),
+        _ => return Err(Exc::value_error("invalid normalization form")),
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if ucd_unassigned(table, c) {
+            out.push_str(&f(&s[start..i]));
+            out.push(c);
+            start = i + c.len_utf8();
+        }
+    }
+    out.push_str(&f(&s[start..]));
+    Ok(V::str(out))
+}
+
+/// `unicodedata.combining(chr)`
+pub fn unicodedata_combining(table: &[(u32, u32)], c: &V) -> R {
+    let V::Str(s) = c else {
+        return Err(Exc::type_error(format!("combining() argument must be a unicode character, not {}", arg_type(c))));
+    };
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(ch), None) => Ok(V::Int(if ucd_unassigned(table, ch) {
+            0
+        } else {
+            unicode_normalization::char::canonical_combining_class(ch) as i64
+        })),
+        // reworded in CPython 3.14
+        _ if super::python() < (3, 14) => Err(Exc::type_error("combining() argument must be a unicode character, not str")),
+        _ => Err(Exc::type_error(format!(
+            "combining(): argument must be a unicode character, not a string of length {}",
+            s.chars().count()
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------- string.Template
+
+/// `string.Template(template)`
+pub fn template_new(args: &[V], kwargs: &[(String, V)]) -> R {
+    let t = args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "template").map(|(_, v)| v));
+    match t {
+        Some(V::Str(s)) => Ok(V::native(Native::Template(s.to_string()))),
+        Some(o) => Err(Exc::type_error(format!("py2axum: string.Template of a {}", o.type_name()))),
+        None => Err(Exc::type_error("Template.__init__() missing 1 required positional argument: 'template'")),
+    }
+}
+
+fn ident_len(s: &[u8]) -> usize {
+    // idpattern (?a:[_a-z][_a-z0-9]*) with re.IGNORECASE
+    match s.first() {
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' => 1 + s[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count(),
+        _ => 0,
+    }
+}
+
+/// `Template.substitute(mapping={}, /, **kws)` and `safe_substitute`
+pub fn template_method(t: &str, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    let safe = match name {
+        "substitute" => false,
+        "safe_substitute" => true,
+        "template" => return Ok(V::str(t)),
+        _ => return Err(Exc::attr_error(format!("'Template' object has no attribute '{name}'"))),
+    };
+    if args.len() > 1 {
+        return Err(Exc::type_error("Too many positional arguments"));
+    }
+    let lookup = |k: &str| -> R<Option<V>> {
+        if let Some((_, v)) = kwargs.iter().find(|(n, _)| n == k) {
+            return Ok(Some(v.clone()));
+        }
+        match args.first() {
+            Some(m) => match super::ops::getitem(m, &V::str(k)) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.isinstance(&KEY_ERROR) => Ok(None),
+                Err(e) => Err(e),
+            },
+            None => Ok(None),
+        }
+    };
+    let b = t.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut last = 0;
+    while i < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        out += &t[last..i];
+        let rest = &b[i + 1..];
+        let (name, len) = if rest.first() == Some(&b'$') {
+            out.push('$');
+            i += 2;
+            last = i;
+            continue;
+        } else if rest.first() == Some(&b'{') && ident_len(&rest[1..]) > 0 && rest.get(1 + ident_len(&rest[1..])) == Some(&b'}') {
+            let n = ident_len(&rest[1..]);
+            (&t[i + 2..i + 2 + n], n + 3)
+        } else if ident_len(rest) > 0 {
+            let n = ident_len(rest);
+            (&t[i + 1..i + 1 + n], n + 1)
+        } else {
+            // invalid placeholder
+            if safe {
+                out.push('$');
+                i += 1;
+                last = i;
+                continue;
+            }
+            // string.Template._invalid: i = start of the (empty) `invalid` group, just after the `$`;
+            // lines = text[:i].splitlines(keepends=True), counted in characters
+            let before = &t[..i + 1];
+            let (line, col) = if before.is_empty() {
+                (1, 1)
+            } else {
+                let lines: Vec<&str> = before.split_inclusive('\n').collect();
+                let prior: usize = lines[..lines.len() - 1].iter().map(|l| l.chars().count()).sum();
+                (lines.len(), before.chars().count() - prior)
+            };
+            return Err(Exc::value_error(format!("Invalid placeholder in string: line {line}, col {col}")));
+        };
+        match lookup(name)? {
+            Some(v) => out += &super::ops::str_(&v)?,
+            None if safe => out += &t[i..i + len],
+            None => return Err(Exc::new(&KEY_ERROR, vec![V::str(name)])),
+        }
+        i += len;
+        last = i;
+    }
+    out += &t[last..];
     Ok(V::str(out))
 }

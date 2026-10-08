@@ -65,6 +65,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
         match &**n {
             Native::Module(m) => return (m.attr)(cx, name).await,
             Native::Tenacity(t) => return super::tenacity::attr(t, name),
+            Native::RelDelta(r) => return super::reldelta::attr(r, name).ok_or_else(|| no_attr(v, name)),
             Native::Prom(p) => return super::prom::attr(p, name),
             Native::Routing(o) => return super::routing::attr(o, name),
             Native::TraceFrame(f) => return super::trace::frame_attr(f, name),
@@ -108,7 +109,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                     items.extend(i.extra.lock().iter().map(|(k, x)| (V::str(k), x.clone())));
                     V::dict_from(items)
                 }
-                _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{}'", i.desc.name, name))),
+                // __getattr__: only once the normal lookup failed
+                _ => match find_method(i.desc.methods, "__getattr__") {
+                    Some((false, f)) => f(cx, v.clone(), vec![V::str(name)]).await,
+                    _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{}'", i.desc.name, name))),
+                },
             }
         }
         V::Class(c) if matches!(c.kind, ClassKind::UserException(_)) && c.exc_lookup(name).is_some() => match c.exc_lookup(name).unwrap() {
@@ -165,13 +170,20 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             "microsecond" => V::Int((d.wall.nanosecond() / 1000) as i64),
             "tzinfo" => d.tz.map(V::Tz).unwrap_or(V::None),
             "fold" => V::Int(d.fold as i64),
-            _ => return Err(no_attr(v, name)),
+            // a method read as a value (`hasattr(x, "isoformat")`, `f = d.strftime`)
+            _ => match DATETIME_METHODS.iter().find(|m| **m == name) {
+                Some(m) => V::native(Native::MethodOf(v.clone(), m)),
+                None => return Err(no_attr(v, name)),
+            },
         }),
         V::Date(d) => Ok(match name {
             "year" => V::Int(d.year() as i64),
             "month" => V::Int(d.month() as i64),
             "day" => V::Int(d.day() as i64),
-            _ => return Err(no_attr(v, name)),
+            _ => match DATE_METHODS.iter().find(|m| **m == name) {
+                Some(m) => V::native(Native::MethodOf(v.clone(), m)),
+                None => return Err(no_attr(v, name)),
+            },
         }),
         V::Delta(d) => {
             let us = dt::micros(d);
@@ -208,10 +220,13 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             _ => unreachable!(),
         },
         V::Native(n) => match &**n {
+            Native::WebSocket(s) => super::ws::attr(cx, s, name),
             Native::Request(r) => Ok(match name {
                 "headers" => V::native(Native::Headers(r.clone())),
                 "state" => V::native(Native::State(r.clone())),
                 "url" => V::native(Native::Url(r.clone())),
+                // root_path is always empty here: the origin and "/"
+                "base_url" => V::native(Native::HttpUrl(format!("{}/", ops::request_origin(r)))),
                 "method" => V::str(&r.method),
                 "query_params" => V::dict_from(r.query.iter().map(|(k, x)| (V::str(k), V::str(x))).collect())?,
                 "cookies" => cookies(r)?,
@@ -251,9 +266,12 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 _ => return Err(no_attr(v, name)),
             }),
             Native::Url(r) => Ok(match name {
-                "path" => V::str(&r.path),
+                // Starlette's URL is built from scope["path"], which uvicorn percent-decodes
+                "path" => V::str(web::unquote(&r.path)),
                 "query" => V::str(&r.raw_query),
                 "hostname" => r.header("host").map(|h| V::str(h.split(':').next().unwrap_or(""))).unwrap_or(V::None),
+                "scheme" => V::str("http"),
+                "netloc" => V::str(r.header("host").unwrap_or_default()),
                 _ => return Err(no_attr(v, name)),
             }),
             Native::State(r) => r
@@ -288,6 +306,14 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
     }
 }
 
+const DATETIME_METHODS: &[&str] = &[
+    "isoformat", "strftime", "date", "time", "timetz", "replace", "astimezone", "timestamp", "weekday", "isoweekday",
+    "isocalendar", "utcoffset", "tzname", "dst", "timetuple", "utctimetuple", "toordinal", "ctime",
+];
+const DATE_METHODS: &[&str] = &[
+    "isoformat", "strftime", "replace", "weekday", "isoweekday", "isocalendar", "toordinal", "timetuple", "ctime",
+];
+
 const BUILTIN_METHODS: &[(&str, &str)] = &[
     ("list", "append"), ("list", "extend"), ("list", "pop"), ("list", "remove"), ("list", "insert"), ("list", "clear"),
     ("list", "index"), ("list", "count"),
@@ -298,7 +324,7 @@ const BUILTIN_METHODS: &[(&str, &str)] = &[
 ];
 
 /// `request.cookies`: Starlette's `cookie_parser` (lenient, `http.cookies._unquote` on values)
-fn cookies(r: &web::ReqCell) -> R {
+pub fn cookies(r: &web::ReqCell) -> R {
     let mut out: Vec<(V, V)> = Vec::new();
     for raw in r.headers.iter().filter(|(k, _)| k == "cookie").map(|(_, v)| v) {
         for chunk in raw.split(';') {
@@ -355,18 +381,81 @@ fn schema_fields(s: &'static pyd::SchemaDesc) -> R {
     V::dict_from(s.fields.iter().map(|f| (V::str(f.name), V::native(Native::FieldInfo))).collect())
 }
 
+/// UTF-8 decoding with CPython's error messages (`offset`: bytes already consumed, a BOM)
+fn utf8_decode(b: &[u8], offset: usize) -> R {
+    match std::str::from_utf8(b) {
+        Ok(s) => Ok(V::str(s)),
+        Err(e) => {
+            let p = e.valid_up_to();
+            let msg = match e.error_len() {
+                None if b.len() - p > 1 => format!("can't decode bytes in position {}-{}: unexpected end of data", p + offset, b.len() - 1 + offset),
+                None => format!("can't decode byte 0x{:02x} in position {}: unexpected end of data", b[p], p + offset),
+                Some(_) => {
+                    let start = matches!(b[p], 0xc2..=0xf4);
+                    format!("can't decode byte 0x{:02x} in position {}: invalid {} byte", b[p], p + offset, if start { "continuation" } else { "start" })
+                }
+            };
+            Err(Exc::msg(&UNICODE_DECODE_ERROR, format!("'utf-8' codec {msg}")))
+        }
+    }
+}
+
+/// The `bytes` methods that return text or bytes: strip family, split, startswith/endswith, lower/upper
+fn bytes_method(b: &Arc<[u8]>, name: &str, args: &[V]) -> R {
+    let chars = |i: usize| -> R<Option<Vec<u8>>> {
+        match args.get(i) {
+            None | Some(V::None) => Ok(None),
+            Some(V::Bytes(c)) => Ok(Some(c.to_vec())),
+            Some(o) => Err(Exc::type_error(format!("a bytes-like object is required, not '{}'", o.type_name()))),
+        }
+    };
+    let ws = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
+    let bytes = |v: &[u8]| V::Bytes(Arc::from(v));
+    match name {
+        "strip" | "lstrip" | "rstrip" => {
+            let set = chars(0)?;
+            let keep = |c: &u8| match &set {
+                Some(s) => !s.contains(c),
+                None => !ws(c),
+            };
+            let start = if name == "rstrip" { 0 } else { b.iter().position(keep).unwrap_or(b.len()) };
+            let end = if name == "lstrip" { b.len() } else { b.iter().rposition(keep).map(|i| i + 1).unwrap_or(start) };
+            Ok(bytes(&b[start..end.max(start)]))
+        }
+        "startswith" | "endswith" => {
+            let pre = chars(0)?.ok_or_else(|| Exc::type_error(format!("{name} first arg must be bytes or a tuple of bytes, not NoneType")))?;
+            Ok(V::Bool(if name == "startswith" { b.starts_with(&pre) } else { b.ends_with(&pre) }))
+        }
+        "lower" => Ok(bytes(&b.to_ascii_lowercase())),
+        "upper" => Ok(bytes(&b.to_ascii_uppercase())),
+        "hex" if args.is_empty() => Ok(V::str(hex::encode(b))),
+        _ => Err(Exc::attr_error(format!("'bytes' object has no attribute '{name}'"))),
+    }
+}
+
 fn set_of(items: Vec<V>) -> R {
     let mut m = IndexMap::new();
     for v in items {
-        m.insert(Key::of(&v)?, v);
+        m.insert(Key::set_elem(&v)?, v);
     }
     Ok(V::Set(Arc::new(Mutex::new(m))))
+}
+
+/// `object.__setattr__(obj, name, value)`: past the class's `__setattr__`
+pub fn setattr_raw(v: &V, name: &str, val: V) -> R<()> {
+    match v {
+        V::Inst(i) => i.set_field(name, val),
+        _ => setattr(v, name, val),
+    }
 }
 
 pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
     match v {
         V::Obj(o) => o.set_attr(name, val),
-        V::Inst(i) => i.set_field(name, val),
+        V::Inst(i) => match ops::dunder(v, "__setattr__") {
+            Some(f) => ops::call_dunder(f, v, vec![V::str(name), val], "__setattr__").map(|_| ()),
+            None => i.set_field(name, val),
+        },
         // any exception instance takes attributes (`self.code = ...` in a project exception's __init__)
         V::Exc(e) => {
             e.0.attrs.lock().insert(name.to_string(), val);
@@ -400,6 +489,10 @@ pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
 }
 
 pub async fn hasattr(cx: &Cx, v: &V, name: &str) -> R {
+    // a builtin value's methods are not values here (`getattr(d, "date")` fails): CPython's dir() answers
+    if builtin_dir(v).is_some_and(|d| d.contains(&name)) {
+        return Ok(V::Bool(true));
+    }
     match getattr(cx, v, name).await {
         Ok(_) => Ok(V::Bool(true)),
         Err(e) if e.isinstance(&ATTRIBUTE_ERROR) => Ok(V::Bool(false)),
@@ -429,6 +522,14 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         V::Native(n) if matches!(&**n, Native::Prom(_)) => {
             let Native::Prom(p) = &**n else { unreachable!() };
             super::prom::method(cx, p, name, args, kwargs).await
+        }
+        V::Native(n) if matches!(&**n, Native::Sentry(_)) => {
+            let Native::Sentry(o) = &**n else { unreachable!() };
+            super::sentry::method(cx, o, name, args, kwargs, None).await
+        }
+        V::Native(n) if matches!(&**n, Native::Logger(_)) => {
+            let Native::Logger(l) = &**n else { unreachable!() };
+            web::log(cx, l, name, &args, &kwargs).await
         }
         V::Native(n) if matches!(&**n, Native::Adapter(..)) => {
             let Native::Adapter(td, _) = &**n else { unreachable!() };
@@ -521,20 +622,39 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         V::Str(s) => str_method(s, name, &args, &kwargs),
         V::Bytes(b) if name == "decode" => {
             let enc = args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "encoding").map(|(_, v)| v));
-            if let Some(e) = enc {
-                let e = ops::str_(e)?.to_ascii_lowercase().replace('_', "-");
-                if !matches!(e.as_str(), "utf-8" | "utf8") || args.len() > 1 || kwargs.iter().any(|(k, _)| k != "encoding") {
-                    return Err(Exc::type_error("py2axum: bytes.decode() supports UTF-8 with strict errors only"));
+            let errors = args.get(1).or_else(|| kwargs.iter().find(|(k, _)| k == "errors").map(|(_, v)| v));
+            if let Some(e) = errors {
+                if ops::str_(e)? != "strict" {
+                    return Err(Exc::type_error("py2axum: bytes.decode() supports errors='strict' only"));
                 }
             }
-            match std::str::from_utf8(b) {
-                Ok(s) => Ok(V::str(s)),
-                Err(e) => Err(Exc::msg(
-                    &UNICODE_DECODE_ERROR,
-                    format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: invalid start byte", b[e.valid_up_to()], e.valid_up_to()),
-                )),
+            if args.len() > 2 || kwargs.iter().any(|(k, _)| k != "encoding" && k != "errors") {
+                return Err(Exc::type_error("decode() takes at most 2 arguments"));
+            }
+            let e = match enc {
+                Some(e) => ops::str_(e)?.to_ascii_lowercase().replace(['_', ' '], "-"),
+                None => "utf-8".into(),
+            };
+            match e.as_str() {
+                "utf-8" | "utf8" | "u8" | "utf" => utf8_decode(b, 0),
+                "utf-8-sig" | "utf8-sig" => match b.strip_prefix(b"\xef\xbb\xbf") {
+                    Some(rest) => utf8_decode(rest, 3),
+                    None => utf8_decode(b, 0),
+                },
+                "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "8859" | "l1" | "latin" | "cp819" => {
+                    Ok(V::str(b.iter().map(|&c| c as char).collect::<String>()))
+                }
+                "ascii" | "us-ascii" | "646" => match b.iter().position(|c| *c >= 0x80) {
+                    None => Ok(V::str(b.iter().map(|&c| c as char).collect::<String>())),
+                    Some(p) => Err(Exc::msg(
+                        &UNICODE_DECODE_ERROR,
+                        format!("'ascii' codec can't decode byte 0x{:02x} in position {p}: ordinal not in range(128)", b[p]),
+                    )),
+                },
+                other => Err(Exc::type_error(format!("py2axum: bytes.decode({other:?}) is not supported (utf-8, utf-8-sig, latin-1, ascii)"))),
             }
         }
+        V::Bytes(b) => bytes_method(b, name, &args),
         V::List(l) => list_method(cx, l, name, args, kwargs).await,
         V::Dict(d) => dict_method(d, name, &args, &kwargs),
         V::Set(s) => set_method(s, name, &args),
@@ -557,6 +677,16 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             }
         },
         V::Inst(i) => match name {
+            // pydantic v1's `.dict()`, still on v2 models (deprecated): `model_dump` in Python mode
+            "dict" if !i.desc.dataclass && !i.desc.open && i.desc.settings.is_none() && find_method(i.desc.methods, "dict").is_none() => {
+                if !args.is_empty() {
+                    return Err(Exc::type_error(format!("BaseModel.dict() takes 1 positional argument but {} were given", args.len() + 1)));
+                }
+                if let Some((k, _)) = kwargs.iter().find(|(k, _)| k == "mode") {
+                    return Err(Exc::type_error(format!("BaseModel.dict() got an unexpected keyword argument '{k}'")));
+                }
+                Box::pin(call_method(cx, recv, "model_dump", args, kwargs)).await
+            }
             "model_dump" | "model_dump_json" => {
                 for (k, _) in &kwargs {
                     if !matches!(k.as_str(), "mode" | "exclude_none" | "exclude_unset" | "by_alias" | "exclude" | "include") || (name == "model_dump_json" && k == "mode") {
@@ -655,6 +785,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 }
                 pyd::construct(cx, s, obj).await
             }
+            (ClassKind::Schema(s), "model_json_schema") => match s.json_schema {
+                Some(j) => pyd::loads(j),
+                None => Err(Exc::type_error(format!("py2axum: {}.model_json_schema() was not computed", s.name))),
+            },
             (ClassKind::Schema(s), "model_validate_json") => {
                 let obj = pyd::loads(&ops::str_(args.first().unwrap_or(&V::None))?)?;
                 pyd::construct(cx, s, obj).await
@@ -713,7 +847,8 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             "delete" => s.delete(&args[0]).await.map(|_| V::None),
             "begin_nested" => s.begin_nested().await,
             "query" => orm::query(s, args),
-            "close" | "aclose" => Ok(V::None),
+            "close" | "aclose" => s.close().await.map(|_| V::None),
+            "connection" => s.connection().await,
             // the engine the session is bound to (sync side for get_bind(), but the same process pool)
             "get_bind" => Ok(V::native(Native::Engine)),
             _ => Err(Exc::attr_error(format!("'AsyncSession' object has no attribute '{name}' (not supported by py2axum)"))),
@@ -735,13 +870,17 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 "items" => Ok(V::list(r.headers.iter().map(|(k, x)| V::tuple(vec![V::str(k), V::str(x)])).collect())),
                 _ => Err(no_attr(recv, name)),
             },
+            Native::WebSocket(s) => super::ws::method(cx, s, name, args, kwargs).await,
+            Native::WsIter(s, kind) if name == "__anext__" => match super::ws::iter_next(s, kind).await? {
+                Some(v) => Ok(v),
+                None => Err(Exc::new(&STOP_ASYNC_ITERATION, vec![])),
+            },
             Native::Request(r) => match name {
                 "is_disconnected" => Ok(V::Bool(r.disconnected.load(std::sync::atomic::Ordering::Relaxed))),
                 "body" => Ok(V::Bytes(Arc::from(&r.body[..]))),
                 "json" => pyd::loads(&String::from_utf8_lossy(&r.body)),
                 _ => Err(no_attr(recv, name)),
             },
-            Native::Logger(n) => web::log(n, name, &args),
             Native::Queue(q) => match name {
                 "put_nowait" => q.put_nowait(args[0].clone()).map(|_| V::None),
                 "put" => q.put(args[0].clone()).await.map(|_| V::None),
@@ -769,9 +908,15 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::McpManager(s) => super::mcp::manager_method(cx, s, name, &args).await,
             Native::IniConfig(c) => super::ini::method(c, name, &args, &kwargs),
             Native::PydUrl(_, u) if name == "unicode_string" => Ok(V::str(u.as_str())),
+            Native::SessConn(s) => match name {
+                "close" => s.close_connection().await.map(|_| V::None),
+                _ => Err(no_attr(recv, name)),
+            },
             Native::Engine => match name {
                 // a connection: its own transaction, rolled back when the `async with` ends
                 "connect" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, false, Arc::downgrade(cx)))),
+                // a connection in a transaction: committed when the `async with` ends without an exception
+                "begin" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, false, Arc::downgrade(cx)).begin_block())),
                 "dispose" => Ok(V::None),
                 _ => Err(no_attr(recv, name)),
             },
@@ -787,9 +932,11 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::CsvWriter(w) => super::stdlib::writer_method(w, name, &args),
             Native::SnifferObj if name == "sniff" => super::stdlib::sniff(&args, &kwargs),
             Native::Hmac(h) => super::stdlib::hmac_method(h, name, &args),
-            Native::Jinja(j) => super::mail::jinja_method(j, name, &args),
+            Native::Jinja(j) => super::mail::jinja_method(j, name, &args, &kwargs),
             Native::JinjaTpl(t) => super::mail::tpl_method(t, name, &args, &kwargs),
             Native::Mime(m) => super::mail::mime_method(m, name, &args, &kwargs),
+            Native::Deque(d) => super::deque::method(d, name, &args),
+            Native::Template(t) => super::stdlib::template_method(t, name, &args, &kwargs),
             Native::Tasks(t) => super::resp::tasks_method(t, name, &args, &kwargs),
             Native::Response(r) if name == "set_cookie" || name == "delete_cookie" => {
                 super::resp::set_cookie(&r.headers, &args, &kwargs, name == "delete_cookie")
@@ -1295,21 +1442,21 @@ async fn list_method(cx: &Cx, l: &Arc<Mutex<Vec<V>>>, name: &str, args: Vec<V>, 
 fn dict_method(d: &Arc<Mutex<IndexMap<Key, (V, V)>>>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     match name {
         "get" => {
-            let k = Key::of(&args[0])?;
+            let k = Key::dict_key(&args[0])?;
             Ok(d.lock().get(&k).map(|(_, v)| v.clone()).unwrap_or_else(|| args.get(1).cloned().unwrap_or(V::None)))
         }
         "items" => Ok(V::list(d.lock().values().map(|(k, v)| V::tuple(vec![k.clone(), v.clone()])).collect())),
         "keys" => Ok(V::list(d.lock().values().map(|(k, _)| k.clone()).collect())),
         "values" => Ok(V::list(d.lock().values().map(|(_, v)| v.clone()).collect())),
         "pop" => {
-            let k = Key::of(&args[0])?;
+            let k = Key::dict_key(&args[0])?;
             match d.lock().shift_remove(&k) {
                 Some((_, v)) => Ok(v),
                 None => args.get(1).cloned().ok_or_else(|| Exc::new(&KEY_ERROR, vec![args[0].clone()])),
             }
         }
         "setdefault" => {
-            let k = Key::of(&args[0])?;
+            let k = Key::dict_key(&args[0])?;
             let mut g = d.lock();
             Ok(g.entry(k).or_insert_with(|| (args[0].clone(), args.get(1).cloned().unwrap_or(V::None))).1.clone())
         }
@@ -1331,7 +1478,7 @@ fn dict_method(d: &Arc<Mutex<IndexMap<Key, (V, V)>>>, name: &str, args: &[V], kw
             }
             let mut g = d.lock();
             for (k, v) in items {
-                g.insert(Key::of(&k)?, (k, v));
+                g.insert(Key::dict_key(&k)?, (k, v));
             }
             Ok(V::None)
         }
@@ -1347,20 +1494,20 @@ fn dict_method(d: &Arc<Mutex<IndexMap<Key, (V, V)>>>, name: &str, args: &[V], kw
 fn set_method(s: &Arc<Mutex<IndexMap<Key, V>>>, name: &str, args: &[V]) -> R {
     match name {
         "add" => {
-            s.lock().insert(Key::of(&args[0])?, args[0].clone());
+            s.lock().insert(Key::set_elem(&args[0])?, args[0].clone());
             Ok(V::None)
         }
         "discard" => {
-            s.lock().shift_remove(&Key::of(&args[0])?);
+            s.lock().shift_remove(&Key::set_elem(&args[0])?);
             Ok(V::None)
         }
-        "remove" => match s.lock().shift_remove(&Key::of(&args[0])?) {
+        "remove" => match s.lock().shift_remove(&Key::set_elem(&args[0])?) {
             Some(_) => Ok(V::None),
             None => Err(Exc::new(&KEY_ERROR, vec![args[0].clone()])),
         },
         "update" => {
             for x in ops::iter(&args[0])? {
-                s.lock().insert(Key::of(&x)?, x);
+                s.lock().insert(Key::set_elem(&x)?, x);
             }
             Ok(V::None)
         }
@@ -1396,15 +1543,18 @@ fn set_method(s: &Arc<Mutex<IndexMap<Key, V>>>, name: &str, args: &[V]) -> R {
         }
         "difference_update" | "intersection_update" => {
             let mut keep = s.lock().clone();
+            // CPython 3.14 names the role in difference_update, not in intersection_update
+            let key = if name == "intersection_update" { Key::of } else { Key::set_elem };
             for other in args {
-                let o = ops::iter(other)?.iter().map(Key::of).collect::<R<std::collections::HashSet<Key>>>()?;
+                let o = ops::iter(other)?.iter().map(key).collect::<R<std::collections::HashSet<Key>>>()?;
                 keep.retain(|k, _| o.contains(k) == (name == "intersection_update"));
             }
             *s.lock() = keep;
             Ok(V::None)
         }
         "issubset" | "issuperset" | "isdisjoint" => {
-            let o = ops::iter(&args[0])?.iter().map(Key::of).collect::<R<std::collections::HashSet<Key>>>()?;
+            let key = if name == "issubset" { Key::of } else { Key::set_elem };
+            let o = ops::iter(&args[0])?.iter().map(key).collect::<R<std::collections::HashSet<Key>>>()?;
             let mine: Vec<Key> = s.lock().keys().cloned().collect();
             Ok(V::Bool(match name {
                 "issubset" => mine.iter().all(|k| o.contains(k)),
@@ -1417,6 +1567,15 @@ fn set_method(s: &Arc<Mutex<IndexMap<Key, V>>>, name: &str, args: &[V]) -> R {
 }
 
 // ---------------------------------------------------------------- datetime methods
+
+/// a date's or datetime's method, synchronously (from a template)
+pub fn value_method_sync(v: &V, name: &str, args: &[V]) -> R {
+    match v {
+        V::DateTime(d) => datetime_method(d, name, args, &[]),
+        V::Date(d) => date_method(d, name, args, &[]),
+        _ => Err(no_attr(v, name)),
+    }
+}
 
 fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     Ok(match name {
@@ -1445,27 +1604,27 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
             V::DateTime(d.astimezone(tz))
         }
         "replace" => {
-            let mut w = d.wall;
+            let w = d.wall;
             let mut tz = d.tz;
+            let mut f = [w.year() as i64, w.month() as i64, w.day() as i64, w.hour() as i64, w.minute() as i64, w.second() as i64, (w.nanosecond() / 1000) as i64];
             for (k, v) in kwargs {
-                let i = || -> R<u32> { match v { V::Int(i) => Ok(*i as u32), _ => Err(Exc::type_error("an integer is required")) } };
-                w = match k.as_str() {
-                    "year" => w.with_year(i()? as i32),
-                    "month" => w.with_month(i()?),
-                    "day" => w.with_day(i()?),
-                    "hour" => w.with_hour(i()?),
-                    "minute" => w.with_minute(i()?),
-                    "second" => w.with_second(i()?),
-                    "microsecond" => w.with_nanosecond(i()? * 1000),
+                let slot = match k.as_str() {
+                    "year" => 0, "month" => 1, "day" => 2, "hour" => 3, "minute" => 4, "second" => 5, "microsecond" => 6,
                     "tzinfo" => {
                         tz = libs::tz_of(v)?;
-                        Some(w)
+                        continue;
                     }
                     _ => return Err(Exc::type_error(format!("'{k}' is an invalid keyword argument for replace()"))),
-                }
-                .ok_or_else(|| Exc::value_error("replace(): value out of range"))?;
+                };
+                f[slot] = match v { V::Int(i) => *i, V::Bool(b) => *b as i64, o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))) };
             }
-            V::DateTime(DateTime { wall: w, tz, fold: 0 })
+            let date = ymd(f[0], f[1], f[2])?;
+            let (h, mi, sec, us) = (f[3], f[4], f[5], f[6]);
+            for (v, hi, what) in [(h, 23, "hour"), (mi, 59, "minute"), (sec, 59, "second"), (us, 999_999, "microsecond")] {
+                time_field(v, hi, what)?;
+            }
+            let wall = date.and_hms_micro_opt(h as u32, mi as u32, sec as u32, us as u32).ok_or_else(|| Exc::value_error("replace(): value out of range"))?;
+            V::DateTime(DateTime { wall, tz, fold: 0 })
         }
         "utcoffset" => d.offset().map(|o| V::Delta(Duration::seconds(o as i64))).unwrap_or(V::None),
         "weekday" => V::Int(d.wall.weekday().num_days_from_monday() as i64),
@@ -1478,6 +1637,40 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
 
 use chrono::TimeZone;
 
+/// `date(year, month, day)` with CPython's checks and messages (reworded in 3.14: the value and the bounds)
+pub fn ymd(y: i64, m: i64, d: i64) -> R<chrono::NaiveDate> {
+    let new = super::python() >= (3, 14);
+    if !(1..=9999).contains(&y) {
+        return Err(Exc::value_error(if new { format!("year must be in 1..9999, not {y}") } else { format!("year {y} is out of range") }));
+    }
+    if !(1..=12).contains(&m) {
+        return Err(Exc::value_error(if new { format!("month must be in 1..12, not {m}") } else { "month must be in 1..12".into() }));
+    }
+    chrono::NaiveDate::from_ymd_opt(y as i32, m as u32, d as u32).filter(|_| d >= 1).ok_or_else(|| {
+        Exc::value_error(if new {
+            format!("day {d} must be in range 1..{} for month {m} in year {y}", days_in(y, m))
+        } else {
+            "day is out of range for month".into()
+        })
+    })
+}
+
+/// `hour/minute/second/microsecond must be in 0..N` (3.14 adds `, not V`)
+pub fn time_field(v: i64, hi: i64, what: &str) -> R<()> {
+    if (0..=hi).contains(&v) {
+        return Ok(());
+    }
+    Err(Exc::value_error(if super::python() >= (3, 14) { format!("{what} must be in 0..{hi}, not {v}") } else { format!("{what} must be in 0..{hi}") }))
+}
+
+fn days_in(y: i64, m: i64) -> u32 {
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    chrono::NaiveDate::from_ymd_opt(ny as i32, nm as u32, 1)
+        .and_then(|n| n.pred_opt())
+        .map(|p| p.day())
+        .unwrap_or(31)
+}
+
 fn date_method(d: &chrono::NaiveDate, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     Ok(match name {
         "isoformat" => V::str(dt::date_iso(d)),
@@ -1486,21 +1679,15 @@ fn date_method(d: &chrono::NaiveDate, name: &str, args: &[V], kwargs: &[(String,
         "toordinal" => V::Int(d.num_days_from_ce() as i64),
         "strftime" => V::str(libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, &strs(&args[0])?)),
         "replace" => {
-            let mut x = *d;
+            let mut f = [d.year() as i64, d.month() as i64, d.day() as i64];
             for (k, v) in kwargs {
-                let i = match v {
-                    V::Int(i) => *i,
-                    _ => return Err(Exc::type_error("an integer is required")),
+                let slot = match k.as_str() {
+                    "year" => 0, "month" => 1, "day" => 2,
+                    _ => return Err(Exc::type_error(format!("'{k}' is an invalid keyword argument for replace()"))),
                 };
-                x = match k.as_str() {
-                    "year" => x.with_year(i as i32),
-                    "month" => x.with_month(i as u32),
-                    "day" => x.with_day(i as u32),
-                    _ => None,
-                }
-                .ok_or_else(|| Exc::value_error("replace(): value out of range"))?;
+                f[slot] = match v { V::Int(i) => *i, V::Bool(b) => *b as i64, o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))) };
             }
-            V::Date(x)
+            V::Date(ymd(f[0], f[1], f[2])?)
         }
         _ => return Err(Exc::attr_error(format!("'datetime.date' object has no attribute '{name}'"))),
     })
@@ -1900,9 +2087,26 @@ pub fn b_enumerate(args: &[V]) -> R {
     Ok(V::list(ops::iter(&args[0])?.into_iter().enumerate().map(|(i, x)| V::tuple(vec![V::Int(start + i as i64), x])).collect()))
 }
 
-pub fn b_zip(args: &[V]) -> R {
+pub fn b_zip(args: &[V], kwargs: &[(String, V)]) -> R {
     let lists = args.iter().map(ops::iter).collect::<R<Vec<_>>>()?;
     let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    let strict = match kwargs {
+        [] => false,
+        [(k, v)] if k == "strict" => ops::truthy(v)?,
+        [(k, _), ..] => return Err(Exc::type_error(format!("zip() got an unexpected keyword argument '{k}'"))),
+    };
+    if strict {
+        // raised at the call, not after the common prefix was consumed (docs/supported.md)
+        let args_word = |j: usize| if j == 1 { "argument 1".to_string() } else { format!("arguments 1-{j}") };
+        if let Some(i) = lists.iter().position(|l| l.len() == n) {
+            if i > 0 {
+                return Err(Exc::value_error(format!("zip() argument {} is shorter than {}", i + 1, args_word(i))));
+            }
+            if let Some(j) = lists.iter().position(|l| l.len() > n) {
+                return Err(Exc::value_error(format!("zip() argument {} is longer than {}", j + 1, args_word(j))));
+            }
+        }
+    }
     Ok(V::list((0..n).map(|i| V::tuple(lists.iter().map(|l| l[i].clone()).collect())).collect()))
 }
 
@@ -2132,4 +2336,25 @@ pub async fn enum_call(cx: &Cx, desc: &'static EnumDesc, v: &V) -> R {
             ))),
         },
     }
+}
+/// `dir()` of CPython 3.14's builtin values: what `hasattr` answers for them (methods included)
+pub fn builtin_dir(v: &V) -> Option<&'static [&'static str]> {
+    Some(match v {
+        V::None => &["__bool__", "__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__"],
+        V::Bool(_) => &["__abs__", "__add__", "__and__", "__bool__", "__ceil__", "__class__", "__delattr__", "__dir__", "__divmod__", "__doc__", "__eq__", "__float__", "__floor__", "__floordiv__", "__format__", "__ge__", "__getattribute__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__index__", "__init__", "__init_subclass__", "__int__", "__invert__", "__le__", "__lshift__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__", "__new__", "__or__", "__pos__", "__pow__", "__radd__", "__rand__", "__rdivmod__", "__reduce__", "__reduce_ex__", "__repr__", "__rfloordiv__", "__rlshift__", "__rmod__", "__rmul__", "__ror__", "__round__", "__rpow__", "__rrshift__", "__rshift__", "__rsub__", "__rtruediv__", "__rxor__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__truediv__", "__trunc__", "__xor__", "as_integer_ratio", "bit_count", "bit_length", "conjugate", "denominator", "from_bytes", "imag", "is_integer", "numerator", "real", "to_bytes"],
+        V::Int(_) => &["__abs__", "__add__", "__and__", "__bool__", "__ceil__", "__class__", "__delattr__", "__dir__", "__divmod__", "__doc__", "__eq__", "__float__", "__floor__", "__floordiv__", "__format__", "__ge__", "__getattribute__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__index__", "__init__", "__init_subclass__", "__int__", "__invert__", "__le__", "__lshift__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__", "__new__", "__or__", "__pos__", "__pow__", "__radd__", "__rand__", "__rdivmod__", "__reduce__", "__reduce_ex__", "__repr__", "__rfloordiv__", "__rlshift__", "__rmod__", "__rmul__", "__ror__", "__round__", "__rpow__", "__rrshift__", "__rshift__", "__rsub__", "__rtruediv__", "__rxor__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__truediv__", "__trunc__", "__xor__", "as_integer_ratio", "bit_count", "bit_length", "conjugate", "denominator", "from_bytes", "imag", "is_integer", "numerator", "real", "to_bytes"],
+        V::Float(_) => &["__abs__", "__add__", "__bool__", "__ceil__", "__class__", "__delattr__", "__dir__", "__divmod__", "__doc__", "__eq__", "__float__", "__floor__", "__floordiv__", "__format__", "__ge__", "__getattribute__", "__getformat__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__int__", "__le__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__", "__new__", "__pos__", "__pow__", "__radd__", "__rdivmod__", "__reduce__", "__reduce_ex__", "__repr__", "__rfloordiv__", "__rmod__", "__rmul__", "__round__", "__rpow__", "__rsub__", "__rtruediv__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__truediv__", "__trunc__", "as_integer_ratio", "conjugate", "from_number", "fromhex", "hex", "imag", "is_integer", "real"],
+        V::Str(_) => &["__add__", "__class__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__iter__", "__le__", "__len__", "__lt__", "__mod__", "__mul__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__", "__rmod__", "__rmul__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__", "capitalize", "casefold", "center", "count", "encode", "endswith", "expandtabs", "find", "format", "format_map", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit", "isidentifier", "islower", "isnumeric", "isprintable", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "maketrans", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "translate", "upper", "zfill"],
+        V::Bytes(_) => &["__add__", "__buffer__", "__bytes__", "__class__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__iter__", "__le__", "__len__", "__lt__", "__mod__", "__mul__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__", "__rmod__", "__rmul__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__", "capitalize", "center", "count", "decode", "endswith", "expandtabs", "find", "fromhex", "hex", "index", "isalnum", "isalpha", "isascii", "isdigit", "islower", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "maketrans", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "translate", "upper", "zfill"],
+        V::List(_) => &["__add__", "__class__", "__class_getitem__", "__contains__", "__delattr__", "__delitem__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getstate__", "__gt__", "__hash__", "__iadd__", "__imul__", "__init__", "__init_subclass__", "__iter__", "__le__", "__len__", "__lt__", "__mul__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__", "__reversed__", "__rmul__", "__setattr__", "__setitem__", "__sizeof__", "__str__", "__subclasshook__", "append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove", "reverse", "sort"],
+        V::Tuple(_) => &["__add__", "__class__", "__class_getitem__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__iter__", "__le__", "__len__", "__lt__", "__mul__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__", "__rmul__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__", "count", "index"],
+        V::Dict(_) => &["__class__", "__class_getitem__", "__contains__", "__delattr__", "__delitem__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__ior__", "__iter__", "__le__", "__len__", "__lt__", "__ne__", "__new__", "__or__", "__reduce__", "__reduce_ex__", "__repr__", "__reversed__", "__ror__", "__setattr__", "__setitem__", "__sizeof__", "__str__", "__subclasshook__", "clear", "copy", "fromkeys", "get", "items", "keys", "pop", "popitem", "setdefault", "update", "values"],
+        V::Set(_) => &["__and__", "__class__", "__class_getitem__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__iand__", "__init__", "__init_subclass__", "__ior__", "__isub__", "__iter__", "__ixor__", "__le__", "__len__", "__lt__", "__ne__", "__new__", "__or__", "__rand__", "__reduce__", "__reduce_ex__", "__repr__", "__ror__", "__rsub__", "__rxor__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__xor__", "add", "clear", "copy", "difference", "difference_update", "discard", "intersection", "intersection_update", "isdisjoint", "issubset", "issuperset", "pop", "remove", "symmetric_difference", "symmetric_difference_update", "union", "update"],
+        V::DateTime(_) => &["__add__", "__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__radd__", "__reduce__", "__reduce_ex__", "__replace__", "__repr__", "__rsub__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "astimezone", "combine", "ctime", "date", "day", "dst", "fold", "fromisocalendar", "fromisoformat", "fromordinal", "fromtimestamp", "hour", "isocalendar", "isoformat", "isoweekday", "max", "microsecond", "min", "minute", "month", "now", "replace", "resolution", "second", "strftime", "strptime", "time", "timestamp", "timetuple", "timetz", "today", "toordinal", "tzinfo", "tzname", "utcfromtimestamp", "utcnow", "utcoffset", "utctimetuple", "weekday", "year"],
+        V::Date(_) => &["__add__", "__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__radd__", "__reduce__", "__reduce_ex__", "__replace__", "__repr__", "__rsub__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "ctime", "day", "fromisocalendar", "fromisoformat", "fromordinal", "fromtimestamp", "isocalendar", "isoformat", "isoweekday", "max", "min", "month", "replace", "resolution", "strftime", "strptime", "timetuple", "today", "toordinal", "weekday", "year"],
+        V::Time(_) => &["__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__replace__", "__repr__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__", "dst", "fold", "fromisoformat", "hour", "isoformat", "max", "microsecond", "min", "minute", "replace", "resolution", "second", "strftime", "strptime", "tzinfo", "tzname", "utcoffset"],
+        V::Delta(_) => &["__abs__", "__add__", "__bool__", "__class__", "__delattr__", "__dir__", "__divmod__", "__doc__", "__eq__", "__floordiv__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__", "__new__", "__pos__", "__radd__", "__rdivmod__", "__reduce__", "__reduce_ex__", "__repr__", "__rfloordiv__", "__rmod__", "__rmul__", "__rsub__", "__rtruediv__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__truediv__", "days", "max", "microseconds", "min", "resolution", "seconds", "total_seconds"],
+        V::Decimal(_) => &["__abs__", "__add__", "__bool__", "__ceil__", "__class__", "__complex__", "__copy__", "__deepcopy__", "__delattr__", "__dir__", "__divmod__", "__doc__", "__eq__", "__float__", "__floor__", "__floordiv__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__int__", "__le__", "__lt__", "__mod__", "__module__", "__mul__", "__ne__", "__neg__", "__new__", "__pos__", "__pow__", "__radd__", "__rdivmod__", "__reduce__", "__reduce_ex__", "__repr__", "__rfloordiv__", "__rmod__", "__rmul__", "__round__", "__rpow__", "__rsub__", "__rtruediv__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__truediv__", "__trunc__", "adjusted", "as_integer_ratio", "as_tuple", "canonical", "compare", "compare_signal", "compare_total", "compare_total_mag", "conjugate", "copy_abs", "copy_negate", "copy_sign", "exp", "fma", "from_float", "from_number", "imag", "is_canonical", "is_finite", "is_infinite", "is_nan", "is_normal", "is_qnan", "is_signed", "is_snan", "is_subnormal", "is_zero", "ln", "log10", "logb", "logical_and", "logical_invert", "logical_or", "logical_xor", "max", "max_mag", "min", "min_mag", "next_minus", "next_plus", "next_toward", "normalize", "number_class", "quantize", "radix", "real", "remainder_near", "rotate", "same_quantum", "scaleb", "shift", "sqrt", "to_eng_string", "to_integral", "to_integral_exact", "to_integral_value"],
+        _ => return None,
+    })
 }

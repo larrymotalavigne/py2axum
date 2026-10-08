@@ -55,7 +55,8 @@ async def team(team_id: int, s: AsyncSession = Depends(db)):
 @pytest.mark.parametrize(
     "rel, message",
     [
-        ('parent: Mapped["Team"] = relationship(remote_side=[id])', "option remote_side= is not supported"),
+        ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], remote_side=[id])',
+         "remote_side= is only supported on a self-referential"),
         ('owner: Mapped["User"] = relationship()', "cannot pick the foreign key between teams and users"),
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], lazy="dynamic")', "lazy='dynamic' is not supported"),
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], order_by="User.nope")', "order_by= must name columns of User"),
@@ -316,6 +317,28 @@ def test_schema_declaration_rejected(tmp_path, capsys, body, message):
         "from decimal import Decimal\nfrom functools import cached_property\n"
         "from fastapi import FastAPI\nfrom pydantic import BaseModel, Field, computed_field\n\napp = FastAPI()\n\n\n"
         f"class In(BaseModel):\n{body}\n\n\n@app.post('/x')\nasync def x(b: In):\n    return b\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "classes, message",
+    [
+        ("class A:\n    pass\n\n\nclass B:\n    pass\n\n\nclass C(A, B):\n    pass\n", "only exception classes are supported"),
+        ("class A:\n    def m(self):\n        return 1\n\n\nclass C(A):\n    def m(self):\n        return super().m()\n",
+         "only `super().__init__(...)` inside a method is supported"),
+        ("from abc import ABC\n\n\nclass A(ABC):\n    pass\n\n\nclass C(A):\n    def __init__(self):\n        super().__init__(1)\n",
+         "object.__init__() takes exactly one argument"),
+    ],
+)
+def test_plain_class_inheritance_rejected(tmp_path, capsys, classes, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\n\napp = FastAPI()\n\n\n" + classes
+                                 + "\n\n@app.get('/x')\nasync def x():\n    c = C()\n    return {'m': c.m() if hasattr(c, 'm') else 0}\n")
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
@@ -948,3 +971,728 @@ def test_raw_asgi_class_endpoint_rejected(tmp_path, capsys):
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "add_route() with a class endpoint" in err and "main.py:10" in err
+
+
+WS_APP = '''
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Request, WebSocket
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+class Msg(BaseModel):
+    text: str
+
+
+async def needs_request(request: Request):
+    return request.url.path
+
+
+async def outer(v: Annotated[str, Depends(needs_request)]):
+    return v
+{extra}
+'''
+
+
+@pytest.mark.parametrize(
+    "extra, message, line",
+    [
+        ('@app.websocket("/w")\nasync def w(websocket: WebSocket, request: Request):\n    pass\n',
+         "parameter `request` (a Request) is not provided by FastAPI on a WebSocket route", 23),
+        ('@app.websocket("/w")\nasync def w(websocket: WebSocket, msg: Msg):\n    pass\n',
+         "parameter `msg` (a body) is not provided", 23),
+        ('@app.websocket("/w")\nasync def w(websocket: WebSocket, v: Annotated[str, Depends(outer)]):\n    pass\n',
+         "dependency needs_request (main.py:14) takes a Request, which FastAPI does not provide on a WebSocket route", 23),
+        ('@app.websocket("/w", dependencies=[Depends(needs_request)])\nasync def w(websocket: WebSocket):\n    pass\n',
+         "dependency needs_request (main.py:14) takes a Request", 23),
+        ('@app.websocket("/w")\ndef w(websocket: WebSocket):\n    pass\n', "WebSocket endpoint w must be an `async def`", 23),
+        ('@app.websocket("/w", response_class=None)\nasync def w(websocket: WebSocket):\n    pass\n',
+         "unsupported WebSocket route option response_class=", 22),
+        ('async def w(websocket: WebSocket):\n    pass\n\napp.add_websocket_route("/w", w)\n',
+         "app.add_websocket_route(...) is not supported", 25),
+        ('async def w(websocket: WebSocket):\n    pass\n\napp.add_api_websocket_route("/w", w)\n',
+         "app.add_api_websocket_route(...) is not supported", 25),
+        ('@app.websocket_route("/w")\nasync def w(websocket: WebSocket):\n    pass\n', "@app.websocket_route(...) is not supported", 22),
+        ('from fastapi import APIRouter\nr = APIRouter()\n@r.websocket_route("/w")\nasync def w(websocket: WebSocket):\n    pass\n'
+         'app.include_router(r)\n', "@router.websocket_route(...) is not supported: use @router.websocket(...)", 24),
+    ],
+)
+def test_websocket_rejected(tmp_path, capsys, extra, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(WS_APP.format(extra="\n\n" + extra))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and f"main.py:{line}" in err, err
+
+
+def test_websocket_python_side_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(WS_APP.format(extra='\n\n@app.websocket("/w")\nasync def w(websocket: WebSocket):\n    await websocket.accept()\n'))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "/w", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "WebSocket route /w cannot be declared --python-side" in err and "main.py:22" in err, err
+
+
+def test_websocket_accepted(tmp_path):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(WS_APP.format(extra='''
+
+from fastapi import APIRouter, WebSocketDisconnect
+router = APIRouter(prefix="/r")
+
+
+@router.websocket("/w/{room}", name="room")
+async def w(websocket: WebSocket, room: str, n: int = 1):
+    await websocket.accept()
+    try:
+        async for t in websocket.iter_text():
+            await websocket.send_text(room + t * n)
+    except WebSocketDisconnect:
+        pass
+
+app.include_router(router)
+'''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "/// WEBSOCKET /r/w/{room}" in gen and "WsRouteDef" in gen and "Node::Ws" in gen
+
+
+JSON_SCHEMA_APP = '''
+from dataclasses import dataclass
+
+from fastapi import FastAPI
+from pydantic import BaseModel, field_validator
+
+
+class A(BaseModel):
+    x: int = 1
+
+
+class B(BaseModel):
+    y: str
+
+    @field_validator("y")
+    @classmethod
+    def strip(cls, v):
+        return v.strip()
+
+
+@dataclass
+class Tool:
+    params_model: type
+
+
+TOOLS = [Tool(params_model=A), Tool(params_model={other})]
+app = FastAPI()
+
+
+@app.get("/x")
+async def x():
+    {body}
+'''
+
+
+@pytest.mark.parametrize(
+    "other, body, message, line",
+    [
+        ("A", "return [t.params_model.model_json_schema() for t in TOOLS]", None, None),
+        ("B", "return [t.params_model.model_json_schema() for t in TOOLS]",
+         ".model_json_schema() of B: ", 32),
+        ("A", "return B.model_json_schema()", ".model_json_schema() of B: ", 32),
+        ("A", "m = A\n    return m.model_json_schema()",
+         "on a value that is not a model class or an attribute holding one", 33),
+        ("A", "return A(x=2).model_json_schema()", "not a model class or an attribute holding one", 32),
+        ("A", "return A.model_json_schema(mode='serialization')", "with arguments is not supported", 32),
+        ("A()", "return [t.params_model.model_json_schema() for t in TOOLS]", "which is also bound to `A()`", 32),
+    ],
+)
+def test_model_json_schema_rejected(tmp_path, capsys, other, body, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(JSON_SCHEMA_APP.format(other=other, body=body))
+    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert code == 0, err
+        assert 'title\\":\\"A' in (tmp_path / "out" / "src" / "gen.rs").read_text()
+        return
+    assert code == 1
+    assert message in err and f"main.py:{line}" in err
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ("return inspect(x)", "only inspect(x, raiseerr=False) is supported"),
+        ("return inspect(x, raiseerr=True)", "only inspect(x, raiseerr=False) is supported"),
+        ("return json.dumps(x, cls=None)", "json.dumps(cls=) is not supported"),
+        ("return unicodedata.normalize(form='NFC', unistr=x)", "two positional arguments"),
+    ],
+)
+def test_library_options_rejected(tmp_path, capsys, body, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "import json\nimport unicodedata\n\nfrom fastapi import FastAPI\nfrom sqlalchemy import inspect\n\n"
+        f"app = FastAPI()\n\n\n@app.get('/x')\nasync def x(x: str = 'a'):\n    {body}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and "main.py:12" in err
+
+
+def test_response_model_validator_blocks_its_routes(tmp_path):
+    """A model validator outside the subset is reached by every route that validates or serializes the model:
+    `--python-side auto` moves those routes (and only them), instead of a 500 at run time."""
+    from py2axum.report import collect_dyn
+
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        from fastapi import FastAPI
+        from pydantic import BaseModel, model_validator
+        import tempfile
+
+
+        class Out(BaseModel):
+            a: int = 1
+
+            @model_validator(mode="before")
+            @classmethod
+            def odd(cls, data):
+                tempfile.mkdtemp()
+                return data
+
+
+        class Nested(BaseModel):
+            inner: Out
+
+
+        app = FastAPI()
+
+
+        @app.get("/direct", response_model=Out)
+        async def direct():
+            return {"a": 2}
+
+
+        @app.get("/nested", response_model=Nested)
+        async def nested():
+            return {"inner": {"a": 2}}
+
+
+        @app.post("/body")
+        async def body(o: Out):
+            return {}
+
+
+        @app.get("/plain")
+        async def plain():
+            return {"a": 2}
+    '''))
+    _, per_route = collect_dyn(pkg, tmp_path, set())
+    blocked = {info["path"] for info, errs in per_route if errs}
+    assert blocked == {"/direct", "/nested", "/body"}
+
+
+@pytest.mark.parametrize(
+    "expr, message",
+    [
+        ("enumerate(x, begin=1)", "enumerate(begin=) is not supported (only start=, in that order)"),
+        ("round(1.5, 1, ndigits=2)", "round(ndigits=) is not supported"),
+        ("str(b'x', encoding='utf-8')", "str(encoding=) is not supported"),
+    ],
+)
+def test_builtin_keywords_rejected(tmp_path, capsys, expr, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(f"from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x(x: str = 'ab'):\n    return {expr}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and "main.py:8" in err
+
+
+def test_custom_response_class_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\nfrom fastapi.responses import ORJSONResponse\n\napp = FastAPI()\n\n\n"
+        "@app.get('/x', response_class=ORJSONResponse)\nasync def x():\n    return {}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "response_class=ORJSONResponse is not supported" in err and "main.py:7" in err
+
+
+def test_uuid_as_str_column_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(
+        "from sqlalchemy import Uuid\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\n\n\n"
+        "class Base(DeclarativeBase):\n    pass\n\n\nclass T(Base):\n    __tablename__ = 't'\n"
+        "    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True)\n")
+    (pkg / "main.py").write_text(MAIN.replace("from .models import Team", "from .models import T as Team"))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "Uuid(as_uuid=False) is not supported" in err and "models.py:11" in err
+
+
+def test_http_basic_realm_must_be_literal(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import Depends, FastAPI\nfrom fastapi.security import HTTPBasic\n\nREALM = 'x'\n"
+        "basic = HTTPBasic(realm=REALM)\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x(c=Depends(basic)):\n    return {}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "HTTPBasic(realm=) must be a literal string" in err and "main.py:5" in err
+
+
+VERSION_APP = """
+from importlib.metadata import PackageNotFoundError, version
+
+from fastapi import FastAPI
+
+app = FastAPI()
+try:
+    V = version("My_App")
+except PackageNotFoundError:
+    V = "?"
+
+
+@app.get("/v")
+async def v():
+    try:
+        other = version({name})
+    except PackageNotFoundError as e:
+        other = str(e)
+    return {{"v": V, "other": other}}
+"""
+
+
+def _version_project(tmp_path, name):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "my-app"\nversion = "1.2.3"\n')
+    (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "my-app"\nversion = "1.2.3"\n\n'
+                                      '[[package]]\nname = "fastapi"\nversion = "0.142.2"\n')
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(VERSION_APP.format(name=name))
+    return pkg
+
+
+@pytest.mark.parametrize("name, expected", [('"FastAPI"', '"0.142.2"'), ('"requests"', "PACKAGE_NOT_FOUND")])
+def test_distribution_version_from_pyproject_and_lock(tmp_path, name, expected):
+    pkg = _version_project(tmp_path, name)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert 'V::str("1.2.3")' in gen and expected in gen
+
+
+def test_distribution_version_needs_literal(tmp_path, capsys):
+    pkg = _version_project(tmp_path, "__name__")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "importlib.metadata.version() needs one literal distribution name" in err and "main.py:16" in err
+
+
+def test_app_wrapped_in_asgi_class_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\n\n\nclass Quota:\n    def __init__(self, app):\n        self.app = app\n\n"
+        "    async def __call__(self, scope, receive, send):\n        await self.app(scope, receive, send)\n\n\n"
+        "api = FastAPI()\n\n\n@api.get('/x')\nasync def x():\n    return {}\n\n\napp = Quota(api)\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "the application wrapped in an ASGI class (`Quota(api)`) is not supported" in err and "main.py:20" in err
+
+
+SENTRY_APP = '''
+import sentry_sdk
+from fastapi import FastAPI
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+
+app = FastAPI()
+
+
+@app.get("/x")
+async def x():
+    {stmt}
+    return {{}}
+'''
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("sentry_sdk.init(dsn='http://k@h/1', transport=object)", "sentry_sdk.init(transport=...) is not supported: the binary sends envelopes"),
+    ("sentry_sdk.init(before_breadcrumb=print)", "sentry_sdk.init(before_breadcrumb=...) is not supported"),
+    ("sentry_sdk.init(profiles_sample_rate=1.0)", "profiling has no equivalent"),
+    ("sentry_sdk.init(nope=1)", "sentry_sdk.init(nope=...) is not supported"),
+    ("sentry_sdk.capture_message('m', scope=None)", "capture_message(scope=...) is not supported"),
+    ("sentry_sdk.start_transaction(name='t')", "`sentry_sdk.start_transaction()` is not supported"),
+    ("sentry_sdk.push_scope(lambda s: None)", "positional arguments, at most 0"),
+    ("sentry_sdk.init(integrations=[FastApiIntegration(failed_request_status_codes={500})])",
+     "FastApiIntegration(failed_request_status_codes=...) is not supported: 5xx only"),
+    ("sentry_sdk.set_tag('k')", "missing required argument: 'value'"),
+])
+def test_sentry_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(SENTRY_APP.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err and "main.py:11" in err
+
+
+def test_sentry_init_in_factory_not_translatable_rejected(tmp_path, capsys):
+    """The app factory's `init_sentry()` runs at startup: a function it calls that does not translate is
+    refused at transpile time, not left to fail when the binary starts."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        import sentry_sdk
+        from fastapi import FastAPI
+
+
+        def init_sentry():
+            n = 0
+            def bump():
+                nonlocal n
+            bump()
+            sentry_sdk.init(dsn="")
+
+
+        def create_app():
+            init_sentry()
+            app = FastAPI()
+
+            @app.get("/x")
+            async def x():
+                return {}
+
+            return app
+
+
+        app = create_app()
+    '''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "`nonlocal` is not supported" in err and "main.py:9" in err
+
+
+
+LIBS_MAIN = """
+import enum
+
+import xmltodict
+from dateutil.relativedelta import relativedelta
+from fastapi import FastAPI
+from pydantic import BaseModel, PrivateAttr
+
+app = FastAPI()
+
+
+{body}
+
+
+@app.get("/x")
+async def x():
+    return use()
+"""
+
+
+@pytest.mark.parametrize("body, msg, line", [
+    ("def use():\n    return str(relativedelta(day=1))", "relativedelta(day=) is not supported", 13),
+    ("def use():\n    return str(relativedelta(1, 2))", "relativedelta(dt1, dt2) is not supported", 13),
+    ("def use():\n    return xmltodict.parse('<a/>', attr_prefix='$')", "xmltodict.parse(attr_prefix=) is not supported", 13),
+    ("class M(BaseModel):\n    _p: list = PrivateAttr(default=[], init=False)\n\n\ndef use():\n    return M().model_dump()",
+     "PrivateAttr() supports default= and default_factory= only", 13),
+    ("class E(str, enum.Enum):\n    A = ('a', 'utf-8')\n\n\ndef use():\n    return E.A.value", "member value ('a', 'utf-8') is not supported", 12),
+])
+def test_library_ports_rejected(tmp_path, capsys, body, msg, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(LIBS_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert f"main.py:{line}" in err
+
+
+
+MOUNT_APP = '''
+from fastapi import FastAPI
+from starlette.applications import Starlette
+
+from . import other
+
+sub = Starlette()
+app = FastAPI()
+
+
+@app.get("/x")
+async def x():
+    return {{}}
+
+
+{tail}
+'''
+
+
+@pytest.mark.parametrize(
+    "tail, other, flags, message, line",
+    [
+        # registered last, left to Python: relayed under its prefix
+        ('app.mount("/sub/", sub)', "", ["--python-side", "mount"], None, None),
+        ('app.mount("/sub", sub)\napp.mount("/", sub)', "", ["--python-side", "auto"], None, None),
+        ('app.mount("/sub", sub)', "", [], "app.mount(...) is not translated: as the app's last registration "
+         "it can stay on the Python side (--python-side mount, or --python-side auto)", 16),
+        # a route after it would be shadowed in Python but served by the binary
+        ('app.mount("/sub", sub)\n\n\n@app.get("/y")\nasync def y():\n    return {}',
+         "", ["--python-side", "mount"], "`app.get(...)` at ", 16),
+        ('app.mount("/sub", sub)\napp.add_api_route("/y", x)', "", ["--python-side", "auto"], "`app.add_api_route(...)` at ", 16),
+        ('def setup():\n    app.mount("/sub", sub)', "", ["--python-side", "mount"], "is in another function", 17),
+        ('app.mount("/sub", sub)', "from fastapi import APIRouter\n\nfrom .main import app\n\n\n@app.get('/z')\nasync def z():\n"
+         "    return {}\n", ["--python-side", "mount"], "is in another module", 16),
+    ],
+)
+def test_mount_left_to_python(tmp_path, capsys, tail, other, flags, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "other.py").write_text(other)
+    (pkg / "main.py").write_text(MOUNT_APP.format(tail=tail))
+    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", *flags, "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert code == 0, err
+        main_rs = (tmp_path / "out" / "src" / "main.rs").read_text()
+        want = '&["", "/sub"]' if 'mount("/",' in tail else '&["/sub"]'
+        assert f"set_python_side(&[], {want})" in " ".join(main_rs.split()), main_rs
+        return
+    assert code == 1
+    assert message in err and f"main.py:{line}" in err, err
+
+
+
+DDL_MODELS = '''
+import enum
+from sqlalchemy import Enum, ForeignKey, Index, Sequence, String, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, declared_attr, mapped_column
+from sqlalchemy.types import TypeDecorator
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Color(enum.Enum):
+    red = "r"
+
+
+class Item(Base):
+    __tablename__ = "items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    {extra}
+'''
+
+DDL_MAIN = '''
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from .models import Base
+
+engine = create_async_engine("postgresql+psycopg://x/y")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    async with engine.begin() as conn:
+        {call}
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/x")
+async def x():
+    return {{}}
+'''
+
+
+def _ddl_project(tmp_path, extra="", call="await conn.run_sync(Base.metadata.create_all)", files=None):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(DDL_MODELS.format(extra=textwrap.indent(textwrap.dedent(extra), "    ").strip()))
+    (pkg / "main.py").write_text(DDL_MAIN.format(call=call))
+    for name, src in (files or {}).items():
+        (pkg / name).write_text(src)
+    return main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")])
+
+
+def test_create_all_compiles_sqlalchemy_ddl(tmp_path):
+    extra = '''
+    name: Mapped[str] = mapped_column(String(20), index=True, comment="n")
+    color: Mapped[Color]
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"))
+    '''
+    assert _ddl_project(tmp_path, extra) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert 'types: &[("color", "CREATE TYPE color AS ENUM (\'red\')")]' in gen
+    assert "name VARCHAR(20) NOT NULL" in gen and "FOREIGN KEY(parent_id) REFERENCES items (id) ON DELETE CASCADE" in gen
+    assert '"CREATE INDEX ix_items_name ON items (name)", "COMMENT ON COLUMN items.name IS \'n\'"' in gen
+
+
+@pytest.mark.parametrize("extra, call, message, where", [
+    ("", "await conn.run_sync(lambda c: None)", "only `run_sync(Base.metadata.create_all)` is supported", "main.py:15"),
+    ("", "await conn.run_sync(Base.metadata.drop_all)", "only `run_sync(Base.metadata.create_all)` is supported", "main.py:15"),
+    ("", "conn.run_sync(Base.metadata.create_all)", "without `await` does nothing", "main.py:15"),
+    ("@declared_attr\ndef code(cls):\n    return mapped_column(String(5))", None, "@declared_attr is computed at class creation",
+     "models.py:19"),
+    ("n: Mapped[int] = mapped_column(Sequence('n_seq'))", None, "a Sequence (CREATE SEQUENCE) is not supported", "models.py:19"),
+    ("c: Mapped[Color] = mapped_column(Enum(Color, values_callable=lambda x: [str(e) for e in x]))", None,
+     "only `lambda x: [e.value for e in x]` is evaluated", "models.py:19"),
+    ("v: Mapped[object]", None, "SQLAlchemy raised MappedAnnotationError", "models.py:16"),
+    ("__table_args__ = {'schema': 'other'}", None, "schema='other'", "main.py:15"),
+    ("n: Mapped[str] = mapped_column(server_default=str(5))", None, "is not evaluated at translation time", "models.py:19"),
+])
+def test_create_all_rejects(tmp_path, capsys, extra, call, message, where):
+    code = _ddl_project(tmp_path, extra, call or "await conn.run_sync(Base.metadata.create_all)")
+    err = capsys.readouterr().err
+    assert code == 1 and message in err and where in err, err
+
+
+@pytest.mark.parametrize("locked, virtual", [("2.1.3", True), ("2.0.46", False)])
+def test_create_all_computed_column_follows_server_and_project_versions(tmp_path, capsys, locked, virtual):
+    """A computed column without `persisted=`: SQLAlchemy 2.1 renders it bare (VIRTUAL) on PostgreSQL 18+ and
+    STORED before, chosen by the binary from the server's version; a project on SQLAlchemy 2.0 always gets STORED."""
+    (tmp_path / "uv.lock").write_text(f'[[package]]\nname = "sqlalchemy"\nversion = "{locked}"\n')
+    src = DDL_MODELS.format(extra="d: Mapped[int] = mapped_column(Computed('id * 2'))").replace(
+        "from sqlalchemy import ", "from sqlalchemy import Computed, ", 1)
+    import sqlalchemy
+    if virtual and tuple(int(x) for x in sqlalchemy.__version__.split(".")[:2]) < (2, 1):
+        # translated by SQLAlchemy 2.0 (the CI's lowest end): it cannot render the project's 2.1 DDL
+        assert _ddl_project(tmp_path, files={"models.py": src}) == 1
+        assert "translate with SQLAlchemy >= 2.1" in capsys.readouterr().err
+        return
+    assert _ddl_project(tmp_path, files={"models.py": src}) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    if virtual:
+        assert "d INTEGER GENERATED ALWAYS AS (id * 2) NOT NULL" in gen
+        assert "create_pre18: Some(" in gen and "d INTEGER GENERATED ALWAYS AS (id * 2) STORED NOT NULL" in gen
+    else:
+        assert "create_pre18: None" in gen and "GENERATED ALWAYS AS (id * 2) STORED" in gen
+        assert "GENERATED ALWAYS AS (id * 2) NOT NULL" not in gen
+
+
+def test_create_all_fk_cycle_added_by_alter(tmp_path):
+    extra = 'other_id: Mapped[int | None] = mapped_column(ForeignKey("others.id"))'
+    other = '\n\nclass Other(Base):\n    __tablename__ = "others"\n    id: Mapped[int] = mapped_column(primary_key=True)\n' \
+            '    item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id"))\n'
+    assert _ddl_project(tmp_path, files={"models.py": DDL_MODELS.format(extra=extra) + other}) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert 'alters: &["ALTER TABLE items ADD FOREIGN KEY(other_id) REFERENCES others (id)"]' in gen
+    assert 'alters: &["ALTER TABLE others ADD FOREIGN KEY(item_id) REFERENCES items (id)"]' in gen
+
+
+def test_create_all_rejects_ddl_listener(tmp_path, capsys):
+    listener = '\n\n@event.listens_for(Base.metadata, "after_create")\ndef seed(target, conn, **kw):\n    pass\n'
+    code = _ddl_project(tmp_path, files={"models.py": DDL_MODELS.format(extra="") + listener})
+    err = capsys.readouterr().err
+    assert code == 1 and "a DDL event listener is not reproduced" in err and "models.py:22" in err, err
+
+
+def test_create_all_rejects_type_decorator_dialect_impl(tmp_path, capsys):
+    td = ('\n\nclass Up(TypeDecorator):\n    impl = String\n    cache_ok = True\n\n'
+          '    def load_dialect_impl(self, dialect):\n        return String(5)\n')
+    src = DDL_MODELS.format(extra="u: Mapped[str] = mapped_column(Up)").replace("\n\nclass Item(Base)", td + "\n\nclass Item(Base)")
+    code = _ddl_project(tmp_path, files={"models.py": src})
+    err = capsys.readouterr().err
+    assert code == 1 and "load_dialect_impl() changes the column type" in err, err
+
+
+def test_create_all_rejects_model_imported_late(tmp_path, capsys):
+    late = ('from sqlalchemy.orm import Mapped, mapped_column\n\nfrom .models import Base\n\n\n'
+            'class Late(Base):\n    __tablename__ = "late"\n    id: Mapped[int] = mapped_column(primary_key=True)\n')
+    lazy = 'async def later():\n    from . import late  # noqa: F401\n'
+    code = _ddl_project(tmp_path, files={"late.py": late, "lazy.py": lazy})
+    err = capsys.readouterr().err
+    assert code == 1 and "only imported inside a function" in err and "late.py:6" in err, err
+
+
+def test_factory_sentry_init_not_blamed_for_route_errors(tmp_path, capsys):
+    """A function queued earlier (here by a module statement) that does not translate is not blamed on the
+    factory's `init_sentry()`: only the functions that statement reaches count."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "letters.py").write_text(textwrap.dedent('''
+        import reportlab.lib.styles
+
+
+        def styled():
+            return reportlab.lib.styles.ParagraphStyle("x")
+
+
+        # module statements: their lambda queues styled() while the module is compiled
+        GENERATORS = {}
+        for _k in ("pdf",):
+            GENERATORS[_k] = lambda: styled()
+    '''))
+    (pkg / "views.py").write_text(textwrap.dedent('''
+        from fastapi import APIRouter
+
+        from .letters import GENERATORS
+
+        router = APIRouter()
+
+
+        @router.get("/pdf")
+        async def pdf():
+            return {"s": str(GENERATORS["pdf"]())}
+    '''))
+    (pkg / "main.py").write_text(textwrap.dedent('''
+        import sentry_sdk
+        from fastapi import FastAPI
+
+        from .views import router
+
+
+        def init_sentry():
+            sentry_sdk.init(dsn="")
+
+
+        def create_app():
+            init_sentry()
+            app = FastAPI()
+            app.include_router(router)
+            return app
+
+
+        app = create_app()
+    '''))
+    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto", "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    assert code == 0, err
+    assert "app factory statement" not in err

@@ -40,6 +40,10 @@ pub fn truthy(v: &V) -> R<bool> {
         V::Dict(d) => !d.lock().is_empty(),
         V::Set(s) => !s.lock().is_empty(),
         V::Delta(d) => !d.is_zero(),
+        V::Native(n) if matches!(&**n, Native::RelDelta(_)) => match &**n {
+            Native::RelDelta(r) => super::reldelta::truthy(r),
+            _ => unreachable!(),
+        },
         V::Enum(e, i) => match e.kind {
             EnumKind::Plain => true,
             _ => truthy(&e.value(*i))?,
@@ -47,6 +51,7 @@ pub fn truthy(v: &V) -> R<bool> {
         V::Sql(_) | V::Col(..) => {
             return Err(Exc::type_error("Boolean value of this clause is not defined"))
         }
+        V::Native(n) if matches!(&**n, Native::Deque(_)) => len(v)? > 0,
         _ => true,
     })
 }
@@ -122,6 +127,9 @@ pub fn add(a: &V, b: &V) -> R {
     if let Some(r) = super::tenacity::binop(a, "+", b) {
         return r;
     }
+    if let Some(r) = super::reldelta::binop(a, "+", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_binop(a, "+", b);
     }
@@ -154,6 +162,9 @@ pub fn add(a: &V, b: &V) -> R {
 }
 
 pub fn sub(a: &V, b: &V) -> R {
+    if let Some(r) = super::reldelta::binop(a, "-", b) {
+        return r;
+    }
     if let Some(r) = dec_op(a, b, "-") {
         return r;
     }
@@ -187,6 +198,9 @@ pub fn sub(a: &V, b: &V) -> R {
 }
 
 pub fn mul(a: &V, b: &V) -> R {
+    if let Some(r) = super::reldelta::binop(a, "*", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_binop(a, "*", b);
     }
@@ -323,6 +337,10 @@ pub fn neg(a: &V) -> R {
         V::Int(i) => V::Int(i.checked_neg().ok_or_else(overflow)?),
         V::Float(f) => V::Float(-f),
         V::Delta(d) => V::Delta(-*d),
+        V::Native(n) if matches!(&**n, Native::RelDelta(_)) => match &**n {
+            Native::RelDelta(r) => super::reldelta::neg(r),
+            _ => unreachable!(),
+        },
         _ => return Err(Exc::type_error(format!("bad operand type for unary -: '{}'", a.type_name()))),
     })
 }
@@ -460,6 +478,9 @@ pub fn invert(a: &V) -> R {
 // ---------------------------------------------------------------- comparisons
 
 pub fn eq_bool(a: &V, b: &V) -> bool {
+    if let Some(Ok(V::Bool(r))) = super::reldelta::binop(a, "==", b) {
+        return r;
+    }
     if let Some(t) = row_tuple(a) {
         return eq_bool(&t, b);
     }
@@ -671,9 +692,11 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
         },
         V::List(l) => l.lock().clone().iter().any(|x| eq_bool(x, item)),
         V::Tuple(t) => t.iter().any(|x| eq_bool(x, item)),
-        V::Dict(d) => d.lock().contains_key(&Key::of(item)?),
-        V::Set(s) => s.lock().contains_key(&Key::of(item)?),
+        V::Dict(d) => d.lock().contains_key(&Key::dict_key(item)?),
+        V::Set(s) => s.lock().contains_key(&Key::set_elem(item)?),
         V::Native(n) => match &**n {
+            Native::Deque(d) => super::deque::items(d).iter().any(|x| eq_bool(x, item)),
+            Native::IpNet(a, l) => super::net::contains(&(*a, *l), item),
             Native::RespHeaders(r) => super::resp::headers_contains(&r.headers, item)?,
             Native::CellHeaders(c) => super::resp::headers_contains(&c.headers, item)?,
             Native::Headers(r) => match item {
@@ -841,8 +864,25 @@ pub fn str_(v: &V) -> R<String> {
         if let Native::YarlUrl(u) = &**n {
             return Ok(u.clone()); // yarl keeps the text it was given (no added `/`)
         }
+        if let Native::HttpUrl(u) = &**n {
+            return Ok(u.clone());
+        }
+        if let Native::Url(r) = &**n {
+            // Starlette's request.url: scheme://Host header + path (+ ?query)
+            let q = if r.raw_query.is_empty() { String::new() } else { format!("?{}", r.raw_query) };
+            return Ok(format!("{}{}{q}", request_origin(r), r.path));
+        }
+        if let Native::IpAddr(a) = &**n {
+            return Ok(super::net::addr_str(a));
+        }
+        if let Native::IpNet(a, l) = &**n {
+            return Ok(super::net::net_str(&(*a, *l)));
+        }
         if let Native::Prom(p) = &**n {
             return Ok(super::prom::str(p));
+        }
+        if let Native::RelDelta(r) = &**n {
+            return Ok(super::reldelta::repr(r));
         }
     }
     Ok(match v {
@@ -881,8 +921,20 @@ pub fn repr(v: &V) -> R<String> {
         if let Native::PydUrl(name, u) = &**n {
             return Ok(format!("{name}('{}')", u.as_str()));
         }
+        if let Native::Deque(d) = &**n {
+            return super::deque::repr(d);
+        }
+        if let Native::IpAddr(a) = &**n {
+            return Ok(super::net::addr_repr(a));
+        }
+        if let Native::IpNet(a, l) = &**n {
+            return Ok(super::net::net_repr(&(*a, *l)));
+        }
         if let Native::Prom(p) = &**n {
             return Ok(super::prom::repr(p));
+        }
+        if let Native::RelDelta(r) = &**n {
+            return Ok(super::reldelta::repr(r));
         }
     }
     Ok(match v {
@@ -1011,6 +1063,12 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
     }
     if spec.is_empty() {
         return str_(v);
+    }
+    // datetime.__format__ / date.__format__: strftime(spec)
+    match v {
+        V::DateTime(d) => return Ok(super::libs::strftime(&d.wall, d.offset(), d.tz.map(|t| t.name()), spec)),
+        V::Date(d) => return Ok(super::libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, spec)),
+        _ => {}
     }
     if let V::Enum(e, i) = v {
         return match e.kind {
@@ -1360,6 +1418,7 @@ fn default_value(factory: &str) -> V {
         "str" => V::str(""),
         "bool" => V::Bool(false),
         "list" => V::list(vec![]),
+        "deque" => V::native(Native::Deque(Arc::new(super::deque::Deque { items: parking_lot::Mutex::new(Default::default()), maxlen: None }))),
         "tuple" => V::tuple(vec![]),
         "set" => V::Set(Arc::new(Mutex::new(IndexMap::new()))),
         _ => V::Dict(Arc::new(Mutex::new(IndexMap::new()))),
@@ -1373,6 +1432,7 @@ pub fn getitem(v: &V, k: &V) -> R {
     if let V::Native(n) = v {
         match &**n {
             Native::Mime(m) => return super::mail::mime_getitem(m, k),
+            Native::Deque(d) => return super::deque::getitem(d, k),
             Native::RespHeaders(r) => return super::resp::headers_getitem(&r.headers, k),
             Native::CellHeaders(c) => return super::resp::headers_getitem(&c.headers, k),
             Native::Headers(r) => {
@@ -1411,7 +1471,7 @@ pub fn getitem(v: &V, k: &V) -> R {
             norm_index(i, cs.len()).map(|j| V::str(cs[j].to_string())).ok_or_else(|| Exc::msg(&INDEX_ERROR, "string index out of range"))?
         }
         V::Dict(d) => {
-            let key = Key::of(k)?;
+            let key = Key::dict_key(k)?;
             let found = d.lock().get(&key).map(|(_, v)| v.clone());
             match found {
                 Some(v) => v,
@@ -1442,6 +1502,7 @@ pub fn getitem(v: &V, k: &V) -> R {
 pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
     if let V::Native(n) = v {
         match &**n {
+            Native::Deque(d) => return super::deque::setitem(d, k, val),
             Native::Mime(m) => return super::mail::mime_setitem(m, k, &val),
             Native::RespHeaders(r) => return super::resp::headers_setitem(&r.headers, k, &val),
             Native::CellHeaders(c) => return super::resp::headers_setitem(&c.headers, k, &val),
@@ -1457,7 +1518,7 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
             l[j] = val;
         }
         V::Dict(d) => {
-            d.lock().insert(Key::of(k)?, (k.clone(), val));
+            d.lock().insert(Key::dict_key(k)?, (k.clone(), val));
         }
         _ => return Err(Exc::type_error(format!("'{}' object does not support item assignment", v.type_name()))),
     }
@@ -1475,7 +1536,7 @@ pub fn delitem(v: &V, k: &V) -> R<()> {
     }
     match v {
         V::Dict(d) => {
-            if d.lock().shift_remove(&Key::of(k)?).is_none() {
+            if d.lock().shift_remove(&Key::dict_key(k)?).is_none() {
                 return Err(Exc::new(&KEY_ERROR, vec![k.clone()]));
             }
         }
@@ -1504,6 +1565,10 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         V::Str(s) => s.chars().map(|c| V::str(c.to_string())).collect(),
         V::Bytes(b) => b.iter().map(|x| V::Int(*x as i64)).collect(),
         V::Result(r) => r.lock().take_rows()?,
+        V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
+            Native::Deque(d) => super::deque::items(d),
+            _ => vec![],
+        },
         V::Native(n) if matches!(&**n, Native::CsvRows(..) | Native::StringIO(_) | Native::Iter(_)) => match &**n {
             Native::CsvRows(_, rows) => iter(rows)?,
             Native::Iter(q) => q.lock().drain(..).collect(),
@@ -1540,6 +1605,10 @@ pub fn len(v: &V) -> R<usize> {
             _ => return Err(Exc::type_error("object of type 'type' has no len()")),
         },
         V::Enum(e, i) if e.kind != EnumKind::Plain => len(&e.value(*i))?,
+        V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
+            Native::Deque(d) => d.items.lock().len(),
+            _ => 0,
+        },
         _ => return Err(Exc::type_error(format!("object of type '{}' has no len()", v.type_name()))),
     })
 }
@@ -1577,4 +1646,9 @@ pub fn bound(v: &V, name: &str) -> R<V> {
 
 pub fn dt_value(d: DateTime) -> V {
     V::DateTime(d)
+}
+
+/// `scheme://host` of a request as Starlette builds it from the scope (plain HTTP: the binary terminates no TLS)
+pub fn request_origin(r: &super::web::ReqCell) -> String {
+    format!("http://{}", r.header("host").unwrap_or_else(|| "127.0.0.1".into()))
 }

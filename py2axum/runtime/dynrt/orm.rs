@@ -403,9 +403,14 @@ impl ObjCell {
                     if let Ok(s) = sess.try_lock() {
                         if let Some(o) = s.identity.get(&ident(rel.target, &fk)?) {
                             let o = &o;
-                            let ost = o.st.lock();
-                            if !ost.expired && ost.status == Status::Persistent {
-                                drop(ost);
+                            // a self-referential row pointing at itself: its state is the one locked here
+                            let ok = if std::ptr::eq(Arc::as_ptr(o), self) {
+                                !st.expired && st.status == Status::Persistent
+                            } else {
+                                let ost = o.st.lock();
+                                !ost.expired && ost.status == Status::Persistent
+                            };
+                            if ok {
                                 let v = V::Obj(o.clone());
                                 st.rels[ri] = Some(v.clone());
                                 return Ok(v);
@@ -728,6 +733,8 @@ pub struct Select {
     pub loads: Vec<LoadChain>,
     /// subqueries in the FROM list (`select_from(sq)` or referenced through `sq.c`)
     pub from_subs: Vec<Arc<Subq>>,
+    /// `join(sq, on)`: (rendered before `joins[pos]`, the subquery, ON, outer)
+    pub join_subs: Vec<(usize, Arc<Subq>, Sql, bool)>,
 }
 
 #[derive(Clone)]
@@ -758,7 +765,9 @@ pub enum Sql {
     ACol(Arc<Alias>, usize),
     /// the `aliased()` entity itself
     Alias(Arc<Alias>),
-    Param(V, Option<ColTy>),
+    /// a bound value, with its identity: the same BindParameter rendered twice is one parameter
+    /// (`func.date_trunc("hour", col)` built once, in the columns and in GROUP BY), 0 = none
+    Param(V, Option<ColTy>, u64),
     Null,
     Bin(&'static str, Box<Sql>, Box<Sql>),
     Bool(&'static str, Vec<Sql>),
@@ -863,10 +872,16 @@ fn to_sql(v: &V, hint: Option<ColTy>) -> Sql {
             _ => unreachable!(),
         },
         // a value for a JSON column: None is JSON null (SQLAlchemy's JSON type, none_as_null=False)
-        V::None if hint == Some(ColTy::Json) => Sql::Param(V::None, hint),
+        V::None if hint == Some(ColTy::Json) => Sql::Param(V::None, hint, bind_id()),
         V::None => Sql::Null,
-        other => Sql::Param(other.clone(), hint),
+        other => Sql::Param(other.clone(), hint, bind_id()),
     }
+}
+
+/// a new BindParameter's identity
+fn bind_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn hint_of(s: &Sql) -> Option<ColTy> {
@@ -947,7 +962,7 @@ pub fn sql(s: Sql) -> V {
 pub fn sql_cmp(a: &V, op: &'static str, b: &V) -> R {
     let la = to_sql(a, None);
     let lb = to_sql(b, hint_of(&la));
-    let la = if let Sql::Param(v, None) = la { Sql::Param(v, hint_of(&lb)) } else { la };
+    let la = if let Sql::Param(v, None, id) = la { Sql::Param(v, hint_of(&lb), id) } else { la };
     Ok(sql(match (op, &la, &lb) {
         ("=", _, Sql::Null) => Sql::IsNull(Box::new(la), false),
         ("!=", _, Sql::Null) => Sql::IsNull(Box::new(la), true),
@@ -1240,6 +1255,13 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
                     }
                 }
                 let on = args.get(1).map(|o| to_sql(o, None));
+                if let V::Sql(x) = &a {
+                    if let Sql::Subquery(q) = &**x {
+                        let on = on.ok_or_else(|| Exc::type_error("py2axum: join(subquery) needs an explicit ON clause"))?;
+                        s.join_subs.push((s.joins.len(), q.clone(), on, outer));
+                        return Ok(sql(Sql::Select(Box::new(s))));
+                    }
+                }
                 if let V::Sql(x) = &a {
                     if let Sql::Alias(al) = &**x {
                         s.joins.push((al.model, on, outer, Some(al.clone())));
@@ -1586,6 +1608,8 @@ struct Rend {
     binds: Vec<Bind>,
     /// aliases named so far in this statement: (alias id, name)
     aliases: Vec<(usize, String)>,
+    /// shared parameters rendered so far: (bind identity, placeholder text)
+    shared: Vec<(u64, String)>,
 }
 
 impl Rend {
@@ -1665,6 +1689,9 @@ impl Rend {
             (V::Float(_), _) => Some("float8"),
             // psycopg sends a list as text[]: SQLAlchemy casts it to the column's array type
             (V::List(_) | V::Tuple(_), Some(ColTy::StrArray)) => Some("VARCHAR[]"),
+            // a UUID (or a str bound to a Uuid column, which psycopg sends untyped) travels as text
+            (_, Some(ColTy::Uuid)) => Some("uuid"),
+            (V::Native(n), _) if matches!(&**n, Native::Uuid(_)) => Some("uuid"),
             _ => None,
         };
         self.binds.push(Bind::V(v, ty.map(|t| if let ColTy::Enum(_) = t { ColTy::Str } else { t })));
@@ -1691,7 +1718,18 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
         }
         Sql::Alias(_) => return Err(Exc::msg(&ARGUMENT_ERROR, "py2axum: an aliased() entity used as an SQL expression")),
         Sql::BadLabel(m) => return Err(Exc::msg(&COMPILE_ERROR, m.clone())),
-        Sql::Param(v, ty) => r.bind(v.clone(), *ty),
+        Sql::Param(v, ty, id) => {
+            if let Some((_, text)) = r.shared.iter().find(|(i, _)| *i == *id && *id != 0) {
+                r.sql += &text.clone();
+            } else {
+                let at = r.sql.len();
+                r.bind(v.clone(), *ty);
+                if *id != 0 {
+                    let text = r.sql[at..].to_string();
+                    r.shared.push((*id, text));
+                }
+            }
+        }
         Sql::Null => r.sql += "NULL",
         Sql::Text(t) => r.sql += t,
         Sql::Rel(m, ri) => {
@@ -1848,8 +1886,8 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
 /// a value for column `c` of an INSERT / ON CONFLICT SET (JSON columns as in the unit of work)
 fn render_col_value(r: &mut Rend, c: &ColDesc, v: &Sql) -> R<()> {
     match v {
-        Sql::Param(x, _) if c.ty == ColTy::JsonNull && x.is_none() => r.bind(V::None, Some(ColTy::JsonNull)),
-        Sql::Param(x, _) if matches!(c.ty, ColTy::Json | ColTy::JsonNull) => {
+        Sql::Param(x, _, _) if c.ty == ColTy::JsonNull && x.is_none() => r.bind(V::None, Some(ColTy::JsonNull)),
+        Sql::Param(x, _, _) if matches!(c.ty, ColTy::Json | ColTy::JsonNull) => {
             r.binds.push(json_param(x)?);
             r.sql += &format!("CAST(${} AS JSON)", r.binds.len());
         }
@@ -2064,6 +2102,11 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             subs_in(on, &mut subs);
         }
     }
+    for (_, _, on, _) in &s.join_subs {
+        subs_in(on, &mut subs);
+    }
+    // a joined subquery is not in the FROM list
+    subs.retain(|q| !s.join_subs.iter().any(|(_, j, _, _)| Arc::ptr_eq(j, q)));
     // aliases used and not joined: in the FROM list
     let mut alias_from: Vec<Arc<Alias>> = Vec::new();
     for c in &s.cols {
@@ -2095,7 +2138,17 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             r.sql += &format!(") AS {}", q.name);
         }
     }
-    for (m, on, outer, al) in &s.joins {
+    let render_subs = |r: &mut Rend, at: usize| -> R<()> {
+        for (_, q, on, outer) in s.join_subs.iter().filter(|j| j.0 == at) {
+            r.sql += if *outer { " LEFT OUTER JOIN (" } else { " JOIN (" };
+            render_select(r, &q.sel)?;
+            r.sql += &format!(") AS {} ON ", q.name);
+            render(r, on)?;
+        }
+        Ok(())
+    };
+    for (i, (m, on, outer, al)) in s.joins.iter().enumerate() {
+        render_subs(r, i)?;
         r.sql += if *outer { " LEFT OUTER JOIN " } else { " JOIN " };
         r.sql += m.table;
         if let Some(a) = al {
@@ -2107,6 +2160,7 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             render(r, on)?;
         }
     }
+    render_subs(r, s.joins.len())?;
     render_where(r, &s.wheres)?;
     if !s.group.is_empty() {
         r.sql += " GROUP BY ";
@@ -2145,7 +2199,7 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
 }
 
 fn render_expr_standalone(e: &Sql) -> R<(String, usize)> {
-    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
     render(&mut r, e)?;
     Ok((r.sql, r.binds.len()))
 }
@@ -2200,6 +2254,7 @@ fn push_bind(args: &mut PgArguments, b: &Bind) -> R<()> {
         // sent as text, cast by the SQL (`$n::numeric`)
         V::Decimal(d) => args.add(d.to_string()),
         V::Str(s) => args.add(s.to_string()),
+        V::Native(n) if matches!(&**n, Native::Uuid(_)) => args.add(ops::str_(v)?),
         V::Date(d) => args.add(*d),
         V::Time(t) => args.add(*t),
         V::DateTime(d) => match d.tz {
@@ -2301,7 +2356,7 @@ fn decode(row: &PgRow, i: usize, tz: Tz) -> R<V> {
             Some(items) => V::list(items.into_iter().map(|x| x.map(V::str).unwrap_or(V::None)).collect()),
             None => V::None,
         },
-        "UUID" => row.try_get::<Option<sqlx::types::Uuid>, _>(i).map_err(e)?.map(|u| V::str(u.to_string())).unwrap_or(V::None),
+        "UUID" => row.try_get::<Option<sqlx::types::Uuid>, _>(i).map_err(e)?.map(|u| V::native(Native::Uuid(u.as_u128()))).unwrap_or(V::None),
         "INTERVAL" => {
             let iv = row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(i).map_err(e)?;
             match iv {
@@ -2539,6 +2594,10 @@ struct SessInner {
     /// `begin_nested()` savepoints, innermost last
     savepoints: Vec<SpFrame>,
     sp_seq: usize,
+    /// the connection of `session.connection()` was closed: statements raise until rollback/close
+    conn_closed: bool,
+    /// `engine.begin()`: the transaction commits when the `async with` ends without an exception
+    commit_on_exit: bool,
 }
 
 /// What a savepoint's rollback undoes in the session: objects INSERTed (expunged), UPDATEd (expired)
@@ -2590,6 +2649,36 @@ impl Drop for SessInner {
 
 type BoxR<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = R<T>> + Send + 'a>>;
 
+/// `Base.metadata.create_all`, compiled at translation time by SQLAlchemy (py2axum/ddl.py)
+pub struct Ddl {
+    /// named enum types, in the order SQLAlchemy creates them: (name, CREATE TYPE)
+    pub types: &'static [(&'static str, &'static str)],
+    /// tables in dependency order
+    pub tables: &'static [DdlTable],
+}
+
+pub struct DdlTable {
+    pub name: &'static str,
+    /// CREATE TABLE, then its CREATE INDEX and COMMENT ON statements
+    pub stmts: &'static [&'static str],
+    /// its foreign keys of a cycle: ALTER TABLE ... ADD CONSTRAINT, once every table is created
+    pub alters: &'static [&'static str],
+    /// the CREATE TABLE SQLAlchemy 2.1 renders for a server before PostgreSQL 18, when it differs (a computed
+    /// column without `persisted=` is STORED there, VIRTUAL from 18 on)
+    pub create_pre18: Option<&'static str>,
+}
+
+/// `await conn.run_sync(Base.metadata.create_all)`
+pub async fn run_create_all(conn: &V, ddl: &'static Ddl) -> R {
+    match conn {
+        V::Session(s) => {
+            s.create_all(ddl).await?;
+            Ok(V::None)
+        }
+        other => Err(Exc::attr_error(format!("'{}' object has no attribute 'run_sync'", other.type_name()))),
+    }
+}
+
 /// `AsyncSession`: one per request (FastAPI dependency cache), cheap to clone.
 #[derive(Clone)]
 pub struct Session(Arc<tokio::sync::Mutex<SessInner>>);
@@ -2599,6 +2688,11 @@ fn ident(m: &'static ModelDesc, pk: &V) -> R<(usize, Key)> {
 }
 
 impl Session {
+    /// a `sessionmaker` session (plain methods), not an `AsyncSession` (unknown while it is busy: async)
+    pub fn is_sync(&self) -> bool {
+        self.0.try_lock().map(|s| s.sync).unwrap_or(false)
+    }
+
     pub fn new(pool: sqlx::PgPool, expire_on_commit: bool, autoflush: bool, sync: bool, cx: std::sync::Weak<super::CxInner>) -> Session {
         Session(Arc::new_cyclic(|me| {
             tokio::sync::Mutex::new(SessInner {
@@ -2616,6 +2710,8 @@ impl Session {
                 pending: Vec::new(),
                 savepoints: Vec::new(),
                 sp_seq: 0,
+                conn_closed: false,
+                commit_on_exit: false,
             })
         }))
     }
@@ -2782,11 +2878,11 @@ impl Session {
             let ty = t.cols[rel.remote].ty;
             let sel = Select {
                 cols: vec![SelCol::Entity(t)],
-                wheres: vec![Sql::In(Box::new(Sql::Col(t, rel.remote)), query.into_iter().map(|k| Sql::Param(k, Some(ty))).collect(), false)],
+                wheres: vec![Sql::In(Box::new(Sql::Col(t, rel.remote)), query.into_iter().map(|k| Sql::Param(k, Some(ty), 0)).collect(), false)],
                 order: rel.order.iter().map(|&(i, desc)| Sql::Order(Box::new(Sql::Col(t, i)), desc, None)).collect(),
                 ..Default::default()
             };
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
             render_select(&mut r, &sel)?;
             let rows = Session::run(s, &r).await?;
             for row in &rows {
@@ -2817,7 +2913,7 @@ impl Session {
     /// Relationship changes since the last flush, turned into foreign-key copies (`links`):
     /// many-to-one assignments, collection members added/removed (removed = NULL, or deleted with
     /// delete-orphan), and the save-update cascade (transient related objects become pending).
-    fn sync_rels(s: &mut SessInner) {
+    fn sync_rels(s: &mut SessInner) -> R<()> {
         let mut queue: Vec<Arc<ObjCell>> = s.new.iter().cloned().chain(s.identity.values()).collect();
         let mut i = 0;
         while i < queue.len() {
@@ -2848,6 +2944,13 @@ impl Session {
                             V::Obj(x) => Some(x.clone()),
                             _ => None,
                         };
+                        if src.as_ref().is_some_and(|x| Arc::ptr_eq(x, &o)) {
+                            // the unit of work cannot order a row after itself (no post_update)
+                            let at = format!("<{} at 0x{:x}>", o.desc.name, Arc::as_ptr(&o) as usize);
+                            return Err(Exc::msg(&CIRCULAR_DEPENDENCY_ERROR, format!(
+                                "Circular dependency detected. (SaveUpdateState({at}), ProcessState(ManyToOneDP({}.{}), {at}, delete=False))",
+                                o.desc.name, rel.name)));
+                        }
                         let mut st = o.st.lock();
                         st.links.push((rel.local, src, rel.remote));
                         st.rel_set[ri] = false;
@@ -2887,6 +2990,7 @@ impl Session {
                 st.rel_set[ri] = false;
             }
         }
+        Ok(())
     }
 
     /// Resolve the pending foreign-key copies of an object (its sources are flushed first).
@@ -2904,6 +3008,9 @@ impl Session {
     }
 
     async fn begin(s: &mut SessInner) -> R<()> {
+        if s.conn_closed {
+            return Err(Exc::msg(&RESOURCE_CLOSED_ERROR, "This Connection is closed"));
+        }
         if s.tx.is_none() {
             s.tx = Some(s.pool.begin().await?);
         }
@@ -2970,14 +3077,14 @@ impl Session {
     }
 
     async fn flush_inner(s: &mut SessInner) -> R<()> {
-        Session::sync_rels(s);
+        Session::sync_rels(s)?;
         // INSERTs, referenced tables first
         let mut new = std::mem::take(&mut s.new);
         new.sort_by_key(|o| o.desc.rank);
         for o in new {
             Session::apply_links(&o);
             let desc = o.desc;
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
             let mut cols = Vec::new();
             let mut dyn_defaults = Vec::new();
             // columns whose value the database generates: fetched by RETURNING (eager_defaults="auto")
@@ -3102,7 +3209,7 @@ impl Session {
                 o.st.lock().modified = vec![false; desc.cols.len()];
                 continue;
             }
-            let mut r = Rend { sql: format!("UPDATE {} SET ", desc.table), binds: Vec::new(), aliases: Vec::new() };
+            let mut r = Rend { sql: format!("UPDATE {} SET ", desc.table), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
             let mut first = true;
             for (i, v) in &changes {
                 if !first {
@@ -3160,7 +3267,7 @@ impl Session {
         for o in std::mem::take(&mut s.deleted) {
             let desc = o.desc;
             let pk = o.pk();
-            let mut r = Rend { sql: format!("DELETE FROM {}", desc.table), binds: Vec::new(), aliases: Vec::new() };
+            let mut r = Rend { sql: format!("DELETE FROM {}", desc.table), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
             desc.where_pk(&mut r, &pk);
             Session::run_exec(s, &r).await?;
             s.identity.remove(&ident(desc, &pk)?);
@@ -3245,13 +3352,103 @@ impl Session {
         Ok(())
     }
 
+    /// `engine.begin()`: a connection whose transaction commits at the end of its `async with`
+    pub fn begin_block(self) -> Session {
+        if let Ok(mut s) = self.0.try_lock() {
+            s.commit_on_exit = true;
+        }
+        self
+    }
+
+    pub fn commits_on_exit(&self) -> bool {
+        self.0.try_lock().map(|s| s.commit_on_exit).unwrap_or(false)
+    }
+
+    /// `metadata.create_all(conn)` (checkfirst, as SQLAlchemy runs it): every named enum type absent from
+    /// `pg_type` is created (its table may exist: `MetaData.before_create`), then each table absent from
+    /// `pg_class`, with its indexes and comments, then the foreign keys of cycles of the tables created.
+    /// Same catalog queries as SQLAlchemy's PostgreSQL dialect.
+    /// (Statements unprepared but through `query`: `raw_sql`'s future is not `Send` for every lifetime here.)
+    pub async fn create_all(&self, ddl: &'static Ddl) -> R<()> {
+        const HAS_TABLES: &str = "SELECT c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
+            ON n.oid = c.relnamespace WHERE c.relname::text = ANY($1) AND c.relkind = ANY(ARRAY['r', 'p', 'f', 'v', 'm']) \
+            AND pg_catalog.pg_table_is_visible(c.oid) AND n.nspname != 'pg_catalog'";
+        const HAS_TYPE: &str = "SELECT t.typname::text FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n \
+            ON n.oid = t.typnamespace WHERE t.typname::text = $1 AND pg_catalog.pg_type_is_visible(t.oid) \
+            AND n.nspname != 'pg_catalog'";
+        let mut s = self.0.lock().await;
+        Session::begin(&mut s).await?;
+        let tx = s.tx.as_mut().unwrap();
+        let names: Vec<String> = ddl.tables.iter().map(|t| t.name.to_string()).collect();
+        let existing: Vec<String> =
+            sqlx::query_scalar(HAS_TABLES).bind(names).fetch_all(&mut **tx).await.map_err(|e| sql_error(e, HAS_TABLES))?;
+        for &(name, sql) in ddl.types {
+            let found: Option<String> =
+                sqlx::query_scalar(HAS_TYPE).bind(name).fetch_optional(&mut **tx).await.map_err(|e| sql_error(e, HAS_TYPE))?;
+            if found.is_none() {
+                sqlx::query(sql).persistent(false).execute(&mut **tx).await.map_err(|e| sql_error(e, sql))?;
+            }
+        }
+        let created: Vec<&DdlTable> = ddl.tables.iter().filter(|t| !existing.iter().any(|e| e == t.name)).collect();
+        let pre18 = if created.iter().any(|t| t.create_pre18.is_some()) {
+            const VERSION: &str = "SELECT current_setting('server_version_num')";
+            let v: String = sqlx::query_scalar(VERSION).fetch_one(&mut **tx).await.map_err(|e| sql_error(e, VERSION))?;
+            v.parse::<u32>().unwrap_or(0) < 180000
+        } else {
+            false
+        };
+        for t in &created {
+            for (i, &sql) in t.stmts.iter().enumerate() {
+                let sql = match t.create_pre18 {
+                    Some(pre) if i == 0 && pre18 => pre,
+                    _ => sql,
+                };
+                sqlx::query(sql).persistent(false).execute(&mut **tx).await.map_err(|e| sql_error(e, sql))?;
+            }
+        }
+        for t in &created {
+            for &sql in t.alters {
+                sqlx::query(sql).persistent(false).execute(&mut **tx).await.map_err(|e| sql_error(e, sql))?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn flush(&self) -> R<()> {
         let mut s = self.0.lock().await;
         Session::flush_inner(&mut s).await
     }
 
+    /// `await session.connection()`: begins the session's transaction
+    pub async fn connection(&self) -> R<V> {
+        let mut s = self.0.lock().await;
+        Session::begin(&mut s).await?;
+        Ok(V::native(Native::SessConn(self.clone())))
+    }
+
+    /// `session.close()` / `aclose()`: only the state of a closed `connection()` is reset here (the
+    /// request's dependency ends the session itself)
+    pub async fn close(&self) -> R<()> {
+        self.0.lock().await.conn_closed = false;
+        Ok(())
+    }
+
+    /// `await (await session.connection()).close()`: the connection goes back to the pool (its
+    /// transaction rolled back); the session raises ResourceClosedError until rollback() or close()
+    pub async fn close_connection(&self) -> R<()> {
+        let mut s = self.0.lock().await;
+        if let Some(tx) = s.tx.take() {
+            let _ = tx.rollback().await;
+            s.conn_closed = true;
+        }
+        Ok(())
+    }
+
     pub async fn commit(&self) -> R<()> {
         let mut s = self.0.lock().await;
+        if s.conn_closed {
+            return Err(Exc::msg(&INVALID_REQUEST_ERROR, "This transaction is inactive"));
+        }
         Session::flush_inner(&mut s).await?;
         if let Some(tx) = s.tx.take() {
             tx.commit().await?;
@@ -3273,6 +3470,7 @@ impl Session {
 
     pub async fn rollback(&self) -> R<()> {
         let mut s = self.0.lock().await;
+        s.conn_closed = false;
         if let Some(tx) = s.tx.take() {
             let _ = tx.rollback().await;
         }
@@ -3337,7 +3535,7 @@ impl Session {
         }
         let mut s = self.0.lock().await;
         if !cols.is_empty() {
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
             render_select(&mut r, &Select { cols: vec![SelCol::Entity(desc)], ..Default::default() })?;
             desc.where_pk(&mut r, &o.pk());
             let rows = Session::run(&mut s, &r).await?;
@@ -3386,7 +3584,7 @@ impl Session {
             }
         };
         if !expired.is_empty() {
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
             render_select(&mut r, &Select { cols: vec![SelCol::Entity(desc)], ..Default::default() })?;
             desc.where_pk(&mut r, &o.pk());
             let rows = Session::run(&mut s, &r).await?;
@@ -3428,7 +3626,7 @@ impl Session {
         let mut s = self.0.lock().await;
         let desc = o.desc;
         let pk = o.pk();
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
         render_select(&mut r, &Select { cols: vec![SelCol::Entity(desc)], wheres: vec![], ..Default::default() })?;
         desc.where_pk(&mut r, &pk);
         let rows = Session::run(&mut s, &r).await?;
@@ -3476,7 +3674,7 @@ impl Session {
         if s.autoflush {
             Session::flush_inner(&mut s).await?;
         }
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
         render_select(&mut r, &Select { cols: vec![SelCol::Entity(desc)], ..Default::default() })?;
         desc.where_pk(&mut r, pk);
         let rows = Session::run(&mut s, &r).await?;
@@ -3610,7 +3808,7 @@ impl Session {
                     Session::flush_inner(&mut s).await?;
                 }
                 // each value rendered by the usual binder (`$n` with its type), then put in place
-                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
                 let mut marks = Vec::new();
                 for v in binds {
                     let start = r.sql.len();
@@ -3681,7 +3879,7 @@ impl Session {
         if s.autoflush {
             Session::flush_inner(&mut s).await?;
         }
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new() };
         match &st {
             Sql::Insert(ins) => {
                 render(&mut r, &st)?;
@@ -3713,7 +3911,7 @@ impl Session {
                             if implicit.contains(i) {
                                 ost.vals[*i] = V::Unbound;
                                 ost.expired = true;
-                            } else if let Sql::Param(val, _) = v {
+                            } else if let Sql::Param(val, _, _) = v {
                                 ost.vals[*i] = val.clone();
                                 ost.committed[*i] = val.clone();
                             } else if let Sql::Null = v {
@@ -3772,7 +3970,7 @@ fn evaluates_true(o: &ObjCell, w: &[Sql]) -> bool {
         let val = |s: &Sql| -> Option<V> {
             match s {
                 Sql::Col(m, i) if std::ptr::eq(*m, o.desc) => Some(st.vals[*i].clone()),
-                Sql::Param(v, _) => Some(v.clone()),
+                Sql::Param(v, _, _) => Some(v.clone()),
                 Sql::Null => Some(V::None),
                 _ => None,
             }
@@ -3938,7 +4136,7 @@ async fn query_rows(sess: &Session, sel: &V) -> R<Vec<V>> {
 fn query_bulk_target(sel: &V, name: &str) -> R<(&'static ModelDesc, Vec<Sql>)> {
     let s = query_sel(sel)?;
     let m = query_entity(sel)?.ok_or_else(|| Exc::type_error(format!("py2axum: Query.{name}() needs query(Model)")))?;
-    if !s.joins.is_empty() || !s.order.is_empty() || !s.group.is_empty() || s.limit.is_some() || s.offset.is_some() || s.distinct || !s.from_subs.is_empty() {
+    if !s.joins.is_empty() || !s.join_subs.is_empty() || !s.order.is_empty() || !s.group.is_empty() || s.limit.is_some() || s.offset.is_some() || s.distinct || !s.from_subs.is_empty() {
         return Err(Exc::type_error(format!("py2axum: Query.{name}() is supported on query(Model).filter(...) only")));
     }
     Ok((m, s.wheres.clone()))
@@ -4047,4 +4245,44 @@ pub async fn iter(v: &V) -> R<Vec<V>> {
         }
     }
     ops::iter(v)
+}
+
+// ---------------------------------------------------------------- sqlalchemy.inspect
+
+fn mapper_ns(desc: &'static ModelDesc) -> R {
+    let cols = desc
+        .cols
+        .iter()
+        .map(|c| super::libs::namespace(&[], &[("key".to_string(), V::str(c.name))]))
+        .collect::<R<Vec<_>>>()?;
+    super::libs::namespace(&[], &[("column_attrs".to_string(), V::list(cols))])
+}
+
+/// `sqlalchemy.inspect(x, raiseerr=False)`: a mapped object's state (`unloaded`: the attributes missing
+/// from its `__dict__`, `mapper.column_attrs[i].key`), a mapped class's mapper (`column_attrs`), None
+/// for anything else. Only those attributes: the others raise AttributeError.
+pub fn inspect(v: &V) -> R {
+    match v {
+        V::Obj(o) => {
+            let present = match o.instance_dict()? {
+                V::Dict(d) => d.lock().values().map(|(k, _)| ops::str_(k)).collect::<R<Vec<_>>>()?,
+                _ => vec![],
+            };
+            let mut m = indexmap::IndexMap::new();
+            for name in o.desc.cols.iter().map(|c| c.name).chain(o.desc.rels.iter().map(|r| r.name)) {
+                if !present.iter().any(|p| p == name) {
+                    m.insert(Key::Str(name.into()), V::str(name));
+                }
+            }
+            super::libs::namespace(
+                &[],
+                &[("unloaded".to_string(), V::Set(Arc::new(Mutex::new(m)))), ("mapper".to_string(), mapper_ns(o.desc)?)],
+            )
+        }
+        V::Class(c) => match c.kind {
+            super::v::ClassKind::Model(d) => mapper_ns(d),
+            _ => Ok(V::None),
+        },
+        _ => Ok(V::None),
+    }
 }

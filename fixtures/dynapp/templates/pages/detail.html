@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}{{ item.address }} — pages{% endblock %}
+{% block content %}
+  <h1>{{ item.address }}</h1>
+  {% if item.findings %}<p>{{ item.findings.n }}</p>{% endif %}
+{% endblock %}

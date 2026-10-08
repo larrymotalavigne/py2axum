@@ -132,6 +132,9 @@ pub fn median(data: &V) -> R {
 
 pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
     let mut default_str = false;
+    let mut sort_keys = false;
+    let mut indent: Option<String> = None;
+    let seps_given = kwargs.iter().any(|(k, _)| k == "separators");
     let mut style = pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": " };
     for (k, v) in kwargs {
         match k.as_str() {
@@ -144,6 +147,18 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
                 default_str = true
             }
             "ensure_ascii" => style.ensure_ascii = ops::truthy(v)?,
+            "sort_keys" => sort_keys = ops::truthy(v)?,
+            "indent" => {
+                indent = match v {
+                    V::None => None,
+                    V::Int(n) => Some(" ".repeat((*n).max(0) as usize)),
+                    V::Str(s) => Some(s.to_string()),
+                    other => return Err(Exc::type_error(format!("py2axum: json.dumps(indent=) of type {}", other.type_name()))),
+                };
+                if indent.is_some() && !seps_given {
+                    style.item_sep = ",";
+                }
+            }
             "separators" => {
                 let parts = ops::iter(v)?;
                 let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
@@ -153,7 +168,91 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
             _ => return Err(Exc::type_error(format!("json.dumps({k}=) is not supported"))),
         }
     }
+    let sorted;
+    let obj = if sort_keys {
+        sorted = sorted_keys(obj)?;
+        &sorted
+    } else {
+        obj
+    };
+    if let Some(ind) = indent {
+        let mut out = String::new();
+        write_indented(&mut out, obj, &style, default_str, &ind, 0)?;
+        return Ok(V::str(out));
+    }
     Ok(V::str(pyd::to_json(obj, &style, default_str)?))
+}
+
+/// `json.dumps(indent=)`: CPython's `_iterencode` layout (newline + indent per level, `[]`/`{}` when empty)
+fn write_indented(out: &mut String, v: &V, st: &pyd::JsonStyle, default_str: bool, ind: &str, level: usize) -> R<()> {
+    let nl = |out: &mut String, lvl: usize| {
+        out.push('\n');
+        out.push_str(&ind.repeat(lvl));
+    };
+    let sep = st.item_sep;
+    match v {
+        V::List(_) | V::Tuple(_) => {
+            let items = ops::iter(v)?;
+            if items.is_empty() {
+                out.push_str("[]");
+                return Ok(());
+            }
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(sep);
+                }
+                nl(out, level + 1);
+                write_indented(out, x, st, default_str, ind, level + 1)?;
+            }
+            nl(out, level);
+            out.push(']');
+        }
+        V::Dict(d) => {
+            let items = d.lock().values().cloned().collect::<Vec<_>>();
+            if items.is_empty() {
+                out.push_str("{}");
+                return Ok(());
+            }
+            out.push('{');
+            for (i, (k, x)) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(sep);
+                }
+                nl(out, level + 1);
+                out.push_str(&pyd::to_json(&V::str(pyd::json_key(k)?), st, false)?);
+                out.push_str(st.key_sep);
+                write_indented(out, x, st, default_str, ind, level + 1)?;
+            }
+            nl(out, level);
+            out.push('}');
+        }
+        other => out.push_str(&pyd::to_json(other, st, default_str)?),
+    }
+    Ok(())
+}
+
+/// `sort_keys=True`: every dict's items in `sorted(d.items())` order (keys of mixed types raise like CPython)
+fn sorted_keys(v: &V) -> R {
+    Ok(match v {
+        V::Dict(d) => {
+            let mut items: Vec<(V, V)> = d.lock().values().cloned().collect();
+            let mut err = None;
+            items.sort_by(|a, b| {
+                ops::cmp(&a.0, &b.0).unwrap_or_else(|e| {
+                    err.get_or_insert(e);
+                    std::cmp::Ordering::Equal
+                })
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
+            V::dict_from(items.into_iter().map(|(k, x)| Ok((k, sorted_keys(&x)?))).collect::<R<Vec<_>>>()?)?
+        }
+        V::List(l) => V::list(l.lock().iter().map(sorted_keys).collect::<R<Vec<_>>>()?),
+        V::Tuple(t) => V::Tuple(std::sync::Arc::new(t.iter().map(sorted_keys).collect::<R<Vec<_>>>()?)),
+        other => other.clone(),
+    })
 }
 
 // ---------------------------------------------------------------- datetime
@@ -328,20 +427,47 @@ pub fn zoneinfo(name: &V) -> R {
     Tz::zone(&n).map(V::Tz).ok_or_else(|| Exc::msg(&KEY_ERROR, format!("No time zone found with key {n}")))
 }
 
+/// A string shaped like an ISO date (`YYYY-MM-DD`, then `T`/space and `HH:MM[:SS]`) whose values are out of
+/// range: CPython's `fromisoformat` names the field (`month must be in 1..12, not 13`), else None
+fn iso_range_error(t: &str) -> Option<Exc> {
+    let b = t.as_bytes();
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let s = t.get(r)?;
+        s.bytes().all(|c| c.is_ascii_digit()).then(|| s.parse().ok()).flatten()
+    };
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let (y, m, d) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    if let Err(e) = super::methods::ymd(y, m, d) {
+        return Some(e);
+    }
+    if b.len() >= 16 && matches!(b[10], b'T' | b' ') && b[13] == b':' {
+        let (h, mi) = (digits(11..13)?, digits(14..16)?);
+        let sec = if b.len() >= 19 && b[16] == b':' { digits(17..19) } else { Some(0) };
+        for (v, hi, what) in [(h, 23, "hour"), (mi, 59, "minute"), (sec?, 59, "second")] {
+            if let Err(e) = super::methods::time_field(v, hi, what) {
+                return Some(e);
+            }
+        }
+    }
+    None
+}
+
 pub fn fromisoformat_dt(s: &V) -> R {
     let t = ops::str_(s)?;
     match dt::parse_datetime(&t) {
         Ok(d) => Ok(V::DateTime(DateTime { tz: d.tz.map(|z| if let Tz::Fixed(0) = z { Tz::Utc } else { z }), ..d })),
         Err(_) => match dt::parse_date(&t) {
             Ok(d) => Ok(V::DateTime(DateTime::naive(d.and_hms_opt(0, 0, 0).unwrap()))),
-            Err(_) => Err(Exc::value_error(format!("Invalid isoformat string: {}", ops::str_repr(&t)))),
+            Err(_) => Err(iso_range_error(&t).unwrap_or_else(|| Exc::value_error(format!("Invalid isoformat string: {}", ops::str_repr(&t))))),
         },
     }
 }
 
 pub fn fromisoformat_date(s: &V) -> R {
     let t = ops::str_(s)?;
-    dt::parse_date(&t).map(V::Date).map_err(|_| Exc::value_error(format!("Invalid isoformat string: {}", ops::str_repr(&t))))
+    dt::parse_date(&t).map(V::Date).map_err(|_| iso_range_error(&t).unwrap_or_else(|| Exc::value_error(format!("Invalid isoformat string: {}", ops::str_repr(&t)))))
 }
 
 /// `strftime` with the common directives.
@@ -511,7 +637,9 @@ pub static NAMESPACE: pyd::SchemaDesc = pyd::SchemaDesc {
     slots: &[],
     settings: None,
     init: None,
+    private: &[],
     computed: &[],
+    json_schema: None,
 };
 
 /// `types.SimpleNamespace(**kwargs)`

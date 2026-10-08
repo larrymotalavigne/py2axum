@@ -18,6 +18,12 @@ class Author(Base):
 
     books = relationship("Book", back_populates="author", order_by="[Book.title, Book.id.desc()]")
 
+    # adjacency list (a section and its parent section): many-to-one through remote_side=, its backref
+    # one-to-many, and a one-to-many declared without remote_side=
+    mentor_id = Column(Integer, ForeignKey("authors.id", ondelete="SET NULL"), nullable=True)
+    mentor = relationship("Author", remote_side=[id], foreign_keys=[mentor_id], backref="mentees")
+    pupils = relationship("Author", order_by="Author.name", overlaps="mentor,mentees")
+
 
 class Book(Base):
     __tablename__ = "books"
@@ -34,6 +40,15 @@ class Book(Base):
     author_id = Column(Integer, ForeignKey("authors.id", ondelete="CASCADE"), nullable=False, index=True)
 
     author = relationship("Author", back_populates="books")
+
+    # read by a response model (from_attributes): the first one lazy-loads
+    @property
+    def author_name(self) -> str | None:
+        return self.author.name if self.author else None
+
+    @property
+    def shout(self) -> str:
+        return self.title.upper()
 
 
 class Review(Base):

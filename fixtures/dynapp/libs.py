@@ -609,6 +609,299 @@ async def small_libs():
     return out
 
 
+# ---- unicodedata (normalize, combining): Unicode 16 like CPython 3.14
+import unicodedata  # noqa: E402
+
+
+@router.get("/unicodedata")
+async def unicode_data(s: str = "Élève Ǆ ﬁ ½ e\u0301\u0327 \u1acf\u0301 x\u1ae6\u0300"):
+    out = {f: unicodedata.normalize(f, s) for f in ("NFC", "NFD", "NFKC", "NFKD")}
+    out["slug"] = "".join(c for c in unicodedata.normalize("NFKD", s.lower()) if not unicodedata.combining(c))
+    out["classes"] = [unicodedata.combining(c) for c in unicodedata.normalize("NFD", s)]
+    errs = []
+    for f in (lambda: unicodedata.normalize("NFX", s), lambda: unicodedata.normalize("NFC", 3),
+              lambda: unicodedata.normalize(None, s), lambda: unicodedata.combining("ab"),
+              lambda: unicodedata.combining(""), lambda: unicodedata.combining(7)):
+        try:
+            f()
+        except (ValueError, TypeError) as e:
+            errs.append([type(e).__name__, str(e)])
+    out["errors"] = errs
+    return out
+
+
+# ---- json.dumps(sort_keys=, indent=)
+import json as _json  # noqa: E402
+
+
+@router.get("/jsonfmt")
+async def json_formats():
+    data = {"b": [1, {"z": None, "a": 2.5}], "a": {}, "é": [], "c": (True, "x")}
+    out = [_json.dumps(data, sort_keys=True), _json.dumps(data, indent=2), _json.dumps(data, indent=0),
+           _json.dumps(data, indent="\t", sort_keys=True, ensure_ascii=False),
+           _json.dumps(data, indent=1, separators=(", ", ": ")), _json.dumps([], indent=4),
+           _json.dumps({1: "a", 2: "b"}, sort_keys=True, separators=(",", ":"))]
+    try:
+        _json.dumps({1: "a", "b": 2}, sort_keys=True)
+    except TypeError as e:
+        out.append(type(e).__name__)  # the message names the operands in timsort's comparison order
+    return out
+
+
+# ---- date/datetime.replace: every field at once (Jan 31 -> Feb 28 in one call), CPython's range errors
+@router.get("/datereplace")
+async def date_replace():
+    d, t = _date(2026, 1, 31), datetime(2026, 1, 31, 10, 30)
+    out = [str(d.replace(month=2, day=28)), str(t.replace(year=2024, month=2, day=29, hour=0)),
+           str(d.replace(day=1).replace(month=3))]
+    for f in (lambda: _date.fromisoformat("2026-13-45"), lambda: _date.fromisoformat("2026-02-30"),
+              lambda: _date.fromisoformat("2026-1-5"), lambda: datetime.fromisoformat("2026-01-05T25:00"),
+              lambda: datetime.fromisoformat("2026-01-05 10:61"), lambda: datetime.fromisoformat("2026-00-01T10:00"),
+              lambda: d.replace(month=2), lambda: d.replace(month=13), lambda: d.replace(year=0),
+              lambda: d.replace(day=0), lambda: t.replace(hour=24), lambda: t.replace(microsecond=1000000)):
+        try:
+            f()
+        except ValueError as e:
+            out.append(str(e))
+    return out
+
+
+# ---- a field validator never sees a value that failed its constraints (min_length, items)
+from pydantic import BaseModel as _BaseModel, Field, field_validator  # noqa: E402
+
+
+class LastPositive(_BaseModel):
+    items: list[int] = Field(..., min_length=1, max_length=3)
+    tags: set[int] = Field(set(), max_length=1)
+    meta: dict[str, int] = Field({}, max_length=1)
+    pair: tuple[int, ...] = Field((), max_length=2)
+    names: list = Field([], min_length=0, max_length=2)
+
+    @field_validator("items")
+    @classmethod
+    def last_positive(cls, v):
+        if v[-1] < 0:
+            raise ValueError("the last item must be positive")
+        return v
+
+
+@router.post("/lastpositive")
+async def last_positive(body: LastPositive):
+    return body
+
+
+# ---- collections.deque (bounded, defaultdict(deque) sliding windows)
+from collections import defaultdict as _defaultdict, deque  # noqa: E402
+
+_WINDOWS: dict[str, deque[int]] = _defaultdict(deque)
+
+
+@router.get("/deque")
+async def deque_cases(key: str = "a"):
+    win = _WINDOWS[key]
+    while win and win[0] < len(win) - 1:
+        win.popleft()
+    win.append(len(win))
+    d = deque([1, 2, 3], maxlen=3)
+    d.append(4)
+    d.appendleft(0)
+    out = [repr(d), list(d), len(d), d[0], d[-1], 3 in d, 9 in d, bool(deque()), repr(deque()), repr(deque("ab"))]
+    d.rotate(1)
+    out.append(list(d))
+    d.rotate(-2)
+    out.append(list(d))
+    e = deque()
+    e.extend([1, 2])
+    e.extendleft([3, 4])
+    e[0] = 10
+    out += [list(e), e.count(2), e.index(2), e.pop(), e.popleft(), list(e), list(e.copy())]
+    e.remove(1)
+    e.clear()
+    out.append(len(e))
+    for f in (lambda: deque().pop(), lambda: deque().popleft(), lambda: deque([1])[5], lambda: deque(maxlen=-1)):
+        try:
+            f()
+        except (IndexError, ValueError) as x:
+            out.append(f"{type(x).__name__}: {x}")
+    return {"out": out, "window": win, "size": len(win), "keys": sorted(_WINDOWS)}
+
+
+# ---- plain classes: ABC, @abstractmethod, single inheritance, super().__init__
+from abc import ABC, abstractmethod  # noqa: E402
+
+
+class Shape(ABC):
+    sides = 0
+
+    def __init__(self, name: str):
+        self.name = name
+
+    @abstractmethod
+    def area(self): ...
+
+    @abstractmethod
+    async def load(self): ...
+
+    def describe(self) -> str:
+        return f"{self.name}:{self.kind()}:{self.area()}:{self.sides}"
+
+    def kind(self) -> str:
+        return "shape"
+
+    async def fetch(self):
+        return [await self.load(), self.kind()]
+
+
+class Square(Shape):
+    sides = 4
+
+    def __init__(self, name: str, side: int):
+        super().__init__(name)
+        self.side = side
+
+    def area(self):
+        return self.side ** 2
+
+    async def load(self):
+        return self.side
+
+
+class Half(Shape):
+    def area(self):
+        return 0
+
+
+class Unit(Square):
+    def __init__(self):
+        super().__init__("unit", 1)
+
+    def kind(self) -> str:
+        return "unit"
+
+
+@router.get("/shapes")
+async def shapes():
+    s, u = Square("s", 3), Unit()
+    out = [s.describe(), u.describe(), isinstance(u, Shape), isinstance(u, Square), isinstance(s, Unit),
+           type(u).__name__, u.sides, await s.fetch(), await u.fetch()]
+    for f in (lambda: Shape("x"), lambda: Half("h")):
+        try:
+            f()
+        except TypeError as e:
+            out.append(str(e))
+    return out
+
+
+# ---- nh3 (ammonia): HTML sanitization
+import nh3  # noqa: E402
+
+_ATTRS = {"*": {"style", "class", "title"}, "a": {"href", "target"}, "img": {"src", "alt"}, "td": {"colspan"}}
+
+
+@router.post("/sanitize")
+async def sanitize(body: dict):
+    html = body["html"]
+    out = {"default": nh3.clean(html),
+           "mail": nh3.clean(html, attributes=_ATTRS, url_schemes={"http", "https", "mailto", "cid"},
+                              link_rel="noopener noreferrer nofollow"),
+           "tags": nh3.clean(html, tags={"b", "p"}, attributes={}, strip_comments=False, link_rel=None),
+           "classes": nh3.clean(html, allowed_classes={"b": {"k"}}),
+           "content": nh3.clean(html, clean_content_tags={"style", "script"}),
+           "text": nh3.clean_text(html), "is_html": nh3.is_html(html)}
+    for f in (lambda: nh3.clean(html, attributes={"a": {"rel"}}), lambda: nh3.clean(html, clean_content_tags={"p"})):
+        try:
+            f()
+        except ValueError as e:
+            out.setdefault("errors", []).append(str(e))
+    return out
+
+
+# ---- socket.getaddrinfo + ipaddress (an SSRF guard)
+import ipaddress  # noqa: E402
+import socket  # noqa: E402
+
+_BLOCKED = [ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"),
+            ipaddress.ip_network("fc00::/7")]
+
+
+@router.get("/ssrf")
+async def ssrf(host: str):
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        return {"error": str(e), "os": isinstance(e, OSError)}
+    out = []
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        out.append([sockaddr[0], str(addr), repr(addr), [str(n) for n in _BLOCKED if addr in n]])
+    return {"n": len(infos), "addrs": out, "ports": sorted({i[4][1] for i in infos})}
+
+
+@router.get("/ipaddr")
+async def ipaddr():
+    out = [repr(ipaddress.ip_network("10.0.0.1", strict=False)), str(ipaddress.ip_network("10.0.0.1/8", strict=False)),
+           repr(ipaddress.ip_network("2001:db8::/32")), f"{ipaddress.ip_address('2001:db8::1')}",
+           ipaddress.ip_address("10.1.2.3") in ipaddress.ip_network("10.0.0.0/8"),
+           ipaddress.ip_address("11.1.2.3") in ipaddress.ip_network("10.0.0.0/8"),
+           ipaddress.ip_address("::1") in ipaddress.ip_network("10.0.0.0/8"), str(ipaddress.ip_address(3232235777))]
+    for s in ("x", "10.0.0.1/8", "01.2.3.4", "1.2.3.4/33", "1.2.3.4/x"):
+        try:
+            out.append(str(ipaddress.ip_network(s) if "/" in s else ipaddress.ip_address(s)))
+        except ValueError as e:
+            out.append(str(e))
+    return out
+
+
+# ---- MIMEBase attachments (email.encoders), Fernet.generate_key
+from email import encoders  # noqa: E402
+from email.mime.base import MIMEBase  # noqa: E402
+
+from cryptography.fernet import Fernet as _Fernet  # noqa: E402
+
+
+@router.get("/mimebase")
+async def mimebase():
+    part = MIMEBase("application", "pdf")
+    part.set_payload(b"%PDF\x00\xff" * 30)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename="f \u00e9.pdf")
+    plain = MIMEBase("text", "plain", name="a.txt")
+    plain.set_payload("h\u00e9llo")
+    empty = MIMEBase("application", "octet-stream")
+    try:
+        encoders.encode_base64(empty)  # no payload: CPython's TypeError
+    except TypeError as e:
+        empty.set_payload(str(e))
+    key = _Fernet.generate_key()
+    f = _Fernet(key)
+    return {"part": part.as_string(), "plain": plain.as_string(), "empty": empty.as_string(),
+            "key": [len(key), isinstance(key, bytes), key.endswith(b"="), f.decrypt(f.encrypt(b"x")).decode()],
+            "keys_differ": _Fernet.generate_key() != key}
+
+
+# ---- string.Template
+from string import Template  # noqa: E402
+
+_TPL = Template("body { color: ${ink}; w: ${w}px } $$5 $name/$name_2 $missing ${x")
+
+
+@router.get("/template")
+async def template(ink: str = "red"):
+    out = [_TPL.safe_substitute(ink=ink, w=3, name="n"), _TPL.safe_substitute({"ink": "blue", "name": 1}, w=4),
+           Template("$a and $b").substitute({"a": 1, "b": [2]}), Template("x$").safe_substitute()]
+    for t, kw in (("$a $b", {"a": 1}), ("ok\n  $", {}), ("$", {}), ("a\nb\n$!", {})):
+        try:
+            Template(t).substitute(**kw)
+        except KeyError as e:
+            out.append(f"KeyError {e}")
+        except ValueError as e:
+            out.append(f"ValueError {e}")
+    return out
+
+
 # ---- email.utils.formatdate (RFC 2822 dates)
 from email.utils import formatdate  # noqa: E402
 

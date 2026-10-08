@@ -18,7 +18,7 @@ On the bundled example ([`examples/notes`](examples/notes)), same machine (Apple
 
 The binary used 19 MB of RSS under load. Gains depend on how much of your request time is Python (validation, serialization, ORM) versus the database: measure your own app with `bench/`.
 
-> **Status: alpha.** py2axum translates a *closed, growing subset* of Python and of a list of libraries. Anything outside it is **refused at compile time with `file:line`** — never approximated silently. A per-route coverage report tells you what blocks and what each fix would unlock.
+> **Status: alpha.** py2axum translates a *closed, growing subset* of Python and of a list of libraries. Anything outside it is **refused at compile time with `file:line`** — never approximated silently. `py2axum check` tells you, route by route, what translates and what blocks.
 
 ## Why
 
@@ -32,7 +32,7 @@ The binary used 19 MB of RSS under load. Gains depend on how much of your reques
 pip install git+https://github.com/larrymotalavigne/py2axum     # Python ≥ 3.12, no dependencies (PyPI soon)
 
 # what would translate, route by route (nothing is generated)
-py2axum examples/notes/app --root examples/notes --report coverage.md
+py2axum check examples/notes/app --root examples/notes
 
 # generate the Rust crate, build it, run it
 py2axum examples/notes/app --root examples/notes --backend dyn -o build/notes --name notes
@@ -42,7 +42,48 @@ DATABASE_URL=postgresql://postgres@localhost/notes PORT=8080 ./build/notes/targe
 
 The binary reads `DATABASE_URL`, `HOST` (`0.0.0.0`), `PORT` (`8080`), plus whatever your code reads from the environment (`os.environ`, pydantic-settings). It does not create tables: run your migrations as usual.
 
-Run the transpiler on a Python **at least as recent** as the one your app targets (the parser only knows its own syntax). Library behaviours that changed between versions (Starlette's CORS, Pydantic error URLs, CPython messages) follow the versions pinned in your project's `uv.lock`.
+Run the transpiler on a Python **at least as recent** as the one your app targets (the parser only knows its own syntax). Library behaviours that changed between versions (Starlette's CORS, Pydantic error URLs, CPython messages) follow the versions pinned in your project's `uv.lock`; versions outside the [tested ranges](docs/supported.md#supported-versions) (FastAPI 0.137–0.142, Starlette 1.0–1.7, Pydantic 2.12–2.13, SQLAlchemy 2.0.44–2.1, Python 3.12–3.14...) are refused rather than translated.
+
+## Check an application
+
+`py2axum check` runs the whole translation without writing a crate and prints, for each route, whether it is
+**native** (compiled into the binary), **python-side** (left to a Python process with `--python-side PATH`, or
+moved by `--python-side auto`) or **refused**, with the reason at `file:line`, then the blocking constructs
+ranked by how many routes each one blocks:
+
+```
+$ py2axum check proj --root .
+py2axum check proj (dyn backend)
+
+refused      GET /api/items/me/info    proj/views/items.py:22
+             └ proj/deps.py:5: library call `jwt.decode()` is not supported (not in the py2axum library map)
+refused      GET /api/items/stamp/now  proj/views/items.py:18
+             └ proj/schemas.py:10: unsupported type annotation `SecretStr` (pydantic.SecretStr)
+native       GET /api/items/{item_id}  proj/views/items.py:11
+native       GET /users/count          proj/views/users.py:7
+...
+Blockers (routes touched, routes for which it is the only blocker):
+     2    2  library jwt  (proj/deps.py:5)
+     2    2  type SecretStr  (proj/schemas.py:10)
+
+2/6 routes native (33.3 %), 0 python-side, 4 refused — generation would fail
+hint: --python-side auto leaves the refused routes to a Python process next to the binary
+```
+
+Errors that concern the whole application (an unsupported middleware, a library version outside the
+[tested ranges](docs/supported.md#supported-versions)) are listed first: they refuse generation whatever the
+routes. It accepts the generation options (`--root`, `--backend`, `--python-side`), so the answer is the one
+generation would give.
+
+In CI, `check` exits with 1 when generation would fail; `--fail-under PCT` also fails below a share of
+native routes, and `--json` gives the same data to scripts:
+
+```bash
+py2axum check api --root . --python-side auto --fail-under 80
+py2axum check api --root . --json > coverage.json
+```
+
+`--report coverage.md` remains for a detailed Markdown/JSON report (internal labels, greedy order of fixes).
 
 ## In a Dockerfile
 
@@ -84,9 +125,10 @@ A summary — the full list, with every documented difference from CPython, is i
 - **Pydantic v2**: lax-mode validation with pydantic-core's error types and messages, unions, enums, `Field` constraints and aliases, validators (`field_validator`/`model_validator`, before/after), computed defaults, `model_dump`/`model_validate`/`model_copy`, `TypeAdapter`, frozen models, URL and email types, `BaseSettings`.
 - **SQLAlchemy 2.0 async**: declarative models (composite keys, `Identity`, JSON/JSONB, enums, `Numeric`, `TypeDecorator`), sessions (identity map, autoflush, `expire_on_commit`, savepoints, refresh, rollback), relationships and loader strategies, `select`/`update`/`delete`/`insert ... on conflict`, joins, aliases, subqueries, aggregates, `case`, `text()`.
 - **Python**: functions, closures, decorators, classes (with `__eq__`/`__str__`/`__aenter__`...), dataclasses, exceptions, comprehensions, generators, `match`, coroutines and `asyncio` (`gather`, tasks, locks), `threading`, `pickle` (CPython-compatible bytes), `datetime`/`decimal`/`uuid`/`re`/`json`/`csv`/`base64`/`hashlib`/`hmac`/`math`/`urllib.parse`...
+- **WebSockets**: `@app.websocket` / `@router.websocket` with Starlette's `WebSocket` API (dyn backend; see docs/supported.md).
 - **Libraries**: httpx and aiohttp clients, redis.asyncio, python-jose (HMAC), bcrypt, pyotp, itsdangerous, cryptography's Fernet, jinja2 + `email` + aiosmtplib, pywebpush, google-auth id tokens, alembic config, psutil.
 
-Not translated (stay in Python with `--python-side`, or refused): WebSockets, `lifespan`, other libraries, arbitrary `eval`/reflection, C extensions.
+Not translated (stay in Python with `--python-side`, or refused): `lifespan`, other libraries, arbitrary `eval`/reflection, C extensions.
 
 ## How it works
 

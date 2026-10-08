@@ -30,6 +30,8 @@ CONSTRAINTS["number"] = CONSTRAINTS["integer"]
 FIELD_KW = {"default", "default_factory", "description", "title", "examples"} | {
     k for c in CONSTRAINTS.values() for k in c}
 _MISSING = object()
+# model_config extra= -> additionalProperties
+EXTRA = {"ignore": None, "forbid": False, "allow": True}
 
 
 def title_of(name: str) -> str:
@@ -52,6 +54,8 @@ class SchemaGen:
         self.p = proj
         self.defs: dict[str, dict] = {}
         self._building: set = set()
+        self._def_syms: dict[str, Sym] = {}
+        self._extra: dict[Sym, str | None] = {}
 
     def err(self, msg: str, node: ast.AST, module: str) -> TranspileError:
         return TranspileError(f"JSON schema: {msg}", node, self.p.src(module))
@@ -241,6 +245,7 @@ class SchemaGen:
             t = self.ref(sym.module, b)
             if isinstance(t, Sym) and t in self.p.fe.schema_syms:
                 out = self.class_fields(t)
+                self._extra[sym] = self._extra.get(t)
             elif not (isinstance(t, Ext) and t.dotted.split(".")[-1] == "BaseModel"):
                 raise self.err(f"base class `{ast.unparse(b)}` of {sym.name}", b, sym.module)
         for st in node.body:
@@ -251,9 +256,14 @@ class SchemaGen:
                 out.append((st.target.id, st.annotation, st.value if st.value is not None else _MISSING))
             elif isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "model_config" for t in st.targets):
                 ok = isinstance(st.value, ast.Call) and all(
-                    k.arg in {"from_attributes", "str_strip_whitespace"} for k in st.value.keywords)
+                    k.arg in {"from_attributes", "str_strip_whitespace"}
+                    or k.arg == "extra" and isinstance(k.value, ast.Constant) and k.value.value in EXTRA
+                    for k in st.value.keywords)
                 if not ok:
-                    raise self.err(f"{sym.name}.model_config other than from_attributes", st, sym.module)
+                    raise self.err(f"{sym.name}.model_config other than from_attributes, extra=", st, sym.module)
+                for k in st.value.keywords:
+                    if k.arg == "extra":
+                        self._extra[sym] = k.value.value
             elif isinstance(st, ast.ClassDef) and st.name == "Config":
                 raise self.err(f"{sym.name}: class Config", st, sym.module)
             elif isinstance(st, ast.FunctionDef) and st.decorator_list:
@@ -275,13 +285,32 @@ class SchemaGen:
         return s
 
     def model_def(self, sym: Sym) -> None:
+        other = self._def_syms.setdefault(sym.name, sym)
+        if other != sym:
+            # pydantic then qualifies both names with their module: not reproduced
+            raise self.err(f"two models named {sym.name} ({other.module} and {sym.module}) in one schema",
+                           self.p.fe.schema_syms[sym], sym.module)
         if sym.name in self.defs or sym in self._building:
             return
         self._building.add(sym)
         node = self.p.fe.schema_syms[sym]
         fields = [(n, a, d, sym.module) for n, a, d in self.class_fields(sym)]
         self.defs[sym.name] = self.object_schema(fields, None, sym.name, ast.get_docstring(node, clean=False))
+        if EXTRA.get(self._extra.get(sym)) is not None:
+            self.defs[sym.name]["additionalProperties"] = EXTRA[self._extra[sym]]
         self._building.discard(sym)
+
+    def model(self, sym: Sym) -> dict:
+        """`Model.model_json_schema()`: the class's own schema at the top, the models it uses under `$defs`."""
+        self.model_def(sym)
+        if sym.name in self.defs and any(f'"#/$defs/{sym.name}"' in repr(v).replace("'", '"')
+                                         for v in self.defs.values()):
+            raise self.err(f"{sym.name} refers to itself (a recursive model's schema is a $ref)",
+                           self.p.fe.schema_syms[sym], sym.module)
+        s = dict(self.defs.pop(sym.name))
+        if self.defs:
+            s["$defs"] = dict(self.defs)
+        return sort_schema(s)
 
     def arguments(self, fn: ast.AsyncFunctionDef | ast.FunctionDef, module: str) -> dict:
         """FastMCP's `<function>Arguments` model schema, top-level keys in the wire model's order (properties,

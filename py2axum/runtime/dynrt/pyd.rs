@@ -90,6 +90,24 @@ pub enum TD {
     Decimal(DecC),
     /// pydantic's URL types (AnyUrl, HttpUrl, AnyHttpUrl, RedisDsn)
     Url(&'static UrlSpec),
+    /// uuid.UUID
+    Uuid,
+    /// `Field(min_length=, max_length=)` on a list, set, tuple or dict: (container, min, max)
+    Len(&'static TD, Option<usize>, Option<usize>),
+}
+
+fn items_word(n: usize) -> &'static str {
+    if n == 1 { "item" } else { "items" }
+}
+
+impl TD {
+    /// the container under its length constraints (`Len`), else itself
+    pub fn bare(&self) -> &TD {
+        match self {
+            TD::Len(t, _, _) => t.bare(),
+            t => t,
+        }
+    }
 }
 
 /// pydantic's `UrlConstraints` of a URL type
@@ -247,7 +265,9 @@ static VALINFO: SchemaDesc = SchemaDesc {
     slots: &[],
     settings: None,
     init: None,
+    private: &[],
     computed: &[],
+    json_schema: None,
 };
 
 pub struct SchemaDesc {
@@ -291,6 +311,29 @@ pub struct SchemaDesc {
     pub init: Option<MethodFn>,
     /// `@computed_field` properties, serialized after the fields and the extras
     pub computed: &'static [(&'static str, MethodFn)],
+    /// `model_json_schema()`, computed at translation time for the models used as values (None otherwise:
+    /// the translator refused every call that could reach it)
+    pub json_schema: Option<&'static str>,
+    /// private attributes (`_name: T = PrivateAttr(...)`, any `_name`): set per instance, never
+    /// validated nor dumped (held in `extra`)
+    pub private: &'static [(&'static str, Dflt)],
+}
+
+impl SchemaDesc {
+    pub fn is_private(&self, name: &str) -> bool {
+        self.private.iter().any(|(n, _)| *n == name)
+    }
+    /// the private attributes' defaults (a fresh value per instance)
+    pub fn private_defaults(&self, extra: &mut IndexMap<String, V>) {
+        for (n, d) in self.private {
+            match d {
+                Dflt::Value(f) | Dflt::Factory(f) => {
+                    extra.insert(n.to_string(), f());
+                }
+                Dflt::Required | Dflt::Dyn(_) => {}
+            }
+        }
+    }
 }
 
 /// pydantic-settings' `model_config` as `BaseSettings()` uses it
@@ -387,7 +430,8 @@ enum Step {
     /// field `field` of the instance in `slot` passed its type check: run its validators on `value`;
     /// `prior` = the earlier fields that passed theirs (`info.data`, once their own validators ran),
     /// filled only when a validator takes `info`
-    Validators { slot: usize, field: usize, desc: &'static SchemaDesc, value: V, loc: Vec<V>, prior: Vec<(usize, V)> },
+    /// (`raw`: the field's input, what a validator error reports as `input`, like pydantic-core)
+    Validators { slot: usize, field: usize, desc: &'static SchemaDesc, value: V, raw: V, loc: Vec<V>, prior: Vec<(usize, V)> },
     /// field `field` of the instance in `slot` was omitted and has a computed default
     Default { slot: usize, field: usize, f: MethodFn },
     /// start of a model that has `@model_validator(mode="after")`: errors counted from here
@@ -477,14 +521,15 @@ pub struct Inst {
 /// Exceptions other than ValueError/AssertionError raised by a validator propagate.
 pub async fn validate(cx: &super::Cx, input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDetail>) -> R<Option<V>> {
     let input = if td_has_before(td) { prepare(cx, input.clone(), td).await? } else { input.clone() };
-    prefetch(td, &input).await?;
+    let pf = Pf { cx, keys: Default::default() };
+    prefetch(&pf, td, &input).await?;
     run(cx, errs, |e| val(&input, td, loc, e)).await
 }
 
 fn td_has_before(td: &TD) -> bool {
     match td {
         TD::Schema(d) => d.has_before,
-        TD::List(Some(t)) | TD::Set(Some(t)) | TD::Tuple(Some(t)) | TD::Optional(t) => td_has_before(t),
+        TD::List(Some(t)) | TD::Set(Some(t)) | TD::Tuple(Some(t)) | TD::Optional(t) | TD::Len(t, _, _) => td_has_before(t),
         TD::Dict(Some((_, v))) => td_has_before(v),
         TD::Enum(d, _) => d.missing.is_some(),
         _ => false,
@@ -512,6 +557,7 @@ fn prepare<'a>(cx: &'a super::Cx, input: V, td: &'static TD) -> super::BoxFut<'a
         Ok(match (td, &input) {
             (TD::Optional(_), V::None) => input,
             (TD::Optional(t), _) => prepare(cx, input, t).await?,
+            (TD::Len(t, _, _), _) => prepare(cx, input, t).await?,
             (TD::List(Some(t)), V::List(l)) if td_has_before(t) => {
                 let items = l.lock().clone();
                 let mut out = Vec::with_capacity(items.len());
@@ -671,7 +717,7 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
                     inst.vals.lock()[field] = d;
                 }
             }
-            Step::Validators { slot, field, desc, value, loc, prior } => {
+            Step::Validators { slot, field, desc, value, raw, loc, prior } => {
                 let name = desc.fields[field].name;
                 let mut cur = value;
                 let mut failed = false;
@@ -711,7 +757,7 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
                             };
                             // ctx.error is the exception object (FastAPI's jsonable_encoder renders its vars)
                             let msg = format!("{word}, {}", x.message());
-                            errs.push(ErrDetail { kind, loc: loc.clone(), msg, input: cur.clone(), ctx: Some(vec![("error", V::Exc(x))]) });
+                            errs.push(ErrDetail { kind, loc: loc.clone(), msg, input: raw.clone(), ctx: Some(vec![("error", V::Exc(x))]) });
                             failed = true;
                             break;
                         }
@@ -1045,6 +1091,76 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 None
             }
         },
+        TD::Len(inner, mn, mx) => {
+            let ft = match inner {
+                TD::List(_) => "List",
+                TD::Tuple(_) => "Tuple",
+                TD::Set(_) => "Set",
+                _ => "Dictionary",
+            };
+            let items = items_word;
+            // a set stops as soon as its distinct valid items pass the bound: that error alone
+            if let (Some(mx), TD::Set(Some(it))) = (mx, inner) {
+                let items = match input {
+                    V::List(l) => l.lock().clone(),
+                    V::Tuple(t) => t.to_vec(),
+                    V::Set(s) => s.lock().values().cloned().collect(),
+                    _ => vec![],
+                };
+                let mut seen = std::collections::HashSet::new();
+                for (i, x) in items.iter().enumerate() {
+                    let mut scratch = Vec::new();
+                    let mut se = e.sub(&mut scratch);
+                    if let Some(v) = val(x, it, &with(loc, V::Int(i as i64)), &mut se) {
+                        if se.n == 0 {
+                            if let Ok(k) = Key::of(&v) {
+                                seen.insert(k);
+                            }
+                        }
+                    }
+                    if seen.len() > *mx {
+                        e.push("too_long", loc, format!("Set should have at most {mx} {} after validation, not more", items_word(*mx)), input,
+                            Some(vec![("field_type", V::str("Set")), ("max_length", V::Int(*mx as i64)), ("actual_length", V::None)]));
+                        return None;
+                    }
+                }
+            }
+            // a list too long is refused before its items are looked at
+            if let (Some(mx), TD::List(_)) = (mx, inner) {
+                let n = match input {
+                    V::List(l) => Some(l.lock().len()),
+                    V::Tuple(t) => Some(t.len()),
+                    V::Set(s) => Some(s.lock().len()),
+                    _ => None,
+                };
+                if let Some(n) = n.filter(|n| n > mx) {
+                    e.push("too_long", loc, format!("{ft} should have at most {mx} {} after validation, not {n}", items(*mx)), input,
+                        Some(vec![("field_type", V::str(ft)), ("max_length", V::Int(*mx as i64)), ("actual_length", V::Int(n as i64))]));
+                    return None;
+                }
+            }
+            let out = val(input, inner, loc, e)?;
+            let n = match &out {
+                V::List(l) => l.lock().len(),
+                V::Tuple(t) => t.len(),
+                V::Set(s) => s.lock().len(),
+                V::Dict(d) => d.lock().len(),
+                _ => 0,
+            };
+            if let Some(mx) = mx.filter(|mx| n > *mx) {
+                // a set stops at the first item past the bound: no actual length
+                let (not, actual) = if ft == "Set" { ("more".to_string(), V::None) } else { (n.to_string(), V::Int(n as i64)) };
+                e.push("too_long", loc, format!("{ft} should have at most {mx} {} after validation, not {not}", items(mx)), input,
+                    Some(vec![("field_type", V::str(ft)), ("max_length", V::Int(mx as i64)), ("actual_length", actual)]));
+                return None;
+            }
+            if let Some(mn) = mn.filter(|mn| n < *mn) {
+                e.push("too_short", loc, format!("{ft} should have at least {mn} {} after validation, not {n}", items(mn)), input,
+                    Some(vec![("field_type", V::str(ft)), ("min_length", V::Int(mn as i64)), ("actual_length", V::Int(n as i64))]));
+                return None;
+            }
+            Some(out)
+        }
         TD::List(item) | TD::Set(item) | TD::Tuple(item) => {
             let (kind, msg) = match td {
                 TD::List(_) => ("list_type", "Input should be a valid list"),
@@ -1126,6 +1242,7 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
         TD::Schema(desc) => schema_val(input, desc, loc, e),
         TD::Decimal(c) => decimal_val(input, c, loc, e),
         TD::Url(spec) => url_val(input, spec, loc, e),
+        TD::Uuid => uuid_val(input, loc, e),
         TD::Email => match input {
             V::Str(s) => match super::email::validate(s) {
                 Ok(v) => Some(V::str(v)),
@@ -1188,6 +1305,7 @@ fn label(td: &TD) -> String {
         TD::Set(t) => format!("set[{}]", t.map(label).unwrap_or_else(|| "any".into())),
         TD::Tuple(t) => format!("tuple[{}, ...]", t.map(label).unwrap_or_else(|| "any".into())),
         TD::Optional(t) => format!("nullable[{}]", label(t)),
+        TD::Len(t, _, _) => label(t),
         TD::Union(cs) => format!("union[{}]", cs.iter().map(|c| label(c)).collect::<Vec<_>>().join(",")),
         TD::Literal(lits) => format!(
             "literal[{}]",
@@ -1210,7 +1328,100 @@ fn label(td: &TD) -> String {
         TD::Email => "function-after[_validate(), str]".into(),
         TD::Decimal(_) => "decimal".into(),
         TD::Url(s) => format!("url[{}]", s.name),
+        TD::Uuid => "uuid".into(),
     }
+}
+
+/// pydantic-core's uuid validator: a UUID instance, else a str (`Uuid::parse_str` of the uuid crate it
+/// pins, messages included), else bytes (as text, then as 16 raw bytes)
+fn uuid_val(input: &V, loc: &[V], e: &mut Errs) -> Option<V> {
+    if let V::Native(n) = input {
+        if let Native::Uuid(_) = &**n {
+            return Some(input.clone());
+        }
+    }
+    e.floor(LAX);
+    let parsed = match input {
+        V::Str(s) => uuid_parse(s),
+        V::Bytes(b) => match std::str::from_utf8(b).ok().and_then(|t| uuid_parse(t).ok()) {
+            Some(u) => Ok(u),
+            None if b.len() == 16 => Ok(u128::from_be_bytes(b[..].try_into().unwrap())),
+            None => Err(format!("invalid length: expected 16 bytes, found {}", b.len())),
+        },
+        _ => {
+            e.push("uuid_type", loc, "UUID input should be a string, bytes or UUID object", input, None);
+            return None;
+        }
+    };
+    match parsed {
+        Ok(u) => Some(V::native(Native::Uuid(u))),
+        Err(err) => {
+            e.push("uuid_parsing", loc, format!("Input should be a valid UUID, {err}"), input, Some(vec![("error", V::str(&err))]));
+            None
+        }
+    }
+}
+
+/// `uuid::Uuid::parse_str` as pydantic-core's uuid crate does it: simple, hyphenated, `{braced}` and
+/// `urn:uuid:` forms; on failure the error is computed on the inner text when the length matched a form
+pub fn uuid_parse(s: &str) -> Result<u128, String> {
+    fn hex(b: &[u8]) -> Option<u128> {
+        b.iter().try_fold(0u128, |acc, c| (*c as char).to_digit(16).map(|d| acc << 4 | d as u128))
+    }
+    fn hyphenated(b: &[u8]) -> Option<u128> {
+        if [8, 13, 18, 23].iter().any(|&i| b[i] != b'-') {
+            return None;
+        }
+        let digits: Vec<u8> = b.iter().copied().filter(|c| *c != b'-').collect();
+        if digits.len() != 32 { None } else { hex(&digits) }
+    }
+    let b = s.as_bytes();
+    let (res, failed) = match b.len() {
+        32 => (hex(b), s),
+        36 => (hyphenated(b), s),
+        38 if b[0] == b'{' && b[37] == b'}' => (hyphenated(&b[1..37]), &s[1..37]),
+        45 if s.starts_with("urn:uuid:") => (hyphenated(&b[9..]), &s[9..]),
+        _ => (None, s),
+    };
+    if let Some(u) = res {
+        return Ok(u);
+    }
+    // InvalidUuid::into_err
+    let (inner, offset, simple) = if failed.len() >= 2 && failed.starts_with('{') && failed.ends_with('}') {
+        (&failed[1..failed.len() - 1], 1, false)
+    } else if let Some(rest) = failed.strip_prefix("urn:uuid:") {
+        (rest, 9, false)
+    } else {
+        (failed, 0, true)
+    };
+    let mut hyphens = 0;
+    let mut bounds = [0usize; 4];
+    for (i, c) in inner.char_indices() {
+        if c == '-' {
+            if hyphens < 4 {
+                bounds[hyphens] = i;
+            }
+            hyphens += 1;
+        } else if !c.is_ascii_hexdigit() {
+            // pydantic-core < 2.46 (pydantic 2.12) used a uuid crate that listed the expected characters
+            let expected = if super::pydantic_before(2, 13) { "expected an optional prefix of `urn:uuid:` followed by [0-9a-fA-F-], " } else { "" };
+            return Err(format!("invalid character: {expected}found `{c}` at {}", i + offset + 1));
+        }
+    }
+    if hyphens == 0 && simple {
+        return Err(format!("invalid length: expected length 32 for simple format, found {}", failed.len()));
+    }
+    if hyphens != 4 {
+        return Err(format!("invalid group count: expected 5, found {}", hyphens + 1));
+    }
+    const STARTS: [usize; 5] = [0, 9, 14, 19, 24];
+    const EXPECTED: [usize; 5] = [8, 4, 4, 4, 12];
+    for i in 0..4 {
+        if bounds[i] != STARTS[i + 1] - 1 {
+            return Err(format!("invalid group length in group {i}: expected {}, found {}", EXPECTED[i], bounds[i] - STARTS[i]));
+        }
+    }
+    Err(format!("invalid group length in group 4: expected 12, found {}", failed.len() - STARTS[4]))
 }
 
 /// pydantic-core's decimal validator (lax mode): a float through its repr, a string through
@@ -1373,15 +1584,17 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
             Some(v) => {
                 set.push(true);
                 let floc = with(loc, V::str(used));
+                let n_field = e.n;
                 match val(&v, f.td, &floc, e) {
-                    Some(v) => {
-                        if let Some(slot) = slot {
+                    Some(x) => {
+                        // a value with an error (a length constraint, an item) never reaches the validators
+                        if let (Some(slot), true) = (slot, e.n == n_field) {
                             if desc.validators.iter().any(|vd| vd.fields.contains(&f.name)) {
                                 let prior = prior(fi, &vals, &ok);
-                                e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), loc: floc, prior });
+                                e.steps.push(Step::Validators { slot, field: fi, desc, value: x.clone(), raw: v.clone(), loc: floc, prior });
                             }
                         }
-                        vals.push(v)
+                        vals.push(x)
                     }
                     None => vals.push(V::None),
                 }
@@ -1395,12 +1608,14 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
                     }
                     Dflt::Value(d) | Dflt::Factory(d) if f.validate_default => {
                         let floc = with(loc, V::str(key));
-                        match val(&d(), f.td, &floc, e) {
+                        let n_field = e.n;
+                        let raw = d();
+                        match val(&raw, f.td, &floc, e) {
                             Some(v) => {
-                                if let Some(slot) = slot {
+                                if let (Some(slot), true) = (slot, e.n == n_field) {
                                     if desc.validators.iter().any(|vd| vd.fields.contains(&f.name)) {
                                         let prior = prior(fi, &vals, &ok);
-                                        e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), loc: floc, prior });
+                                        e.steps.push(Step::Validators { slot, field: fi, desc, value: v.clone(), raw: raw.clone(), loc: floc, prior });
                                     }
                                 }
                                 vals.push(v)
@@ -1447,6 +1662,8 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
         e.steps.push(Step::ModelAfter { slot, desc, input: input.clone(), loc: loc.to_vec() });
     }
     e.fields_set = Some(set.iter().filter(|x| **x).count());
+    let mut extra = extra;
+    desc.private_defaults(&mut extra);
     let inst = Arc::new(Inst { desc, vals: Mutex::new(vals), set: Mutex::new(set), extra: Mutex::new(extra) });
     if let Some(slot) = slot {
         e.slots[slot] = Some(inst.clone());
@@ -1473,16 +1690,41 @@ pub fn take_fatal() -> Option<Exc> {
 
 type Fut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = R<()>> + Send + 'a>>;
 
+/// Values of ORM `@property`s computed (asynchronously) before a validation reads them synchronously,
+/// by (object, name); a property that raised keeps its exception, raised where pydantic-core reads it.
+static PROPS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<(usize, &'static str), Result<V, Exc>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One validation's prefetch: the context properties run in, the property values it stored.
+struct Pf<'a> {
+    cx: &'a super::Cx,
+    keys: parking_lot::Mutex<Vec<(usize, &'static str)>>,
+}
+
+impl Drop for Pf<'_> {
+    fn drop(&mut self) {
+        let keys = std::mem::take(&mut *self.keys.lock());
+        if !keys.is_empty() {
+            let mut props = PROPS.lock();
+            for k in keys {
+                props.remove(&k);
+            }
+        }
+    }
+}
+
 /// Validation reads ORM attributes synchronously (`from_attributes`); in a synchronous `Session` some
 /// of them need SQL (lazy loads): those the validation will read are loaded first, in its order.
 /// MissingGreenlet (an async session) is left for the validation to raise where pydantic-core does.
-fn prefetch<'a>(td: &'static TD, v: &'a V) -> Fut<'a> {
+/// The model's `@property`s are evaluated here too (they may lazy-load), their values kept for the
+/// validation that follows.
+fn prefetch<'a>(pf: &'a Pf<'a>, td: &'static TD, v: &'a V) -> Fut<'a> {
     Box::pin(async move {
         match (td, v) {
-            (TD::Optional(t), _) => prefetch(t, v).await,
+            (TD::Optional(t) | TD::Len(t, _, _), _) => prefetch(pf, t, v).await,
             (TD::Union(ts), _) => {
                 for t in ts.iter() {
-                    prefetch(t, v).await?;
+                    prefetch(pf, t, v).await?;
                 }
                 Ok(())
             }
@@ -1493,26 +1735,47 @@ fn prefetch<'a>(td: &'static TD, v: &'a V) -> Fut<'a> {
                     _ => vec![],
                 };
                 for x in &items {
-                    prefetch(t, x).await?;
+                    prefetch(pf, t, x).await?;
                 }
                 Ok(())
             }
-            (TD::Schema(s), V::Obj(_)) => prefetch_schema(s, v).await,
+            (TD::Schema(s), V::Obj(_)) => prefetch_schema(pf, s, v).await,
             _ => Ok(()),
         }
     })
 }
 
-fn prefetch_schema<'a>(s: &'static SchemaDesc, v: &'a V) -> Fut<'a> {
+fn prefetch_schema<'a>(pf: &'a Pf<'a>, s: &'static SchemaDesc, v: &'a V) -> Fut<'a> {
     Box::pin(async move {
+        if let V::Dict(d) = v {
+            // `Model(field=orm_objects, ...)`: the ORM values its fields will validate
+            let items: Vec<(V, V)> = d.lock().values().cloned().collect();
+            for f in s.fields {
+                let hit = items.iter().find(|(k, _)| [f.alias, Some(f.name)].into_iter().flatten().any(|n| k.as_str() == Some(n)));
+                if let Some((_, x)) = hit {
+                    prefetch(pf, f.td, x).await?;
+                }
+            }
+            return Ok(());
+        }
         let V::Obj(o) = v else { return Ok(()) };
         for f in s.fields {
             for key in [f.alias, Some(f.name)].into_iter().flatten() {
                 if o.desc.col_index(key).is_none() && o.desc.rel_index(key).is_none() {
+                    if o.desc.methods.iter().any(|(n, prop, _)| *prop && *n == key) {
+                        let got = super::methods::getattr(pf.cx, v, key).await;
+                        if let Ok(x) = &got {
+                            prefetch(pf, f.td, x).await?;
+                        }
+                        let k = (Arc::as_ptr(o) as usize, key);
+                        PROPS.lock().insert(k, got);
+                        pf.keys.lock().push(k);
+                        break;
+                    }
                     continue;
                 }
                 match o.get_attr(key).await {
-                    Ok(x) => prefetch(f.td, &x).await?,
+                    Ok(x) => prefetch(pf, f.td, &x).await?,
                     Err(e) if e.isinstance(&super::v::MISSING_GREENLET) => {}
                     Err(e) => return Err(e),
                 }
@@ -1524,6 +1787,20 @@ fn prefetch_schema<'a>(s: &'static SchemaDesc, v: &'a V) -> Fut<'a> {
 }
 
 fn attr_value(o: &V, name: &str) -> Option<V> {
+    if let V::Obj(obj) = o {
+        let hit = PROPS.lock().get(&(Arc::as_ptr(obj) as usize, name)).cloned();
+        match hit {
+            Some(Ok(v)) => return Some(v),
+            Some(Err(x)) if x.isinstance(&ATTRIBUTE_ERROR) => return None,
+            Some(Err(x)) => {
+                FATAL.with(|f| {
+                    f.borrow_mut().get_or_insert(x);
+                });
+                return None;
+            }
+            None => {}
+        }
+    }
     match o {
         V::Obj(obj) => match obj.get_attr_sync(name) {
             Ok(v) => Some(v),
@@ -1544,9 +1821,8 @@ fn attr_value(o: &V, name: &str) -> Option<V> {
 pub async fn construct(cx: &super::Cx, desc: &'static SchemaDesc, input: V) -> R {
     let mut errs = Vec::new();
     let input = if desc.has_before { prepare_schema(cx, input, desc).await? } else { input };
-    if let V::Obj(_) = &input {
-        prefetch_schema(desc, &input).await?;
-    }
+    let pf = Pf { cx, keys: Default::default() };
+    prefetch_schema(&pf, desc, &input).await?;
     match run(cx, &mut errs, |e| schema_val(&input, desc, &[], e)).await? {
         Some(v) => Ok(v),
         None => Err(Exc::validation(&VALIDATION_ERROR, errs)),
@@ -1657,9 +1933,12 @@ impl Inst {
                 self.set.lock()[i] = true;
                 Ok(())
             }
-            None if self.desc.open => {
+            None if self.desc.open || name.starts_with('_') => {
                 self.extra.lock().insert(name.to_string(), v);
                 Ok(())
+            }
+            None if self.desc.methods.iter().any(|(n, prop, _)| *prop && *n == name) => {
+                Err(Exc::attr_error(format!("property '{name}' of '{}' object has no setter", self.desc.name)))
             }
             None => Err(Exc::value_error(format!("\"{}\" object has no field \"{}\"", self.desc.name, name))),
         }
@@ -1688,6 +1967,18 @@ impl Inst {
             .zip(vals.iter())
             .map(|(f, v)| Ok(format!("{}={}", f.name, ops::repr(v)?)))
             .collect::<R<Vec<_>>>()?;
+        let mut parts = parts;
+        if !self.desc.computed.is_empty() {
+            let me = Arc::new(Inst {
+                desc: self.desc,
+                vals: Mutex::new(vals.clone()),
+                set: Mutex::new(self.set.lock().clone()),
+                extra: Mutex::new(self.extra.lock().clone()),
+            });
+            for (n, v) in computed_values(&me)? {
+                parts.push(format!("{n}={}", ops::repr(&v)?));
+            }
+        }
         if self.desc.open {
             if std::ptr::eq(self.desc, &super::libs::NAMESPACE) {
                 let extra = self.extra.lock().clone();
@@ -1749,6 +2040,10 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
                 items.push((V::str(k), dump(&vals[i], o)?));
             }
             for (k, ev) in inst.extra.lock().clone() {
+                // private attributes (declared, or `_name` set on the instance) are not dumped
+                if inst.desc.is_private(&k) || (k.starts_with('_') && !inst.desc.open && inst.desc.extra != Extra::Allow) {
+                    continue;
+                }
                 items.push((V::str(k), dump(&ev, o)?));
             }
             for (k, cv) in computed_values(inst)? {
@@ -1779,13 +2074,13 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
         V::Delta(d) if o.json => V::str(delta_iso(d)),
         // pydantic serializes a Decimal as its str() in JSON mode
         V::Decimal(d) if o.json => V::str(d.to_string()),
-        V::Native(n) if o.json && matches!(&**n, Native::PydUrl(..)) => V::str(ops::str_(v)?),
+        V::Native(n) if o.json && matches!(&**n, Native::PydUrl(..) | Native::Uuid(_)) => V::str(ops::str_(v)?),
         V::Enum(e, i) if o.json => dump(&e.value(*i), o)?,
         _ => v.clone(),
     })
 }
 
-fn json_key(k: &V) -> R<String> {
+pub fn json_key(k: &V) -> R<String> {
     Ok(match k {
         V::Enum(e, i) => json_key(&e.value(*i))?,
         V::Str(s) => s.to_string(),
@@ -1839,6 +2134,8 @@ pub fn jsonable(v: &V) -> R {
         V::List(l) => V::list(l.lock().clone().iter().map(jsonable).collect::<R<Vec<_>>>()?),
         V::Tuple(t) => V::list(t.iter().map(jsonable).collect::<R<Vec<_>>>()?),
         V::Set(s) => V::list(s.lock().values().map(jsonable).collect::<R<Vec<_>>>()?),
+        // FastAPI's jsonable_encoder: a deque is a sequence
+        V::Native(n) if matches!(&**n, Native::Deque(_)) => V::list(ops::iter(v)?.iter().map(jsonable).collect::<R<Vec<_>>>()?),
         V::Dict(d) => {
             let items = d.lock().values().cloned().collect::<Vec<_>>();
             let mut out = Vec::new();
@@ -1852,7 +2149,7 @@ pub fn jsonable(v: &V) -> R {
         V::Time(t) => V::str(dt::time_iso(t)),
         V::Delta(d) => V::Float(dt::micros(d) as f64 / 1e6),
         V::Decimal(d) => super::decimal::jsonable(d),
-        V::Native(n) if matches!(&**n, Native::PydUrl(..)) => V::str(ops::str_(v)?),
+        V::Native(n) if matches!(&**n, Native::PydUrl(..) | Native::Uuid(_)) => V::str(ops::str_(v)?),
         // `vars(exc)` (dict(exc) fails): HTTPException's fields, then the attributes its `__init__` set
         V::Exc(e) => {
             let mut items = Vec::new();
@@ -1864,6 +2161,19 @@ pub fn jsonable(v: &V) -> R {
             jsonable(&V::dict_from(items)?)?
         }
         V::Enum(e, i) => jsonable(&e.value(*i))?,
+        // a mapped object: `vars(obj)` without SQLAlchemy's `_sa_*` keys (`sqlalchemy_safe`), its loaded
+        // attributes in column order (CPython's order follows a set of columns: see docs/supported.md)
+        V::Obj(o) => {
+            let V::Dict(d) = o.instance_dict()? else { unreachable!() };
+            let items = d.lock().values().cloned().collect::<Vec<_>>();
+            let mut out = Vec::new();
+            for (k, x) in items {
+                if !ops::str_(&k)?.starts_with("_sa") {
+                    out.push((k, jsonable(&x)?));
+                }
+            }
+            V::dict_from(out)?
+        }
         _ => v.clone(),
     })
 }

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block subtitle %}{{ items|length }} analyse(s){% endblock %}
+{% block content %}
+  {% if not items %}
+    <p class="muted">Rien encore.</p>
+  {% endif %}
+  {% for item in items %}
+    <div class="item">
+      <a href="/small/pages/{{ item.id }}">{{ item.address }}</a>
+      {% if item.findings %}· {{ item.findings.n }} doc(s){% endif %}
+    </div>
+  {% endfor %}
+  <p>{{ when.strftime('%Y-%m-%d %H:%M') }} · {{ day }} · {{ day.strftime('%d/%m') }} · {{ when }}</p>
+{% endblock %}

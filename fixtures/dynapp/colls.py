@@ -47,3 +47,14 @@ async def percent(body: dict):
         return {"out": body["fmt"] % tuple(body["args"])}
     except (ValueError, TypeError) as e:
         return {"error": type(e).__name__}
+
+
+# a module-level endpoint shadowed by a later one of the same name: both routes stay registered
+@router.get("/dup/{x}")
+async def dup(x: str):
+    return {"first": x}
+
+
+@router.get("/dup/two/{x}")
+async def dup(x: str, n: int = 1):
+    return {"second": x, "n": n}
