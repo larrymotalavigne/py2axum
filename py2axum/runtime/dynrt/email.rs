@@ -258,6 +258,10 @@ pub fn validate(value: &str) -> Result<String, String> {
     if value.chars().count() > 2048 {
         return Err("Length must not exceed 2048 characters".into());
     }
+    // pydantic 2.14: CR and LF are refused before parsing (a standalone value, not a folded header line)
+    if !super::pydantic_before(2, 14) && value.contains(['\r', '\n']) {
+        return Err("Carriage return and line feed characters are not allowed".into());
+    }
     let mut email = value.to_string();
     if let Some(caps) = pretty_re().captures(value) {
         if caps.get(0).map(|m| m.as_str().len() == value.len()).unwrap_or(false) {

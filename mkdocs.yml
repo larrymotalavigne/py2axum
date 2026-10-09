@@ -1,0 +1,141 @@
+site_name: py2axum
+site_description: Compile a FastAPI + SQLAlchemy + Pydantic application ahead of time into a Rust (axum) binary, and prove it behaves like the Python app.
+site_url: https://larrymotalavigne.github.io/py2axum/
+repo_url: https://github.com/larrymotalavigne/py2axum
+repo_name: larrymotalavigne/py2axum
+edit_uri: ""
+copyright: py2axum is released under the Apache License 2.0.
+strict: true
+validation:
+  links:
+    anchors: warn
+    unrecognized_links: warn
+
+theme:
+  name: material
+  language: en
+  icon:
+    logo: material/language-rust
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+
+# the version of the package being documented (pyproject.toml), the reference pages generated from the source
+# (versions.py, the CLI's --help), the coverage page while the corpus bench has not written it
+hooks:
+  - docs/_hooks/py2axum_docs.py
+
+exclude_docs: |
+  _hooks/
+  internal/
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/larrymotalavigne/py2axum
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/py2axum/
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+nav:
+  - py2axum: index.md
+  - Getting started:
+      - getting-started/index.md
+      - Installation: getting-started/install.md
+      - First application: getting-started/first-app.md
+      - py2axum check: getting-started/check.md
+      - Hybrid mode: getting-started/hybrid.md
+  - Tutorial - User Guide:
+      - tutorial/index.md
+      - Parameters: tutorial/parameters.md
+      - Request body: tutorial/body.md
+      - Models (Pydantic): tutorial/models.md
+      - Responses: tutorial/responses.md
+      - Handling errors: tutorial/errors.md
+      - Dependencies: tutorial/dependencies.md
+      - Security: tutorial/security.md
+      - Middleware: tutorial/middleware.md
+      - CORS: tutorial/cors.md
+      - SQL databases: tutorial/sql.md
+      - Forms and files: tutorial/files.md
+      - Background tasks: tutorial/background-tasks.md
+      - WebSockets: tutorial/websockets.md
+      - Lifespan events: tutorial/lifespan.md
+      - Bigger applications: tutorial/bigger-applications.md
+      - Testing: tutorial/testing.md
+  - Advanced:
+      - advanced/index.md
+      - How it works: advanced/how-it-works.md
+      - Graceful shutdown: advanced/shutdown.md
+      - Large list responses: advanced/streaming.md
+      - Sentry: advanced/sentry.md
+      - Prometheus metrics: advanced/metrics.md
+      - MCP servers: advanced/mcp.md
+      - Performance: advanced/performance.md
+      - Conformance and replay: advanced/conformance.md
+      - Deployment: advanced/deployment.md
+      - Security: advanced/security.md
+  - Reference:
+      - reference/index.md
+      - Supported subset: supported.md
+      - Command line: reference/cli.md
+      - Environment variables: reference/environment.md
+      - Python semantics: reference/python.md
+      - Standard library: reference/stdlib.md
+      - Libraries: reference/libraries.md
+      - Versions: reference/versions.md
+  - Coverage: coverage.md
+  - Release notes: release-notes.md

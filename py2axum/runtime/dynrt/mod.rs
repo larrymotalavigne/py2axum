@@ -465,6 +465,49 @@ pub fn iadd(a: &V, b: &V) -> R {
     ops::add(a, b)
 }
 
+/// default stack of the runtime threads (main.rs, PY2AXUM_STACK_SIZE): reserved address space, used only
+/// as deep as a request recurses
+pub const STACK_SIZE: usize = 256 << 20;
+static STACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(STACK_SIZE);
+thread_local! {
+    /// lowest stack address this thread may reach before `stack_guard` raises (0: unknown thread)
+    static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn set_stack_size(n: usize) {
+    STACK.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn stack_size() -> usize {
+    STACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline(always)]
+fn stack_here() -> usize {
+    let probe = 0u8;
+    std::hint::black_box(&probe) as *const u8 as usize
+}
+
+/// called first on every thread the runtime starts (tokio's `on_thread_start`, emulated threads): records
+/// the floor `stack_guard` checks, keeping a margin for the code that runs after the check
+pub fn stack_thread_start() {
+    let size = stack_size();
+    let margin = (size / 8).clamp(64 << 10, 4 << 20);
+    STACK_FLOOR.with(|f| f.set(stack_here().saturating_sub(size) + margin));
+}
+
+/// RecursionError instead of a stack overflow (which aborts the process, every request with it): on
+/// entry to each project function and in the runtime's recursive walks of values (serialisation,
+/// validation, repr, copies), whose depth a request body can choose
+#[inline]
+pub fn stack_guard() -> R<()> {
+    let floor = STACK_FLOOR.with(|f| f.get());
+    if floor != 0 && stack_here() < floor {
+        return Err(Exc::msg(&v::RECURSION_ERROR, "maximum recursion depth exceeded"));
+    }
+    Ok(())
+}
+
 static ROOT: std::sync::OnceLock<Arc<AppState>> = std::sync::OnceLock::new();
 
 /// Called once by main(): the process-level context used outside requests.

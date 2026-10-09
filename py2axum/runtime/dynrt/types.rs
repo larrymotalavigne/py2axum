@@ -168,7 +168,7 @@ pub fn td_value(td: &'static TD) -> V {
         TD::Bool => V::native(Native::Type("bool")),
         TD::Int(_) => V::native(Native::Type("int")),
         TD::Float(_) => V::native(Native::Type("float")),
-        TD::Str(_) | TD::Email => V::native(Native::Type("str")),
+        TD::Str(_) | TD::Email(_) => V::native(Native::Type("str")),
         TD::DateTime => V::native(Native::Type("datetime")),
         TD::Date => V::native(Native::Type("date")),
         TD::Time => V::native(Native::Type("time")),

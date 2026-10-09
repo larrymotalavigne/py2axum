@@ -330,12 +330,16 @@ pub fn into_response(r: &RespObj) -> R<Response> {
             for (k, v) in &headers {
                 out = out.header(k.as_str(), axum::http::HeaderValue::from_bytes(&v.chars().map(|c| c as u8).collect::<Vec<u8>>()).map_err(|e| Exc::value_error(e.to_string()))?);
             }
-            return Ok(out.body(body).unwrap());
+            return Ok(out.body(body).unwrap_or_else(super::web::bad_response));
         }
         RespBody::Bytes(b) => b.clone(),
         RespBody::File { path, filename, disposition } => {
             let meta = std::fs::metadata(path).map_err(|_| Exc::runtime(format!("File at path {path} does not exist.")))?;
-            let data = std::fs::read(path).map_err(|e| Exc::runtime(format!("{e}")))?;
+            if !meta.is_file() {
+                return Err(Exc::runtime(format!("File at path {path} is not a file.")));
+            }
+            // a disk read: off the loop worker (Starlette reads in a thread)
+            let data = super::thread::blocking(|| std::fs::read(path)).map_err(|e| Exc::runtime(format!("{e}")))?;
             let mut h = vec![("content-type".to_string(), with_charset(r.media.as_deref().unwrap_or("text/plain"))), ("accept-ranges".to_string(), "bytes".to_string())];
             if let Some(f) = filename {
                 let q = quote(f, "");
@@ -362,7 +366,7 @@ pub fn into_response(r: &RespObj) -> R<Response> {
     for (k, v) in &headers {
         b = b.header(k.as_str(), v.as_str());
     }
-    Ok(b.body(Body::from(body)).unwrap())
+    Ok(b.body(Body::from(body)).unwrap_or_else(super::web::bad_response))
 }
 
 // ---------------------------------------------------------------- background tasks

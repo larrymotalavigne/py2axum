@@ -85,7 +85,8 @@ pub enum TD {
     /// enum class, use_enum_values
     Enum(&'static EnumDesc, bool),
     /// pydantic.EmailStr
-    Email,
+    /// EmailStr, with the str_strip_whitespace / str_to_lower / str_to_upper of model_config
+    Email(StrC),
     /// decimal.Decimal
     Decimal(DecC),
     /// pydantic's URL types (AnyUrl, HttpUrl, AnyHttpUrl, RedisDsn)
@@ -622,12 +623,17 @@ fn prepare<'a>(cx: &'a super::Cx, input: V, td: &'static TD) -> super::BoxFut<'a
                 V::dict_from(out)?
             }
             (TD::Schema(d), _) if d.has_before => prepare_schema(cx, input, d).await?,
-            // pydantic-core calls a custom `_missing_` for a value that is no member
+            // pydantic-core calls a custom `_missing_` for a value that is no member (as `Enum(value)` does): None
+            // or an exception is the `enum` error; any exception before pydantic 2.14, a ValueError only since
             (TD::Enum(d, _), _) if d.missing.is_some() && !matches!(&input, V::Enum(x, _) if std::ptr::eq(*x, *d)) && d.by_value(&input).is_none() => {
                 match (d.missing.unwrap())(cx, V::Class(d.class), vec![input.clone()]).await {
                     Ok(m @ V::Enum(x, _)) if std::ptr::eq(x, *d) => m,
-                    Ok(_) => input,
-                    Err(x) => before_error(x, input)?,
+                    Ok(V::None) => input,
+                    Ok(other) => {
+                        return Err(Exc::type_error(format!("error in {}._missing_: returned {} instead of None or a valid member", d.name, super::ops::repr(&other)?)))
+                    }
+                    Err(x) if x.isinstance(&VALUE_ERROR) || super::pydantic_before(2, 14) => input,
+                    Err(x) => return Err(x),
                 }
             }
             _ => input,
@@ -1162,15 +1168,7 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
         }
         TD::Str(c) => match input {
             V::Str(s) => {
-                let mut s: String = s.to_string();
-                if c.strip {
-                    s = s.trim().to_string();
-                }
-                if c.lower {
-                    s = s.to_lowercase();
-                } else if c.upper {
-                    s = s.to_uppercase();
-                }
+                let s = str_settings(s, c);
                 let n = s.chars().count();
                 if let Some(m) = c.min {
                     if n < m {
@@ -1461,8 +1459,8 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
         TD::Decimal(c) => decimal_val(input, c, loc, e),
         TD::Url(spec) => url_val(input, spec, loc, e),
         TD::Uuid => uuid_val(input, loc, e),
-        TD::Email => match input {
-            V::Str(s) => match super::email::validate(s) {
+        TD::Email(c) => match input {
+            V::Str(s) => match super::email::validate(&str_settings(s, c)) {
                 Ok(v) => Some(V::str(v)),
                 Err(reason) => {
                     e.push("value_error", loc, format!("value is not a valid email address: {reason}"), input, Some(vec![("reason", V::str(&reason))]));
@@ -1543,7 +1541,7 @@ fn label(td: &TD) -> String {
             EnumKind::Int | EnumKind::IntEnum => format!("int-enum[{}]", d.name),
             EnumKind::Plain => format!("enum[{}]", d.name),
         },
-        TD::Email => "function-after[_validate(), str]".into(),
+        TD::Email(_) => "function-after[_validate(), str]".into(),
         TD::Decimal(_) => "decimal".into(),
         TD::Url(s) => format!("url[{}]", s.name),
         TD::Uuid => "uuid".into(),
@@ -1580,8 +1578,22 @@ fn uuid_val(input: &V, loc: &[V], e: &mut Errs) -> Option<V> {
     }
 }
 
+/// The str schema's `strip_whitespace`, `to_lower`, `to_upper` (from model_config)
+fn str_settings(s: &str, c: &StrC) -> String {
+    let mut s: String = s.to_string();
+    if c.strip {
+        s = s.trim().to_string();
+    }
+    if c.lower {
+        s = s.to_lowercase();
+    } else if c.upper {
+        s = s.to_uppercase();
+    }
+    s
+}
+
 /// `uuid::Uuid::parse_str` as pydantic-core's uuid crate does it: simple, hyphenated, `{braced}` and
-/// `urn:uuid:` forms; on failure the error is computed on the inner text when the length matched a form
+/// `urn:uuid:` forms; on failure, the crate's `InvalidUuid::into_err` of the locked version
 pub fn uuid_parse(s: &str) -> Result<u128, String> {
     fn hex(b: &[u8]) -> Option<u128> {
         b.iter().try_fold(0u128, |acc, c| (*c as char).to_digit(16).map(|d| acc << 4 | d as u128))
@@ -1594,17 +1606,24 @@ pub fn uuid_parse(s: &str) -> Result<u128, String> {
         if digits.len() != 32 { None } else { hex(&digits) }
     }
     let b = s.as_bytes();
-    let (res, failed) = match b.len() {
-        32 => (hex(b), s),
-        36 => (hyphenated(b), s),
-        38 if b[0] == b'{' && b[37] == b'}' => (hyphenated(&b[1..37]), &s[1..37]),
-        45 if s.starts_with("urn:uuid:") => (hyphenated(&b[9..]), &s[9..]),
-        _ => (None, s),
+    // try_parse: the slice the error is computed on, and whether the hyphenated form was attempted
+    let (res, failed, hyph) = match b.len() {
+        32 => (hex(b), s, false),
+        36 => (hyphenated(b), s, true),
+        38 if b[0] == b'{' && b[37] == b'}' => (hyphenated(&b[1..37]), &s[1..37], true),
+        45 if s.starts_with("urn:uuid:") => (hyphenated(&b[9..]), &s[9..], true),
+        _ => (None, s, false),
     };
-    if let Some(u) = res {
-        return Ok(u);
+    match res {
+        Some(u) => Ok(u),
+        // pydantic-core 2.50 (pydantic 2.14) moved to uuid 1.23.4: 0-based positions, the requested form
+        None if super::pydantic_before(2, 14) => Err(uuid_err_1_23_0(failed)),
+        None => Err(uuid_err_1_23_4(failed, hyph)),
     }
-    // InvalidUuid::into_err
+}
+
+/// uuid 1.23.0's `InvalidUuid::into_err` (pydantic-core 2.41 to 2.46)
+fn uuid_err_1_23_0(failed: &str) -> String {
     let (inner, offset, simple) = if failed.len() >= 2 && failed.starts_with('{') && failed.ends_with('}') {
         (&failed[1..failed.len() - 1], 1, false)
     } else if let Some(rest) = failed.strip_prefix("urn:uuid:") {
@@ -1623,23 +1642,75 @@ pub fn uuid_parse(s: &str) -> Result<u128, String> {
         } else if !c.is_ascii_hexdigit() {
             // pydantic-core < 2.46 (pydantic 2.12) used a uuid crate that listed the expected characters
             let expected = if super::pydantic_before(2, 13) { "expected an optional prefix of `urn:uuid:` followed by [0-9a-fA-F-], " } else { "" };
-            return Err(format!("invalid character: {expected}found `{c}` at {}", i + offset + 1));
+            return format!("invalid character: {expected}found `{c}` at {}", i + offset + 1);
         }
     }
     if hyphens == 0 && simple {
-        return Err(format!("invalid length: expected length 32 for simple format, found {}", failed.len()));
+        return format!("invalid length: expected length 32 for simple format, found {}", failed.len());
     }
+    uuid_groups(failed, hyphens, &bounds)
+}
+
+/// uuid 1.23.4's `InvalidUuid::into_err` (pydantic-core 2.50): `hyph` = the input was handed to
+/// `parse_hyphenated` (RequestedUuid::Hyphenated), else RequestedUuid::Any
+fn uuid_err_1_23_4(failed: &str, hyph: bool) -> String {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Form {
+        Any,
+        Hyphenated,
+        Braced,
+        Urn,
+    }
+    let b = failed.as_bytes();
+    if b.is_empty() || b.len() > 45 {
+        return format!("invalid length: found {}", b.len());
+    }
+    let (start, end, mut form) = if hyph {
+        (0, b.len(), Form::Hyphenated)
+    } else if b.len() >= 2 && b[0] == b'{' && b[b.len() - 1] == b'}' {
+        (1, b.len() - 1, Form::Braced)
+    } else if b.starts_with(b"urn:uuid:") {
+        (9, b.len(), Form::Urn)
+    } else {
+        (0, b.len(), Form::Any)
+    };
+    let mut hyphens = 0;
+    let mut bounds = [0usize; 4];
+    for (i, c) in failed[start..end].char_indices() {
+        // the crate looks at the low byte of each character (`character as u8`)
+        match (c as u32 as u8).to_ascii_lowercase() {
+            b'0'..=b'9' | b'a'..=b'f' => (),
+            b'-' => {
+                if form == Form::Any {
+                    form = Form::Hyphenated;
+                }
+                if hyphens < 4 {
+                    bounds[hyphens] = i;
+                }
+                hyphens += 1;
+            }
+            _ => return format!("invalid character: found `{c}` at {}", i + start),
+        }
+    }
+    if form == Form::Any {
+        return format!("invalid length: found {}", b.len());
+    }
+    uuid_groups(failed, hyphens, &bounds)
+}
+
+/// The group count, then the first group of the wrong length (both crate versions)
+fn uuid_groups(failed: &str, hyphens: usize, bounds: &[usize; 4]) -> String {
     if hyphens != 4 {
-        return Err(format!("invalid group count: expected 5, found {}", hyphens + 1));
+        return format!("invalid group count: expected 5, found {}", hyphens + 1);
     }
     const STARTS: [usize; 5] = [0, 9, 14, 19, 24];
     const EXPECTED: [usize; 5] = [8, 4, 4, 4, 12];
     for i in 0..4 {
         if bounds[i] != STARTS[i + 1] - 1 {
-            return Err(format!("invalid group length in group {i}: expected {}, found {}", EXPECTED[i], bounds[i] - STARTS[i]));
+            return format!("invalid group length in group {i}: expected {}, found {}", EXPECTED[i], bounds[i] - STARTS[i]);
         }
     }
-    Err(format!("invalid group length in group 4: expected 12, found {}", failed.len() - STARTS[4]))
+    format!("invalid group length in group 4: expected 12, found {}", failed.len() - STARTS[4])
 }
 
 /// pydantic-core's decimal validator (lax mode): a float through its repr, a string through
@@ -1684,13 +1755,28 @@ fn decimal_val(input: &V, c: &DecC, loc: &[V], e: &mut Errs) -> Option<V> {
         if num_traits::Zero::is_zero(&coeff) {
             exp = 0;
         } else {
+            // pydantic-core < 2.50 (pydantic 2.13) normalized with `Decimal.normalize()`, which also rounds to
+            // the context's 28 digits (ROUND_HALF_EVEN): a longer value can pass
+            let text = coeff.to_str_radix(10);
+            if super::pydantic_before(2, 14) && text.len() > 28 {
+                let drop = (text.len() - 28) as u32;
+                let unit = ten.pow(drop);
+                let (q, r) = (&coeff / &unit, &coeff % &unit);
+                let half = &unit / 2u32;
+                let odd = (&q % 2u32) == num_bigint::BigUint::from(1u32);
+                coeff = if r > half || (r == half && odd) { q + 1u32 } else { q };
+                exp += drop as i64;
+            }
             while num_traits::Zero::is_zero(&(&coeff % &ten)) {
                 coeff /= &ten;
                 exp += 1;
             }
         }
-        let nd = coeff.to_str_radix(10).len() as i64;
-        let (digits, decimals) = if exp >= 0 { (nd + exp, 0) } else { (nd.max(-exp), -exp) };
+        let count = |nd: i64, exp: i64| if exp >= 0 { (nd + exp, 0) } else { (nd.max(-exp), -exp) };
+        let (digits, decimals) = count(coeff.to_str_radix(10).len() as i64, exp);
+        // a bound is exceeded when both the value as written and the normalized one exceed it
+        let (raw_digits, raw_decimals) = count(d.coeff.to_str_radix(10).len() as i64, d.exp);
+        let (digits, decimals, whole_digits) = (digits.min(raw_digits), decimals.min(raw_decimals), (digits - decimals).min(raw_digits - raw_decimals));
         let pl = |n: u64| if n == 1 { "" } else { "s" };
         if let Some(m) = c.max_digits {
             if digits > m as i64 {
@@ -1705,7 +1791,7 @@ fn decimal_val(input: &V, c: &DecC, loc: &[V], e: &mut Errs) -> Option<V> {
             }
             if let Some(m) = c.max_digits {
                 let whole = m.saturating_sub(p);
-                if digits - decimals > whole as i64 {
+                if whole_digits > whole as i64 {
                     e.push("decimal_whole_digits", loc, format!("Decimal input should have no more than {whole} digit{} before the decimal point", pl(whole)), input, Some(vec![("whole_digits", V::Int(whole as i64))]));
                     return None;
                 }
@@ -2253,6 +2339,7 @@ pub struct DumpOpts {
 
 /// `model_dump(...)`: a dict (python mode keeps objects, json mode makes everything JSON-able).
 pub fn dump(v: &V, o: DumpOpts) -> R {
+    super::stack_guard()?;
     if let Some(t) = ops::row_tuple(v) {
         return dump(&t, o);
     }
@@ -2353,6 +2440,7 @@ fn delta_iso(d: &chrono::TimeDelta) -> String {
 
 /// FastAPI's `jsonable_encoder` (no response_model): datetimes via `isoformat()`.
 pub fn jsonable(v: &V) -> R {
+    super::stack_guard()?;
     if let Some(t) = ops::row_tuple(v) {
         return jsonable(&t);
     }
@@ -2467,6 +2555,7 @@ pub fn to_json(v: &V, st: &JsonStyle, default_str: bool) -> R<String> {
 }
 
 fn write(out: &mut String, v: &V, st: &JsonStyle, default_str: bool) -> R<()> {
+    super::stack_guard()?;
     match v {
         V::None => out.push_str("null"),
         V::Bool(b) => out.push_str(if *b { "true" } else { "false" }),

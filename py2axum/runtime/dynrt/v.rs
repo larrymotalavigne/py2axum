@@ -743,6 +743,7 @@ builtin_exc!(ZERO_DIVISION_ERROR, "ZeroDivisionError", [ARITHMETIC_ERROR]);
 builtin_exc!(OVERFLOW_ERROR, "OverflowError", [ARITHMETIC_ERROR]);
 builtin_exc!(RUNTIME_ERROR, "RuntimeError", [EXCEPTION]);
 builtin_exc!(RECURSION_ERROR, "RecursionError", [RUNTIME_ERROR]);
+builtin_exc!(MEMORY_ERROR, "MemoryError", [EXCEPTION]);
 builtin_exc!(ASSERTION_ERROR, "AssertionError", [EXCEPTION]);
 builtin_exc!(NOT_IMPLEMENTED_ERROR, "NotImplementedError", [RUNTIME_ERROR]);
 builtin_exc!(OS_ERROR, "OSError", [EXCEPTION]);

@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev,conformance]"
-      - run: ruff check py2axum tests examples
+      - run: ruff check py2axum tests examples docs_src
       - run: python -m pytest -q
       - name: wheel builds and installs
         run: |
@@ -81,6 +81,8 @@ jobs:
           python -c "from tests.scenarios import dynapp; dynapp.reset('$DATABASE_URL')"
           ./scripts_start_dyn.sh
           python tests/conformance.py http://127.0.0.1:8200 http://127.0.0.1:8280 --scenario dynapp
+          RUST_ENV="PY2AXUM_MAX_BODY=1048576" ./scripts_start_dyn.sh
+          python tests/security_check.py http://127.0.0.1:8280 --max-body 1048576
       - name: factoryapp (app factory, middleware stack, exception handlers)
         run: |
           python -m py2axum fixtures/factoryapp --root . --backend dyn -o generated/factoryapp_axum --name factoryapp_axum
@@ -155,6 +157,40 @@ jobs:
           name: example-logs
           path: /tmp/bookshelf-logs
 
+  docs-examples:
+    name: documentation examples (docs_src, compared with FastAPI)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: py2axum_docs
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
+    env:
+      DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_docs
+      # the job checks equivalence, not speed: no fat LTO
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      LOG: /tmp/docs-src-logs
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: generated/docs_axum
+      - run: pip install -e . -r docs_src/requirements.txt httpx websockets
+      - run: docs_src/compare.sh
+      - if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: docs-examples-logs
+          path: /tmp/docs-src-logs
+
   docker:
     name: reference Docker build (examples/docker, hybrid)
     runs-on: ubuntu-latest
@@ -179,3 +215,11 @@ jobs:
           docker image ls
       - if: failure()
         run: docker compose -f examples/docker/compose.yaml logs
+
+  audit:
+    name: RustSec audit of the runtime lock file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: ./tools/cargo_audit.sh

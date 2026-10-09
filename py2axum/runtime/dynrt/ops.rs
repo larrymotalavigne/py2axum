@@ -204,6 +204,17 @@ pub fn sub(a: &V, b: &V) -> R {
     })
 }
 
+/// `seq * n` with a size from the request: OverflowError / MemoryError as CPython, never an allocation
+/// failure (which aborts the process)
+fn repeat_room(unit: usize, k: usize, overflow_msg: &str) -> R<()> {
+    let total = unit.checked_mul(k).filter(|t| *t <= isize::MAX as usize).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, overflow_msg))?;
+    if total > 1 << 20 {
+        let mut probe: Vec<u8> = Vec::new();
+        probe.try_reserve_exact(total).map_err(|_| Exc::msg(&MEMORY_ERROR, ""))?;
+    }
+    Ok(())
+}
+
 pub fn mul(a: &V, b: &V) -> R {
     if let Some(r) = super::reldelta::binop(a, "*", b) {
         return r;
@@ -215,11 +226,20 @@ pub fn mul(a: &V, b: &V) -> R {
         return r;
     }
     Ok(match (a, b) {
-        (V::Str(s), n) | (n, V::Str(s)) if int_of(n).is_some() => V::str(s.repeat(int_of(n).unwrap().max(0) as usize)),
-        (V::Bytes(b), n) | (n, V::Bytes(b)) if int_of(n).is_some() => V::Bytes(Arc::from(b.repeat(int_of(n).unwrap().max(0) as usize))),
+        (V::Str(s), n) | (n, V::Str(s)) if int_of(n).is_some() => {
+            let k = int_of(n).unwrap().max(0) as usize;
+            repeat_room(s.len(), k, "repeated string is too long")?;
+            V::str(s.repeat(k))
+        }
+        (V::Bytes(b), n) | (n, V::Bytes(b)) if int_of(n).is_some() => {
+            let k = int_of(n).unwrap().max(0) as usize;
+            repeat_room(b.len(), k, "repeated bytes are too long")?;
+            V::Bytes(Arc::from(b.repeat(k)))
+        }
         (V::List(l), n) | (n, V::List(l)) if int_of(n).is_some() => {
             let src = l.lock().clone();
             let k = int_of(n).unwrap().max(0) as usize;
+            repeat_room(src.len() * std::mem::size_of::<V>(), k, "")?;
             V::list(src.iter().cloned().cycle().take(src.len() * k).collect())
         }
         (V::Delta(d), n) | (n, V::Delta(d)) if num(n).is_some() => {
@@ -577,6 +597,7 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
 }
 
 pub fn eq(a: &V, b: &V) -> R {
+    super::stack_guard()?;
     if is_sql(a) || is_sql(b) {
         return orm::sql_cmp(a, "=", b);
     }
@@ -678,6 +699,8 @@ pub fn is(a: &V, b: &V) -> bool {
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y),
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),
+        // enum members are singletons: `shelf is Shelf.done`
+        (V::Enum(x, i), V::Enum(y, j)) => std::ptr::eq(*x, *y) && i == j,
         // a builtin type is one object: `type(x) is str`
         (V::Native(x), V::Native(y)) => Arc::ptr_eq(x, y) || matches!((&**x, &**y), (Native::Type(p), Native::Type(q)) if p == q),
         _ => false,
@@ -927,6 +950,7 @@ pub fn ellipsis() -> V {
 }
 
 pub fn repr(v: &V) -> R<String> {
+    super::stack_guard()?;
     if let Some(t) = row_tuple(v) {
         return repr(&t);
     }

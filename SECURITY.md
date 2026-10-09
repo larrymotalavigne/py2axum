@@ -8,4 +8,5 @@ Please report such issues privately through GitHub's
 public issue. Include the Python construct, the expected (Python) behaviour and what the binary does. You
 should get an answer within a week.
 
-Only the latest release receives fixes.
+Only the latest release receives fixes. What the generated server guarantees against untrusted clients, and
+how it differs from uvicorn and Starlette, is described in [the security documentation](https://larrymotalavigne.github.io/py2axum/advanced/security/).

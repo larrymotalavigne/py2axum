@@ -35,7 +35,7 @@ pub fn get_ident() -> u64 {
 }
 
 /// runs `f`, which may block the OS thread: on a loop worker, tokio is told first
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     if IDENT.with(|c| c.get()) == 0 && tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(f)
     } else {
@@ -265,7 +265,9 @@ fn spawn_os(cx: &Cx, f: V, args: Vec<V>, kwargs: Vec<(String, V)>, alive: Arc<At
     let cx2 = cx.clone();
     alive.store(true, Ordering::SeqCst);
     std::thread::Builder::new()
+        .stack_size(super::stack_size())
         .spawn(move || {
+            super::stack_thread_start();
             IDENT.with(|c| c.set(ident));
             let r = handle.block_on(super::methods::call_value(&cx2, &f, args, kwargs));
             if let Err(e) = r {

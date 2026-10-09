@@ -649,6 +649,32 @@ pub struct Alias {
 
 static ALIAS_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// a name the application gives (label, subquery alias, `index_elements` string) as SQLAlchemy's
+/// IdentifierPreparer writes it: as is when it is a plain lowercase identifier and not a reserved word,
+/// else between double quotes with any `"` doubled (never spliced raw into the SQL text)
+pub fn quote_ident(name: &str) -> std::borrow::Cow<'_, str> {
+    const RESERVED: &[&str] = &[
+        "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "authorization", "binary",
+        "both", "case", "cast", "check", "collate", "collation", "column", "concurrently", "constraint", "create",
+        "cross", "current_catalog", "current_date", "current_role", "current_schema", "current_time",
+        "current_timestamp", "current_user", "default", "deferrable", "desc", "distinct", "do", "else", "end",
+        "except", "false", "fetch", "for", "foreign", "freeze", "from", "full", "grant", "group", "having", "ilike",
+        "in", "initially", "inner", "intersect", "into", "is", "isnull", "join", "lateral", "leading", "left", "like",
+        "limit", "localtime", "localtimestamp", "natural", "not", "notnull", "null", "offset", "on", "only", "or",
+        "order", "outer", "overlaps", "placing", "primary", "references", "returning", "right", "select",
+        "session_user", "similar", "some", "symmetric", "system_user", "table", "tablesample", "then", "to",
+        "trailing", "true", "union", "unique", "user", "using", "variadic", "verbose", "when", "where", "window",
+        "with",
+    ];
+    let plain = name.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
+        && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'$');
+    if plain && !RESERVED.contains(&name) {
+        std::borrow::Cow::Borrowed(name)
+    } else {
+        std::borrow::Cow::Owned(format!("\"{}\"", name.replace('"', "\"\"")))
+    }
+}
+
 /// a string in `order_by`/`group_by`: a label (or column name) of the columns clause, as SQLAlchemy
 /// resolves it; anything else is its CompileError
 fn label_ref(s: &Select, a: &V, clause: &str) -> R<Sql> {
@@ -657,7 +683,7 @@ fn label_ref(s: &Select, a: &V, clause: &str) -> R<Sql> {
     // clause has it (SQLAlchemy's compiler), else the expression; `desc("name")` is a label reference
     let resolve = |e: &Sql| -> R<Sql> {
         Ok(match e {
-            Sql::Label(_, l) if clause == "ORDER BY" && in_cols(l) => Sql::Text(l.clone()),
+            Sql::Label(_, l) if clause == "ORDER BY" && in_cols(l) => Sql::Text(quote_ident(l).into_owned()),
             Sql::Label(x, _) => (**x).clone(),
             Sql::LabelRef(n) => label_ref(s, &V::str(n.as_str()), clause)?,
             other => other.clone(),
@@ -681,7 +707,7 @@ fn label_ref(s: &Select, a: &V, clause: &str) -> R<Sql> {
             "Can't resolve label reference for {clause} / GROUP BY / DISTINCT etc. Textual SQL expression '{name}' should be explicitly declared as text('{name}')"
         )));
     }
-    Ok(Sql::Text(name.to_string()))
+    Ok(Sql::Text(quote_ident(name).into_owned()))
 }
 
 /// `join(Target)` without ON: the single foreign-key path between Target and an entity already in the
@@ -1541,7 +1567,7 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         };
         let names_of = |v: &V| -> R<Vec<String>> {
             ops::iter(v)?.iter().map(|x| match x {
-                V::Str(s) => Ok(s.to_string()),
+                V::Str(s) => Ok(quote_ident(s).into_owned()),
                 V::Col(cm, ci) => Ok(cm.cols[*ci].sql.to_string()),
                 _ => Err(Exc::type_error("py2axum: index_elements are column names or columns")),
             }).collect()
@@ -2060,7 +2086,7 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
         }
         Sql::Label(a, name) => {
             render(r, a)?;
-            r.sql += &format!(" AS {name}");
+            r.sql += &format!(" AS {}", quote_ident(name));
         }
         Sql::Distinct(a) => {
             r.sql += "DISTINCT ";
@@ -2087,11 +2113,11 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
             render(r, a)?;
             r.sql += &format!(" AS {t})");
         }
-        Sql::SubCol(q, name) => r.sql += &format!("{}.{}", q.name, name),
+        Sql::SubCol(q, name) => r.sql += &format!("{}.{}", quote_ident(&q.name), quote_ident(name)),
         Sql::Subquery(q) => {
             r.sql.push('(');
             render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {}", q.name);
+            r.sql += &format!(") AS {}", quote_ident(&q.name));
         }
         Sql::SubColumns(_) => return Err(Exc::type_error("py2axum: a subquery's .c is not an expression")),
         Sql::Scalar(s) => {
@@ -2399,14 +2425,14 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             }
             r.sql.push('(');
             render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {}", q.name);
+            r.sql += &format!(") AS {}", quote_ident(&q.name));
         }
     }
     let render_subs = |r: &mut Rend, at: usize| -> R<()> {
         for (_, q, on, outer) in s.join_subs.iter().filter(|j| j.0 == at) {
             r.sql += if *outer { " LEFT OUTER JOIN (" } else { " JOIN (" };
             render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {} ON ", q.name);
+            r.sql += &format!(") AS {} ON ", quote_ident(&q.name));
             render(r, on)?;
         }
         Ok(())

@@ -12,7 +12,7 @@ Open an issue with:
 3. the versions involved (Python, FastAPI, Pydantic, SQLAlchemy — or your `uv.lock`).
 
 `py2axum check <package> --root <root>` lists, per route, what blocks it with `file:line`: attach the relevant
-lines. For a behaviour that differs, a [conformance scenario](docs/conformance.md) step that shows it is the best
+lines. For a behaviour that differs, a [conformance scenario](docs/advanced/conformance.md) step that shows it is the best
 reproduction.
 
 ## Development setup
@@ -43,7 +43,7 @@ python tests/conformance.py http://127.0.0.1:8200 http://127.0.0.1:8280 --scenar
 2. **Refuse rather than guess.** What the runtime cannot reproduce is refused at compile time with a
    `TranspileError` pointing at `file:line`, and a test in `tests/test_rejects_dyn.py`. Never translate a
    construct approximately and silently.
-3. **Document every difference** in [docs/supported.md](docs/supported.md).
+3. **Document every difference** in the documentation page that describes the construct ([docs/supported.md](docs/supported.md) says which).
 4. **Library behaviour follows the project's locked version** (`uv.lock`) when it changed across versions.
 5. The generated crate must build with `RUSTFLAGS="-D warnings"`; never edit generated code by hand — fix the
    transpiler or the runtime.

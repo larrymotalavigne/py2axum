@@ -1841,9 +1841,20 @@ impl MFile {
             file.set_len(INITIAL_MMAP_SIZE as u64)?;
             cap = INITIAL_MMAP_SIZE;
         }
+        // the header and every offset come from a file other processes write: checked before any access
+        // through the mapping (`unsafe` below relies on `8 <= used <= cap`)
+        let corrupted = || std::io::Error::other("Read beyond file size detected, file is corrupted.");
+        if cap < 8 {
+            return Err(corrupted());
+        }
         let ptr = map(file.as_raw_fd(), cap)?;
         let mut f = MFile { file, ptr, cap, used: 0, positions: HashMap::new() };
-        f.used = f.read_i32(0) as usize;
+        let used = f.read_i32(0);
+        if used < 0 || used as usize > cap || (used != 0 && used < 8) {
+            unsafe { libc::munmap(f.ptr as *mut libc::c_void, f.cap) };
+            return Err(corrupted());
+        }
+        f.used = used as usize;
         if f.used == 0 {
             f.used = 8;
             f.write_i32(0, 8);
@@ -1910,19 +1921,25 @@ fn map(fd: i32, len: usize) -> std::io::Result<*mut u8> {
 
 /// `_read_all_values`: (key, value, timestamp, position)
 fn read_values(data: &[u8], used: usize) -> R<Vec<(String, f64, f64, usize)>> {
-    let i32_at = |p: usize| -> i32 { i32::from_ne_bytes(data[p..p + 4].try_into().unwrap()) };
-    let f64_at = |p: usize| -> f64 { f64::from_ne_bytes(data[p..p + 8].try_into().unwrap()) };
+    // bounds checked against both `used` (as prometheus_client) and the bytes really read: a corrupted
+    // or concurrently written file is an error, never a panic
+    let used = used.min(data.len());
+    let corrupted = || Exc::runtime("Read beyond file size detected, file is corrupted.");
+    let at = |p: usize, n: usize| -> R<&[u8]> { p.checked_add(n).filter(|e| *e <= used).map(|e| &data[p..e]).ok_or_else(corrupted) };
     let mut out = Vec::new();
     let mut pos = 8;
     while pos < used {
-        let len = i32_at(pos) as usize;
-        if len + pos > used {
-            return Err(Exc::runtime("Read beyond file size detected, file is corrupted."));
+        let len = i32::from_ne_bytes(at(pos, 4)?.try_into().unwrap());
+        let len = usize::try_from(len).map_err(|_| corrupted())?;
+        if len.checked_add(pos).is_none_or(|e| e > used) {
+            return Err(corrupted());
         }
         pos += 4;
-        let key = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+        let key = String::from_utf8_lossy(at(pos, len)?).into_owned();
         pos += len + (8 - (len + 4) % 8);
-        out.push((key, f64_at(pos), f64_at(pos + 8), pos));
+        let value = f64::from_ne_bytes(at(pos, 8)?.try_into().unwrap());
+        let ts = f64::from_ne_bytes(at(pos + 8, 8)?.try_into().unwrap());
+        out.push((key, value, ts, pos));
         pos += 16;
     }
     Ok(out)

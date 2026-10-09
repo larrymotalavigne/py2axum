@@ -5,6 +5,49 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-09
+
+### Security
+
+- **Denial of service fixed (all earlier versions):** a small request carrying a deeply nested JSON body could
+  overflow the stack of a generated binary and abort the process, without authentication. The decoder is now
+  iterative (400 past 10 000 levels, as CPython), the runtime threads get a larger stack (`PY2AXUM_STACK_SIZE`),
+  and recursive walks raise `RecursionError` instead of overflowing, so the worst outcome is a 500, never an
+  abort. Upgrading is strongly recommended.
+- Security review of the runtime before 1.0: threat model, guarantees and differences with uvicorn/Starlette in
+  the new [docs/security.md](https://larrymotalavigne.github.io/py2axum/advanced/security/). Hardening of SQL identifiers given as strings, request input
+  handling (nesting, sizes, multipart limits, cookies), `Path.resolve()`, response headers, bcrypt off the event
+  loop, the `--python-side` relay and the multiprocess Prometheus files. Upgrading is recommended.
+- New settings: `PY2AXUM_MAX_BODY` (optional 413 on large bodies, off by default) and `PY2AXUM_STACK_SIZE`.
+- CI audits the runtime's `Cargo.lock` with `cargo audit` (`tools/cargo_audit.sh`).
+
+### Added
+
+- Documentation site (MkDocs Material, <https://larrymotalavigne.github.io/py2axum/>), organised like FastAPI's:
+  getting started, tutorial, advanced, reference, release notes. Its examples (`docs_src/`) are tested against the
+  binary in CI.
+- pydantic 2.14 / pydantic-core 2.50 supported (range `pydantic>=2.12.0,<2.15`, `pydantic-core>=2.41.1,<2.51`). The
+  binary reproduces the minor the project locks: error URLs `…/2.14/v/…`; UUID messages of the uuid crate 1.23.4
+  (0-based positions, `invalid length: found N`, the requested form); `EmailStr` refusing CR/LF; `Decimal`
+  `max_digits`/`decimal_places` counted without `Decimal.normalize()`'s 28-digit rounding; an Enum `_missing_`
+  that raises something other than a `ValueError` propagates. Projects on 2.12/2.13 keep their messages. See
+  docs/supported.md, "Pydantic behaviours that follow the project's minor version".
+- The project's library version is also read from an `==` pin in `requirements*.txt` / `pyproject.toml` (only
+  `uv.lock` was read), or chosen inside the project's specifier when the installed one is outside it.
+- CI: the `versions` matrix runs pydantic 2.12 (min), 2.13 (`python -m py2axum.versions pydantic2.13`) and 2.14 (max).
+
+### Fixed
+
+- `x is Enum.MEMBER` between Enum members was always `False`, and a header parameter `x: list[str] = Header()`
+  answered 422 instead of collecting every occurrence: two silent wrong answers found by the documentation's
+  examples.
+- `model_config`'s `str_strip_whitespace` / `str_to_lower` / `str_to_upper` were ignored on `EmailStr` fields.
+- An Enum `_missing_` raising a `ValueError` gave a `value_error` instead of pydantic's `enum` error; returning a
+  value that is neither `None` nor a member gave the `enum` error instead of Enum's `TypeError`.
+- `Decimal` digit bounds compared only the normalized value: a value whose written form fits passes, as in pydantic.
+- Refused instead of mistranslated: a `default_factory` taking the validated data (`lambda data: ...`, called
+  without arguments before), length constraints on `Iterable[T]`.
+
 ## [0.4.0] — 2026-10-08
 
 ### Breaking
@@ -241,7 +284,7 @@ All notable changes to this project are documented here. The format follows
 - Ahead-of-time compilation of FastAPI + SQLAlchemy 2.0 (async, PostgreSQL) + Pydantic v2 applications to
   Rust (axum, tokio, sqlx): the **dyn** backend (general) and the **typed** backend (simple CRUD).
 - Runtime reproducing CPython, Pydantic v2, SQLAlchemy and Starlette semantics, plus a closed list of
-  standard and third-party libraries ([docs/supported.md](docs/supported.md)).
+  standard and third-party libraries ([docs/supported.md](https://larrymotalavigne.github.io/py2axum/supported/)).
 - `--report`: per-route coverage report with the first blocking construct (`file:line`).
 - `--python-side`: paths and `lifespan` left to the Python application, relayed by the binary when
   `PY2AXUM_PYTHON_URL` is set.

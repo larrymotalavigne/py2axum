@@ -70,12 +70,13 @@ pub fn getaddrinfo(args: &[V], kwargs: &[(String, V)]) -> R {
         let ai = unsafe { &*p };
         let canon = if ai.ai_canonname.is_null() { String::new() } else { unsafe { CStr::from_ptr(ai.ai_canonname) }.to_string_lossy().into_owned() };
         let sockaddr = match ai.ai_family {
-            libc::AF_INET => {
+            // SAFETY (both arms): getaddrinfo's entry, its address checked non-null and long enough for the family
+            libc::AF_INET if !ai.ai_addr.is_null() && ai.ai_addrlen as usize >= std::mem::size_of::<libc::sockaddr_in>() => {
                 let sa = unsafe { &*(ai.ai_addr as *const libc::sockaddr_in) };
                 let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
                 V::tuple(vec![V::str(ip.to_string()), V::Int(u16::from_be(sa.sin_port) as i64)])
             }
-            libc::AF_INET6 => {
+            libc::AF_INET6 if !ai.ai_addr.is_null() && ai.ai_addrlen as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
                 let sa = unsafe { &*(ai.ai_addr as *const libc::sockaddr_in6) };
                 let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
                 V::tuple(vec![
@@ -410,7 +411,14 @@ pub struct Sock {
 }
 
 fn strerror(errno: i32) -> String {
-    unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }.to_string_lossy().into_owned()
+    // strerror_r (XSI, libc's binding on Linux and macOS): `strerror` shares a static buffer between threads
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer and its length are passed together; on success it holds a NUL-terminated string
+    if unsafe { libc::strerror_r(errno, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return format!("Unknown error {errno}");
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 /// `socket.create_connection((host, port), timeout=None)`: the `getaddrinfo` addresses in order, the last

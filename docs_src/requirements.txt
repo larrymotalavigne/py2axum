@@ -1,0 +1,9 @@
+# The Python side of the documentation's examples (the reference server of their conformance check).
+fastapi==0.142.3
+starlette==1.7.0
+pydantic[email]==2.13.5
+pydantic-core==2.46.5
+sqlalchemy[asyncio]==2.1.4
+psycopg[binary]==3.3.6
+python-multipart==0.0.32
+uvicorn[standard]==0.54.0

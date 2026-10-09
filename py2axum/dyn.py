@@ -887,6 +887,10 @@ class Project:
                     if isinstance(meta, ast.Call) and (dotted(meta.func) or "").split(".")[-1] in {"Field", "Query", "Path", "Body", "Header"}:
                         cons.update(self.field_cons(meta, module, scope)[0])
                 return self._td_init(args[0], module, cons, scope)
+            if last == "Iterable" and {"min_length", "max_length"} & set(cons):
+                # pydantic validates an Iterable lazily (a generator): its length errors are raised on iteration
+                # ("Generator should have..."), and without an item validator only since pydantic 2.14
+                raise self.err(f"length constraints on `{ast.unparse(ann)}` are not supported", ann, module)
             if last in {"list", "List", "Sequence", "Iterable"}:
                 return self._sized(f"{RT}::pyd::TD::List(Some(&{self._static_td(self._td_init(args[0], module, {}, scope))}))", cons, ann, module)
             if last in {"set", "Set", "frozenset", "FrozenSet"}:
@@ -931,8 +935,9 @@ class Project:
                 "datetime.timedelta": f"{RT}::pyd::TD::Delta",
                 "uuid.UUID": f"{RT}::pyd::TD::Uuid",
                 "typing.Any": f"{RT}::pyd::TD::Any",
-                "pydantic.EmailStr": f"{RT}::pyd::TD::Email",
-                "pydantic.networks.EmailStr": f"{RT}::pyd::TD::Email",
+                # the str schema under EmailStr's validator gets the str_* settings of model_config
+                **dict.fromkeys(("pydantic.EmailStr", "pydantic.networks.EmailStr"), f"{RT}::pyd::TD::Email("
+                                + self._str({k: v for k, v in cons.items() if k in ("_strip", "_lower", "_upper")}) + ")"),
                 **{f"pydantic{m}.{n}": f"{RT}::pyd::TD::Url(&{RT}::pyd::{c})" for m in ("", ".networks")
                    for n, c in (("AnyUrl", "ANY_URL"), ("AnyHttpUrl", "ANY_HTTP_URL"), ("HttpUrl", "HTTP_URL"),
                                 ("RedisDsn", "REDIS_DSN"))},
@@ -1094,6 +1099,10 @@ class Project:
 
     def default_spec(self, node: ast.AST, module: str, factory: bool) -> str:
         """`Dflt::...` variant text for a Pydantic field/param default."""
+        if factory and isinstance(node, ast.Lambda) and (node.args.posonlyargs or node.args.args):
+            # pydantic passes the validated data to a factory with one positional parameter (and, since 2.14,
+            # reports `default_factory_not_called` after an error of another field)
+            raise self.err("a default_factory taking the validated data (`lambda data: ...`) is not supported", node, module)
         try:
             return f"{'Factory' if factory else 'Value'}({self.dflt(node, module, factory=factory)})"
         except TranspileError:
@@ -2929,6 +2938,8 @@ class FnCompiler:
         self.emit("#[allow(unreachable_code)]")
         self.emit("Ok(V::None)")
         head = f"pub async fn {self.name}(cx: &Cx{', ' + sig if sig else ''}{caps}{gen_param}) -> R {{"
+        # RecursionError rather than a stack overflow (the process would abort): dynrt::stack_guard
+        guard = f"    {RT}::stack_guard()?;"
         if traced:
             # sys.settrace: `call` on entry, `return` / `exception` on exit (dynrt/trace.rs)
             ln, qual = node.lineno, self.qualname() or node.name
@@ -2939,8 +2950,8 @@ class FnCompiler:
                    "    let __r: R = async move {"]
             post = ["    }.await;",
                     f"    {RT}::trace::leave(cx, __tf, __r, __ln.load(std::sync::atomic::Ordering::Relaxed)).await"]
-            return "\n".join([*self.extra_fns, head, *pre, *("    " + l for l in self.lines), *post, "}"])
-        return "\n".join([*self.extra_fns, head, *self.lines, "}"])
+            return "\n".join([*self.extra_fns, head, guard, *pre, *("    " + l for l in self.lines), *post, "}"])
+        return "\n".join([*self.extra_fns, head, guard, *self.lines, "}"])
 
     # ---------------------------------------------------------------- statements
 
@@ -6194,8 +6205,23 @@ fn env_or(key: &str, default: &str) -> String {{
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }}
 
-#[tokio::main]
-async fn main() {{
+fn main() {{
+    // Runtime threads get a large stack (reserved address space, touched only as deep as a request goes):
+    // CPython accepts JSON nested ~10 000 levels deep (more on 3.14) and the runtime walks such values
+    // recursively (validation, serialisation, repr); tokio's 2 MiB default would let one small request
+    // overflow it and abort the whole process. PY2AXUM_STACK_SIZE (bytes) overrides it.
+    let stack = std::env::var("PY2AXUM_STACK_SIZE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(dynrt::STACK_SIZE);
+    dynrt::set_stack_size(stack);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(stack)
+        .on_thread_start(dynrt::stack_thread_start)
+        .build()
+        .expect("tokio runtime")
+        .block_on(serve());
+}}
+
+async fn serve() {{
     let database_url = env_or("DATABASE_URL", "postgresql://postgres@127.0.0.1/postgres");
     dynrt::orm::set_driver(&database_url);
     let database_url = database_url
@@ -6206,13 +6232,13 @@ async fn main() {{
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(pool_size)
         .after_connect(|conn, _meta| Box::pin(async move {{
-            use sqlx::Executor;
             if dynrt::orm::db_tz_name().is_none() {{
                 let name = dynrt::orm::discover_db_tz_conn(conn).await;
                 dynrt::orm::set_db_tz(&name);
             }}
             let tz = dynrt::orm::db_tz_name().unwrap_or_else(|| "UTC".into());
-            conn.execute(format!("SET TimeZone TO '{{}}'", tz.replace('\\'', "")).as_str()).await?;
+            // bound, never spliced: the name comes from the environment or the server's catalog
+            sqlx::query("SELECT set_config('TimeZone', $1, false)").bind(&tz).execute(&mut *conn).await?;
             dynrt::orm::session_params(conn).await?;
             Ok(())
         }}))
@@ -6682,7 +6708,10 @@ def fastapi_strict_content_type(root) -> bool:
 
 def locked_version(root, name: str) -> str | None:
     """The version of a library the project locks: the `uv.lock` of --root or of a parent directory (up to
-    the repository's root), else the one installed next to the transpiler, else None."""
+    the repository's root); for a supported library (versions.py), else its `==` pin in requirements*.txt /
+    pyproject.toml; else the one installed next to the transpiler (or, when the project's specifier excludes
+    it, the highest version of the tested ones the specifier allows); else None."""
+    from . import versions
     d = Path(root).resolve()
     for cand in (d, *d.parents):
         lock = cand / "uv.lock"
@@ -6693,11 +6722,22 @@ def locked_version(root, name: str) -> str | None:
             break
         if (cand / ".git").exists():
             break  # a lock further up belongs to another project
+    found = [f for f in versions.project_constraints(root)[0] if f.name == name] if name in versions.SUPPORTED else []
+    if exact := next((f.constraint for f in found if f.exact), None):
+        return exact
     from importlib.metadata import PackageNotFoundError, version
     try:
-        return version(name)
+        installed = version(name)
     except PackageNotFoundError:
-        return None
+        installed = None
+    ivs = [iv for f in found if (iv := versions.interval(f.constraint)) is not None]
+    if ivs and (installed is None or not all(lo <= versions.parse(installed) < hi for lo, hi in ivs)):
+        lo_t, hi_t, _ = versions.SUPPORTED[name]
+        tested = [lo_t, hi_t, *(m[name] for m in versions.MIDDLES.values() if name in m)]
+        allowed = [v for v in tested if all(lo <= versions.parse(v) < hi for lo, hi in ivs)]
+        if allowed:
+            return max(allowed, key=versions.parse)
+    return installed
 
 
 def project_distribution(root) -> tuple[tuple[str, str], list[tuple[str, str]]] | None:

@@ -33,6 +33,7 @@ fn bound(f: pyd::MethodFn, recv: V) -> V {
 
 /// `copy.deepcopy` of validated data (lists, dicts, sets, model instances; immutable values shared).
 fn deepcopy(v: &V) -> R {
+    super::stack_guard()?;
     Ok(match v {
         V::List(l) => V::list(l.lock().iter().map(deepcopy).collect::<R<Vec<_>>>()?),
         V::Dict(d) => {
@@ -342,7 +343,8 @@ const BUILTIN_METHODS: &[(&str, &str)] = &[
 
 /// `request.cookies`: Starlette's `cookie_parser` (lenient, `http.cookies._unquote` on values)
 pub fn cookies(r: &web::ReqCell) -> R {
-    let mut out: Vec<(V, V)> = Vec::new();
+    // insertion order, last value wins (a dict, as Starlette): indexed, a header of many cookies stays linear
+    let mut out: indexmap::IndexMap<&str, V> = indexmap::IndexMap::new();
     for raw in r.headers.iter().filter(|(k, _)| k == "cookie").map(|(_, v)| v) {
         for chunk in raw.split(';') {
             let (k, v) = match chunk.split_once('=') {
@@ -350,17 +352,13 @@ pub fn cookies(r: &web::ReqCell) -> R {
                 None => ("", chunk.trim()),
             };
             if !k.is_empty() || !v.is_empty() {
-                let val = V::str(cookie_unquote(v));
-                match out.iter_mut().find(|(x, _)| matches!(x, V::Str(s) if &**s == k)) {
-                    Some(e) => e.1 = val,
-                    None => out.push((V::str(k), val)),
-                }
+                out.insert(k, V::str(cookie_unquote(v)));
             }
         }
         // Starlette reads the first Cookie header only
         break;
     }
-    V::dict_from(out)
+    V::dict_from(out.into_iter().map(|(k, v)| (V::str(k), v)).collect())
 }
 
 /// `http.cookies._unquote`

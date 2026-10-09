@@ -178,36 +178,98 @@ fn python_side(path: &str) -> bool {
     })
 }
 
-/// relays the request to the Python application, streaming its response back
+/// `PY2AXUM_MAX_BODY` (bytes): optional cap on a request body, answered 413 before it is buffered whole.
+/// Unset by default, as uvicorn and Starlette have none (equivalence); set it when no proxy in front caps
+/// bodies (ingress-nginx's `proxy-body-size`), since the binary buffers a body before routing.
+fn max_body() -> Option<usize> {
+    static MAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("PY2AXUM_MAX_BODY").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+fn too_large() -> Response {
+    Response::builder()
+        .status(413)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("connection", "close")
+        .body(Body::from("Request Entity Too Large"))
+        .unwrap()
+}
+
+/// the whole request body, or the response to give instead (400 on a broken body, 413 over the cap)
+async fn read_body(headers: &axum::http::HeaderMap, body: Body) -> Result<axum::body::Bytes, Response> {
+    let Some(max) = max_body() else {
+        return axum::body::to_bytes(body, usize::MAX).await.map_err(|_| Response::builder().status(400).body(Body::empty()).unwrap());
+    };
+    let declared = headers.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > max as u64) {
+        return Err(too_large());
+    }
+    axum::body::to_bytes(body, max).await.map_err(|e| {
+        // http-body-util's LengthLimitError, seen through axum's error (not a dependency of its own)
+        let over = std::error::Error::source(&e).is_some_and(|s| s.to_string() == "length limit exceeded");
+        if over { too_large() } else { Response::builder().status(400).body(Body::empty()).unwrap() }
+    })
+}
+
+/// hop-by-hop headers (RFC 9110 §7.6.1), never relayed in either direction, plus the ones the `Connection`
+/// header names; `content-length` is recomputed by the client from the buffered body
+fn relayed(headers: &axum::http::HeaderMap, extra: &[&str]) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    const HOP: [&str; 9] =
+        ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "proxy-connection"];
+    let named: Vec<String> = headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+        .filter(|t| !t.is_empty())
+        .collect();
+    headers
+        .iter()
+        .filter(|(k, _)| {
+            let k = k.as_str();
+            !HOP.contains(&k) && !extra.contains(&k) && !named.iter().any(|n| n == k)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// relays the request to the Python application, streaming its response back. The headers go through
+/// unchanged apart from the hop-by-hop ones (X-Forwarded-* included: see docs/security.md for the
+/// sidecar's `--forwarded-allow-ips`); the client ignores HTTP(S)_PROXY, the sidecar is local
 async fn proxy(upstream: &str, req: axum::extract::Request) -> Response {
     static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let http = HTTP.get_or_init(|| reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_gzip().no_deflate().build().unwrap());
+    let http = HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_deflate()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+    });
     let (parts, body) = req.into_parts();
     let pq = parts.uri.path_and_query().map(|x| x.as_str()).unwrap_or("/");
     let url = format!("{}{}", upstream.trim_end_matches('/'), pq);
-    let hop = ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate"];
     let mut rb = http.request(parts.method.clone(), &url);
-    for (k, v) in parts.headers.iter() {
-        if !hop.contains(&k.as_str()) {
-            rb = rb.header(k, v);
-        }
+    for (k, v) in relayed(&parts.headers, &["content-length"]) {
+        rb = rb.header(k, v);
     }
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
+    let body = match read_body(&parts.headers, body).await {
         Ok(b) => b,
-        Err(_) => return Response::builder().status(400).body(Body::empty()).unwrap(),
+        Err(r) => return r,
     };
     match rb.body(body).send().await {
         Ok(r) => {
             let mut out = Response::builder().status(r.status().as_u16());
-            for (k, v) in r.headers().iter() {
-                if !hop.contains(&k.as_str()) {
-                    out = out.header(k, v);
-                }
+            for (k, v) in relayed(r.headers(), &[]) {
+                out = out.header(k, v);
             }
             out.body(Body::from_stream(r.bytes_stream())).unwrap_or_else(|_| plain_500())
         }
         Err(e) => {
-            eprintln!("ERROR:py2axum:python-side upstream {url}: {e}");
+            // the path only: a query string can carry a token
+            eprintln!("ERROR:py2axum:python-side upstream {}: {}", parts.uri.path(), e.without_url());
             Response::builder().status(502).header("content-type", "text/plain; charset=utf-8").body(Body::from("Bad Gateway")).unwrap()
         }
     }
@@ -252,9 +314,9 @@ pub async fn app(
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|c| (c.0.ip().to_canonical().to_string(), c.0.port()));
     let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let bytes = match read_body(&parts.headers, body).await {
         Ok(b) => b,
-        Err(_) => return Response::builder().status(400).body(Body::empty()).unwrap(),
+        Err(r) => return r,
     };
     let mut cell = web::ReqCell::from_parts(parts.method.as_str(), &parts.uri, &parts.headers, vec![], bytes);
     cell.client = client;

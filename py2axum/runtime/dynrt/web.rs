@@ -89,11 +89,18 @@ fn loc2(a: &str, b: &str) -> Vec<V> {
 
 /// A path/query/header parameter, validated like FastAPI (`loc = [source, name]`).
 pub async fn param(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
+    // a list parameter takes every occurrence (FastAPI: `query_params.getlist`, `headers.getlist`)
+    let list = matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_)));
     let raw = match source {
         "path" => cx.req.path_params.lock().iter().find(|(k, _)| k == alias).map(|(_, v)| V::str(v)),
+        "header" if list => {
+            let n = alias.to_ascii_lowercase();
+            let vals: Vec<V> = cx.req.headers.iter().filter(|(k, _)| *k == n).map(|(_, v)| V::str(v)).collect();
+            if vals.is_empty() { None } else { Some(V::list(vals)) }
+        }
         "header" => cx.req.header(alias).map(V::str),
         _ => {
-            if matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_))) {
+            if list {
                 let vals: Vec<V> = cx.req.query.iter().filter(|(k, _)| k == alias).map(|(_, v)| V::str(v)).collect();
                 if vals.is_empty() { None } else { Some(V::list(vals)) }
             } else {
@@ -409,14 +416,36 @@ pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(body.to_vec())) });
             let mut mp = multer::Multipart::new(stream, boundary);
             let mut out = Vec::new();
+            // Starlette's MultiPartParser limits (max_files, max_fields: 1000; max_part_size: 1 MiB for a
+            // field that is not a file), checked as its callbacks do: the count when a part's headers end
+            let (mut files, mut fields) = (0, 0);
             // python-multipart keeps what it parsed from a truncated or malformed body
             while let Ok(Some(field)) = mp.next_field().await {
                 let name = field.name().unwrap_or("").to_string();
-                let filename = field.file_name().map(str::to_string);
+                // python-multipart's parse_options_header (0.0.2x): the quoted value unescaped (multer keeps
+                // `\\` and `\"` as sent), then an IE-style full Windows path keeps its last part
+                let filename = field.file_name().map(|raw| {
+                    let f = raw.replace("\\\\", "\\").replace("\\\"", "\"");
+                    if f.get(1..3) == Some(":\\") || f.starts_with("\\\\") { f.rsplit('\\').next().unwrap_or("").to_string() } else { f }
+                });
+                if filename.is_some() {
+                    files += 1;
+                    if files > 1000 {
+                        return Err(Exc::http(400, V::str("Too many files. Maximum number of files is 1000."), vec![]));
+                    }
+                } else {
+                    fields += 1;
+                    if fields > 1000 {
+                        return Err(Exc::http(400, V::str("Too many fields. Maximum number of fields is 1000."), vec![]));
+                    }
+                }
                 let ctype = field.content_type().map(|m| m.to_string());
                 let headers: Vec<(String, String)> =
                     field.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).to_string())).collect();
                 let Ok(data) = field.bytes().await else { break };
+                if filename.is_none() && data.len() > 1024 * 1024 {
+                    return Err(Exc::http(400, V::str("Part exceeded maximum size of 1024KB."), vec![]));
+                }
                 out.push((
                     name,
                     match filename {
@@ -539,6 +568,7 @@ fn prepare_for(v: &V, td: &'static TD) -> R {
 }
 
 fn prepare(v: &V) -> R {
+    super::stack_guard()?;
     Ok(match v {
         V::Inst(_) => pyd::dump(v, pyd::DumpOpts { by_alias: true, ..Default::default() })?,
         V::List(l) => V::list(l.lock().clone().iter().map(prepare).collect::<R<Vec<_>>>()?),
@@ -556,7 +586,7 @@ fn json_body(status: u16, body: String, extra: &[(String, String)]) -> Response 
     for (k, v) in extra {
         b = b.header(k.as_str(), v.as_str());
     }
-    b.body(Body::from(body)).unwrap()
+    b.body(Body::from(body)).unwrap_or_else(bad_response)
 }
 
 fn no_body(status: u16) -> bool {
@@ -648,7 +678,7 @@ async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) 
         for (k, v) in &headers {
             b = b.header(k.as_str(), v.as_str());
         }
-        return Ok(b.body(Body::empty()).unwrap());
+        return Ok(b.body(Body::empty()).unwrap_or_else(bad_response));
     }
     let content = encode(cx, &ret, model).await?;
     let style = if model.is_some() && response_dump_json() { &pyd::DUMP_JSON } else { &pyd::RESPONSE };
@@ -730,7 +760,7 @@ async fn stream_list(cx: &Cx, l: super::orm::ListStream, status: u16, extra: Vec
         b = b.header(k.as_str(), v.as_str());
     }
     match rx.recv().await {
-        Some(Ok(Block::Complete(body))) => Ok(b.body(Body::from(body)).unwrap()),
+        Some(Ok(Block::Complete(body))) => Ok(b.body(Body::from(body)).unwrap_or_else(bad_response)),
         Some(Ok(Block::Start(first) | Block::Chunk(first))) => {
             let rest = futures_util::stream::unfold(rx, |mut rx| async move {
                 match rx.recv().await {
@@ -744,7 +774,7 @@ async fn stream_list(cx: &Cx, l: super::orm::ListStream, status: u16, extra: Vec
             });
             // fuse(): the compression layer may poll again after the end
             let body = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(first) }).chain(rest).fuse();
-            Ok(b.body(Body::from_stream(body)).unwrap())
+            Ok(b.body(Body::from_stream(body)).unwrap_or_else(bad_response))
         }
         Some(Err(e)) => Err(e),
         None => Err(Exc::runtime("py2axum: list stream ended without a result")),
@@ -772,7 +802,7 @@ fn stream_response(s: Streaming, extra: &[(String, String)]) -> Response {
         })
     })
     .fuse();
-    b.body(Body::from_stream(stream)).unwrap()
+    b.body(Body::from_stream(stream)).unwrap_or_else(bad_response)
 }
 
 /// Exception escaping the endpoint -> HTTP response (FastAPI's default exception handlers).
@@ -799,6 +829,17 @@ pub fn try_error_response(e: Exc) -> R<Response> {
         return Ok(json_body(422, pyd::to_json(&body, &pyd::RESPONSE, true)?, &[]));
     }
     Ok(internal_error(e))
+}
+
+/// a response the application gave headers HTTP cannot carry (CR, LF, NUL in a value, a bad name):
+/// uvicorn's h11 refuses it at send time and answers 500, never reaching the client either
+pub fn bad_response(e: axum::http::Error) -> Response {
+    eprintln!("ERROR:py2axum:Exception in ASGI application: invalid response header: {e}");
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from("Internal Server Error"))
+        .unwrap()
 }
 
 fn internal_error(e: Exc) -> Response {

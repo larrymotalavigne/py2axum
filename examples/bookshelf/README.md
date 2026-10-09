@@ -64,5 +64,5 @@ curl -s 'localhost:8080/books?tag=sf'
 Without `PY2AXUM_PYTHON_URL`, the export route answers 404; to serve it, run the same application with uvicorn
 (`cd examples/bookshelf && uvicorn app.main:app --port 8000`) and start the binary with
 `PY2AXUM_PYTHON_URL=http://127.0.0.1:8000`.
-A Docker build of it is in [`examples/docker`](../docker). The [getting-started guide](../../docs/getting-started.md)
+A Docker build of it is in [`examples/docker`](../docker). The [getting-started guide](https://larrymotalavigne.github.io/py2axum/getting-started/)
 walks through all of this step by step.

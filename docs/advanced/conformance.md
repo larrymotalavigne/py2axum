@@ -4,7 +4,7 @@ py2axum's contract is observable equivalence: for the same request on the same d
 what FastAPI answers. Its own test suites check that construct by construct, but your application combines
 them in its own way, so check it too. This page shows three ways, from the simplest to the broadest:
 
-1. [**A scenario**](#1-write-a-scenario): requests you write, played on both servers ([`tests/conformance.py`](../tests/conformance.py)).
+1. [**A scenario**](#1-write-a-scenario): requests you write, played on both servers ([`tests/conformance.py`](https://github.com/larrymotalavigne/py2axum/blob/main/tests/conformance.py)).
 2. [**Replay**](#2-replay-recorded-traffic): traffic recorded in front of your Python application, replayed on both.
 3. [**Generation**](#3-generate-requests): requests derived from your OpenAPI schema, valid and invalid.
 
@@ -31,7 +31,7 @@ bookshelf scenario uses PyJWT to sign its tokens).
 ## 1. Write a scenario
 
 A scenario is a Python file, which can live in your own repository. A complete one:
-[`examples/bookshelf/scenario.py`](../examples/bookshelf/scenario.py).
+[`examples/bookshelf/scenario.py`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/bookshelf/scenario.py).
 
 ```python
 # my_project/conformance/scenario.py
@@ -90,7 +90,7 @@ python tests/conformance.py http://127.0.0.1:9050 http://127.0.0.1:9090 --scenar
 
 `PY2AXUM_PYTHON_URL` is only needed in hybrid mode (routes left to Python). The output lists every step,
 `ok` or `DIFF` with both responses, and ends with `N/N identical responses`; the exit status is 1 if any
-differs. [`examples/bookshelf/compare.sh`](../examples/bookshelf/compare.sh) does all of this in one script:
+differs. [`examples/bookshelf/compare.sh`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/bookshelf/compare.sh) does all of this in one script:
 copy it as a starting point.
 
 `--ignore-encoding` compares bodies regardless of their content encoding (for lists streamed from the session,
@@ -121,7 +121,7 @@ which have no `content-length` and are therefore compressed even under `GZipMidd
 - **Order without `ORDER BY`** is up to PostgreSQL, on both sides: give your queries an order, or normalize.
 - **Keep-alive after a 500**: uvicorn closes the connection after an unhandled exception; the harness resends
   the next request once.
-- Differences py2axum knows about and documents ([supported.md](supported.md)) are not bugs of your
+- Differences py2axum knows about and documents ([supported.md](../supported.md)) are not bugs of your
   application or of the binary: mask them only after reading their entry.
 
 ## 2. Replay recorded traffic
@@ -141,7 +141,7 @@ python tests/difftest.py replay requests.jsonl --ref http://127.0.0.1:9050 --can
 
 Both commands of this section and the next write `divergences.jsonl` and `summary.md` (grouped by route and
 first differing field; each divergence carries the request as a scenario step, ready to paste into `STEPS`).
-Divergences [supported.md](supported.md) documents as known (integers beyond 64 bits, lone surrogates) are
+Divergences [supported.md](../supported.md) documents as known (integers beyond 64 bits, lone surrogates) are
 counted apart.
 
 The traffic is recorded on the Python side by `py2axum.record`, an ASGI wrapper that leaves the application
@@ -194,8 +194,8 @@ URL taken from the request.
 | `dynapp` | `fixtures/dynapp`: the reference app (every supported construct) | ~1 000 |
 | `syncapp` | `fixtures/syncapp`: synchronous SQLAlchemy sessions | 57 |
 | `factoryapp` | `fixtures/factoryapp`: app factory, middleware stack, exception handlers | 37 |
-| `examples/bookshelf/scenario.py` | [`examples/bookshelf`](../examples/bookshelf), in hybrid mode | 75 |
-| `notes` | [`examples/notes`](../examples/notes) | 24 |
+| `examples/bookshelf/scenario.py` | [`examples/bookshelf`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/bookshelf), in hybrid mode | 75 |
+| `notes` | [`examples/notes`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/notes) | 24 |
 | `app` | `app/`: CRUD, GZip, aiohttp, large lists streamed from the session (also with forced streaming) | 80 |
 
 `dynapp` needs PostgreSQL, Redis (database 13 is flushed), RabbitMQ (`BROKER_DSN`, default

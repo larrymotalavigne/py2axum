@@ -179,23 +179,12 @@ pub fn path_method(p: &str, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
             Err(e) => Err(os_err(e, p)),
             Ok(()) => Ok(V::None),
         },
-        "resolve" | "absolute" => {
+        // `resolve()` = os.path.realpath (symlinks followed even below a missing tail, like CPython)
+        "resolve" => Ok(path(&super::stdlib::realpath(&absolute(p)))),
+        "absolute" => {
             let a = absolute(p);
-            Ok(path(&match std::fs::canonicalize(&a) {
-                Ok(c) if name == "resolve" => c.to_string_lossy().to_string(),
-                _ => {
-                    // lexical: ".." removes the previous part
-                    let mut out: Vec<&str> = Vec::new();
-                    for part in a.split('/').filter(|x| !x.is_empty() && *x != ".") {
-                        if part == ".." && name == "resolve" {
-                            out.pop();
-                        } else {
-                            out.push(part);
-                        }
-                    }
-                    format!("/{}", out.join("/"))
-                }
-            }))
+            let parts: Vec<&str> = a.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+            Ok(path(&format!("/{}", parts.join("/"))))
         }
         "relative_to" => {
             let other = norm(&fspath(args.first().ok_or_else(|| Exc::type_error("relative_to() missing argument"))?)?);

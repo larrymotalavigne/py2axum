@@ -41,20 +41,20 @@ INSERT) the ratio moved with the load of the machine, which other jobs shared du
 with `python bench/bench.py --target bookshelf --interleave 3`, ideally on a dedicated machine.
 
 Gains depend on how much of your request time is Python (validation, serialization, the ORM) rather than the
-database. Measure your own application: the bench script and the [conformance harness](docs/conformance.md) are
+database. Measure your own application: the bench script and the [conformance harness](https://larrymotalavigne.github.io/py2axum/advanced/conformance/) are
 in this repository.
 
 ## What it does not do
 
-- **It is not a Python interpreter.** It compiles a closed, growing [subset](docs/supported.md) of Python and
-  of a [list of libraries](docs/supported.md#libraries). `eval`, metaclasses, C extensions, raw ASGI
-  middlewares and unlisted libraries are refused, never approximated.
+- **It is not a Python interpreter.** It compiles a closed, growing [subset](https://larrymotalavigne.github.io/py2axum/supported/) of Python and
+  of a [list of libraries](https://larrymotalavigne.github.io/py2axum/reference/libraries/). `eval`, metaclasses, C extensions, an
+  application wrapped in a project ASGI class and unlisted libraries are refused, never approximated.
 - **It does not run your migrations** nor serve the OpenAPI `/docs` pages: run Alembic as usual, and keep the
   docs on your Python deployment.
 - **PostgreSQL only** (through sqlx). FastAPI, Pydantic, SQLAlchemy and Python must be within the
-  [tested version ranges](docs/supported.md#supported-versions), read from your lock file.
+  [tested version ranges](https://larrymotalavigne.github.io/py2axum/reference/versions/), read from your lock file.
 - **It is alpha.** Each supported behaviour is verified by differential tests, but your application combines
-  them its own way: run a [conformance check](docs/conformance.md) on it before production.
+  them its own way: run a [conformance check](https://larrymotalavigne.github.io/py2axum/advanced/conformance/) on it before production.
 
 ## Quick start
 
@@ -83,24 +83,24 @@ native       WEBSOCKET /ws/books/{book_id}  examples/bookshelf/app/routers/live.
 hint: --python-side auto leaves the refused routes to a Python process next to the binary
 ```
 
-The [getting-started guide](docs/getting-started.md) walks through the example end to end: check, build, run,
+The [getting-started guide](https://larrymotalavigne.github.io/py2axum/getting-started/) walks through the example end to end: check, build, run,
 hybrid mode, comparison with FastAPI, Docker, runtime configuration, graceful shutdown and Sentry.
 
 ## Why trust the binary
 
 - **Differential testing.** The same requests go to FastAPI and to the binary; status, headers and bodies must
   match byte for byte. The repository's suites run about 1 300 such requests, the bookshelf example 75 of its
-  own, and [`tests/conformance.py`](docs/conformance.md) runs yours, from a scenario you write, recorded
+  own, and [`tests/conformance.py`](https://larrymotalavigne.github.io/py2axum/advanced/conformance/) runs yours, from a scenario you write, recorded
   traffic or requests generated from your OpenAPI schema.
 - **Refuse rather than guess.** A construct outside the subset stops the translation with `file:line`; it is
-  never translated approximately. Every known difference from CPython is [documented](docs/supported.md).
+  never translated approximately. Every known difference from CPython is [documented](https://larrymotalavigne.github.io/py2axum/supported/).
 - **No rewrite, no fork.** Unit tests, local development, debugging and the OpenAPI docs keep running on
   Python. A route py2axum cannot handle stays in Python (`--python-side`) and the binary relays it, so one
   deployment serves both.
 
 ## What is supported
 
-A summary; the full list, with every documented difference, is in [docs/supported.md](docs/supported.md).
+A summary; the full list, with every documented difference, is in [the documentation](https://larrymotalavigne.github.io/py2axum/supported/).
 
 - **FastAPI / Starlette**: routes and routers (prefixes, factories, conditional registration), path, query,
   header, body, form and file parameters with FastAPI's exact 422 errors, dependencies (`Depends`,
@@ -130,17 +130,17 @@ A summary; the full list, with every documented difference, is in [docs/supporte
    serialization, the SQLAlchemy session and SQL compiler on sqlx, Starlette's middleware and routing, the
    supported libraries.
 
-Details, and how this differs from RustPython: [docs/how-it-works.md](docs/how-it-works.md).
+Details, and how this differs from RustPython: [How it works](https://larrymotalavigne.github.io/py2axum/advanced/how-it-works/).
 
 ## Documentation
 
 | | |
 |---|---|
-| [Getting started](docs/getting-started.md) | from `pip install` to a deployed binary, step by step |
-| [Supported subset](docs/supported.md) | what translates, version ranges, every known difference |
-| [Conformance](docs/conformance.md) | check that the binary answers like your application |
-| [How it works](docs/how-it-works.md) | the compiler, the runtime, hybrid deployments |
-| [Docker](docs/docker.md) | multi-stage builds, caching, the hybrid setup |
+| [Getting started](https://larrymotalavigne.github.io/py2axum/getting-started/) | from `pip install` to a deployed binary, step by step |
+| [Supported subset](https://larrymotalavigne.github.io/py2axum/supported/) | what translates, version ranges, every known difference |
+| [Conformance](https://larrymotalavigne.github.io/py2axum/advanced/conformance/) | check that the binary answers like your application |
+| [How it works](https://larrymotalavigne.github.io/py2axum/advanced/how-it-works/) | the compiler, the runtime, hybrid deployments |
+| [Deployment](https://larrymotalavigne.github.io/py2axum/advanced/deployment/) | multi-stage builds, caching, the hybrid setup |
 | [Changelog](CHANGELOG.md) | what changed in each release |
 
 ## Project layout

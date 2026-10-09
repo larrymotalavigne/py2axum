@@ -98,14 +98,15 @@ pub fn call(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             let names = ["password", "salt"];
             let pw = bytes_arg(arg(name, args, kwargs, 0, "password", &names)?, "password")?;
             let salt = bytes_arg(arg(name, args, kwargs, 1, "salt", &names)?, "salt")?;
-            Ok(V::Bytes(std::sync::Arc::from(&hashpw(&pw, &salt)?[..])))
+            // CPU-bound for ~0.25 s at cost 12: off the loop worker, as pyca/bcrypt releases the GIL
+            Ok(V::Bytes(std::sync::Arc::from(&super::thread::blocking(|| hashpw(&pw, &salt))?[..])))
         }
         "checkpw" => {
             let names = ["password", "hashed_password"];
             let pw = bytes_arg(arg(name, args, kwargs, 0, "password", &names)?, "password")?;
             let hashed = bytes_arg(arg(name, args, kwargs, 1, "hashed_password", &names)?, "hashed_password")?;
             use subtle::ConstantTimeEq;
-            Ok(V::Bool(hashpw(&pw, &hashed)?.ct_eq(&hashed).into()))
+            Ok(V::Bool(super::thread::blocking(|| hashpw(&pw, &hashed))?.ct_eq(&hashed).into()))
         }
         _ => Err(Exc::attr_error(format!("module 'bcrypt' has no attribute '{name}'"))),
     }

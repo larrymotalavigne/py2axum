@@ -1,6 +1,7 @@
 """Scenario of fixtures/dynapp: the dyn backend's own reference app (enums, computed defaults,
 annotated dependency aliases...). Tables are (re)created by SQLAlchemy from the fixture models."""
 import os
+import urllib.parse
 from importlib.metadata import version as _version
 
 # get_db commits after the response (FastAPI >= 0.121): pause after each write so that the reference has
@@ -267,6 +268,9 @@ STEPS: list = [
     ("POST", "/contacts", {"name": " Ada ", "email": 'ada@'}),
     ("POST", "/contacts", {"name": " Ada ", "email": '@x.fr'}),
     ("POST", "/contacts", {"name": " Ada ", "email": 'ada@localhost'}),
+    # pydantic 2.14 refuses CR/LF before parsing (2.13: stripped by `.strip()` or a pretty-form separator)
+    *[("POST", "/contacts/loud", {"email": e}) for e in (" ada@example.com\n", "Ada <ada@example.com>", "ada@ex\na.com")],
+    *[("POST", "/contacts", {"name": "Ada", "email": e}) for e in ("ada@example.com\n", "Ada\n<ada@example.com>", "\r\nada@example.com", "ad\na@example.com")],
     ("POST", "/contacts", {"name": " Ada ", "email": 'a b@x.fr'}),
     ("POST", "/contacts", {"name": " Ada ", "email": 'ada@x..fr'}),
     ("POST", "/contacts", {"name": " Ada ", "email": 'ada@-x.fr'}),
@@ -772,6 +776,7 @@ STEPS: list = [
     ("GET", "/libs/enum?rank=zz", None),
     ("POST", "/libs/enum", {"rank": "ESTAR", "ranks": ["low", "", "estar"]}),
     ("POST", "/libs/enum", {"rank": "bad", "ranks": ["low", "worse"]}),
+    *[("POST", "/libs/enum-missing", {"grade": g}) for g in ("a", "ve", "ke", "ae", "up", "wr", "zz", 1)],
     ("GET", "/libs/urllib", None),
     ("GET", "/libs/b64", None),
     ("GET", "/libs/psutil", None),
@@ -853,6 +858,14 @@ STEPS: list = [
     ("POST", "/libs/decimal-in", {"amount": 1, "capped": "12.345"}),
     ("POST", "/libs/decimal-in", {"amount": 1, "capped": "100.000"}),
     ("POST", "/libs/decimal-in", {"amount": 1, "capped": "1.2300"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "0.12345678901234567890123456789"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "1.234567890123456789012345678901"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "1.2345678901234567890123456785"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "1.2345678901234567890123456775"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "9.9999999999999999999999999999"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "12345678901234567890123456789"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "0.1000000000000000000000000000000"}),
+    ("POST", "/libs/decimal-in", {"amount": 1, "wide": "1.23456789012345678901234567"}),
     ("POST", "/libs/decimal-in", {"amount": 1, "capped": "-1234.567"}),
     ("POST", "/libs/decimal-in", {"amount": 1, "small": 0.05}),
     ("POST", "/libs/decimal-in", {"amount": 1, "small": 10}),
@@ -951,6 +964,14 @@ STEPS: list = [
     ("GET", "/small/uuid-ops/aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee?other=------------------------------------", None),
     ("GET", "/small/uuid-ops/aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee?other=12345678-1234-5678-1234-567812345678%7D", None),
     ("GET", "/small/uuid-ops/aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee?other=urn:uuid:aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee", None),
+    # uuid crate of pydantic-core 2.46 (uuid 1.23.0) vs 2.50 (uuid 1.23.4): positions, length, requested form
+    *[("GET", "/small/uuid-ops/aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee?other=" + urllib.parse.quote(u), None) for u in (
+        "{}", "{", "urn:uuid:", "urn:uuid:123", "g" * 32, "-" * 32, "a" * 31, "a" * 33, "a" * 46, "a" * 100,
+        "{12345678-1234-5678-1234-567812345678", "urn:uuid:12345678-1234-5678-1234-56781234567g",
+        "URN:UUID:12345678-1234-5678-1234-567812345678", "12345678123456781234567812345678-", "šššš",
+        "12345678-1234-5678-1234-56781234567š", "1234-5678", "12345678-1234-5678-1234-5678-12345678",
+        "12345678_1234_5678_1234_567812345678", "{1234567812345678123456781234567}", "ĭĭĭĭ",
+        "12345678-1234-5678-1234-5678123456ĭ", "{-}", "{" + "a" * 44 + "}")],
     ("GET", "/small/basic-opt", None),
     ("GET", "/small/basic-opt", None, {"authorization": 'Bearer x'}),
     ("GET", "/small/basic-opt", None, {"authorization": 'Basic !!!'}),
@@ -1180,6 +1201,11 @@ def reset(db: str) -> None:
     with open("storage-test/fixed.pdf", "wb") as f:
         f.write(b"%PDF-1.4 fixed")
     os.utime("storage-test/fixed.pdf", (1700000000.123456, 1700000000.123456))
+    # fixtures/dynapp/sec.py /sec/resolve: a symlink inside BASE leading out of it
+    os.makedirs("/tmp/py2axum-sec/base/sub", exist_ok=True)
+    os.makedirs("/tmp/py2axum-sec/outside", exist_ok=True)
+    if not os.path.islink("/tmp/py2axum-sec/base/link"):
+        os.symlink("/tmp/py2axum-sec/outside", "/tmp/py2axum-sec/base/link")
     import redis as _redis
     _redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/13")).flushdb()
     _reset_broker()
@@ -1407,3 +1433,52 @@ STEPS += [
     ("POST", "/pydmore/domains", {"name": "ok.org", "catch_all": " nobody "}),
     ("POST", "/pydmore/domains?catch_all=%20nobody%20", {"name": "ok.org"}),
 ]
+
+
+# ---- security review (fixtures/dynapp/sec.py, docs/advanced/security.md): request values used as SQL names are quoted,
+# values bound (the owners count after each step shows the table intact); symlinks followed by resolve();
+# no message in a 500; Starlette's multipart limits; sizes from the request raise instead of aborting
+from urllib.parse import quote  # noqa: E402
+_SQLI = ["n", "N", "order", 'a"b', "x FROM owners; DROP TABLE owners; --", "' OR 1=1 --", "%_\\", ":n", "$1", "é"]
+STEPS += [("GET", f"/sec/label?name={quote(v)}", None) for v in _SQLI]
+STEPS += [("GET", f"/sec/filter?q={quote(v)}", None) for v in _SQLI]
+STEPS += [("GET", f"/sec/text?q={quote(v)}", None) for v in _SQLI]
+STEPS += [("GET", f"/sec/sub?name={quote(v)}", None) for v in ("anon", "Sub", "select", 'q"x', "s) AS t; DROP TABLE owners; --")]
+STEPS += [("GET", f"/sec/order?sort={quote(v)}", None) for v in ("n", "id; DROP TABLE owners", "n DESC")]
+STEPS += [("POST", f"/sec/upsert?col={quote(v)}", None) for v in ("role", "Role", "role) DO NOTHING; DROP TABLE owners; --")]
+STEPS += [("GET", f"/sec/resolve?name={quote(v)}", None) for v in (
+    "a.txt", "sub/new.txt", "sub/../a", "../escape", "link/new.txt", "link", "sub/../link/x/../y", "/etc/passwd", "a/../../x")]
+STEPS += [
+    ("GET", "/sec/header?v=plain", None),
+    ("GET", "/sec/boom", None),
+    ("GET", "/sec/dup", None),
+    ("GET", "/sec/token?n=8", None),
+    ("GET", "/sec/token?n=0", None),
+    ("GET", "/sec/token?n=-1", None),
+    ("GET", "/sec/repeat?n=3", None),
+    ("GET", "/sec/repeat?n=-2", None),
+    ("GET", f"/sec/repeat?n={2**62}", None),
+    ("GET", f"/sec/repeat?n={10**15}", None),
+]
+
+
+def _multipart_limits() -> list:
+    steps = []
+    for n in (1000, 1001):
+        body, h = _multipart([("files", f"{i}.txt", "text/plain", b"x") for i in range(n)])
+        steps.append(("POST", "/sec/upload", body, h))
+    for n in (1000, 1001):
+        body, h = _multipart([(f"f{i}", "v") for i in range(n)])
+        steps.append(("POST", "/sec/upload", body, h))
+    for size in (1024 * 1024, 1024 * 1024 + 1):
+        body, h = _multipart([("caption", "x" * size)])
+        steps.append(("POST", "/sec/upload", body, h))
+    body, h = _multipart([("files", "big.bin", "text/plain", b"x" * (2 * 1024 * 1024))])
+    steps.append(("POST", "/sec/upload", body, h))
+    for name in ("C:\\Users\\x\\evil.txt", "\\\\host\\share\\f.txt", "../../etc/passwd", "a\\b.txt", "D:rel.txt"):
+        body, h = _multipart([("files", name, "text/plain", b"x")])
+        steps.append(("POST", "/sec/upload", body, h))
+    return steps
+
+
+STEPS += _multipart_limits()

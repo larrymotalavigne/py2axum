@@ -25,7 +25,7 @@ def test_pyproject_mirrors_supported():
 
 
 def test_docs_list_every_range():
-    doc = (ROOT / "docs" / "supported.md").read_text()
+    doc = (ROOT / "docs" / "reference" / "versions.md").read_text()
     for name in versions.SUPPORTED:
         lo, hi, _ = versions.SUPPORTED[name]
         assert f"| {name} | {lo} | {hi} | `{versions.spec(name)}` |" in doc, name
@@ -38,6 +38,9 @@ def test_ci_matrix_runs_both_ends():
     assert "python -m py2axum.versions $END" in ci
     assert 'PY: "3.12"' in ci and 'PY: "3.14"' in ci
     assert versions.pins("min")[0] == "fastapi==0.137.0" and "psycopg[binary]==3.3.6" in versions.pins("max")
+    for end in versions.MIDDLES:
+        assert "END: " + end + " }" in ci  # each intermediate version has its job
+        assert {f"{n}=={v}" for n, v in versions.MIDDLES[end].items()} <= set(versions.pins(end))
 
 
 def test_interval():
@@ -121,3 +124,21 @@ def test_feature_needs_newer_version(tmp_path):
         (tmp_path / "uv.lock").unlink(missing_ok=True)
         write(tmp_path, "requirements.txt", f"starlette{pin}\n")
         assert check_project(tmp_path, pkg) == []
+
+
+def test_locked_version_reads_pins_and_specifiers(tmp_path):
+    """The binary reproduces the pydantic minor of the project: its lock, else its `==` pin, else the installed
+    one when the project's specifier allows it (else the highest tested version the specifier allows)."""
+    from importlib.metadata import version as installed
+
+    from py2axum.dyn import locked_version
+    (tmp_path / ".git").mkdir()
+    write(tmp_path, "requirements.txt", "pydantic[email]==2.13.5\n")
+    assert locked_version(tmp_path, "pydantic") == "2.13.5"
+    write(tmp_path, "requirements.txt", "pydantic>=2.12,<2.14\n")
+    mine = installed("pydantic")
+    assert locked_version(tmp_path, "pydantic") == (mine if parse(mine) < parse("2.14") else "2.13.5")
+    write(tmp_path, "requirements.txt", "pydantic>=2.14\n")
+    assert locked_version(tmp_path, "pydantic") == (mine if parse(mine) >= parse("2.14") else "2.14.0")
+    write(tmp_path, "uv.lock", '[[package]]\nname = "pydantic"\nversion = "2.12.5"\n')
+    assert locked_version(tmp_path, "pydantic") == "2.12.5"

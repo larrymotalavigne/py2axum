@@ -17,13 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # name -> (lowest tested, highest tested, first untested). Accepted: lowest <= v < first untested. Mirrored by
-# the `conformance` extra of pyproject.toml and by docs/supported.md (tests/test_versions.py); the CI job
+# the `conformance` extra of pyproject.toml and by docs/reference/versions.md (tests/test_versions.py); the CI job
 # `versions` installs both ends (`python -m py2axum.versions min|max`) and runs pytest + the dynapp conformance.
 SUPPORTED: dict[str, tuple[str, str, str]] = {
     "fastapi": ("0.137.0", "0.142.3", "0.143"),
     "starlette": ("1.0.0", "1.7.0", "1.8"),
-    "pydantic": ("2.12.0", "2.13.5", "2.14"),
-    "pydantic-core": ("2.41.1", "2.46.5", "2.47"),
+    "pydantic": ("2.12.0", "2.14.0", "2.15"),
+    "pydantic-core": ("2.41.1", "2.50.0", "2.51"),
     "pydantic-settings": ("2.11.0", "2.15.0", "2.16"),
     "sqlalchemy": ("2.0.44", "2.1.4", "2.2"),
     "psycopg": ("3.2.12", "3.3.6", "3.4"),
@@ -66,10 +66,19 @@ def in_range(name: str, version: str) -> bool:
     return parse(lo) <= parse(version) < parse(hi)
 
 
+# intermediate versions the CI matrix also runs (`max` otherwise): the minors whose behaviour the runtime
+# reproduces apart from both ends (pydantic 2.13's messages, still locked by most projects)
+MIDDLES: dict[str, dict[str, str]] = {
+    "pydantic2.13": {"pydantic": "2.13.5", "pydantic-core": "2.46.5"},
+}
+
+
 def pins(end: str) -> list[str]:
-    """pip requirements of one end of the ranges (`min` or `max`), as the CI matrix installs them."""
-    i = {"min": 0, "max": 1}[end]
-    return [f"{_EXTRAS.get(n, n)}=={v[i]}" for n, v in SUPPORTED.items() if n not in _LOCK_ONLY]
+    """pip requirements of one end of the ranges (`min` or `max`), or of a `MIDDLES` entry, as the CI matrix
+    installs them."""
+    i = {"min": 0}.get(end, 1)
+    over = MIDDLES[end] if end not in ("min", "max") else {}
+    return [f"{_EXTRAS.get(n, n)}=={over.get(n, v[i])}" for n, v in SUPPORTED.items() if n not in _LOCK_ONLY]
 
 
 def _bump(rel: tuple, n: int) -> tuple:

@@ -38,12 +38,12 @@ from fastapi.middleware import Middleware
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, retrying, small, sqlmore, stdmore, tracing, wsock
+from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, retrying, sec, small, sqlmore, stdmore, tracing, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
 from .paging import ArchiveOut, AsText, Cond, LoudNamed, Named, PageParams, Tagged
-from pydantic import ValidationError
+from pydantic import BaseModel, EmailStr, ValidationError
 
 from .schemas import (
     Agenda, Booking, Contact, Span, Invoice, TaskLoose, Trip, Label, Mixed, Point, Point3, ContactV1, OwnerOut, Person, TaskTitle, ProjectIn, ProjectOut, StatusChange, TaskBrief, TaskIn, TaskOut, TaskSummary, Slot,
@@ -78,6 +78,7 @@ app.include_router(lazyimp.router)
 app.include_router(colls.router)
 app.include_router(retrying.router)
 app.include_router(sqlmore.router)
+app.include_router(sec.router)
 app.include_router(extras.router)
 app.include_router(prom.router)
 app.include_router(outbound.router)
@@ -209,6 +210,17 @@ async def stats(db: DbDep):
 async def contact(payload: Contact):
     payload.name = payload.name + "  (vérifié)  "
     return {"name": payload.name, "email": payload.email, "v1": ContactV1(name=f"  {payload.name}  ").name}
+
+
+class LoudContact(BaseModel):
+    """EmailStr validates the str schema's output: model_config's str_* settings apply first"""
+    model_config = {"str_to_upper": True, "str_strip_whitespace": True}
+    email: EmailStr
+
+
+@app.post("/contacts/loud")
+async def contact_loud(payload: LoudContact):
+    return {"email": payload.email}
 
 
 @app.post("/contacts/bad-assign")

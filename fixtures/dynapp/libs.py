@@ -398,6 +398,34 @@ async def enum_body(body: RankIn):
     return {"rank": body.rank, "ranks": body.ranks, "scores": [r.to_score() for r in body.ranks]}
 
 
+class Grade(str, Enum):
+    """`_missing_` that raises: pydantic 2.13 turns any exception into an `enum` error, 2.14 only a ValueError"""
+    A = "a"
+
+    @classmethod
+    def _missing_(cls, value):
+        if value == "ve":
+            raise ValueError("bad grade")
+        if value == "ke":
+            return {}["k"]
+        if value == "ae":
+            return value.nope
+        if value == "up":
+            return cls(value.upper())
+        if value == "wr":
+            return 5
+        return None
+
+
+class GradeIn(BaseModel):
+    grade: Grade
+
+
+@router.post("/enum-missing")
+async def enum_missing(body: GradeIn):
+    return {"grade": body.grade}
+
+
 # ---- urllib.parse
 from urllib.parse import quote, quote_plus, unquote, unquote_plus, urlencode, urlparse, urlsplit  # noqa: E402
 
@@ -923,6 +951,8 @@ class Price(_BaseModel):
     capped: Decimal | None = Field(None, gt=0, le=500.5, max_digits=5, decimal_places=2)
     small: Decimal | None = Field(None, ge=0.1, lt=10, decimal_places=1)
     digits: Decimal | None = Field(None, max_digits=1)
+    # more than the 28 digits of the decimal context: rounded by Decimal.normalize() before pydantic 2.14
+    wide: Decimal | None = Field(None, max_digits=28, decimal_places=27)
 
 
 class Bill(_BaseModel):

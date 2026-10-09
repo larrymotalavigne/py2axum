@@ -1,21 +1,28 @@
-# Building with Docker
+# Deployment
+
+The binary is one executable with no Python at run time: it reads its configuration from the environment
+([the list](../reference/environment.md)), listens on `HOST`:`PORT`, and talks to PostgreSQL at `DATABASE_URL`.
+This page shows how to build it in a container image and how to run it, alone or next to a Python process for
+the routes left to Python ([hybrid mode](../getting-started/hybrid.md)).
+
+## Building with Docker
 
 A multi-stage build keeps the Python and Rust toolchains out of the final image: transpile, compile, then ship
 the binary alone (an image of a few tens of MB on `debian:bookworm-slim`). The reference files are in
-[`examples/docker`](../examples/docker), set up for the [bookshelf example](../examples/bookshelf):
+[`examples/docker`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/docker), set up for the [bookshelf example](https://github.com/larrymotalavigne/py2axum/tree/main/examples/bookshelf) in hybrid mode:
 
 | File | |
 |---|---|
-| [`Dockerfile`](../examples/docker/Dockerfile) | transpile → compile → run, the binary alone, as `nobody` |
-| [`Dockerfile.python`](../examples/docker/Dockerfile.python) | the same application under uvicorn, for the routes left to Python |
-| [`compose.yaml`](../examples/docker/compose.yaml) | PostgreSQL, the Python sidecar and the binary, in hybrid mode |
+| [`Dockerfile`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/Dockerfile) | transpile (`python:3.13-slim`), compile (`rust:1-bookworm`, cargo caches as BuildKit cache mounts), run: the binary alone on `debian:bookworm-slim`, as `nobody` |
+| [`Dockerfile.python`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/Dockerfile.python) | the same application under uvicorn, for the routes left to Python |
+| [`compose.yaml`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/compose.yaml) | PostgreSQL, the Python sidecar (not published) and the binary (port 8080, the only entry point) |
 
 ```bash
 docker compose -f examples/docker/compose.yaml up --build     # from the repository root
 curl -s localhost:8080/health
 ```
 
-## Adapting the Dockerfile to your application
+### Adapting the Dockerfile to your application
 
 The `Dockerfile` takes build arguments, so it can often be used as is:
 
@@ -46,7 +53,7 @@ recompile the generated code. The generated crate ships with the `Cargo.lock` py
 
 - Environment: `DATABASE_URL`, `HOST`, `PORT`, `PY2AXUM_PYTHON_URL` (hybrid mode), `PY2AXUM_LOG_LEVEL`,
   `PY2AXUM_SHUTDOWN_TIMEOUT`, plus your application's own settings; the full list is in
-  [getting-started.md § Runtime configuration](getting-started.md#10-runtime-configuration). The binary does not
+  [Environment variables](../reference/environment.md). The binary does not
   read `.env` files.
 - Run database migrations as a separate step (a Kubernetes Job, an init container, `alembic upgrade head` in
   your Python image): the binary does not create tables.
@@ -75,6 +82,22 @@ The binary relays matching requests (method, headers, body) and streams the resp
 must share their settings (a token secret, for instance) and keep shared state outside themselves (database,
 Redis). WebSockets are not relayed: a WebSocket route must translate, or be routed to the Python service by
 your ingress. If you leave the lifespan to Python (`--python-side lifespan`), its startup and shutdown code
-runs in the Python container only. More in [how-it-works.md § Hybrid deployments](how-it-works.md#4-hybrid-deployments).
+runs in the Python container only. More in [How it works § Hybrid deployments](how-it-works.md#4-hybrid-deployments).
 
-A smaller, fully native example with its own Dockerfile is in [`examples/notes`](../examples/notes).
+## Kubernetes
+
+The same rules apply in a cluster:
+
+- One container runs the binary; it needs `DATABASE_URL` and your application's own settings as environment
+  variables (it does not read `.env` files).
+- Run migrations as a Kubernetes Job or an init container: the binary does not create tables.
+- Keep `PY2AXUM_SHUTDOWN_TIMEOUT` (25 s by default) below `terminationGracePeriodSeconds` (30 s by default),
+  so that the binary closes its remaining streams itself before the SIGKILL ([Graceful shutdown](shutdown.md)).
+- In hybrid mode, run the Python application as a sidecar container reachable from the binary only, and set
+  `PY2AXUM_PYTHON_URL` to it (for instance `http://127.0.0.1:8000` in the same pod). See
+  [Security § Hybrid deployments](security.md#hybrid-deployments-the-python-side-relay) for the sidecar's
+  `--forwarded-allow-ips`.
+- Request bodies are not capped by default: cap them at the ingress or with `PY2AXUM_MAX_BODY`
+  ([Security § Request input](security.md#request-input)).
+
+A smaller, fully native example with its own Dockerfile is in [`examples/notes`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/notes).

@@ -1003,23 +1003,7 @@ pub fn os_path(name: &str, args: &[V]) -> R {
         "basename" => V::str(p(0)?.rsplit('/').next().unwrap_or("")),
         "normpath" => V::str(normpath(&p(0)?)),
         "abspath" => V::str(abspath(&p(0)?)),
-        // symlinks resolved on the existing prefix, the rest normalised (strict=False)
-        "realpath" => {
-            let a = abspath(&p(0)?);
-            let mut prefix = std::path::PathBuf::from(&a);
-            let mut tail: Vec<String> = Vec::new();
-            while !prefix.exists() {
-                match (prefix.file_name().map(|f| f.to_string_lossy().into_owned()), prefix.parent()) {
-                    (Some(f), Some(parent)) => {
-                        tail.insert(0, f);
-                        prefix = parent.to_path_buf();
-                    }
-                    _ => break,
-                }
-            }
-            let base = std::fs::canonicalize(&prefix).map(|p| p.display().to_string()).unwrap_or_else(|_| prefix.display().to_string());
-            V::str(normpath(&if tail.is_empty() { base } else { format!("{base}/{}", tail.join("/")) }))
-        }
+        "realpath" => V::str(realpath(&p(0)?)),
         "dirname" => {
             let s = p(0)?;
             V::str(match s.rfind('/') {
@@ -1564,6 +1548,78 @@ pub fn abspath(p: &str) -> String {
         let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| ".".into());
         normpath(&format!("{cwd}/{p}"))
     }
+}
+
+/// `os.path.realpath(p)` (strict=False), port of posixpath's `_joinrealpath`: symlinks resolved one
+/// component at a time, `..` applied to the resolved path, missing components kept as written, a symlink
+/// loop left unresolved. `Path.resolve()` shares it: an upload guard
+/// `(BASE / name).resolve().relative_to(BASE)` must see where a symlink inside BASE really leads.
+pub fn realpath(p: &str) -> String {
+    fn join(a: &str, b: &str) -> String {
+        if b.starts_with('/') || a.is_empty() {
+            b.to_string()
+        } else if a.ends_with('/') {
+            format!("{a}{b}")
+        } else {
+            format!("{a}/{b}")
+        }
+    }
+    fn split(p: &str) -> (String, String) {
+        let i = p.rfind('/').map(|i| i + 1).unwrap_or(0);
+        let (head, tail) = (&p[..i], &p[i..]);
+        let trimmed = head.trim_end_matches('/');
+        (if trimmed.is_empty() { head.to_string() } else { trimmed.to_string() }, tail.to_string())
+    }
+    fn walk(mut path: String, rest: &str, seen: &mut std::collections::HashMap<String, Option<String>>) -> (String, bool) {
+        let mut rest = rest.to_string();
+        if rest.starts_with('/') {
+            rest.remove(0);
+            path = "/".into();
+        }
+        while !rest.is_empty() {
+            let (name, tail) = match rest.find('/') {
+                Some(i) => (rest[..i].to_string(), rest[i + 1..].to_string()),
+                None => (rest.clone(), String::new()),
+            };
+            rest = tail;
+            if name.is_empty() || name == "." {
+                continue;
+            }
+            if name == ".." {
+                if path.is_empty() {
+                    path = "..".into();
+                } else {
+                    let (head, n) = split(&path);
+                    path = if n == ".." { join(&join(&head, ".."), "..") } else { head };
+                }
+                continue;
+            }
+            let newpath = join(&path, &name);
+            let is_link = std::fs::symlink_metadata(&newpath).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            if !is_link {
+                path = newpath;
+                continue;
+            }
+            match seen.get(&newpath) {
+                Some(Some(resolved)) => {
+                    path = resolved.clone();
+                    continue;
+                }
+                Some(None) => return (join(&newpath, &rest), false),
+                None => {}
+            }
+            seen.insert(newpath.clone(), None);
+            let target = std::fs::read_link(&newpath).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default();
+            let (p2, ok) = walk(path, &target, seen);
+            if !ok {
+                return (join(&p2, &rest), false);
+            }
+            seen.insert(newpath, Some(p2.clone()));
+            path = p2;
+        }
+        (path, true)
+    }
+    abspath(&walk(String::new(), p, &mut std::collections::HashMap::new()).0)
 }
 
 /// `html.escape(s, quote=True)`

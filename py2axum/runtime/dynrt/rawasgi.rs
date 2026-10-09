@@ -289,16 +289,16 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
     };
     let Some((first, more)) = first else {
         chan.complete();
-        return Ok(builder.body(Body::empty()).unwrap());
+        return Ok(builder.body(Body::empty()).unwrap_or_else(super::web::bad_response));
     };
     if !more {
         chan.complete();
         if sized {
-            return Ok(builder.body(Body::from(first)).unwrap());
+            return Ok(builder.body(Body::from(first)).unwrap_or_else(super::web::bad_response));
         }
         // no content-length: uvicorn sends it chunked
         let one = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(first)]);
-        return Ok(builder.body(Body::from_stream(one)).unwrap());
+        return Ok(builder.body(Body::from_stream(one)).unwrap_or_else(super::web::bad_response));
     }
     struct Done(Arc<Chan>);
     impl Drop for Done {
@@ -322,7 +322,7 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
         }
     });
     use futures_util::StreamExt;
-    Ok(builder.body(Body::from_stream(stream.fuse())).unwrap())
+    Ok(builder.body(Body::from_stream(stream.fuse())).unwrap_or_else(super::web::bad_response))
 }
 
 /// the app task's result; a panic (a status uvicorn has no line for: the connection is dropped) goes on

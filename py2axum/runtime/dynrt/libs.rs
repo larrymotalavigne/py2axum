@@ -70,11 +70,14 @@ pub fn token_urlsafe(n: &V) -> R {
     use base64::Engine;
     use rand::RngCore;
     let n = match n {
+        V::Int(i) if *i < 0 => return Err(Exc::value_error("negative argument not allowed")),
         V::Int(i) => *i as usize,
         V::None => 32,
         _ => return Err(Exc::type_error("token_urlsafe() needs an int")),
     };
-    let mut buf = vec![0u8; n];
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(n).map_err(|_| Exc::msg(&super::v::MEMORY_ERROR, ""))?;
+    buf.resize(n, 0u8);
     rand::thread_rng().fill_bytes(&mut buf);
     Ok(V::str(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)))
 }
@@ -82,11 +85,14 @@ pub fn token_urlsafe(n: &V) -> R {
 pub fn token_hex(n: &V) -> R {
     use rand::RngCore;
     let n = match n {
+        V::Int(i) if *i < 0 => return Err(Exc::value_error("negative argument not allowed")),
         V::Int(i) => *i as usize,
         V::None => 32,
         _ => return Err(Exc::type_error("token_hex() needs an int")),
     };
-    let mut buf = vec![0u8; n];
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(n).map_err(|_| Exc::msg(&super::v::MEMORY_ERROR, ""))?;
+    buf.resize(n, 0u8);
     rand::thread_rng().fill_bytes(&mut buf);
     Ok(V::str(hex::encode(buf)))
 }
@@ -184,6 +190,7 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
 
 /// `json.dumps(indent=)`: CPython's `_iterencode` layout (newline + indent per level, `[]`/`{}` when empty)
 fn write_indented(out: &mut String, v: &V, st: &pyd::JsonStyle, default_str: bool, ind: &str, level: usize) -> R<()> {
+    super::stack_guard()?;
     let nl = |out: &mut String, lvl: usize| {
         out.push('\n');
         out.push_str(&ind.repeat(lvl));

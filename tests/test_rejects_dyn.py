@@ -1461,7 +1461,7 @@ import enum
 import xmltodict
 from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 
 app = FastAPI()
 
@@ -1482,6 +1482,10 @@ async def x():
     ("class M(BaseModel):\n    _p: list = PrivateAttr(default=[], init=False)\n\n\ndef use():\n    return M().model_dump()",
      "PrivateAttr() supports default= and default_factory= only", 13),
     ("class E(str, enum.Enum):\n    A = ('a', 'utf-8')\n\n\ndef use():\n    return E.A.value", "member value ('a', 'utf-8') is not supported", 12),
+    ("class M(BaseModel):\n    a: int = 1\n    b: int = Field(default_factory=lambda d: d['a'])\n\n\ndef use():\n    return M().b",
+     "a default_factory taking the validated data", 14),
+    ("from typing import Iterable\n\n\nclass M(BaseModel):\n    xs: Iterable[int] = Field(max_length=1)\n\n\ndef use():\n"
+     "    return M(xs=[1]).model_dump()", "length constraints on `Iterable[int]` are not supported", 16),
 ])
 def test_library_ports_rejected(tmp_path, capsys, body, msg, line):
     pkg = tmp_path / "proj"

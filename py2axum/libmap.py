@@ -181,6 +181,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.AssertionError": "ASSERTION_ERROR",
     "builtins.NotImplementedError": "NOT_IMPLEMENTED_ERROR",
     "builtins.RecursionError": "RECURSION_ERROR",
+    "builtins.MemoryError": "MEMORY_ERROR",
     "builtins.ZeroDivisionError": "ZERO_DIVISION_ERROR",
     "builtins.ArithmeticError": "ARITHMETIC_ERROR",
     "builtins.OverflowError": "OVERFLOW_ERROR",

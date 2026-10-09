@@ -60,7 +60,7 @@ start ""
 compare
 stop
 
-# lists streamed from the session whenever the binary can (docs/supported.md, "Large list responses"), in
+# lists streamed from the session whenever the binary can (docs/advanced/streaming.md), in
 # blocks of 256 bytes: same bodies, but a streamed response has no content-length, so GZipMiddleware's
 # minimum size no longer applies (--ignore-encoding)
 echo "== forced streaming pass"

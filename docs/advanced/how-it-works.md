@@ -15,10 +15,10 @@ your package (.py)                py2axum (Python, stdlib only)                 
 py2axum is a compiler: it turns the Python source of a FastAPI application into a Rust crate, once, at build
 time. Nothing of Python remains at run time, except for the routes you choose to leave to a Python process
 (section 4). This page follows a route through the three stages, then explains the design choices. To use
-py2axum, start with the [getting-started guide](getting-started.md); for what is and is not translated, see
-[supported.md](supported.md).
+py2axum, start with the [getting-started guide](../getting-started/index.md); for what is and is not translated, see
+[supported.md](../supported.md).
 
-**One route, end to end.** In the [bookshelf example](../examples/bookshelf), `GET /me` returns the user
+**One route, end to end.** In the [bookshelf example](https://github.com/larrymotalavigne/py2axum/tree/main/examples/bookshelf), `GET /me` returns the user
 behind a JWT Bearer token:
 
 ```python
@@ -63,7 +63,7 @@ finds the FastAPI app(s), routers and their prefixes, routes, SQLAlchemy models 
 Library versions matter (Starlette changed CORS, Pydantic error URLs carry its version, CPython changed
 some messages): they are read from the project's `uv.lock` (else `requirements*.txt`, else `pyproject.toml`), and the
 target Python version from `requires-python`. A library version outside the
-[tested ranges](supported.md#supported-versions) is refused.
+[tested ranges](../reference/versions.md) is refused.
 
 ## 2. Compiling project code
 
@@ -160,8 +160,8 @@ hashing, integer and string methods). RustPython's implementation is a useful re
 
 ## See also
 
-- [Getting started](getting-started.md): install, check, build, run, deploy.
-- [Supported subset and known differences](supported.md).
+- [Getting started](../getting-started/index.md): install, check, build, run, deploy.
+- [Supported subset and known differences](../supported.md).
 - [Conformance](conformance.md): checking your own application against the binary.
 - The generated code of the example: run `py2axum examples/bookshelf/app --root examples/bookshelf
   --python-side auto -o build/bookshelf` and read `build/bookshelf/src/gen.rs`.
