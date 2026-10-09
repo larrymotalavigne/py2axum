@@ -2401,6 +2401,15 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
     })
 }
 
+/// a dict key as `json.dumps` writes it (also after FastAPI's `jsonable_encoder`, which keeps None keys): `None`
+/// is "null", where pydantic's serializer writes "None"
+pub fn dumps_key(k: &V) -> R<String> {
+    match k {
+        V::None => Ok("null".into()),
+        _ => json_key(k),
+    }
+}
+
 pub fn json_key(k: &V) -> R<String> {
     Ok(match k {
         V::Enum(e, i) => json_key(&e.value(*i))?,
@@ -2462,7 +2471,7 @@ pub fn jsonable(v: &V) -> R {
             let items = d.lock().values().cloned().collect::<Vec<_>>();
             let mut out = Vec::new();
             for (k, x) in items {
-                out.push((V::str(json_key(&k)?), jsonable(&x)?));
+                out.push((V::str(dumps_key(&k)?), jsonable(&x)?));
             }
             V::dict_from(out)?
         }
@@ -2590,7 +2599,8 @@ fn write(out: &mut String, v: &V, st: &JsonStyle, default_str: bool) -> R<()> {
                 if i > 0 {
                     out.push_str(st.item_sep);
                 }
-                write_str(out, &json_key(k)?, st);
+                // pydantic's serializer (`nan_null`) writes a None key as "None", json.dumps as "null"
+                write_str(out, &if st.nan_null { json_key(k)? } else { dumps_key(k)? }, st);
                 out.push_str(st.key_sep);
                 write(out, x, st, default_str)?;
             }

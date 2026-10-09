@@ -876,6 +876,7 @@ builtin_exc!(AIO_SERVER_TIMEOUT, "ServerTimeoutError", [AIO_SERVER_CONNECTION_ER
 builtin_exc!(AIO_CONNECTION_TIMEOUT, "ConnectionTimeoutError", [AIO_SERVER_TIMEOUT]);
 builtin_exc!(AIO_INVALID_URL, "InvalidURL", [AIO_CLIENT_ERROR, VALUE_ERROR]);
 builtin_exc!(UNICODE_DECODE_ERROR, "UnicodeDecodeError", [VALUE_ERROR]);
+builtin_exc!(UNICODE_ENCODE_ERROR, "UnicodeEncodeError", [VALUE_ERROR]);
 builtin_exc!(FILE_NOT_FOUND_ERROR, "FileNotFoundError", [OS_ERROR]);
 builtin_exc!(FILE_EXISTS_ERROR, "FileExistsError", [OS_ERROR]);
 builtin_exc!(PERMISSION_ERROR, "PermissionError", [OS_ERROR]);

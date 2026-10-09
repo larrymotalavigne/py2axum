@@ -191,7 +191,34 @@ def _its_cases() -> list:
         (raw.sign(b".bm90IHpsaWI").decode(), ""),
         (raw.sign(b"e30").decode().rsplit(".", 2)[0] + "..sig", ""),
     ]
+    # return_timestamp=, payload and date_signed of the exceptions (09/10/2026)
+    future = 4102444800
+    stamped = [
+        (ser(old).dumps({"user_id": 7, "purpose": "2fa"}), ""),
+        (ser(old).dumps({"user_id": 7, "purpose": "2fa"}), "&positional=true"),
+        (ser(old).dumps({"m": 1}, salt="magic"), "&salt=magic"),
+        (ser(old).dumps({"m": 1}, salt="magic"), "&salt=magic&positional=true"),
+        (ser(old).dumps({"m": 1}, salt="magic"), ""),  # wrong salt: BadTimeSignature with date_signed
+        (ser(old).dumps({"user_id": 7}), "&max_age=60"),  # SignatureExpired.date_signed
+        (ser(old).dumps({"user_id": 7}), "&max_age=60&positional=true"),
+        (ser(future).dumps({"user_id": 7}), "&max_age=60"),  # age < 0
+        (ser(0).dumps({"epoch": True}), ""),
+        (ser(253_402_300_799).dumps([1]), ""),  # the last second datetime takes
+        (ser(old).dumps({"a": 1})[:-2] + "xx", ""),
+        (ser(old).dumps({"a": 1})[:-2] + "xx", "&max_age=60"),
+        ("nodot", ""),
+        ("a.b", ""),  # timestamp missing (signature error first)
+        (raw.sign(b"e30").decode().rsplit(".", 2)[0] + "..sig", ""),
+        (raw.sign(b"e30").decode().rsplit(".", 2)[0] + ".AQAAAAAAAAAA.sig", ""),  # bad sig, a 9-byte timestamp: no date (struct.error swallowed)
+        (raw.sign(b"e30").decode().rsplit(".", 2)[0] + ".AAAAAAAAAAAAAAE.sig", ""),  # 11 bytes, even with leading zeros: no date
+        (raw.sign(b"e30").decode().rsplit(".", 2)[0] + ".f_________8.sig", ""),  # past year 9999: malformed timestamp
+        (raw.sign(b"e30").decode().rsplit(".", 2)[0] + ".!!.sig", ""),  # undecodable timestamp: no date_signed
+        (raw.sign(b"!!!").decode(), ""),
+        (raw.sign(b".bm90IHpsaWI").decode(), ""),
+    ]
     return [("GET", f"/its/check?token={quote(t)}{q}", None) for t, q in tokens] + [
+        ("GET", f"/its/stamped?token={quote(t)}{q}", None) for t, q in stamped] + [
+        ("POST", "/its/fresh", {"user_id": 1, "purpose": "2fa"}),
         ("POST", "/its/issue", {"user_id": 1, "purpose": "2fa", "é": "ü"}),
         ("POST", "/its/issue?salt=magic", {"mandant_id": 3}),
         ("POST", "/its/issue", big),
@@ -1393,6 +1420,21 @@ STEPS += [
     ("DELETE", "/pydmore/notices?pattern=%5Ex&flags=g", None),
     ("POST", "/stdmore/counter", ["10.0.0.1", "10.0.0.2", "10.0.0.1", "", "b", "10.0.0.2", "10.0.0.1"]),
     ("POST", "/stdmore/counter", []),
+    # arguments the runtime used to drop (audit of 09/10/2026): fixtures/dynapp/kwargs.py
+    ("POST", "/kw/encode", {"text": "Bâtiment € 3"}),
+    ("POST", "/kw/encode", {"text": "plain"}),
+    ("POST", "/kw/encode", {"text": "éé€x😀"}),
+    *[("GET", f"/kw/find?s=abcabc&sub={sub}{q}", None) for sub in ("b", "", "c", "zz") for q in (
+        "", "&start=2", "&start=2&end=4", "&start=-2", "&start=10", "&start=4&end=2", "&start=0&end=-1", "&start=3&end=3")],
+    ("POST", "/kw/seq", [1, 2, 3, 2, 1]),
+    ("POST", "/kw/seq", [2]),
+    *[("GET", f"/kw/resp/{k}", None) for k in ("text", "html", "redirect", "file")],
+    ("GET", "/kw/mime", None),
+    ("POST", "/kw/path", {"text": "Clé à 5 $"}),
+    ("POST", "/kw/path", {"text": "plain"}),
+    ("POST", "/kw/csv", {"text": "a,b,c\n1,2\n1,2,3,4,5\n\n7,8,9\n"}),
+    ("POST", "/kw/redis", None),
+    ("POST", "/kw/isinstance", {"vals": [1, 2.5, "s", True, [1], {"a": 1}]}),
     ("GET", "/stdmore/tcp", None),
     ("GET", "/stdmore/tcp?host=localhost", None),
     ("GET", "/stdmore/tcp?host=nonexistent.invalid&port=25", None),

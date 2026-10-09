@@ -7,13 +7,13 @@ refused at compile time with `file:line`.
 `combine`, `fromtimestamp`), `decimal` (`_pydecimal` rules: 28 digits, ROUND_HALF_EVEN, exact
 add/mul then rounding, CPython's division, `quantize`, `round`, formatting; mixing with float refused),
 `uuid`, `json`, `re` (fancy-regex with Python syntax translated; consecutive empty matches follow Rust, not
-Python 3.7+), `csv` (simplified `Sniffer`), `io.StringIO/BytesIO`, `pathlib`/`open()` (UTF-8, POSIX),
+Python 3.7+; `pos`/`endpos` of a compiled pattern's methods refused), `csv` (simplified `Sniffer`; `DictReader(restval=, restkey=)`; a positional dialect refused), `io.StringIO/BytesIO`, `pathlib`/`open()` (UTF-8, POSIX; `Path.read_text/write_text(encoding=, errors=)` with the codecs below),
 `os.environ`/`os.getenv` (read-only), `os.path`, `math`, `random` (OS-seeded), `secrets`, `hashlib`,
 `hmac`, `base64`, `urllib.parse`, `string` constants, `time.time/monotonic/perf_counter`,
 `statistics.median`, `logging` (stderr, `LEVEL:logger:message`, level from `PY2AXUM_LOG_LEVEL`; level constants,
 `Logger.log` with a standard level),
 `email.mime` (incl. `MIMEBase` with `set_payload` and `email.encoders.encode_base64`)/`email.utils` (`formataddr`, `formatdate`, `make_msgid`), `html.escape`, `ipaddress.ip_address`/`ip_network` (prefix length, `strict=`; membership, str/repr; no netmask form, no IPv6 scope id), `socket.getaddrinfo` (the C library's answer; family and kind are plain ints, not `AddressFamily`/`SocketKind` members; `gaierror` carries only its message),
-`unicodedata.normalize/combining` (the Unicode version of the Python that ran the translation: code points it
+codecs of `str.encode`, `bytes.decode` and `str(b, encoding)`: utf-8, utf-8-sig, latin-1 and ascii with their CPython aliases (`errors=` strict, ignore or replace when encoding, strict when decoding; any other codec raises), `unicodedata.normalize/combining` (the Unicode version of the Python that ran the translation: code points it
 leaves unassigned are left alone, as CPython does), `bytes()`, `pickle` (see below), `functools.wraps`, `inspect.iscoroutinefunction`,
 `importlib.metadata.version("literal")` (resolved at compile time from what `uv sync --frozen` installs: the project of the `pyproject.toml` next to a `uv.lock` at `--root` or above, or a package of that lock; any other name raises `PackageNotFoundError`; refused without such a lock), `typing.get_args/get_origin/get_type_hints`, `collections.defaultdict` with a builtin type factory (`int`, `list`, `str`...) or `deque` (`type()` of it reports `dict`), `zipfile.ZipFile(io.BytesIO(), "w", ZIP_STORED | ZIP_DEFLATED, compresslevel=)` with `writestr(name, str | bytes,
 compress_type=, compresslevel=)`, `namelist`, `close`/`with` (CPython's bytes: same headers, `0o600` permissions,

@@ -640,6 +640,7 @@ pub fn cmp(a: &V, b: &V) -> R<std::cmp::Ordering> {
     }
     Ok(match (a, b) {
         (V::Str(x), V::Str(y)) => x.cmp(y),
+        (V::Bytes(x), V::Bytes(y)) => x[..].cmp(&y[..]),
         (V::Tuple(x), V::Tuple(y)) => seq_cmp(x, y)?,
         (V::List(x), V::List(y)) => seq_cmp(&x.lock().clone(), &y.lock().clone())?,
         (V::DateTime(x), V::DateTime(y)) => {

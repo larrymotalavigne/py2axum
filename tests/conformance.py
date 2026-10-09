@@ -51,9 +51,36 @@ def mask_datetimes(value, sent: set[str]):
     return value
 
 
+class Dyn:
+    """A step's path or body computed when the step is played, from what this same server answered before
+    (a token it sent by e-mail, a TOTP code from the secret it handed out): `fn(ctx)`, where `ctx["bodies"]`
+    maps each "METHOD path" (or label) played so far to its last JSON body and `ctx["last"]` is the latest one.
+    `label` stands for the value in the report, the same for both servers. A value that differs between the
+    servers (a token) is registered with `Dyn.mask(ctx, value, label)`: it is replaced by its label everywhere
+    in what is compared (a redirect's location, a body)."""
+
+    def __init__(self, fn, label: str = "<dyn>"):
+        self.fn, self.label = fn, label
+
+    @staticmethod
+    def mask(ctx: dict, value: str, label: str) -> str:
+        ctx.setdefault("masks", {})[value] = label
+        return value
+
+    def __repr__(self) -> str:
+        return self.label
+
+
+def is_dyn(x) -> bool:
+    # by name: run as a script, this module is __main__ while the scenarios import tests.conformance
+    return type(x).__name__ == "Dyn" and hasattr(x, "fn")
+
+
 def sent_datetimes(steps) -> set[str]:
     found: set[str] = set()
     for step in steps:
+        if is_dyn(step[1]) or is_dyn(step[2]):
+            continue
         payload = step[2]
         text = payload.decode(errors="replace") if isinstance(payload, bytes) else json.dumps(payload, default=repr)
         found.update(DATETIME.findall(text + " " + step[1]))
@@ -122,10 +149,24 @@ def mask_file(scenario, value: str | None) -> str | None:
     return value
 
 
-def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str = DB, on_response=None) -> dict | None:
+def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str = DB, on_response=None,
+             ctx: dict | None = None) -> dict | None:
     """Play one step on one server and return what is compared (None for a SQL fixture step, run on `db`).
-    `on_response(r)` sees the raw response first (tests/difftest.py learns the credentials it hands out)."""
+    `on_response(r)` sees the raw response first (tests/difftest.py learns the credentials it hands out).
+    `ctx`: what this server answered so far, for the `Dyn` values of the step."""
     method, path, payload = step[:3]
+    ctx = {"bodies": {}, "last": None} if ctx is None else ctx
+    shown = path.label if is_dyn(path) else path
+    if is_dyn(payload):
+        shown = f"{shown} {payload.label}"
+    try:
+        if is_dyn(path):
+            path = path.fn(ctx)
+        if is_dyn(payload):
+            payload = payload.fn(ctx)
+    except (LookupError, TypeError) as e:
+        # what the step needed never came (no e-mail, no secret in the previous answer): compared as such
+        return {"req": f"{method} {shown}", "error": f"{type(e).__name__}: {e}"}
     if method == "WS":
         return ws_step(base, step)
     if method == "SQL":
@@ -136,7 +177,6 @@ def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str
         with psycopg.connect(db.replace("postgresql+psycopg://", "postgresql://")) as conn:
             conn.execute(path)
         return None
-    normalize = getattr(scenario, "normalize", lambda body: body)
     headers = dict(step[3]) if len(step) > 3 else {}
     if isinstance(payload, bytes):
         kw = {"content": payload, "headers": {**J, **headers}}
@@ -156,6 +196,23 @@ def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str
             return {"req": f"{method} {path}", "error": type(e).__name__}
     if on_response is not None:
         on_response(r)
+    try:
+        ctx["last"] = ctx["bodies"][f"{method} {shown}"] = r.json() if r.content else None
+    except ValueError:
+        ctx["last"] = ctx["bodies"][f"{method} {shown}"] = None
+    out = observe(r, base, scenario, method, path, sent)
+    out["req"] = f"{method} {shown}"
+    if ctx.get("masks"):
+        text = json.dumps(out, ensure_ascii=False)
+        for value, label in sorted(ctx["masks"].items(), key=lambda m: -len(m[0])):
+            text = text.replace(value, label)
+        out = json.loads(text)
+    return out
+
+
+def observe(r: httpx.Response, base: str, scenario, method: str, path: str, sent: set[str]) -> dict:
+    """What is compared of one response (corpus/ compares the official FastAPI tests' requests with it too)."""
+    normalize = getattr(scenario, "normalize", lambda body: body)
     ctype = r.headers.get("content-type", "").split(";")[0]
     try:
         body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
@@ -206,10 +263,10 @@ def client(base: str) -> httpx.Client:
 def run(base: str, scenario) -> list[dict]:
     scenario.reset(DB)
     sent = sent_datetimes(scenario.STEPS)
-    out = []
+    out, ctx = [], {"bodies": {}, "last": None}
     with client(base) as c:
         for step in scenario.STEPS:
-            got = exchange(c, base, scenario, step, sent)
+            got = exchange(c, base, scenario, step, sent, ctx=ctx)
             if got is not None:
                 out.append(got)
     return out

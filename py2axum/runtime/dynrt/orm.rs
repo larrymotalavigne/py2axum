@@ -1228,7 +1228,8 @@ pub fn sessionmaker(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
             "expire_on_commit" => expire = ops::truthy(v)?,
             "autoflush" => autoflush = ops::truthy(v)?,
             "autocommit" if !ops::truthy(v)? => {}
-            "class_" => {}
+            // class_=AsyncSession / Session (the default); a project subclass would be ignored: refused
+            "class_" if !matches!(v, V::Class(_)) => {}
             other => return Err(Exc::type_error(format!("py2axum: async_sessionmaker({other}=) is not supported"))),
         }
     }
@@ -1338,6 +1339,10 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
     let one = |args: &Vec<V>| -> R<V> {
         args.first().cloned().ok_or_else(|| Exc::type_error(format!("{name}() takes one argument")))
     };
+    // a second positional of a pattern operator (`like(pat, escape)`, `startswith(s, escape)`): refused, never dropped
+    if matches!(name, "like" | "ilike" | "not_like" | "not_ilike" | "startswith" | "endswith" | "contains") && args.len() > 1 {
+        return Err(Exc::type_error(format!("py2axum: {name}() with {} positional arguments is not supported", args.len())));
+    }
     if let Sql::Rel(m, ri) = &base {
         match name {
             "has" | "any" => return rel_exists(m, *ri, name, &args, &kwargs),

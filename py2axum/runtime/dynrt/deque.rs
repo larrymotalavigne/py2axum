@@ -106,7 +106,11 @@ fn not_found(what: &str) -> Exc {
 }
 
 pub fn method(d: &Arc<Deque>, name: &str, args: &[V]) -> R {
-    let one = || args.first().cloned().ok_or_else(|| Exc::type_error(format!("deque.{name}() takes exactly one argument (0 given)")));
+    // a second positional (`index(x, start, stop)`) is refused, never dropped
+    let one = || match args {
+        [x] => Ok(x.clone()),
+        _ => Err(Exc::type_error(format!("py2axum: deque.{name}() takes exactly one argument here ({} given)", args.len()))),
+    };
     Ok(match name {
         "append" => {
             push(d, one()?, false);

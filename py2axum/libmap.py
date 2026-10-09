@@ -197,6 +197,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.NameError": "NAME_ERROR",
     "builtins.FileNotFoundError": "FILE_NOT_FOUND_ERROR",
     "builtins.UnicodeDecodeError": "UNICODE_DECODE_ERROR",
+    "builtins.UnicodeEncodeError": "UNICODE_ENCODE_ERROR",
     "builtins.ImportError": "IMPORT_ERROR",
     "builtins.ModuleNotFoundError": "MODULE_NOT_FOUND_ERROR",
     "importlib.metadata.PackageNotFoundError": "PACKAGE_NOT_FOUND",
@@ -387,6 +388,55 @@ def _bind(name, a, kw, params, allowed):
             raise ValueError(f"{name}({k}=) is not supported")
         vals[k] = v
     return vals
+
+
+# Starlette's signatures (1.x): arguments bound by name, so the runtime never reads a positional at a wrong index;
+# those the runtime does not implement are refused here (`background=` was dropped when given positionally)
+_RESP_PARAMS = {
+    "RedirectResponse": ["url", "status_code", "headers", "background"],
+    "FileResponse": ["path", "status_code", "headers", "media_type", "background", "filename", "stat_result", "method",
+                     "content_disposition_type"],
+}
+_RESP_UNSUPPORTED = {"background", "stat_result", "method"}
+
+
+def _resp(kind):
+    params = _RESP_PARAMS.get(kind, ["content", "status_code", "headers", "media_type", "background"])
+
+    def build(a, kw):
+        v = _bind(kind, a, kw, params, set(params) - _RESP_UNSUPPORTED)
+        # a literal None (`FileResponse(p, 200, None, None, None, "a.txt")`) is the default
+        v = {k: x for k, x in v.items() if not (k in _RESP_UNSUPPORTED and x == "V::None")}
+        bad = sorted(set(v) & _RESP_UNSUPPORTED)
+        if bad:
+            raise ValueError(f"{kind}({bad[0]}=) is not supported (a background task: return it from the endpoint "
+                             "or use BackgroundTasks)" if bad[0] == "background" else f"{kind}({bad[0]}=) is not supported")
+        return f"{RT}::resp::new(\"{kind}\", &[], &{_kwvec(v)})"
+    return build
+
+
+# email.mime constructors: (named parameters, those implemented, whether other keywords are `**_params` of the
+# Content-Type); `policy=`, `boundary=`, `_subparts=`, `_encoder=` are refused, never ignored
+_MIME = {
+    "MIMEMultipart": (["_subtype", "boundary", "_subparts"], {"_subtype"}, True),
+    "MIMEText": (["_text", "_subtype", "_charset"], {"_text", "_subtype", "_charset"}, False),
+    "MIMEApplication": (["_data", "_subtype", "_encoder"], {"_data", "_subtype"}, True),
+    "MIMEBase": (["_maintype", "_subtype"], {"_maintype", "_subtype"}, True),
+}
+
+
+def _mime(cls):
+    params, allowed, extra = _MIME[cls]
+
+    def build(a, kw):
+        named = {k: v for k, v in kw.items() if k in params or not extra or k == "policy"}
+        v = _bind(cls, a, named, params, allowed)
+        bad = sorted(set(v) - allowed)
+        if bad:
+            raise ValueError(f"{cls}({bad[0]}=) is not supported")
+        rest = {k: x for k, x in kw.items() if k not in named}
+        return f"{RT}::mail::mime_new(\"{cls}\", &[], &{_kwvec({**v, **rest})})"
+    return build
 
 
 def _its_serializer(a, kw):
@@ -624,7 +674,7 @@ CALLS = {
     **{f"{m}.templating.Jinja2Templates": lambda a, kw: f"{RT}::mail::templates(&{_argv(a)}, &{_kwvec(kw)})" for m in ("fastapi", "starlette")},
     "jinja2.FileSystemLoader": lambda a, kw: f"{RT}::mail::fs_loader(&{_bind('FileSystemLoader', a, kw, ['searchpath'], {'searchpath'})['searchpath']})",
     "jinja2.select_autoescape": lambda a, kw: f"{RT}::mail::select_autoescape({('Some(&' + _bind('select_autoescape', a, kw, ['enabled_extensions'], {'enabled_extensions'})['enabled_extensions'] + ')') if (a or kw) else 'None'})",
-    **{f"email.mime.{m}.{c}": (lambda c: lambda a, kw: f"{RT}::mail::mime_new(\"{c}\", &{_argv(a)}, &{_kwvec(kw)})")(c)
+    **{f"email.mime.{m}.{c}": _mime(c)
        for m, c in (("multipart", "MIMEMultipart"), ("text", "MIMEText"), ("application", "MIMEApplication"), ("base", "MIMEBase"))},
     "email.encoders.encode_base64": lambda a, kw: f"{RT}::mail::encode_base64(&{a[0]})",
     # positional-only in CPython: keywords are a TypeError there, refused here
@@ -653,19 +703,19 @@ CALLS = {
     "email.utils.make_msgid": lambda a, kw: f"{RT}::mail::make_msgid({('Some(&' + _bind('make_msgid', a, kw, ['idstring', 'domain'], {'domain'})['domain'] + ')') if kw.get('domain') else 'None'})",
     "aiosmtplib.send": lambda a, kw: f"{RT}::mail::smtp_send({_argv(a)}, {_kwvec(kw)}).await",
     # Starlette responses returned by an endpoint
-    "fastapi.responses.Response": (lambda a, kw: f"{RT}::resp::new(\"Response\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "starlette.responses.Response": (lambda a, kw: f"{RT}::resp::new(\"Response\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "fastapi.responses.JSONResponse": (lambda a, kw: f"{RT}::resp::new(\"JSONResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "starlette.responses.JSONResponse": (lambda a, kw: f"{RT}::resp::new(\"JSONResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "fastapi.responses.PlainTextResponse": (lambda a, kw: f"{RT}::resp::new(\"PlainTextResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "starlette.responses.PlainTextResponse": (lambda a, kw: f"{RT}::resp::new(\"PlainTextResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "fastapi.responses.HTMLResponse": (lambda a, kw: f"{RT}::resp::new(\"HTMLResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "starlette.responses.HTMLResponse": (lambda a, kw: f"{RT}::resp::new(\"HTMLResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "fastapi.responses.RedirectResponse": (lambda a, kw: f"{RT}::resp::new(\"RedirectResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "starlette.responses.RedirectResponse": (lambda a, kw: f"{RT}::resp::new(\"RedirectResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "fastapi.responses.FileResponse": (lambda a, kw: f"{RT}::resp::new(\"FileResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "starlette.responses.FileResponse": (lambda a, kw: f"{RT}::resp::new(\"FileResponse\", &{_argv(a)}, &{_kwvec(kw)})"),
-    "fastapi.Response": (lambda a, kw: f"{RT}::resp::new(\"Response\", &{_argv(a)}, &{_kwvec(kw)})"),
+    "fastapi.responses.Response": _resp("Response"),
+    "starlette.responses.Response": _resp("Response"),
+    "fastapi.responses.JSONResponse": _resp("JSONResponse"),
+    "starlette.responses.JSONResponse": _resp("JSONResponse"),
+    "fastapi.responses.PlainTextResponse": _resp("PlainTextResponse"),
+    "starlette.responses.PlainTextResponse": _resp("PlainTextResponse"),
+    "fastapi.responses.HTMLResponse": _resp("HTMLResponse"),
+    "starlette.responses.HTMLResponse": _resp("HTMLResponse"),
+    "fastapi.responses.RedirectResponse": _resp("RedirectResponse"),
+    "starlette.responses.RedirectResponse": _resp("RedirectResponse"),
+    "fastapi.responses.FileResponse": _resp("FileResponse"),
+    "starlette.responses.FileResponse": _resp("FileResponse"),
+    "fastapi.Response": _resp("Response"),
     # re
     "re.compile": lambda a, kw: f"{RT}::stdlib::compile(&{_bind('compile', a, kw, ['pattern', 'flags'], {'pattern', 'flags'})['pattern']}, "
                                 f"{('Some(&' + _bind('compile', a, kw, ['pattern', 'flags'], {'pattern', 'flags'})['flags'] + ')') if (len(a) > 1 or 'flags' in kw) else 'None'})",

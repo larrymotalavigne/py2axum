@@ -331,10 +331,26 @@ fn argv<'a>(args: &'a [V], kwargs: &'a [(String, V)], i: usize, name: &str) -> O
 /// `MIMEMultipart(_subtype="mixed")`, `MIMEText(_text, _subtype="plain", _charset=None)`,
 /// `MIMEApplication(_data, _subtype="octet-stream")`
 pub fn mime_new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    // `**_params` of the Content-Type (MIMEBase.add_header): every keyword not a named parameter
+    let named: &[&str] = match kind {
+        "MIMEMultipart" => &["_subtype"],
+        "MIMEText" => &["_text", "_subtype", "_charset"],
+        "MIMEApplication" => &["_data", "_subtype"],
+        _ => &["_maintype", "_subtype"],
+    };
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| matches!(k.as_str(), "policy" | "boundary" | "_subparts" | "_encoder") || (kind == "MIMEText" && !named.contains(&k.as_str()))) {
+        return Err(Exc::type_error(format!("py2axum: {kind}({k}=) is not supported")));
+    }
+    let params = |mut ctype: String| -> R<String> {
+        for (k, v) in kwargs.iter().filter(|(k, _)| !named.contains(&k.as_str())) {
+            ctype += &format!("; {}", format_param(&k.replace('_', "-"), &ops::str_(v)?));
+        }
+        Ok(ctype)
+    };
     match kind {
         "MIMEMultipart" => {
             let sub = argv(args, kwargs, 0, "_subtype").map(ops::str_).transpose()?.unwrap_or_else(|| "mixed".into());
-            Ok(mime(MimeKind::Multipart(sub.clone()), vec![("Content-Type".into(), format!("multipart/{sub}")), ("MIME-Version".into(), "1.0".into())]))
+            Ok(mime(MimeKind::Multipart(sub.clone()), vec![("Content-Type".into(), params(format!("multipart/{sub}"))?), ("MIME-Version".into(), "1.0".into())]))
         }
         "MIMEText" => {
             let body = ops::str_(argv(args, kwargs, 0, "_text").ok_or_else(|| Exc::type_error("MIMEText() missing '_text'"))?)?;
@@ -364,7 +380,7 @@ pub fn mime_new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             Ok(mime(
                 MimeKind::App { sub: sub.clone(), data },
                 vec![
-                    ("Content-Type".into(), format!("application/{sub}")),
+                    ("Content-Type".into(), params(format!("application/{sub}"))?),
                     ("MIME-Version".into(), "1.0".into()),
                     ("Content-Transfer-Encoding".into(), "base64".into()),
                 ],
@@ -373,11 +389,7 @@ pub fn mime_new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         "MIMEBase" => {
             let main = ops::str_(argv(args, kwargs, 0, "_maintype").ok_or_else(|| Exc::type_error("MIMEBase.__init__() missing 2 required positional arguments: '_maintype' and '_subtype'"))?)?;
             let sub = ops::str_(argv(args, kwargs, 1, "_subtype").ok_or_else(|| Exc::type_error("MIMEBase.__init__() missing 1 required positional argument: '_subtype'"))?)?;
-            let mut ctype = format!("{main}/{sub}");
-            for (k, v) in kwargs.iter().filter(|(k, _)| k != "_maintype" && k != "_subtype" && k != "policy") {
-                ctype += &format!("; {}", format_param(&k.replace('_', "-"), &ops::str_(v)?));
-            }
-            Ok(mime(MimeKind::Base, vec![("Content-Type".into(), ctype), ("MIME-Version".into(), "1.0".into())]))
+            Ok(mime(MimeKind::Base, vec![("Content-Type".into(), params(format!("{main}/{sub}"))?), ("MIME-Version".into(), "1.0".into())]))
         }
         _ => Err(Exc::type_error(format!("py2axum: email.mime {kind} is not supported"))),
     }
@@ -454,6 +466,10 @@ pub fn mime_method(m: &Arc<Mime>, name: &str, args: &[V], kwargs: &[(String, V)]
             Ok(V::None)
         }
         "as_string" | "as_bytes" => {
+            // unixfrom=, maxheaderlen=, policy=: refused, never ignored
+            if !args.is_empty() || !kwargs.is_empty() {
+                return Err(Exc::type_error(format!("py2axum: Message.{name}() with arguments is not supported")));
+            }
             let s = render(m);
             Ok(if name == "as_bytes" { V::Bytes(Arc::from(s.into_bytes())) } else { V::str(s) })
         }

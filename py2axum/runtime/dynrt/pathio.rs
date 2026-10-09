@@ -219,16 +219,45 @@ pub fn path_method(p: &str, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
             Ok(path(&q))
         }
         "read_bytes" => std::fs::read(p).map(|b| V::Bytes(Arc::from(b))).map_err(|e| os_err(e, p)),
-        "read_text" => std::fs::read(p).map(|b| V::str(String::from_utf8_lossy(&b))).map_err(|e| os_err(e, p)),
-        "write_bytes" | "write_text" => {
-            let data: Vec<u8> = match (name, args.first()) {
-                ("write_bytes", Some(V::Bytes(b))) => b.to_vec(),
-                ("write_text", Some(V::Str(s))) => s.as_bytes().to_vec(),
-                (_, Some(o)) => return Err(Exc::type_error(format!("data must be {}, not {}", if name == "write_bytes" { "bytes" } else { "str" }, o.type_name()))),
-                _ => return Err(Exc::type_error(format!("{name}() missing argument"))),
+        // read_text(encoding=None, errors=None): bytes.decode (the locale's encoding is utf-8 here)
+        "read_text" => {
+            if args.len() > 2 || kwargs.iter().any(|(k, _)| k != "encoding" && k != "errors") {
+                return Err(Exc::type_error("py2axum: Path.read_text(encoding=, errors=) only"));
+            }
+            let b = std::fs::read(p).map_err(|e| os_err(e, p))?;
+            let ea: Vec<V> = (0..2).map(|i| args.get(i).or_else(|| kw(kwargs, ["encoding", "errors"][i])).cloned().unwrap_or(V::None)).collect();
+            let ea: Vec<V> = if ea[1].is_none() { ea[..1].iter().filter(|v| !v.is_none()).cloned().collect() } else { vec![if ea[0].is_none() { V::str("utf-8") } else { ea[0].clone() }, ea[1].clone()] };
+            super::methods::bytes_decode(&b, &ea, &[], "read_text")
+        }
+        "write_bytes" => {
+            if args.len() != 1 || !kwargs.is_empty() {
+                return Err(Exc::type_error("write_bytes() takes exactly one argument"));
+            }
+            let V::Bytes(b) = &args[0] else { return Err(Exc::type_error(format!("memoryview: a bytes-like object is required, not '{}'", args[0].type_name()))) };
+            std::fs::write(p, &b[..]).map_err(|e| os_err(e, p))?;
+            Ok(V::Int(b.len() as i64))
+        }
+        // write_text(data, encoding=None, errors=None, newline=None): str.encode; newline translation refused
+        "write_text" => {
+            if args.len() > 4 || kwargs.iter().any(|(k, _)| !matches!(k.as_str(), "data" | "encoding" | "errors" | "newline")) {
+                return Err(Exc::type_error("py2axum: Path.write_text(data, encoding=, errors=, newline=) only"));
+            }
+            let at = |i: usize, n: &str| args.get(i).or_else(|| kw(kwargs, n)).cloned().unwrap_or(V::None);
+            let data = match at(0, "data") {
+                V::Str(s) => s,
+                V::None => return Err(Exc::type_error("write_text() missing 1 required positional argument: 'data'")),
+                o => return Err(Exc::type_error(format!("data must be str, not {}", o.type_name()))),
             };
-            std::fs::write(p, &data).map_err(|e| os_err(e, p))?;
-            Ok(V::Int(if name == "write_text" { String::from_utf8_lossy(&data).chars().count() } else { data.len() } as i64))
+            match at(3, "newline") {
+                V::None => {}
+                V::Str(n) if &*n == "\n" || n.is_empty() => {}
+                _ => return Err(Exc::type_error("py2axum: Path.write_text(newline=) other than None, '' or '\\n' is not supported")),
+            }
+            let (enc, err) = (at(1, "encoding"), at(2, "errors"));
+            let ea: Vec<V> = vec![if enc.is_none() { V::str("utf-8") } else { enc }, if err.is_none() { V::str("strict") } else { err }];
+            let V::Bytes(b) = super::methods::str_encode(&data, &ea, &[])? else { unreachable!() };
+            std::fs::write(p, &b[..]).map_err(|e| os_err(e, p))?;
+            Ok(V::Int(data.chars().count() as i64))
         }
         "as_posix" | "__fspath__" => Ok(V::str(p)),
         "is_absolute" => Ok(V::Bool(p.starts_with('/'))),

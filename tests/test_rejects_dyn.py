@@ -2036,3 +2036,90 @@ def test_engine_connect_args_generated(tmp_path):
     assert "engine_connect_args" in gen
     init = gen[gen.index("pub async fn init_globals"):]
     assert "g_proj_main__engine(cx)" in init[:init.index("\n}")]
+
+
+ITS_MAIN = """
+from fastapi import FastAPI
+from itsdangerous import URLSafeTimedSerializer
+
+app = FastAPI()
+S = URLSafeTimedSerializer("k", salt="s")
+
+
+@app.get("/x")
+async def x(t: str):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    # incident of 09/10/2026 (a production app): an argument the runtime did not implement was a TypeError (a 500) at run time
+    ("S.loads(t, max_age=5, serializer=None)", ".loads(serializer=) is not supported (only max_age, return_timestamp, salt)"),
+    ("S.loads(t, 5, True, 's', 'x')", ".loads() takes at most 4 positional arguments here"),
+    ("S.loads(*[t])", ".loads() takes at most 4 positional arguments here (no * or ** unpacking)"),
+    ("S.loads(t, **{'max_age': 5})", ".loads() takes at most 4 positional arguments here (no * or ** unpacking)"),
+    ("S.dumps({'a': 1}, header_fields={})", ".dumps(header_fields=) is not supported (only salt)"),
+    ("S.dumps({'a': 1}, 's', 'x')", ".dumps() takes at most 2 positional arguments here"),
+    ("S.loads_unsafe(t)", "method .loads_unsafe() is not implemented by the runtime"),
+])
+def test_itsdangerous_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(ITS_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:11" in err
+
+
+KW_MAIN = """
+import re
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from fastapi import FastAPI, Response
+from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+class M(BaseModel):
+    a: int = 1
+
+
+@app.get("/x")
+async def x(t: str, response: Response):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    # arguments the runtime dropped or ignored, refused at generation since 09/10/2026 (same class as return_timestamp=)
+    ("t.encode('utf-8', 'strict', 1)", ".encode() takes at most 2 positional arguments here"),
+    ("t.encode(encoding='utf-8', bom=True)", ".encode(bom=) is not supported (only encoding, errors)"),
+    ("t.find('a', 1, 2, 3)", ".find() takes at most 3 positional arguments here"),
+    ("M.model_validate_json('{}', strict=True)", ".model_validate_json(strict=) is not supported"),
+    ("M.model_validate({}, context={})", ".model_validate(context=) is not supported (only from_attributes)"),
+    ("response.set_cookie('a', 'b', partitioned=True)", ".set_cookie(partitioned=) is not supported"),
+    ("PlainTextResponse('x', background=t)", "PlainTextResponse(background=) is not supported"),
+    ("FileResponse('p', 200, None, None, t)", "FileResponse(background=) is not supported"),
+    ("FileResponse('p', stat_result=t)", "FileResponse(stat_result=) is not supported"),
+    ("MIMEApplication(b'x', _encoder=t)", "MIMEApplication(_encoder=) is not supported"),
+    ("MIMEText('x', policy=t)", "MIMEText(policy=) is not supported"),
+    ("MIMEMultipart(boundary='b')", "MIMEMultipart(boundary=) is not supported"),
+    ("re.compile('a').search(t, 1, 2, 3)", ".search() takes at most 3 positional arguments here"),
+    ("re.compile('a').fullmatch(t, 1)", ".fullmatch() takes at most 1 positional argument here"),
+    ("re.match('(a)', t).groupdict(fallback=1)", ".groupdict(fallback=) is not supported (only default)"),
+])
+def test_dropped_arguments_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(KW_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:20" in err

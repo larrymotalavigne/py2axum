@@ -650,12 +650,26 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         }
         V::Native(n) if matches!(&**n, Native::Stream(..)) => {
             let Native::Stream(s, w) = &**n else { unreachable!() };
+            if let Some((k, _)) = kwargs.first() {
+                return Err(Exc::type_error(format!("py2axum: stream.{name}({k}=) is not supported (positional arguments only)")));
+            }
             super::net::stream_method(s, *w, name, &args).await
         }
         V::Native(n) if matches!(&**n, Native::TLock(_) | Native::TEvent(_) | Native::TThread(_) | Native::ELoop(_)) => match &**n {
             Native::TLock(l) => super::thread::lock_method(l, name, &args, &kwargs),
             Native::TEvent(e) => super::thread::event_method(e, name, &args, &kwargs),
-            Native::TThread(t) => super::thread::thread_method(cx, t, name, &args),
+            Native::TThread(t) => {
+                // join(timeout=None): the keyword as the positional; any other keyword refused, never dropped
+                let mut args = args;
+                for (k, v) in kwargs {
+                    if k != "timeout" || name != "join" || !args.is_empty() {
+                        return Err(Exc::type_error(format!("py2axum: Thread.{name}({k}=) is not supported")));
+                    }
+                    args.push(v);
+                }
+                super::thread::thread_method(cx, t, name, &args)
+            }
+            Native::ELoop(_) if !kwargs.is_empty() => Err(Exc::type_error(format!("py2axum: loop.{name}({}=) is not supported", kwargs[0].0))),
             Native::ELoop(l) => Box::pin(super::thread::loop_method(cx, recv, l, name, args)).await,
             _ => unreachable!(),
         },
@@ -726,40 +740,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         V::Enum(e, i) if e.kind != EnumKind::Plain => Box::pin(call_method(cx, &e.value(*i), name, args, kwargs)).await,
         V::Decimal(d) => super::decimal::method(d, name, &args, &kwargs),
         V::Str(s) => str_method(s, name, &args, &kwargs),
-        V::Bytes(b) if name == "decode" => {
-            let enc = args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "encoding").map(|(_, v)| v));
-            let errors = args.get(1).or_else(|| kwargs.iter().find(|(k, _)| k == "errors").map(|(_, v)| v));
-            if let Some(e) = errors {
-                if ops::str_(e)? != "strict" {
-                    return Err(Exc::type_error("py2axum: bytes.decode() supports errors='strict' only"));
-                }
-            }
-            if args.len() > 2 || kwargs.iter().any(|(k, _)| k != "encoding" && k != "errors") {
-                return Err(Exc::type_error("decode() takes at most 2 arguments"));
-            }
-            let e = match enc {
-                Some(e) => ops::str_(e)?.to_ascii_lowercase().replace(['_', ' '], "-"),
-                None => "utf-8".into(),
-            };
-            match e.as_str() {
-                "utf-8" | "utf8" | "u8" | "utf" => utf8_decode(b, 0),
-                "utf-8-sig" | "utf8-sig" => match b.strip_prefix(b"\xef\xbb\xbf") {
-                    Some(rest) => utf8_decode(rest, 3),
-                    None => utf8_decode(b, 0),
-                },
-                "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "8859" | "l1" | "latin" | "cp819" => {
-                    Ok(V::str(b.iter().map(|&c| c as char).collect::<String>()))
-                }
-                "ascii" | "us-ascii" | "646" => match b.iter().position(|c| *c >= 0x80) {
-                    None => Ok(V::str(b.iter().map(|&c| c as char).collect::<String>())),
-                    Some(p) => Err(Exc::msg(
-                        &UNICODE_DECODE_ERROR,
-                        format!("'ascii' codec can't decode byte 0x{:02x} in position {p}: ordinal not in range(128)", b[p]),
-                    )),
-                },
-                other => Err(Exc::type_error(format!("py2axum: bytes.decode({other:?}) is not supported (utf-8, utf-8-sig, latin-1, ascii)"))),
-            }
-        }
+        V::Bytes(b) if name == "decode" => bytes_decode(b, &args, &kwargs, "decode"),
         V::Bytes(b) => bytes_method(b, name, &args),
         V::List(l) => list_method(cx, l, name, args, kwargs).await,
         V::Dict(d) => match ops::is_counter(d).then(|| ops::counter_method(d, name, &args, &kwargs)).flatten() {
@@ -768,6 +749,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         },
         V::Set(s) => set_method(s, name, &args),
         V::Tuple(t) => match name {
+            "count" if args.len() != 1 || !kwargs.is_empty() => Err(Exc::type_error(format!("count() takes exactly one argument ({} given)", args.len()))),
+            "index" if args.len() != 1 || !kwargs.is_empty() => seq_index(t, &args, kwargs.is_empty())?
+                .map(|i| V::Int(i as i64))
+                .ok_or_else(|| Exc::value_error("tuple.index(x): x not in tuple")),
             "index" => t.iter().position(|x| ops::eq_bool(x, &args[0])).map(|i| V::Int(i as i64)).ok_or_else(|| Exc::value_error("tuple.index(x): x not in tuple")),
             "count" => Ok(V::Int(t.iter().filter(|x| ops::eq_bool(x, &args[0])).count() as i64)),
             _ => Err(no_attr(recv, name)),
@@ -899,6 +884,9 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 None => Err(Exc::type_error(format!("py2axum: {}.model_json_schema() was not computed", s.name))),
             },
             (ClassKind::Schema(s), "model_validate_json") => {
+                if let Some((k, _)) = kwargs.first() {
+                    return Err(Exc::type_error(format!("py2axum: model_validate_json({k}=) is not supported")));
+                }
                 let obj = pyd::loads(&ops::str_(args.first().unwrap_or(&V::None))?)?;
                 pyd::construct(cx, s, obj).await
             }
@@ -1036,7 +1024,20 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 _ => Err(no_attr(recv, name)),
             },
             Native::Pattern(p) => super::stdlib::pattern_method(cx, p, name, &args, &kwargs).await,
-            Native::Match(m) => super::stdlib::match_method(m, name, &args),
+            Native::Match(m) => {
+                // groups(default=None), groupdict(default=None): the keyword as the positional; any other refused
+                let mut args = args;
+                for (k, v) in kwargs {
+                    if k != "default" || !args.is_empty() || !matches!(name, "groups" | "groupdict") {
+                        return Err(Exc::type_error(format!("py2axum: Match.{name}({k}=) is not supported")));
+                    }
+                    args.push(v);
+                }
+                super::stdlib::match_method(m, name, &args)
+            }
+            Native::StringIO(_) | Native::CsvWriter(_) if !kwargs.is_empty() => {
+                Err(Exc::type_error(format!("py2axum: {name}({}=) is not supported (positional arguments only)", kwargs[0].0)))
+            }
             Native::StringIO(s) => super::stdlib::stringio_method(s, name, &args),
             Native::CsvWriter(w) => super::stdlib::writer_method(w, name, &args),
             Native::SnifferObj if name == "sniff" => super::stdlib::sniff(&args, &kwargs),
@@ -1266,6 +1267,38 @@ fn py_split_ws(s: &str, maxsplit: i64) -> Vec<V> {
 }
 
 fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    // `sub, start, end`: the method on the slice s[start:end] (a position found is counted from the whole string)
+    if matches!(name, "find" | "rfind" | "index" | "rindex" | "count" | "startswith" | "endswith") && args.len() > 1 {
+        if args.len() > 3 || !kwargs.is_empty() {
+            return Err(Exc::type_error(format!("{name}() takes at most 3 arguments ({} given)", args.len())));
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len() as i64;
+        let bound = |v: Option<&V>, d: i64| -> R<i64> {
+            match v {
+                None | Some(V::None) => Ok(d),
+                Some(V::Int(i)) => Ok(if *i < 0 { (*i + n).max(0) } else { *i }),
+                Some(V::Bool(b)) => Ok(*b as i64),
+                Some(o) => Err(Exc::type_error(format!("slice indices must be integers or None or have an __index__ method (got {})", o.type_name()))),
+            }
+        };
+        let (start, end) = (bound(args.get(1), 0)?, bound(args.get(2), n)?.min(n));
+        if start > n || start > end {
+            // CPython: nothing found, even the empty string, past the end or in an empty range
+            return Ok(match name {
+                "find" | "rfind" => V::Int(-1),
+                "index" | "rindex" => return Err(Exc::value_error("substring not found")),
+                "count" => V::Int(0),
+                _ => V::Bool(false),
+            });
+        }
+        let slice: Arc<str> = Arc::from(chars[start.min(n) as usize..end.max(start).min(n) as usize].iter().collect::<String>().as_str());
+        let r = str_method(&slice, name, &args[..1], &[])?;
+        return Ok(match (name, r) {
+            ("find" | "rfind" | "index" | "rindex", V::Int(i)) if i >= 0 => V::Int(i + start),
+            (_, r) => r,
+        });
+    }
     let a0 = || arg(args, kwargs, 0, "");
     Ok(match name {
         "translate" => {
@@ -1399,7 +1432,7 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
             }
         }
         "count" => V::Int(s.matches(&*strs(&args[0])?).count() as i64),
-        "encode" => V::Bytes(Arc::from(s.as_bytes())),
+        "encode" => str_encode(s, args, kwargs)?,
         "title" => {
             let mut out = String::new();
             let mut prev_alpha = false;
@@ -1576,7 +1609,8 @@ async fn list_method(cx: &Cx, l: &Arc<Mutex<Vec<V>>>, name: &str, args: Vec<V>, 
                 None => Err(Exc::value_error("list.remove(x): x not in list")),
             }
         }
-        "index" => match l.lock().clone().iter().position(|x| ops::eq_bool(x, &args[0])) {
+        "count" if args.len() != 1 => Err(Exc::type_error(format!("list.count() takes exactly one argument ({} given)", args.len()))),
+        "index" => match if args.len() == 1 { l.lock().clone().iter().position(|x| ops::eq_bool(x, &args[0])) } else { seq_index(&l.lock().clone(), &args, kwargs.is_empty())? } {
             Some(i) => Ok(V::Int(i as i64)),
             // CPython 3.14 stopped printing the value
             None if super::python() >= (3, 14) => Err(Exc::value_error("list.index(x): x not in list")),
@@ -1669,9 +1703,12 @@ fn set_method(s: &Arc<Mutex<IndexMap<Key, V>>>, name: &str, args: &[V]) -> R {
             Some(_) => Ok(V::None),
             None => Err(Exc::new(&KEY_ERROR, vec![args[0].clone()])),
         },
+        // update(*others)
         "update" => {
-            for x in ops::iter(&args[0])? {
-                s.lock().insert(Key::set_elem(&x)?, x);
+            for other in args {
+                for x in ops::iter(other)? {
+                    s.lock().insert(Key::set_elem(&x)?, x);
+                }
             }
             Ok(V::None)
         }
@@ -1761,9 +1798,14 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
             V::Float(utc.and_utc().timestamp_micros() as f64 / 1e6)
         }
         "astimezone" => {
+            // no zone (or None): the process's local zone, as a fixed offset at that instant (UTC when it is UTC)
+            let local = || {
+                let off = chrono::TimeZone::offset_from_utc_datetime(&chrono::Local, &d.utc()).local_minus_utc();
+                if off == 0 { Tz::Utc } else { Tz::Fixed(off) }
+            };
             let tz = match arg(args, kwargs, 0, "tz") {
-                Some(v) => libs::tz_of(v)?.unwrap_or(Tz::Utc),
-                None => Tz::Utc,
+                Some(v) => libs::tz_of(v)?.unwrap_or_else(local),
+                None => local(),
             };
             V::DateTime(d.astimezone(tz))
         }
@@ -1866,9 +1908,133 @@ pub fn b_len(v: &V) -> R {
 pub fn b_str(args: &[V]) -> R {
     match args.first() {
         None => Ok(V::str("")),
-        Some(V::Bytes(b)) if args.len() > 1 => Ok(V::str(String::from_utf8_lossy(b))),
+        // str(b, encoding[, errors]): bytes.decode
+        Some(V::Bytes(b)) if args.len() > 1 => bytes_decode(b, &args[1..], &[], "str"),
+        Some(_) if args.len() > 1 => Err(Exc::type_error(format!("decoding to str: need a bytes-like object, {} found", args[0].type_name()))),
         Some(v) => Ok(V::str(ops::str_(v)?)),
     }
+}
+
+/// `list.index(x, start=0, stop=sys.maxsize)` / `tuple.index`: the first equal item within [start, stop)
+/// (bounds clamped like a slice)
+fn seq_index(items: &[V], args: &[V], no_kwargs: bool) -> R<Option<usize>> {
+    if args.is_empty() || args.len() > 3 || !no_kwargs {
+        return Err(Exc::type_error(format!("index expected at least 1 argument, got {}", args.len())));
+    }
+    let n = items.len() as i64;
+    let bound = |v: Option<&V>, d: i64| -> R<i64> {
+        match v {
+            None => Ok(d),
+            Some(V::Int(i)) => Ok(if *i < 0 { (*i + n).max(0) } else { (*i).min(n) }),
+            Some(V::Bool(b)) => Ok(*b as i64),
+            Some(o) => Err(Exc::type_error(format!("slice indices must be integers or have an __index__ method (got {})", o.type_name()))),
+        }
+    };
+    let (start, stop) = (bound(args.get(1), 0)?, bound(args.get(2), n)?);
+    Ok((start..stop.max(start)).map(|i| i as usize).find(|i| ops::eq_bool(&items[*i], &args[0])))
+}
+
+/// a codec name as CPython normalizes it (`encodings.normalize_encoding` and its aliases), for the three codecs
+/// the runtime implements; None for any other
+fn codec(v: Option<&V>) -> R<Option<&'static str>> {
+    let e = match v {
+        Some(e) => ops::str_(e)?.to_ascii_lowercase().replace(['_', ' '], "-"),
+        None => return Ok(Some("utf-8")),
+    };
+    Ok(match e.as_str() {
+        "utf-8" | "utf8" | "u8" | "utf" | "cp65001" => Some("utf-8"),
+        "utf-8-sig" | "utf8-sig" => Some("utf-8-sig"),
+        "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "8859" | "l1" | "latin" | "cp819" | "iso-ir-100" | "csisolatin1" => Some("latin-1"),
+        "ascii" | "us-ascii" | "646" | "us" | "ansi-x3.4-1968" | "cp367" | "csascii" | "ibm367" | "iso646-us" => Some("ascii"),
+        _ => None,
+    })
+}
+
+fn arg_or_kw<'a>(args: &'a [V], kwargs: &'a [(String, V)], i: usize, name: &str) -> Option<&'a V> {
+    args.get(i).or_else(|| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v))
+}
+
+/// `bytes.decode(encoding="utf-8", errors="strict")` (and `str(b, encoding, errors)`)
+pub fn bytes_decode(b: &[u8], args: &[V], kwargs: &[(String, V)], what: &str) -> R {
+    if args.len() > 2 || kwargs.iter().any(|(k, _)| k != "encoding" && k != "errors") {
+        return Err(Exc::type_error(format!("{what}() takes at most 2 arguments")));
+    }
+    if let Some(e) = arg_or_kw(args, kwargs, 1, "errors") {
+        if ops::str_(e)? != "strict" {
+            return Err(Exc::type_error(format!("py2axum: {what}(errors=) supports 'strict' only")));
+        }
+    }
+    let enc = arg_or_kw(args, kwargs, 0, "encoding");
+    match codec(enc)? {
+        Some("utf-8") => utf8_decode(b, 0),
+        Some("utf-8-sig") => match b.strip_prefix(b"\xef\xbb\xbf") {
+            Some(rest) => utf8_decode(rest, 3),
+            None => utf8_decode(b, 0),
+        },
+        Some("latin-1") => Ok(V::str(b.iter().map(|&c| c as char).collect::<String>())),
+        Some(_) => match b.iter().position(|c| *c >= 0x80) {
+            None => Ok(V::str(b.iter().map(|&c| c as char).collect::<String>())),
+            Some(p) => Err(Exc::msg(
+                &UNICODE_DECODE_ERROR,
+                format!("'ascii' codec can't decode byte 0x{:02x} in position {p}: ordinal not in range(128)", b[p]),
+            )),
+        },
+        None => Err(Exc::type_error(format!("py2axum: {what}({}) is not supported (utf-8, utf-8-sig, latin-1, ascii)", ops::repr(enc.unwrap())?))),
+    }
+}
+
+/// `str.encode(encoding="utf-8", errors="strict")`: utf-8, ascii and latin-1, errors strict / ignore / replace
+pub fn str_encode(s: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    if args.len() > 2 || kwargs.iter().any(|(k, _)| k != "encoding" && k != "errors") {
+        return Err(Exc::type_error("encode() takes at most 2 arguments"));
+    }
+    let enc = arg_or_kw(args, kwargs, 0, "encoding");
+    let errors = match arg_or_kw(args, kwargs, 1, "errors") {
+        None => "strict".to_string(),
+        Some(e) => ops::str_(e)?,
+    };
+    let limit = match codec(enc)? {
+        Some("utf-8") => return Ok(V::Bytes(Arc::from(s.as_bytes()))),
+        Some("utf-8-sig") => return Ok(V::Bytes(Arc::from([b"\xef\xbb\xbf".as_slice(), s.as_bytes()].concat()))),
+        Some("latin-1") => 0x100,
+        Some(_) => 0x80,
+        None => return Err(Exc::type_error(format!("py2axum: str.encode({}) is not supported (utf-8, utf-8-sig, latin-1, ascii)", ops::repr(enc.unwrap())?))),
+    };
+    let name = if limit == 0x80 { "ascii" } else { "latin-1" };
+    let mut out = Vec::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if (c as u32) < limit {
+            out.push(c as u32 as u8);
+            i += 1;
+            continue;
+        }
+        match errors.as_str() {
+            "ignore" => {}
+            "replace" => out.push(b'?'),
+            "strict" => {
+                // CPython reports the whole run of unencodable characters
+                let end = (i..chars.len()).find(|j| (chars[*j] as u32) < limit).unwrap_or(chars.len());
+                let msg = if end - i == 1 {
+                    format!("'{name}' codec can't encode character {} in position {i}: ordinal not in range({limit})", char_escape(c))
+                } else {
+                    format!("'{name}' codec can't encode characters in position {i}-{}: ordinal not in range({limit})", end - 1)
+                };
+                return Err(Exc::msg(&UNICODE_ENCODE_ERROR, msg));
+            }
+            other => return Err(Exc::type_error(format!("py2axum: str.encode(errors={other:?}) is not supported (strict, ignore, replace)"))),
+        }
+        i += 1;
+    }
+    Ok(V::Bytes(Arc::from(out)))
+}
+
+/// a character as `repr()` writes it inside the codec error messages ('\xe9', '\u20ac', '\U0001f600')
+fn char_escape(c: char) -> String {
+    let n = c as u32;
+    if n < 0x100 { format!("'\\x{n:02x}'") } else if n < 0x10000 { format!("'\\u{n:04x}'") } else { format!("'\\U{n:08x}'") }
 }
 
 /// `callable(x)`: functions, bound methods, classes, builtin types, instances with `__call__`.

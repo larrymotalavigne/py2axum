@@ -226,7 +226,7 @@ fn write_indented(out: &mut String, v: &V, st: &pyd::JsonStyle, default_str: boo
                     out.push_str(sep);
                 }
                 nl(out, level + 1);
-                out.push_str(&pyd::to_json(&V::str(pyd::json_key(k)?), st, false)?);
+                out.push_str(&pyd::to_json(&V::str(pyd::dumps_key(k)?), st, false)?);
                 out.push_str(st.key_sep);
                 write_indented(out, x, st, default_str, ind, level + 1)?;
             }

@@ -435,6 +435,13 @@ impl Dec {
 /// Decimal methods
 pub fn method(d: &Dec, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let kw = |n: &str| kwargs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    // context= (positional or keyword) and any other keyword: refused, never ignored
+    if matches!(name, "quantize" | "to_integral_value" | "to_integral" | "to_integral_exact") {
+        let max = if name == "quantize" { 2 } else { 1 };
+        if args.len() > max || kwargs.iter().any(|(k, _)| k != "rounding" && !(name == "quantize" && k == "exp")) {
+            return Err(Exc::type_error(format!("py2axum: Decimal.{name}() supports exp and rounding only (no context)")));
+        }
+    }
     match name {
         "quantize" => {
             let target = match args.first() {

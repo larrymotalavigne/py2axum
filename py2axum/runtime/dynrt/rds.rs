@@ -234,8 +234,16 @@ pub async fn method(c: &Arc<RClient>, name: &str, args: Vec<V>, kwargs: Vec<(Str
             if let Some(ex) = k("ex") {
                 cmd.arg("EX").arg(seconds(&ex)?);
             }
-            if let Some(V::Int(px)) = k("px") {
-                cmd.arg("PX").arg(px);
+            // px: milliseconds, an int or a timedelta (redis-py's `int(td.total_seconds() * 1000)`)
+            match k("px") {
+                None | Some(V::None) => {}
+                Some(V::Int(px)) => {
+                    cmd.arg("PX").arg(px);
+                }
+                Some(V::Delta(d)) => {
+                    cmd.arg("PX").arg(super::dt::micros(&d).div_euclid(1000));
+                }
+                Some(o) => return Err(Exc::msg(&REDIS_ERROR, format!("px must be datetime.timedelta or int (got {})", o.type_name()))),
             }
             for (opt, word) in [("nx", "NX"), ("xx", "XX"), ("keepttl", "KEEPTTL"), ("get", "GET")] {
                 if let Some(v) = k(opt) {
@@ -292,7 +300,12 @@ pub async fn method(c: &Arc<RClient>, name: &str, args: Vec<V>, kwargs: Vec<(Str
         "flushdb" => cmd = redis::cmd("FLUSHDB"),
         "scan_iter" => {
             // the whole SCAN, collected (an `async for` over it reads them in order)
-            let pattern = k("match");
+            // scan_iter(match=None, count=None, _type=None), positional or keyword
+            if args.len() > 3 {
+                return Err(Exc::type_error(format!("scan_iter() takes from 1 to 4 positional arguments but {} were given", args.len() + 1)));
+            }
+            let at = |i: usize, name: &str| args.get(i).cloned().or_else(|| k(name)).filter(|v| !v.is_none());
+            let (pattern, count, kind) = (at(0, "match"), at(1, "count"), at(2, "_type"));
             let mut cursor: u64 = 0;
             let mut out = Vec::new();
             loop {
@@ -301,8 +314,11 @@ pub async fn method(c: &Arc<RClient>, name: &str, args: Vec<V>, kwargs: Vec<(Str
                 if let Some(p) = &pattern {
                     sc.arg("MATCH").arg(arg(p)?);
                 }
-                if let Some(V::Int(n)) = k("count") {
-                    sc.arg("COUNT").arg(n);
+                if let Some(n) = &count {
+                    sc.arg("COUNT").arg(arg(n)?);
+                }
+                if let Some(t) = &kind {
+                    sc.arg("TYPE").arg(arg(t)?);
                 }
                 let reply = c.run(&sc).await?;
                 let redis::Value::Array(mut parts) = reply else { return Err(Exc::msg(&REDIS_ERROR, "bad SCAN reply")) };

@@ -4518,6 +4518,11 @@ class FnCompiler:
             for k in node.keywords:
                 if k.arg is not None and k.arg not in allowed:
                     raise self.err(f".{name}({k.arg}=) is not supported (only {', '.join(sorted(allowed))})", k.value)
+        most = METHOD_MAX_ARGS.get(name)
+        if most is not None and (len(node.args) > most or any(isinstance(a, ast.Starred) for a in node.args)
+                                 or any(k.arg is None for k in node.keywords)):
+            raise self.err(f".{name}() takes at most {most} positional argument{'s' if most != 1 else ''} here "
+                           "(no * or ** unpacking)", node)
 
     def static_call(self, ref, node: ast.Call, awaited: bool) -> str:
         if isinstance(ref, tuple) and ref[0] == "builtin":
@@ -4534,6 +4539,7 @@ class FnCompiler:
                     if "classmethod" in decos:
                         return self.project_call(msym, stmt, node, awaited, prefix=[self.class_value(sym, node)])
             recv = self.class_value(sym, node)
+            self.check_method(node)
             args, kwargs = self.dyn_args(node)
             return self.q(f"{RT}::methods::call_method(cx, &{recv}, {rs(attr)}, {args}, {kwargs}).await")
         if isinstance(ref, Sym):
@@ -5073,6 +5079,12 @@ class FnCompiler:
     def isinstance_test(self, t: ast.AST, v: str) -> str:
         if isinstance(t, ast.Tuple):
             return "(" + " || ".join(self.isinstance_test(x, v) for x in t.elts) + ")"
+        # a union `int | float`, `X | None`, `Optional[X]`, `Union[X, Y]` (Python >= 3.10): each member, like a tuple;
+        # a parameterized member (`list[int]`) keeps the run-time path, which raises as CPython does
+        members = self.union_members(t)
+        if members is not None and not any(isinstance(m, ast.Subscript) for m in members):
+            return "(" + " || ".join("matches!(" + v + ", V::None)" if isinstance(m, ast.Constant) and m.value is None
+                                     else self.isinstance_test(m, v) for m in members) + ")"
         ref = self.static_ref(t)
         if isinstance(ref, tuple) and ref[0] == "builtin":
             if ref[1] in libmap.BUILTIN_EXC_NAMES:
@@ -5091,6 +5103,27 @@ class FnCompiler:
         # a type known at run time (a variable, a library class value, a tuple built by the code)
         tv = self.expr(t)
         return self.q(f"{RT}::types::isinstance(&{v}, &{tv})")
+
+
+    def union_members(self, t: ast.AST) -> list[ast.AST] | None:
+        """The members of a union written in the source (`A | B | None`, `typing.Optional[A]`, `typing.Union[A, B]`),
+        flattened; None when `t` is not one."""
+        if isinstance(t, ast.BinOp) and isinstance(t.op, ast.BitOr):
+            out = []
+            for side in (t.left, t.right):
+                inner = self.union_members(side)
+                out.extend(inner if inner is not None else [side])
+            return out
+        if isinstance(t, ast.Subscript) and self.static_ref(t.value) in (Ext("typing.Optional"), Ext("typing.Union")):
+            elts = t.slice.elts if isinstance(t.slice, ast.Tuple) else [t.slice]
+            out = []
+            for e in elts:
+                inner = self.union_members(e)
+                out.extend(inner if inner is not None else [e])
+            if self.static_ref(t.value) == Ext("typing.Optional"):
+                out.append(ast.Constant(value=None))
+            return out
+        return None
 
 
 # ====================================================================== routes and dependencies
@@ -7867,7 +7900,34 @@ METHOD_KWARGS = {
     "model_dump": {"mode", "exclude_none", "exclude_unset", "by_alias", "exclude", "include"},
     "model_dump_json": {"exclude_none", "exclude_unset", "by_alias", "exclude", "include"},
     "model_copy": {"update", "deep"},
+    # itsdangerous.URLSafeTimedSerializer (dynrt/itsd.rs): the only runtime type with these methods
+    "loads": {"max_age", "return_timestamp", "salt"},
+    "dumps": {"salt"},
+    # each name below: the union over every runtime type implementing it (audit of 09/10/2026)
+    "encode": {"encoding", "errors"},
+    "decode": {"encoding", "errors"},
+    "read_text": {"encoding", "errors"},
+    "write_text": {"data", "encoding", "errors", "newline"},
+    "write_bytes": set(),
+    "read_bytes": set(),
+    "set_cookie": {"key", "value", "max_age", "expires", "path", "domain", "secure", "httponly", "samesite"},
+    "delete_cookie": {"key", "path", "domain", "secure", "httponly", "samesite"},
+    "encrypt": set(),
+    "decrypt": set(),
+    "scan_iter": {"match", "count", "_type"},
+    "model_validate": {"from_attributes"},
+    "model_validate_json": set(),
+    "find": set(), "rfind": set(), "rindex": set(),
+    "groups": {"default"},
+    "groupdict": {"default"},
+    "search": {"string", "pos", "endpos"}, "fullmatch": {"string"}, "findall": {"string"}, "finditer": {"string"},
 }
+# positional arguments the runtime implements for these methods (same union)
+METHOD_MAX_ARGS = {"loads": 4, "dumps": 2, "encode": 2, "decode": 2, "read_text": 2, "write_text": 4, "write_bytes": 1,
+                   "read_bytes": 0, "set_cookie": 9, "delete_cookie": 6, "encrypt": 1, "decrypt": 1, "scan_iter": 3,
+                   "model_validate": 1, "model_validate_json": 1, "find": 3, "rfind": 3, "index": 3, "rindex": 3,
+                   "count": 3, "startswith": 3, "endswith": 3, "groups": 1, "groupdict": 1, "search": 3,
+                   "fullmatch": 1, "findall": 1, "finditer": 1}
 
 # calls whose string arguments or keywords name attributes of the objects they make or change
 ATTR_NAMING_CALLS = {"label", "setattr", "getattr", "hasattr", "namedtuple", "NamedTuple", "make_dataclass",

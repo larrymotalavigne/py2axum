@@ -106,8 +106,8 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         }
         "FileResponse" => {
             let path = super::pathio::fspath(arg(args, kwargs, 0, "path").ok_or_else(|| Exc::type_error("FileResponse() missing 'path'"))?)?;
-            let filename = arg(args, kwargs, 4, "filename").map(ops::str_).transpose()?;
-            let disposition = arg(args, kwargs, 5, "content_disposition_type").map(ops::str_).transpose()?.unwrap_or_else(|| "attachment".into());
+            let filename = arg(args, kwargs, 5, "filename").map(ops::str_).transpose()?;
+            let disposition = arg(args, kwargs, 8, "content_disposition_type").map(ops::str_).transpose()?.unwrap_or_else(|| "attachment".into());
             let media = match arg(args, kwargs, 3, "media_type") {
                 Some(m) => ops::str_(m)?,
                 None => guess_type(filename.as_deref().unwrap_or(&path)).unwrap_or("text/plain").to_string(),

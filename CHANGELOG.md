@@ -5,6 +5,41 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-09
+
+### Fixed
+
+- **itsdangerous `loads(..., return_timestamp=True)` answered 500.** The keyword was accepted at transpile time and
+  refused only at run time, so magic-link and 2FA logins built on it failed in production. `URLSafeTimedSerializer.loads`
+  now takes `s, max_age, return_timestamp, salt` positionally or by keyword and returns `(payload, datetime)` with an
+  aware UTC datetime, like itsdangerous 2.2; `BadSignature.payload`, `BadTimeSignature.date_signed` and
+  `SignatureExpired.date_signed` are set as the library sets them. Any other argument is refused at transpile time
+  with `file:line`.
+- `isinstance(x, int | float)` (and `X | None`, `Optional[X]`, `Union[X, Y]`) raised "cannot be a parameterized
+  generic" in the binary: a 2FA login of a production app answered 500. A union is now tested member by member, as
+  CPython 3.10+ does.
+- Arguments the runtime dropped or ignored are now implemented or refused at transpile time (an audit of the
+  library map after the bug above):
+  - `str.encode(encoding, errors)` always produced UTF-8; it now implements utf-8, utf-8-sig, latin-1 and ascii with
+    `errors=` strict, ignore or replace (`UnicodeEncodeError` as CPython). `str(b, encoding)` decodes like
+    `bytes.decode` instead of lossy UTF-8.
+  - `str.find/rfind/index/rindex/count/startswith/endswith(sub, start, end)` and `list/tuple.index(x, start, stop)`
+    ignored their bounds; `set.update(*others)` read only the first; `Match.groups/groupdict(default=)` ignored the
+    keyword.
+  - Starlette responses given positional arguments read `FileResponse`'s `filename` and `content_disposition_type` at
+    wrong indexes and dropped a positional `background`; `background=`, `stat_result=` and `method=` are refused.
+  - `MIMEApplication(data, Name=...)`, `MIMEMultipart(..., **params)` dropped their Content-Type parameters;
+    `policy=`, `boundary=`, `_subparts=`, `_encoder=` and arguments of `as_string()`/`as_bytes()` are refused.
+  - `Path.read_text/write_text(encoding=, errors=, newline=)` were ignored (and `read_text` decoded lossily).
+  - csv: `DictReader(restval=, restkey=)` were ignored; a positional dialect is refused.
+  - redis: `scan_iter("pattern:*")` ignored a positional pattern and scanned every key; `_type=` and
+    `set(px=timedelta)` were dropped.
+  - `model_validate_json(strict=...)` ignored its keywords; class methods such as `Model.model_validate(...)` now go
+    through the transpile-time keyword check.
+  - HTTP client responses (`resp.text(encoding=)`, `resp.json(loads=)`...), SQL `col.like(pattern, escape)` given
+    positionally, a second positional of `deque` methods and `Pattern.search(s, pos)` raise instead of ignoring the
+    argument.
+
 ## [0.5.0] — 2026-10-09
 
 ### Security

@@ -38,7 +38,7 @@ from fastapi.middleware import Middleware
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, retrying, sec, small, sqlmore, stdmore, tracing, wsock
+from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, kwargs, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, retrying, sec, small, sqlmore, stdmore, tracing, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -91,6 +91,7 @@ app.include_router(pyjwt_auth.router)
 app.include_router(asgimw.router)
 app.include_router(pydmore.router)
 app.include_router(stdmore.router)
+app.include_router(kwargs.router)
 
 
 @app.exception_handler(wsock.WsBoom)
@@ -744,6 +745,41 @@ async def its_check(token: str, max_age: int | None = None, salt: str = "itsdang
         return {"error": "signature", "msg": str(e)}
     except BadPayload as e:
         return {"error": "payload", "msg": str(e)}
+
+
+@app.get("/its/stamped")
+async def its_stamped(token: str, max_age: int | None = None, salt: str | None = None, positional: bool = False):
+    """loads(return_timestamp=True): the payload and the signing instant (an aware UTC datetime); the
+    exceptions' payload and date_signed (incident of 09/10/2026: magic links and 2FA of a production app)."""
+    s = URLSafeTimedSerializer(JWT_SECRET)
+    try:
+        if positional:
+            data, ts = s.loads(token, max_age, True, salt)
+        else:
+            data, ts = s.loads(token, max_age=max_age, return_timestamp=True, salt=salt)
+        return {"data": data, "ts": ts.isoformat(), "utc": ts.tzinfo == UTC, "epoch": ts.timestamp(), "year": ts.year}
+    except SignatureExpired as e:
+        return {"error": "expired", "cls": type(e).__name__, "date_signed": e.date_signed.isoformat(),
+                "payload": e.payload.decode(), "utc": e.date_signed.tzinfo == UTC}
+    except BadTimeSignature as e:
+        return {"error": "time", "msg": str(e), "payload": None if e.payload is None else e.payload.decode(),
+                "date_signed": None if e.date_signed is None else e.date_signed.isoformat()}
+    except BadSignature as e:
+        return {"error": "signature", "msg": str(e), "payload": e.payload}
+    except BadPayload as e:
+        return {"error": "payload", "msg": str(e)}
+
+
+@app.post("/its/fresh")
+async def its_fresh(body: dict):
+    """A token signed now, read back with its instant: within a few seconds of now, in UTC."""
+    s = URLSafeTimedSerializer(JWT_SECRET, salt="fresh")
+    token = s.dumps(body)
+    plain = s.loads(token, 60, False)
+    data, ts = s.loads(token, max_age=60, return_timestamp=True)
+    age = (datetime.now(UTC) - ts).total_seconds()
+    return {"plain": plain, "data": data, "recent": 0 <= age < 5, "utc": ts.tzinfo == UTC,
+            "tuple": isinstance(s.loads(token, return_timestamp=1), tuple)}
 
 
 @app.post("/secrets")

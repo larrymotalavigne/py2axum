@@ -373,6 +373,34 @@ fn split(p: &Pattern, s: &V, maxsplit: i64) -> R {
     Ok(V::list(out))
 }
 
+/// `Pattern.search(string, pos=0, endpos=len)`: the search starts at `pos` (`^` and lookbehinds still see the whole
+/// string, as in CPython) in the string cut at `endpos`; spans count from the start of the string
+fn search_from(p: &Pattern, s: &V, pos: Option<V>, endpos: Option<V>) -> R {
+    let full: Arc<str> = Arc::from(s_arg(Some(s), "string")?.as_str());
+    let n = full.chars().count() as i64;
+    let idx = |v: Option<V>, d: i64| -> R<i64> {
+        match v {
+            None => Ok(d),
+            Some(V::Int(i)) => Ok(i.clamp(0, n)),
+            Some(V::Bool(b)) => Ok((b as i64).min(n)),
+            Some(o) => Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+        }
+    };
+    let (pos, end) = (idx(pos, 0)?, idx(endpos, n)?);
+    if end < pos {
+        return Ok(V::None);
+    }
+    let byte = |c: i64| full.char_indices().nth(c as usize).map(|(b, _)| b).unwrap_or(full.len());
+    let cut: Arc<str> = Arc::from(&full[..byte(end)]);
+    Ok(match captures_at(p, &cut, byte(pos))? {
+        Some(mut m) => {
+            m.string = full;
+            V::native(Native::Match(Arc::new(m)))
+        }
+        None => V::None,
+    })
+}
+
 fn search_like(p: &Pattern, s: &V, mode: &str) -> R {
     let s: Arc<str> = Arc::from(s_arg(Some(s), "string")?.as_str());
     let m = captures_at(p, &s, 0)?;
@@ -406,6 +434,16 @@ fn search_like(p: &Pattern, s: &V, mode: &str) -> R {
 
 pub async fn pattern_method(cx: &super::Cx, p: &Arc<Pattern>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let a = |i: usize, k: &str| args.get(i).or_else(|| kw(kwargs, k)).cloned();
+    // search(string, pos, endpos); the other methods' pos/endpos: refused, never ignored
+    if name == "search" && (args.len() > 1 || kwargs.iter().any(|(k, _)| k != "string")) {
+        if args.len() > 3 || kwargs.iter().any(|(k, _)| !matches!(k.as_str(), "string" | "pos" | "endpos")) {
+            return Err(Exc::type_error("search() takes at most 3 arguments"));
+        }
+        return search_from(p, &a(0, "string").unwrap_or(V::None), a(1, "pos"), a(2, "endpos"));
+    }
+    if matches!(name, "match" | "fullmatch" | "findall" | "finditer") && (args.len() > 1 || kwargs.iter().any(|(k, _)| k != "string")) {
+        return Err(Exc::type_error(format!("py2axum: Pattern.{name}() with pos/endpos is not supported")));
+    }
     match name {
         "search" | "match" | "fullmatch" => search_like(p, &a(0, "string").unwrap_or(V::None), name),
         "findall" => findall(p, &a(0, "string").unwrap_or(V::None)),
@@ -608,7 +646,7 @@ fn dialect(kwargs: &[(String, V)]) -> R<Dialect> {
                 }
                 return Err(Exc::type_error("py2axum: csv dialect= other than 'excel' or a sniffed one is not supported"));
             }
-            "fieldnames" | "extrasaction" | "restval" => {}
+            "fieldnames" | "extrasaction" | "restval" | "restkey" => {}
             other => return Err(Exc::type_error(format!("py2axum: csv {other}= is not supported"))),
         }
     }
@@ -639,6 +677,16 @@ pub struct CsvWriter {
 }
 
 pub fn writer_new(args: &[V], kwargs: &[(String, V)], dict: bool) -> R {
+    // a positional dialect (writer) or restval/extrasaction (DictWriter): refused, never ignored
+    if args.len() > if dict { 2 } else { 1 } {
+        return Err(Exc::type_error(format!("py2axum: csv.{}() takes its options as keywords here", if dict { "DictWriter" } else { "writer" })));
+    }
+    if !dict && kwargs.iter().any(|(k, _)| matches!(k.as_str(), "fieldnames" | "extrasaction" | "restval" | "restkey")) {
+        return Err(Exc::type_error("py2axum: csv.writer() takes no fieldnames/extrasaction/restval/restkey"));
+    }
+    if dict && kw(kwargs, "restkey").is_some() {
+        return Err(Exc::type_error("DictWriter.__init__() got an unexpected keyword argument 'restkey'"));
+    }
     let target = args.first().cloned().ok_or_else(|| Exc::type_error("writer() missing 'csvfile'"))?;
     let d = dialect(kwargs)?;
     let dict = if dict {
@@ -791,6 +839,9 @@ fn source_rows(src: &V, d: &Dialect) -> R<Vec<Vec<String>>> {
 
 /// `csv.reader(lines)`: the rows (lists of str)
 pub fn reader(args: &[V], kwargs: &[(String, V)]) -> R {
+    if args.len() > 1 || kwargs.iter().any(|(k, _)| matches!(k.as_str(), "fieldnames" | "extrasaction" | "restval" | "restkey")) {
+        return Err(Exc::type_error("py2axum: csv.reader(f, **fmtparams) only (a positional dialect is not supported)"));
+    }
     let d = dialect(kwargs)?;
     let rows = source_rows(args.first().ok_or_else(|| Exc::type_error("reader() missing 'csvfile'"))?, &d)?;
     Ok(V::native(Native::Iter(Mutex::new(rows.into_iter().map(|r| V::list(r.into_iter().map(V::str).collect())).collect()))))
@@ -798,7 +849,13 @@ pub fn reader(args: &[V], kwargs: &[(String, V)]) -> R {
 
 /// `csv.DictReader(f, fieldnames=None, restkey=None, restval=None)`: the rows as dicts, blank rows skipped
 pub fn dict_reader(args: &[V], kwargs: &[(String, V)]) -> R {
+    if args.len() > 2 || kw(kwargs, "extrasaction").is_some() {
+        return Err(Exc::type_error("py2axum: csv.DictReader(f, fieldnames, restkey=, restval=, **fmtparams) only"));
+    }
     let d = dialect(kwargs)?;
+    // short rows: the missing fields get restval; long rows: the extra values under restkey
+    let restval = kw(kwargs, "restval").cloned().unwrap_or(V::None);
+    let restkey = kw(kwargs, "restkey").cloned().unwrap_or(V::None);
     let mut rows = source_rows(args.first().ok_or_else(|| Exc::type_error("DictReader() missing 'f'"))?, &d)?.into_iter();
     let names: Vec<String> = match args.get(1).or_else(|| kw(kwargs, "fieldnames")).filter(|v| !v.is_none()) {
         Some(n) => ops::iter(n)?.iter().map(ops::str_).collect::<R<_>>()?,
@@ -815,9 +872,9 @@ pub fn dict_reader(args: &[V], kwargs: &[(String, V)]) -> R {
         if r.is_empty() {
             continue;
         }
-        let mut m: Vec<(V, V)> = names.iter().zip(r.iter().map(V::str).chain(std::iter::repeat(V::None))).map(|(k, v)| (V::str(k), v)).collect();
+        let mut m: Vec<(V, V)> = names.iter().zip(r.iter().map(V::str).chain(std::iter::repeat(restval.clone()))).map(|(k, v)| (V::str(k), v)).collect();
         if r.len() > names.len() {
-            m.push((V::None, V::list(r[names.len()..].iter().map(V::str).collect())));
+            m.push((restkey.clone(), V::list(r[names.len()..].iter().map(V::str).collect())));
         }
         out.push(V::dict_from(m)?);
     }
@@ -1141,6 +1198,21 @@ fn unquote_str(s: &str) -> String {
 /// `urllib.parse.quote/quote_plus/unquote/unquote_plus/urlencode/urlparse/urlsplit`
 pub fn urllib(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let safe_of = |v: Option<&V>, d: &str| -> R<String> { v.map(ops::str_).transpose().map(|s| s.unwrap_or_else(|| d.to_string())) };
+    // encoding= other than utf-8 and errors= other than the default (strict to quote, replace to unquote): refused
+    if matches!(name, "quote" | "quote_plus" | "unquote" | "unquote_plus") {
+        let at = if name.starts_with('q') { 2 } else { 1 };
+        let get = |i: usize, k: &str| args.get(i).or_else(|| kwargs.iter().find(|(x, _)| x == k).map(|(_, v)| v)).filter(|v| !v.is_none());
+        if let Some(e) = get(at, "encoding") {
+            if !matches!(ops::str_(e)?.to_ascii_lowercase().replace('_', "-").as_str(), "utf-8" | "utf8") {
+                return Err(Exc::type_error(format!("py2axum: {name}(encoding=) other than utf-8 is not supported")));
+            }
+        }
+        if let Some(e) = get(at + 1, "errors") {
+            if ops::str_(e)? != if name.starts_with('q') { "strict" } else { "replace" } {
+                return Err(Exc::type_error(format!("py2axum: {name}(errors=) other than the default is not supported")));
+            }
+        }
+    }
     match name {
         "quote" => {
             let names = ["string", "safe", "encoding", "errors"];

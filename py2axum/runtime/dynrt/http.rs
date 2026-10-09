@@ -675,7 +675,14 @@ fn loads(text: &str) -> R {
 }
 
 pub fn resp_method(r: &Arc<Resp>, recv: &V, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
-    let _ = args;
+    // json(loads=, encoding=), text(encoding=, errors=)...: refused, never ignored (aiohttp's json(content_type=) only)
+    let allowed: &[&str] = if matches!((r.kind, name), (Kind::Aiohttp, "json")) { &["content_type"] } else { &[] };
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
+        return Err(Exc::type_error(format!("py2axum: response.{name}({k}=) is not supported")));
+    }
+    if !args.is_empty() {
+        return Err(Exc::type_error(format!("py2axum: response.{name}() with positional arguments is not supported")));
+    }
     match (r.kind, name) {
         (Kind::Httpx | Kind::Requests, "json") => loads(&r.text(false)?),
         (Kind::Httpx, "raise_for_status") => {
