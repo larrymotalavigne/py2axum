@@ -880,6 +880,9 @@ pub enum Sql {
     Cast(Box<Sql>, &'static str),
     /// `extract(field, expr)`
     Extract(String, Box<Sql>),
+    /// `json_col["k"]` / `json_col[2]` (an index of a JSON or JSONB column) and its typed accessors:
+    /// None = the JSON element itself (`as_json()`), Some(type) = `CAST(col ->> key AS type)`
+    JsonElem(Box<Sql>, V, Option<String>),
 }
 
 pub struct Subq {
@@ -1017,6 +1020,14 @@ fn hint_of(s: &Sql) -> Option<ColTy> {
         Sql::Label(e, _) | Sql::Order(e, _, _) | Sql::Filter(e, _) => hint_of(e),
         Sql::Func(name, args) if matches!(name.as_str(), "max" | "min" | "coalesce" | "sum") => args.first().and_then(hint_of),
         Sql::Func(name, _) if name == "count" => Some(ColTy::BigInt),
+        Sql::Bin("||", _, _) => Some(ColTy::Str),
+        Sql::JsonElem(_, _, Some(t)) => match t.as_str() {
+            "BOOLEAN" => Some(ColTy::Bool),
+            "VARCHAR" => Some(ColTy::Str),
+            "INTEGER" => Some(ColTy::Int),
+            "FLOAT" => Some(ColTy::Float),
+            _ => Some(ColTy::Numeric),
+        },
         // arithmetic keeps the numeric type (SQLAlchemy's type affinity): a float type wins, then Numeric
         Sql::Bin(op, a, b) if matches!(*op, "+" | "-" | "*" | "/") => {
             let (x, y) = (hint_of(a), hint_of(b));
@@ -1040,6 +1051,24 @@ pub fn text(v: &V) -> R {
 }
 
 /// TextClause's `:name` parameters (`(?<![:\w\\]):(\w+)(?!:)`, `\:` for a literal colon) -> `$n`
+/// a `text()` statement with its parameters, rendered (`$n` per value, with its type)
+fn text_rend(q: &str, params: Option<&V>) -> R<Rend> {
+    let (sql_text, binds) = text_binds(q, params)?;
+    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+    let mut marks = Vec::new();
+    for v in binds {
+        let start = r.sql.len();
+        r.bind(v, None);
+        marks.push(r.sql[start..].to_string());
+    }
+    let mut final_sql = sql_text;
+    for (i, m) in marks.iter().enumerate() {
+        final_sql = final_sql.replace(&format!("\u{0}{i}\u{0}"), m);
+    }
+    r.sql = final_sql;
+    Ok(r)
+}
+
 fn text_binds(q: &str, params: Option<&V>) -> R<(String, Vec<V>)> {
     static P: OnceLock<fancy_regex::Regex> = OnceLock::new();
     let re = P.get_or_init(|| fancy_regex::Regex::new(r"(?<![:\w\\]):(\w+)(?!:)").unwrap());
@@ -1116,9 +1145,80 @@ pub fn sql(s: Sql) -> V {
     V::Sql(Arc::new(s))
 }
 
+/// `col["k"]` / `col[2]` on a JSON or JSONB column (SQLAlchemy's JSON index; paths and other types refused)
+pub fn sql_getitem(v: &V, k: &V) -> R {
+    let base = to_sql(v, None);
+    let json = match &base {
+        Sql::Col(m, i) | Sql::ExCol(m, i) => matches!(m.cols[*i].ty, ColTy::Json | ColTy::JsonNull),
+        Sql::ACol(a, i) => matches!(a.model.cols[*i].ty, ColTy::Json | ColTy::JsonNull),
+        _ => false,
+    };
+    if !json {
+        return Err(Exc::type_error("py2axum: only a JSON or JSONB column can be indexed in SQL (ARRAY and nested JSON indexes are not supported)"));
+    }
+    match k {
+        V::Str(_) | V::Int(_) => Ok(sql(Sql::JsonElem(Box::new(base), k.clone(), None))),
+        V::Tuple(_) | V::List(_) => Err(Exc::type_error("py2axum: a JSON path index (col[(\"a\", \"b\")], #>>) is not supported: index one key at a time is not equivalent either, keep this query in Python")),
+        other => Err(Exc::type_error(format!("py2axum: a JSON index must be a str or an int, not {}", other.type_name()))),
+    }
+}
+
+/// the typed accessors of a JSON index (`as_boolean()`, `as_string()`, ...): `CAST(col ->> key AS type)`
+fn json_accessor(col: &Sql, key: &V, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    let elem = |cast: Option<String>| Ok(sql(Sql::JsonElem(Box::new(col.clone()), key.clone(), cast)));
+    let no_args = || -> R<()> {
+        if args.is_empty() && kwargs.is_empty() {
+            Ok(())
+        } else {
+            Err(Exc::type_error(format!("{name}() takes no arguments")))
+        }
+    };
+    match name {
+        "as_boolean" => no_args().and_then(|_| elem(Some("BOOLEAN".into()))),
+        "as_string" => no_args().and_then(|_| elem(Some("VARCHAR".into()))),
+        "as_integer" => no_args().and_then(|_| elem(Some("INTEGER".into()))),
+        "as_float" => no_args().and_then(|_| elem(Some("FLOAT".into()))),
+        "as_json" => no_args().and_then(|_| elem(None)),
+        "as_numeric" => {
+            // as_numeric(precision, scale, asdecimal=True): read back as a Decimal
+            let get = |i: usize, n: &str| args.get(i).cloned().or_else(|| kwargs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()));
+            if kwargs.iter().any(|(k, _)| !matches!(k.as_str(), "precision" | "scale" | "asdecimal")) || args.len() > 3 {
+                return Err(Exc::type_error("as_numeric() takes precision, scale and asdecimal"));
+            }
+            if !matches!(get(2, "asdecimal"), None | Some(V::Bool(true))) {
+                return Err(Exc::type_error("py2axum: as_numeric(asdecimal=False) is not supported"));
+            }
+            match (get(0, "precision"), get(1, "scale")) {
+                (Some(V::Int(p)), Some(V::Int(s))) => elem(Some(format!("NUMERIC({p}, {s})"))),
+                (None, _) | (_, None) => Err(Exc::type_error("as_numeric() missing required arguments: 'precision' and 'scale'")),
+                _ => Err(Exc::type_error("py2axum: as_numeric() takes int precision and scale")),
+            }
+        }
+        "label" => {
+            let n = args.first().ok_or_else(|| Exc::type_error("label() takes one argument"))?;
+            Ok(sql(Sql::Label(Box::new(Sql::JsonElem(Box::new(col.clone()), key.clone(), None)), ops::str_(n)?)))
+        }
+        _ => Err(Exc::type_error(format!(
+            "py2axum: .{name}() on a JSON index is not supported (use as_string(), as_integer(), as_float(), as_boolean(), as_numeric() or as_json())"
+        ))),
+    }
+}
+
+/// a bare JSON index in a comparison or arithmetic: SQLAlchemy binds the other side as JSON, refused
+fn no_bare_json(e: &Sql) -> R<()> {
+    if matches!(e, Sql::JsonElem(_, _, None)) {
+        return Err(Exc::type_error(
+            "py2axum: comparing a JSON index itself is not supported: compare a typed accessor (col[\"k\"].as_string() == ...)",
+        ));
+    }
+    Ok(())
+}
+
 pub fn sql_cmp(a: &V, op: &'static str, b: &V) -> R {
     let la = to_sql(a, None);
     let lb = to_sql(b, hint_of(&la));
+    no_bare_json(&la)?;
+    no_bare_json(&lb)?;
     let la = if let Sql::Param(v, None, id) = la { Sql::Param(v, hint_of(&lb), id) } else { la };
     Ok(sql(match (op, &la, &lb) {
         ("=", _, Sql::Null) => Sql::IsNull(Box::new(la), false),
@@ -1132,6 +1232,14 @@ pub fn sql_cmp(a: &V, op: &'static str, b: &V) -> R {
 pub fn sql_binop(a: &V, op: &'static str, b: &V) -> R {
     let la = to_sql(a, None);
     let lb = to_sql(b, hint_of(&la));
+    no_bare_json(&la)?;
+    no_bare_json(&lb)?;
+    // `+` with a string on either side is SQLAlchemy's concatenation (`func.upper(x) + " suffix"`, `col + "x"`)
+    // (a string literal takes the other side's type: `int_col + "1"` stays an addition)
+    let (ha, hb) = (hint_of(&la), hint_of(&lb));
+    let str_ty = |h: Option<ColTy>| matches!(h, Some(ColTy::Str));
+    let concat = str_ty(ha) || str_ty(hb) || (matches!(a, V::Str(_)) && hb.is_none()) || (matches!(b, V::Str(_)) && ha.is_none());
+    let op = if op == "+" && concat { "||" } else { op };
     Ok(sql(Sql::Bin(op, Box::new(la), Box::new(lb))))
 }
 
@@ -1342,6 +1450,9 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
     // a second positional of a pattern operator (`like(pat, escape)`, `startswith(s, escape)`): refused, never dropped
     if matches!(name, "like" | "ilike" | "not_like" | "not_ilike" | "startswith" | "endswith" | "contains") && args.len() > 1 {
         return Err(Exc::type_error(format!("py2axum: {name}() with {} positional arguments is not supported", args.len())));
+    }
+    if let Sql::JsonElem(col, key, None) = &base {
+        return json_accessor(col, key, name, &args, &kwargs);
     }
     if let Sql::Rel(m, ri) = &base {
         match name {
@@ -1911,7 +2022,7 @@ fn aliases_in(e: &Sql, out: &mut Vec<Arc<Alias>>) {
             aliases_in(a, out);
             items.iter().for_each(|i| aliases_in(i, out));
         }
-        Sql::Not(a) | Sql::IsNull(a, _) | Sql::Order(a, _, _) | Sql::Label(a, _) | Sql::Distinct(a) | Sql::Cast(a, _) | Sql::Extract(_, a) | Sql::InSelect(a, _, _) => aliases_in(a, out),
+        Sql::Not(a) | Sql::IsNull(a, _) | Sql::Order(a, _, _) | Sql::Label(a, _) | Sql::Distinct(a) | Sql::Cast(a, _) | Sql::Extract(_, a) | Sql::InSelect(a, _, _) | Sql::JsonElem(a, _, _) => aliases_in(a, out),
         _ => {}
     }
 }
@@ -2118,6 +2229,29 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
             render(r, a)?;
             r.sql += &format!(" AS {t})");
         }
+        // as SQLAlchemy's PostgreSQL compiler: `->>` / `->` with the index cast (`::TEXT`, `::INT`), and
+        // JSONB's subscript for the element itself (PostgreSQL 14+)
+        Sql::JsonElem(a, key, cast) => {
+            let key_cast = if matches!(key, V::Int(_)) { "::INT" } else { "::TEXT" };
+            if cast.is_some() {
+                r.sql += "CAST(";
+            }
+            render(r, a)?;
+            let jsonb_sub = cast.is_none() && is_jsonb(a);
+            r.sql += match (cast, jsonb_sub) {
+                (Some(_), _) => " ->> ",
+                (None, true) => "[",
+                (None, false) => " -> ",
+            };
+            r.bind(key.clone(), None);
+            r.sql += key_cast;
+            if jsonb_sub {
+                r.sql.push(']');
+            }
+            if let Some(t) = cast {
+                r.sql += &format!(" AS {t})");
+            }
+        }
         Sql::SubCol(q, name) => r.sql += &format!("{}.{}", quote_ident(&q.name), quote_ident(name)),
         Sql::Subquery(q) => {
             r.sql.push('(');
@@ -2290,7 +2424,7 @@ fn subs_in(e: &Sql, out: &mut Vec<Arc<Subq>>) {
             subs_in(a, out);
             items.iter().for_each(|i| subs_in(i, out));
         }
-        Sql::Not(a) | Sql::IsNull(a, _) | Sql::Order(a, _, _) | Sql::Label(a, _) | Sql::Distinct(a) | Sql::Cast(a, _) | Sql::Extract(_, a) | Sql::InSelect(a, _, _) => subs_in(a, out),
+        Sql::Not(a) | Sql::IsNull(a, _) | Sql::Order(a, _, _) | Sql::Label(a, _) | Sql::Distinct(a) | Sql::Cast(a, _) | Sql::Extract(_, a) | Sql::InSelect(a, _, _) | Sql::JsonElem(a, _, _) => subs_in(a, out),
         _ => {}
     }
 }
@@ -2320,7 +2454,7 @@ fn tables_in(e: &Sql, out: &mut Vec<&'static ModelDesc>) {
             tables_in(a, out);
             items.iter().for_each(|i| tables_in(i, out));
         }
-        Sql::Not(a) | Sql::IsNull(a, _) | Sql::Order(a, _, _) | Sql::Label(a, _) | Sql::Distinct(a) | Sql::Cast(a, _) | Sql::Extract(_, a) | Sql::InSelect(a, _, _) => tables_in(a, out),
+        Sql::Not(a) | Sql::IsNull(a, _) | Sql::Order(a, _, _) | Sql::Label(a, _) | Sql::Distinct(a) | Sql::Cast(a, _) | Sql::Extract(_, a) | Sql::InSelect(a, _, _) | Sql::JsonElem(a, _, _) => tables_in(a, out),
         Sql::Filter(a, b) => {
             tables_in(a, out);
             tables_in(b, out);
@@ -2569,11 +2703,11 @@ fn push_bind(args: &mut PgArguments, b: &Bind) -> R<()> {
     res.map_err(|e| Exc::type_error(format!("bind: {e}")))
 }
 
-/// JSON columns: a Python value (`None` included) stored as JSON text, like SQLAlchemy's JSON type.
+/// JSON columns: a Python value (`None` included) stored as JSON text, like SQLAlchemy's JSON type: the
+/// text of `json.dumps` as is (a `json` column keeps it verbatim, `->>` on an object or a list shows it)
 fn json_param(v: &V) -> R<Bind> {
     let text = pyd::to_json(v, &pyd::DUMPS, false)?;
-    let val: serde_json::Value = serde_json::from_str(&text).map_err(|e| Exc::value_error(e.to_string()))?;
-    Ok(Bind::V(V::Str(Arc::from(val.to_string())), Some(ColTy::Str)))
+    Ok(Bind::V(V::Str(Arc::from(text)), Some(ColTy::Str)))
 }
 
 // ---------------------------------------------------------------- decoding
@@ -3664,7 +3798,13 @@ impl Session {
                 }
             }
             desc.where_pk(&mut r, &pk);
-            Session::run_exec(s, &r).await?;
+            let n = Session::run_exec(s, &r).await?;
+            if n != 1 {
+                // the row was deleted (or its key changed) behind the session's back: SQLAlchemy checks the
+                // rowcount of each UPDATE (one statement per object here; see docs/supported.md)
+                return Err(Exc::msg(&STALE_DATA_ERROR, format!(
+                    "UPDATE statement on table '{}' expected to update 1 row(s); {n} were matched.", desc.table.trim_matches('"'))));
+            }
             if let Some(f) = s.savepoints.last_mut() {
                 f.updated.push(o.clone());
             }
@@ -4252,33 +4392,43 @@ impl Session {
         self.execute_params(stmt, None).await
     }
 
-    /// `session.execute(stmt, params)`: bind parameters for a `text()` statement
+    /// `session.execute(stmt, params)`: bind parameters for a `text()` statement; a list of dicts runs it once
+    /// per dict (executemany: no rows, the rowcount summed)
     pub async fn execute_params(&self, stmt: &V, params: Option<&V>) -> R {
         if let (V::Sql(x), Some(p)) = (stmt, params) {
             if !matches!(&**x, Sql::Text(_)) && !p.is_none() {
                 return Err(Exc::type_error("py2axum: execute(statement, params) is only supported for text()"));
             }
         }
+        if let (V::Sql(x), Some(V::List(l))) = (stmt, params) {
+            if let Sql::Text(q) = &**x {
+                let many = l.lock().clone();
+                if !many.is_empty() {
+                    let mut s = self.0.lock().await;
+                    if s.autoflush {
+                        Session::flush_inner(&mut s).await?;
+                    }
+                    let mut total = 0i64;
+                    for p in &many {
+                        if !matches!(p, V::Dict(_)) {
+                            return Err(Exc::type_error("py2axum: execute(text(), [...]) takes a list of dicts"));
+                        }
+                        let r = text_rend(q, Some(p))?;
+                        total += Session::run_exec(&mut s, &r).await? as i64;
+                    }
+                    return Ok(V::Result(Arc::new(Mutex::new(QResult { rows: None, width: 0, scalars: false, rowcount: total,
+                                                                       names: None }))));
+                }
+            }
+        }
         if let V::Sql(x) = stmt {
             if let Sql::Text(q) = &**x {
-                let (sql_text, binds) = text_binds(q, params)?;
+                // each value rendered by the usual binder (`$n` with its type), then put in place
+                let r = text_rend(q, params)?;
                 let mut s = self.0.lock().await;
                 if s.autoflush {
                     Session::flush_inner(&mut s).await?;
                 }
-                // each value rendered by the usual binder (`$n` with its type), then put in place
-                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
-                let mut marks = Vec::new();
-                for v in binds {
-                    let start = r.sql.len();
-                    r.bind(v, None);
-                    marks.push(r.sql[start..].to_string());
-                }
-                let mut final_sql = sql_text;
-                for (i, m) in marks.iter().enumerate() {
-                    final_sql = final_sql.replace(&format!("\u{0}{i}\u{0}"), m);
-                }
-                r.sql = final_sql;
                 let rows = Session::run(&mut s, &r).await?;
                 let width = rows.first().map(|r| r.len()).unwrap_or(0);
                 let out = rows.iter().map(|row| (0..row.len()).map(|i| decode(row, i, row_tz())).collect::<R<Vec<_>>>()).collect::<R<Vec<_>>>()?;

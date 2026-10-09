@@ -30,15 +30,16 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "httpx": ("0.28.1", "0.28.1", "0.29"),
     "aiohttp": ("3.13.0", "3.14.4", "3.15"),
     "mcp": ("2.2.0", "2.2.0", "2.3"),  # MCP servers: tested through a real MCP server's lock (internal conformance)
-    "asyncpg": ("0.31.0", "0.31.0", "0.32"),  # the asyncpg driver: verified on a real application's lock (since moved to psycopg)
+    "asyncpg": ("0.31.0", "0.32.0", "0.33"),
+    "icalendar": ("7.0.0", "7.0.0", "7.1"),  # calendar files: tested through a real application's lock (internal conformance)  # the asyncpg driver: transcript-service's production driver (internal conformance)
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
-_LOCK_ONLY = ("mcp", "asyncpg")
+_LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
 PYTHON: tuple[str, str, str] = ("3.12", "3.14", "3.15")
 # libraries checked only when the analysed package imports them (module -> distributions); the framework
 # (fastapi, starlette, pydantic, pydantic-core) is always checked
 _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlalchemy", "psycopg", "asyncpg"),
-              "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",)}
+              "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",), "icalendar": ("icalendar",)}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
 _FEATURES = [("WebSocket routes (Starlette 1.7's WebSocketDisconnected semantics)", r"\.websocket\(", "starlette", "1.7.0")]

@@ -19,13 +19,34 @@ def _kwvec(kw: dict[str, str]) -> str:
     return "vec![" + ", ".join(f'("{k}".to_string(), {v})' for k, v in kw.items()) + "]"
 
 
-def _engine(a, kw):
+def _engine(a, kw, sync: bool):
     """`create_[async_]engine(url, ...)`: the binary's own pool; only `connect_args` (session
-    parameters, `orm::engine_connect_args`) changes what it does."""
+    parameters, `orm::engine_connect_args`) changes what it does. A sync engine's connections are sync
+    (`with engine.connect()`, lazy loads)."""
     ev = "".join(f"let _ = {x}; " for k, x in [(None, x) for x in a] + list(kw.items()) if k != "connect_args")
+    eng = f"V::native({RT}::Native::Engine({'true' if sync else 'false'}))"
     if "connect_args" in kw:
-        return "{ " + ev + f"{RT}::orm::engine_connect_args(&{kw['connect_args']}).map(|_| V::native({RT}::Native::Engine)) }}"
-    return "{ " + ev + f"Ok::<V, Exc>(V::native({RT}::Native::Engine)) }}"
+        return "{ " + ev + f"{RT}::orm::engine_connect_args(&{kw['connect_args']}).map(|_| {eng}) }}"
+    return "{ " + ev + f"Ok::<V, Exc>({eng}) }}"
+
+
+def _jsonable_encoder(a, kw):
+    """`jsonable_encoder(obj)`: its options (include, exclude, by_alias=False, custom_encoder...) are refused."""
+    if len(a) != 1 or kw:
+        raise ValueError("jsonable_encoder() is supported with the object only (no include/exclude/by_alias/"
+                         "custom_encoder options)")
+    return f"{RT}::pyd::jsonable(&{a[0]})"
+
+
+def _default_handler(which: str):
+    """FastAPI's `(request, exc)` default handlers: the request is evaluated, unused (as FastAPI's own)."""
+    def tmpl(a, kw):
+        if len(a) + len(kw) != 2 or set(kw) - {"request", "exc"}:
+            raise ValueError("expected two arguments (request, exc)")
+        req = a[0] if a else kw["request"]
+        exc = a[1] if len(a) == 2 else kw["exc"]
+        return f"{{ let _ = {req}; {RT}::web::default_exc_handler(&{exc}, {which!r}) }}".replace("'", '"')
+    return tmpl
 
 
 def _argv(args: list[str]) -> str:
@@ -282,6 +303,8 @@ EXCEPTIONS: dict[str, str] = {
     "pickle.UnpicklingError": "UNPICKLING_ERROR",
     "sqlalchemy.exc.MultipleResultsFound": "MULTIPLE_RESULTS_FOUND",
     "sqlalchemy.orm.exc.NoResultFound": "NO_RESULT_FOUND",
+    # sqlalchemy.orm.exc only (canonical() folds it into sqlalchemy.exc)
+    "sqlalchemy.exc.StaleDataError": "STALE_DATA_ERROR",
     # what python-jose re-exports from jose and jose.jwt
     **{f"jose.{n}": c for n, c in (("ExpiredSignatureError", "EXPIRED_SIGNATURE_ERROR"), ("JOSEError", "JOSE_ERROR"),
                                    ("JWSError", "JWS_ERROR"), ("JWTError", "JWT_ERROR"))},
@@ -615,6 +638,9 @@ CALLS = {
     # bcrypt 5.0, pyotp 2.9
     **{f"bcrypt.{f}": (lambda f: lambda a, kw: f"{RT}::auth::call(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
        for f in ("gensalt", "hashpw", "checkpw")},
+    # pwdlib 0.2+: the recommended Argon2 hasher (hash, verify, verify_and_update)
+    "pwdlib.PasswordHash.recommended": lambda a, kw: f"{RT}::auth::pwd_recommended()" if not a and not kw else
+        (_ for _ in ()).throw(ValueError("PasswordHash.recommended() takes no arguments")),
     "pyotp.random_base32": lambda a, kw: f"{RT}::auth::random_base32(&{_argv(a)}, &{_kwvec(kw)})",
     "pyotp.TOTP": lambda a, kw: f"{RT}::auth::totp_new(&{_argv(a)}, &{_kwvec(kw)})",
     "pyotp.totp.TOTP": lambda a, kw: f"{RT}::auth::totp_new(&{_argv(a)}, &{_kwvec(kw)})",
@@ -648,6 +674,8 @@ CALLS = {
     "secrets.compare_digest": lambda a, kw: f"{RT}::libs::compare_digest(&{a[0]}, &{a[1]})",
     "statistics.median": lambda a, kw: f"{RT}::libs::median(&{a[0]})",
     "json.dumps": _json_dumps,
+    # FastAPI's encoder: what a response without response_model goes through (`pyd::jsonable`)
+    "fastapi.encoders.jsonable_encoder": _jsonable_encoder,
     "json.loads": lambda a, kw: f"{RT}::libs::json_loads(&{a[0]})",
     # python-jose (HMAC only; other options refused)
     "jose.jwt.encode": _jwt_encode,
@@ -698,6 +726,11 @@ CALLS = {
     "nh3.is_html": lambda a, kw: f"{RT}::nh3::is_html(&{_argv(a)})",
     "string.Template": lambda a, kw: f"{RT}::stdlib::template_new(&{_argv(a)}, &{_kwvec(kw)})",
     "html.escape": lambda a, kw: f"{RT}::stdlib::html_escape(&{_argv(a)}, &{_kwvec(kw)})",
+    "html.unescape": lambda a, kw: f"{RT}::stdlib::html_unescape(&{_argv(a)}, &{_kwvec(kw)})",
+    # icalendar 7.0: components built empty, then add()/add_component()/to_ical() (dynrt/ical.rs)
+    **{f"icalendar.{k}": (lambda k: lambda a, kw: f'{RT}::ical::new("{k}")'
+                          if not a and not kw else (_ for _ in ()).throw(ValueError(f"icalendar.{k}() with arguments")))(k)
+       for k in ("Calendar", "Event", "Alarm")},
     "email.utils.formataddr": lambda a, kw: f"{RT}::mail::formataddr(&{a[0]})",
     "email.utils.formatdate": lambda a, kw: f"{RT}::mail::formatdate(&{_argv(a)}, &{_kwvec(kw)})",
     "email.utils.make_msgid": lambda a, kw: f"{RT}::mail::make_msgid({('Some(&' + _bind('make_msgid', a, kw, ['idstring', 'domain'], {'domain'})['domain'] + ')') if kw.get('domain') else 'None'})",
@@ -745,11 +778,16 @@ CALLS = {
     "timeit.default_timer": lambda a, kw: f"{RT}::stdlib::time_now(\"perf_counter\")",
     **{f"os.path.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::os_path(\"{n}\", &{_argv(a)})")(n)
        for n in ("exists", "isfile", "isdir", "join", "basename", "dirname", "splitext", "normpath", "abspath", "realpath")},
+    **{f"os.{n}": (lambda n: lambda a, kw: f"{RT}::pathio::os_remove(\"{n}\", &{_argv(a)})"
+                   if not kw else (_ for _ in ()).throw(ValueError(f"os.{n}(dir_fd=) is not supported")))(n)
+       for n in ("remove", "unlink")},
     "hmac.new": lambda a, kw: f"{RT}::stdlib::hmac_new(&{_argv(a)}, &{_kwvec(kw)})",
     "hmac.compare_digest": lambda a, kw: f"{RT}::libs::compare_digest(&{a[0]}, &{a[1]})",
     # calendar, types
     "calendar.monthrange": lambda a, kw: f"{RT}::libs::monthrange(&{a[0]}, &{a[1]})",
     "types.SimpleNamespace": lambda a, kw: f"{RT}::libs::namespace(&{_argv(a)}, &{_kwvec(kw)})",
+    # FastAPI's SSE event (yielded by a generator endpoint with response_class=EventSourceResponse)
+    "fastapi.sse.ServerSentEvent": lambda a, kw: f"{RT}::web::sse_event(&{_argv(a)}, &{_kwvec(kw)})",
     # pathlib, uuid
     **{f"pathlib.{n}": (lambda a, kw: f"{RT}::pathio::path_new(&{_argv(a)})") for n in ("Path", "PurePath", "PosixPath", "PurePosixPath")},
     "uuid.uuid4": lambda a, kw: f"Ok::<V, Exc>({RT}::pathio::uuid4())",
@@ -767,6 +805,10 @@ CALLS = {
     "logging.getLogger": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::Logger(std::sync::Arc::from({RT}::ops::str_(&{a[0] if a else 'V::str(\"root\")'})?.as_str()))))",
     "asyncio.Queue": lambda a, kw: f"Ok::<V, Exc>({RT}::web::AQueue::new(match &{a[0] if a else kw.get('maxsize', 'V::Int(0)')} {{ V::Int(i) => *i as usize, _ => 0 }}))",
     "asyncio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0]}).await",
+    "anyio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0] if a else kw.get('delay', 'V::Int(0)')}).await",
+    # FastAPI's default exception handlers, awaited by an application's own handler
+    "fastapi.exception_handlers.http_exception_handler": _default_handler("http"),
+    "fastapi.exception_handlers.request_validation_exception_handler": _default_handler("validation"),
     "contextlib.asynccontextmanager": lambda a, kw: f"{RT}::agen::asynccontextmanager(&{a[0]})",
     # mcp 2.2 (dynrt/mcp.rs): the server object; its tools, transport options and attributes are checked
     # by the transpiler (dyn.mcp_tools)
@@ -792,8 +834,8 @@ CALLS = {
     "sqlalchemy.future.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
     "sqlalchemy.ext.asyncio.async_sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, false)",
     "sqlalchemy.orm.sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, true)",
-    "sqlalchemy.create_engine": lambda a, kw: _engine(a, kw),
-    "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: _engine(a, kw),
+    "sqlalchemy.create_engine": lambda a, kw: _engine(a, kw, True),
+    "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: _engine(a, kw, False),
     # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable
     "sqlalchemy.inspect": lambda a, kw: _sa_inspect(a, kw),
     "sqlalchemy.text": lambda a, kw: f"{RT}::orm::text(&{a[0]})",
@@ -807,6 +849,9 @@ CALLS = {
     "sqlalchemy.dialects.postgresql.insert": lambda a, kw: f"{RT}::orm::insert(&{a[0]}, true)",
     "sqlalchemy.case": lambda a, kw: f"{RT}::orm::case(&{_argv(a)}, &{_kwvec(kw)})",
     "sqlalchemy.literal": lambda a, kw: f"{RT}::orm::literal(&{a[0]})",
+    # true() / false(): the literals `true` / `false` (PostgreSQL has a native boolean)
+    "sqlalchemy.true": lambda a, kw: f"{RT}::orm::text(&V::str(\"true\"))" if not a and not kw else (_ for _ in ()).throw(ValueError("true() takes no arguments")),
+    "sqlalchemy.false": lambda a, kw: f"{RT}::orm::text(&V::str(\"false\"))" if not a and not kw else (_ for _ in ()).throw(ValueError("false() takes no arguments")),
     "sqlalchemy.delete": lambda a, kw: f"{RT}::orm::delete(&{a[0]})",
     "sqlalchemy.exists": lambda a, kw: f"{RT}::orm::exists(&{_argv(a)})",
     **{f"sqlalchemy.orm.{n}": (lambda n: lambda a, kw: f"{RT}::orm::loader(\"{n}\", &{a[0]})")(n)

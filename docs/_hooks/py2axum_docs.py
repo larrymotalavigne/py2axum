@@ -3,7 +3,7 @@
 - the version of the package documented (pyproject.toml), in the footer and wherever a page writes
   `<!-- py2axum:version -->`;
 - the reference of the command line, from the real `--help` (`<!-- py2axum:cli-help -->`,
-  `<!-- py2axum:check-help -->`): py2axum has no dependency, it runs from the checkout;
+  `<!-- py2axum:check-help -->`, `<!-- py2axum:watch-help -->`): py2axum has no dependency, it runs from the checkout;
 - coverage.md: written by the corpus bench; until it exists, a placeholder page keeps its place in the nav.
 """
 from __future__ import annotations
@@ -55,4 +55,6 @@ def on_page_markdown(markdown: str, page, config, files, **kwargs) -> str:
         markdown = markdown.replace("<!-- py2axum:cli-help -->", _help())
     if "<!-- py2axum:check-help -->" in markdown:
         markdown = markdown.replace("<!-- py2axum:check-help -->", _help("check"))
+    if "<!-- py2axum:watch-help -->" in markdown:
+        markdown = markdown.replace("<!-- py2axum:watch-help -->", _help("watch"))
     return markdown

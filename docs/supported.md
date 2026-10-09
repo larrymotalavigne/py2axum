@@ -30,7 +30,7 @@ its list streaming moved to [Large list responses](advanced/streaming.md)). `--b
 | `Form()`, `File()`, `UploadFile` | [Forms and files](tutorial/files.md) |
 | Dependencies, the session dependency | [Dependencies](tutorial/dependencies.md) |
 | Security schemes (OAuth2, HTTP Bearer, HTTP Basic) | [Security](tutorial/security.md) |
-| Responses, response classes, status codes, `StreamingResponse` | [Responses](tutorial/responses.md) |
+| Responses, response classes, status codes, `StreamingResponse`, generator endpoints (JSON Lines, Server-Sent Events) | [Responses](tutorial/responses.md) |
 | `BackgroundTasks` | [Background tasks](tutorial/background-tasks.md) |
 | Exception handlers, `HTTPException`, Starlette's error layers | [Handling errors](tutorial/errors.md) |
 | Middleware (`BaseHTTPMiddleware`, raw ASGI, GZip, starlette_context), request attributes, `configure(app)` | [Middleware](tutorial/middleware.md) |
@@ -62,4 +62,10 @@ Limits on untrusted input (an optional body cap, the stack size) and the differe
 An application wrapped in a project ASGI class at module level (`app = Wrapper(api)`, refused: the
 binary would serve `api` without it) and mounted ASGI apps (left to Python with `--python-side mount` when
 registered last), libraries not listed, C extensions, `eval`/`exec`, metaclasses, multiple inheritance of
-project classes, OpenAPI `/docs` in the binary.
+project classes, OpenAPI `/docs` in the binary, and assigning an attribute of the application at module level
+other than `app.state` and `app.dependency_overrides[f] = g` (`app.router.route_class = ...`, a custom
+`APIRoute`, `app.openapi = ...` are refused with `file:line`). Not native, counted apart in the
+[documentation coverage](coverage.md): what only changes the OpenAPI schema or the documentation pages
+(`/openapi.json`, `/docs`, custom docs assets), SQLModel, OpenTelemetry's `FastAPI(telemetry=...)`, GraphQL
+routers, `ORJSONResponse`/`UJSONResponse`, stdlib dataclasses as request or response types, security scopes
+(`SecurityScopes`, `Security(scopes=)`), `AfterValidator` and other functional validators in `Annotated`.

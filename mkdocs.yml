@@ -98,6 +98,8 @@ nav:
       - First application: getting-started/first-app.md
       - py2axum check: getting-started/check.md
       - Hybrid mode: getting-started/hybrid.md
+      - Watch mode: getting-started/watch.md
+      - Migrating an application: getting-started/migration.md
   - Tutorial - User Guide:
       - tutorial/index.md
       - Parameters: tutorial/parameters.md
@@ -138,5 +140,6 @@ nav:
       - Standard library: reference/stdlib.md
       - Libraries: reference/libraries.md
       - Versions: reference/versions.md
+      - Error codes: reference/errors.md
   - Coverage: coverage.md
   - Release notes: release-notes.md

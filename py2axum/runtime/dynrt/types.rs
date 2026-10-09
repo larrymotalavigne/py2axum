@@ -30,7 +30,7 @@ pub fn isinstance(v: &V, t: &V) -> R<bool> {
                 "pydantic.BaseModel" => matches!(v, V::Inst(i) if is_schema(i.desc.class)),
                 "sqlalchemy.ext.asyncio.AsyncSession" => matches!(v, V::Session(_)),
                 "sqlalchemy.orm.Session" | "sqlalchemy.ext.asyncio.AsyncConnection" => false,
-                "sqlalchemy.ext.asyncio.AsyncEngine" => matches!(v, V::Native(m) if matches!(&**m, Native::Engine)),
+                "sqlalchemy.ext.asyncio.AsyncEngine" => matches!(v, V::Native(m) if matches!(&**m, Native::Engine(false))),
                 "types.GenericAlias" => matches!(v, V::Native(m) if matches!(&**m, Native::TypeExpr(..))),
                 p if p.starts_with("prometheus_client.") => super::prom::isinstance(v, &p["prometheus_client.".len()..]),
                 p if p.starts_with("starlette.") || p.starts_with("fastapi.") => super::routing::isinstance(v, p),

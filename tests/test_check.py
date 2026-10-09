@@ -73,10 +73,10 @@ def test_global_error(tmp_path, capsys):
     """An error about the whole application refuses generation, even with --python-side auto."""
     pkg = write_project(tmp_path)
     main_py = pkg / "main.py"
-    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(dependencies=[])"))
+    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(root_path=str(1))"))
     rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--python-side", "auto")
     assert rc == 1
-    assert any("main.py" in g["error"] and "FastAPI(dependencies=...)" in g["error"] for g in data["global"])
+    assert any("main.py" in g["error"] and "FastAPI(root_path=...)" in g["error"] for g in data["global"])
     assert not any(r["status"] == "python-side" for r in data["routes"])
 
 
@@ -120,7 +120,7 @@ def test_untested_version_refused(tmp_path, capsys):
     assert g["where"] == f"{tmp_path}/uv.lock:6"
     assert "fastapi 0.99.1 is outside the range" in g["error"] and "--allow-untested-versions" in g["error"]
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
-    assert f"error: {tmp_path}/uv.lock:6: fastapi 0.99.1" in capsys.readouterr().err
+    assert f"error[P2A0601]: {tmp_path}/uv.lock:6: fastapi 0.99.1" in capsys.readouterr().err
     assert not (tmp_path / "out").exists()
     rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--python-side", "auto",
                         "--allow-untested-versions")
@@ -148,3 +148,32 @@ def test_unmapped_library_setting(tmp_path, capsys):
     (pkg / "pay.py").write_text("import json\n\njson.encoder = None\n\n\ndef customers():\n    return 1\n")
     rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto")
     assert rc == 1 and any("json.encoder" in g["error"] for g in data["global"])
+
+
+def test_discovery_error_is_a_refusal(tmp_path, capsys):
+    """An error found while discovering the app (a route path that is not a literal) refuses the whole
+    application at its file:line instead of crashing `check` (corpus: docs_src/custom_docs_ui)."""
+    pkg = tmp_path / "p"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\n\napp = FastAPI()\n\n\n"
+                                 "@app.get(app.swagger_ui_oauth2_redirect_url)\nasync def r():\n    return 1\n")
+    rc, data = run_json(capsys, str(pkg))
+    assert rc == 1 and not data["summary"]["generates"]
+    assert data["global"][0]["where"] == f"{pkg}/main.py:6"
+    assert "expected a literal value" in data["global"][0]["error"]
+
+
+def test_final_mount_needs_python_side(tmp_path, capsys):
+    """A final app.mount(): generation refuses it without --python-side mount, so `check` says so too."""
+    pkg = tmp_path / "m"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom fastapi.staticfiles import StaticFiles\n\n"
+                                 "app = FastAPI()\n\n\n@app.get('/')\nasync def r():\n    return 1\n\n\n"
+                                 "app.mount('/static', StaticFiles(directory='static'), name='static')\n")
+    rc, data = run_json(capsys, str(pkg))
+    assert rc == 1 and data["global"][0]["construction"] == "app.mount"
+    assert data["global"][0]["where"] == f"{pkg}/main.py:12"
+    rc, data = run_json(capsys, str(pkg), "--python-side", "mount")
+    assert rc == 0 and data["summary"]["generates"]

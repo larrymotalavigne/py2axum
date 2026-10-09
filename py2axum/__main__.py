@@ -1,7 +1,9 @@
 """py2axum: transpile a FastAPI + SQLAlchemy + Pydantic + aiohttp package to a Rust/axum project.
 
 usage: python -m py2axum <python package dir> -o <output dir> [--name crate_name] [--root DIR]
-       python -m py2axum check <python package dir> [--root DIR] [--json] [--fail-under PCT]
+       python -m py2axum check <python package dir> [--root DIR] [--format text|json|markdown] [--fail-under PCT]
+       python -m py2axum check --explain P2A0201
+       python -m py2axum watch <python package dir> -o <output dir> [--run] [--python-side ...]
        python -m py2axum <python package dir> --report report.md [--root DIR]   (+ report.json)
 """
 from __future__ import annotations
@@ -20,6 +22,10 @@ def main(argv: list[str] | None = None) -> int:
         from .check import main as check
 
         return check(argv[1:])
+    if argv[:1] == ["watch"]:
+        from .watch import main as watch
+
+        return watch(argv[1:])
     ap = argparse.ArgumentParser(prog="py2axum", description=__doc__.splitlines()[0])
     ap.add_argument("package", type=Path, help="directory of the FastAPI application package")
     ap.add_argument("-o", "--out", type=Path, help="output directory for the Rust project")
@@ -46,8 +52,12 @@ def main(argv: list[str] | None = None) -> int:
 
     bad = [] if args.allow_untested_versions else check_project(args.root or args.package.resolve().parent, args.package)
     if bad and not args.report:
+        from .errors import BY_CODE
+
+        c = BY_CODE["P2A0601"]
         for msg, file, line in bad:
-            print(f"error: {file}:{line}: {msg}", file=sys.stderr)
+            print(f"error[{c.code}]: {file}:{line}: {msg}", file=sys.stderr)
+        print(f"  = help: {c.fix}\n  = see: {c.anchor()}", file=sys.stderr)
         return 1
     if args.report:
         from .report import aggregate, build, write
@@ -78,7 +88,10 @@ def main(argv: list[str] | None = None) -> int:
         gzip = dyn.prepare(fe, python_side)
         proj = dyn.generate_project(fe, args.out, str(args.package), crate, gzip=gzip, stream=not args.no_stream)
     except TranspileError as e:
-        print(f"error: {e.render()}", file=sys.stderr)
+        print(e.explain(), file=sys.stderr)
+        if not auto:
+            print("  = note: `py2axum check` lists every refusal at once; `--python-side auto` leaves the routes "
+                  "that do not translate to Python", file=sys.stderr)
         return 1
     for n in fe.notes:
         print(f"note: {n}", file=sys.stderr)
@@ -97,7 +110,7 @@ def auto_python_side(package: Path, root: Path | None, python_side: set[str]) ->
     fe, per_route = collect_dyn(package, root, python_side, auto=True)
     if fe.global_errors:
         for e in fe.global_errors:
-            print(f"error: {e.render()}", file=sys.stderr)
+            print(e.explain(), file=sys.stderr)
         print("error: --python-side auto only moves routes; the errors above concern the whole application",
               file=sys.stderr)
         return None
@@ -111,7 +124,7 @@ def auto_python_side(package: Path, root: Path | None, python_side: set[str]) ->
         if e is None:
             print(f"python-side (auto): {what} — requests no translated route fully matches", file=sys.stderr)
         else:
-            print(f"python-side (auto): {path} ({what}) — {e.render()}", file=sys.stderr)
+            print(f"python-side (auto): {path} ({what}) — {e.render()} [{e.code}]", file=sys.stderr)
     return set(moved)
 
 

@@ -1695,6 +1695,97 @@ pub fn realpath(p: &str) -> String {
 }
 
 /// `html.escape(s, quote=True)`
+/// `html.unescape(s)`: CPython's algorithm (html/__init__.py) on its tables (htmlent.rs)
+pub fn html_unescape(args: &[V], kwargs: &[(String, V)]) -> R {
+    let s = args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "s").map(|(_, v)| v))
+        .ok_or_else(|| Exc::type_error("unescape() missing 1 required positional argument: 's'"))?;
+    let V::Str(s) = s else {
+        // `'&' not in s`
+        return Err(Exc::type_error(if matches!(s, V::Bytes(_)) { "a bytes-like object is required, not 'str'".to_string() }
+                                   else { super::ops::not_container(s.type_name()) }));
+    };
+    if !s.contains('&') {
+        return Ok(V::Str(s.clone()));
+    }
+    use super::htmlent::{HTML5, INVALID_CHARREFS, INVALID_CODEPOINTS};
+    let named = |n: &str| HTML5.binary_search_by(|(k, _)| (*k).cmp(n)).ok().map(|i| HTML5[i].1);
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '&' {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        }
+        let j = i + 1;
+        // `#[0-9]+;?` | `#[xX][0-9a-fA-F]+;?` | `[^\t\n\f <&#;]{1,32};?`
+        if cs.get(j) == Some(&'#') {
+            let hex = matches!(cs.get(j + 1), Some('x' | 'X')) && cs.get(j + 2).is_some_and(|c| c.is_ascii_hexdigit());
+            let start = if hex { j + 2 } else { j + 1 };
+            let mut end = start;
+            while end < cs.len() && if hex { cs[end].is_ascii_hexdigit() } else { cs[end].is_ascii_digit() } {
+                end += 1;
+            }
+            if end == start {
+                out.push('&');
+                i += 1;
+                continue;
+            }
+            let digits: String = cs[start..end].iter().collect();
+            if !hex && digits.len() > 4300 {
+                return Err(Exc::msg(&VALUE_ERROR, format!("Exceeds the limit (4300 digits) for integer string conversion: value has {} digits; \
+                                                          use sys.set_int_max_str_digits() to increase the limit", digits.len())));
+            }
+            // past u32: above 0x10FFFF all the same
+            let num = u32::from_str_radix(&digits, if hex { 16 } else { 10 }).unwrap_or(u32::MAX);
+            if let Some((_, r)) = INVALID_CHARREFS.iter().find(|(k, _)| *k == num) {
+                out.push_str(r);
+            } else if (0xD800..=0xDFFF).contains(&num) || num > 0x10FFFF {
+                out.push('\u{FFFD}');
+            } else if !INVALID_CODEPOINTS.contains(&num) {
+                out.push(char::from_u32(num).unwrap_or('\u{FFFD}'));
+            }
+            i = if cs.get(end) == Some(&';') { end + 1 } else { end };
+            continue;
+        }
+        let mut end = j;
+        while end < cs.len() && end - j < 32 && !matches!(cs[end], '\t' | '\n' | '\x0c' | ' ' | '<' | '&' | '#' | ';') {
+            end += 1;
+        }
+        if end == j {
+            out.push('&');
+            i += 1;
+            continue;
+        }
+        if cs.get(end) == Some(&';') {
+            end += 1;
+        }
+        let name: String = cs[j..end].iter().collect();
+        i = end;
+        if let Some(v) = named(&name) {
+            out.push_str(v);
+            continue;
+        }
+        // the longest known prefix (at least 2 characters), the rest kept
+        let found = (2..end - j).rev().find_map(|x| {
+            let p: String = cs[j..j + x].iter().collect();
+            named(&p).map(|v| (v, x))
+        });
+        match found {
+            Some((v, x)) => {
+                out.push_str(v);
+                out.extend(&cs[j + x..end]);
+            }
+            None => {
+                out.push('&');
+                out.push_str(&name);
+            }
+        }
+    }
+    Ok(V::str(out))
+}
+
 pub fn html_escape(args: &[V], kwargs: &[(String, V)]) -> R {
     let s = args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "s").map(|(_, v)| v)).ok_or_else(|| Exc::type_error("escape() missing 1 required positional argument: 's'"))?;
     let quote = match args.get(1).or_else(|| kwargs.iter().find(|(k, _)| k == "quote").map(|(_, v)| v)) {

@@ -579,7 +579,7 @@ pub fn scope(cx: &Cx) -> R {
         (V::str("http_version"), V::str("1.1")),
         (V::str("scheme"), V::str("http")),
         (V::str("method"), V::str(&r.method)),
-        (V::str("root_path"), V::str("")),
+        (V::str("root_path"), V::str(super::web::root_path())),
         (V::str("path"), V::str(&path)),
         (V::str("raw_path"), V::Bytes(Arc::from(r.path.as_bytes()))),
         (V::str("query_string"), V::Bytes(Arc::from(query.as_bytes()))),

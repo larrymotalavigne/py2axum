@@ -455,6 +455,13 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
     if let Some(f) = super::ops::dunder(v, "__enter__") {
         return f(cx, v.clone(), vec![]).await;
     }
+    if let V::Session(s) = v {
+        // a sync engine's connection (`with engine.connect()` / `engine.begin()`); an AsyncConnection is not one
+        if s.is_sync() {
+            return super::aio::aenter(cx, v).await;
+        }
+        return Err(Exc::type_error("'AsyncConnection' object does not support the context manager protocol"));
+    }
     if let V::Native(n) = v {
         if let Native::TLock(l) = &**n {
             lock_method(l, "__enter__", &[], &[])?;
@@ -478,6 +485,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
 
 /// leaving `with v`: `exc` when the body raised; a true result suppresses it
 pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
+    if let V::Session(_) = v {
+        return super::aio::aexit(cx, v, exc).await;
+    }
     if let Some(f) = super::ops::dunder(v, "__exit__") {
         let args = match exc {
             Some(e) => vec![V::Class(e.0.class), V::Exc(e), V::None],

@@ -5,7 +5,7 @@
 #   docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum build app --python-side auto
 #
 # or serves as the first stage of a multi-stage build (examples/docker/Dockerfile). Built from the repository root:
-#   docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.5.1 -t py2axum .   # a published version
+#   docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.6.0 -t py2axum .   # a published version
 #   docker build -f docker/Dockerfile --build-arg PY2AXUM=/src -t py2axum .              # this checkout
 # Debian bookworm (glibc 2.36): the binaries it produces run on bookworm, trixie, Ubuntu 24.04 and
 # gcr.io/distroless/cc-debian12.

@@ -18,12 +18,13 @@ highest with pydantic 2.13 on 3.13 (every supported pydantic minor is run).
 | httpx | 0.28.1 | 0.28.1 | `>=0.28.1,<0.29` |
 | aiohttp | 3.13.0 | 3.14.4 | `>=3.13.0,<3.15` |
 | mcp | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
-| asyncpg | 0.31.0 | 0.31.0 | `>=0.31.0,<0.32` |
+| asyncpg | 0.31.0 | 0.32.0 | `>=0.31.0,<0.33` |
+| icalendar | 7.0.0 | 7.0.0 | `>=7.0.0,<7.1` |
 | Python | 3.12 | 3.14 | `>=3.12,<3.15` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;
-`asyncpg` was verified the same way on a real application at 0.31.0, which has since moved to psycopg: that
-check is no longer run. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
+`asyncpg` the same way, by the conformance of a real application served with that driver (0.31.0 and 0.32.0),
+and `icalendar` by a real application's calendar export. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
 inside a range follow the project's version: CPython's messages (3.14 names the role of an unhashable dict key
 or set element and the expected input of a `math` domain error), Pydantic's (see below), Starlette's
 `CORSMiddleware`. The project's version is the one of its `uv.lock`, else its `==` pin in `requirements*.txt`

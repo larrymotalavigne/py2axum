@@ -49,6 +49,10 @@ adding a header to every response. Like every example on this site, it is compil
   ASGI class, `@app.exception_handler(...)` on its nested functions, `app.add_exception_handler(...)`,
   `@app.middleware("http")`, `app.add_route(path, endpoint, methods=)` (a Starlette `Route`: GET implies
   HEAD; such routes are tried after the declared ones, as when added last), `app.routes`.
+- Starlette's `TrustedHostMiddleware(allowed_hosts=[...], www_redirect=...)` (Host header parsed like
+  Starlette 1.7: `Invalid host header` 400, `www.` redirect) and `HTTPSRedirectMiddleware` (307 to the https URL,
+  port dropped when 80 or 443), with literal options. HTTP requests only: with WebSocket routes they are
+  refused (a WebSocket handshake does not cross the binary's middleware stack).
 
 ## What stays in Python
 
@@ -61,6 +65,9 @@ adding a header to every response. Like every example on this site, it is compil
 
 ## Differences
 
+- **Known difference:** `HTTPSRedirectMiddleware` with no `Host` header or one Starlette cannot parse (or a port
+  above 65535): Starlette redirects to the server's own address (`scope["server"]`), which the binary does not
+  know; it answers 500 instead.
 - Differences (raw ASGI middleware): `GZipMiddleware` always runs outermost, so a middleware added after it
   sees the response before compression; raw middlewares run for `http` scopes only (`websocket` and `lifespan`
   pass as if the middleware let them through, its usual first line); a wrapped `receive` is read to the end of

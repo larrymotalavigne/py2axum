@@ -24,9 +24,19 @@ request is over. Like every example on this site, it is compiled and compared wi
   `Annotated[T, Depends(...)]` aliases, `dependencies=[...]` on routes and routers.
 - `p: Model = Depends()` with a Pydantic model (FastAPI calls the class): one query parameter per field, with its
   type, default and `Field` constraints (`ge`, `le`, `max_length`, `pattern`...), then `Model(**fields)`.
-- `yield` dependencies: one `yield`, in the body or alone in a `try/finally`. The code after `yield` runs at
-  the end of the request, most recent dependency first, before the session commit (FastAPI runs it after
-  sending the response); on error, only `finally` blocks run.
+- `yield` dependencies: one `yield`, in the body or in a top-level `try` (`except`, `else`, `finally`). The
+  code after `yield` runs at the end of the request, most recent dependency first, before the session commit.
+  An exception of the request (the endpoint's, a later dependency's, a validation error) is raised at the
+  `yield`, as FastAPI does: an `except` clause sees it, what it raises replaces it (an `HTTPException` becomes
+  the response), and an exception caught and not raised again is FastAPI's `FastAPIError` ("Response not
+  awaited...", a 500).
+- `Depends(dep, scope="function")` (FastAPI ≥ 0.121): the exit code runs when the endpoint returns, before the
+  response is sent, and an exception there is the request's; the default scope, `"request"`, runs it once the
+  response is sent (for a streamed response, at the end of the stream). The cache key includes the scope.
+- An instance of a project class with `__call__` as a dependency (`checker = Checker("bar")`,
+  `Depends(checker)`): its parameters are those of `__call__`, sync or async.
+- `app.dependency_overrides[dep] = other` written at module level (a project function overridden by a project
+  function): `other` is solved and called wherever `dep` is depended on, with its own parameters.
 - The session dependency: `async with maker() as s: yield s` with optional `await s.commit()`,
   `except: await s.rollback(); raise`, `finally: await s.close()`; the `async_sessionmaker` options
   (`expire_on_commit`, `autoflush`) are read from it, or from a project class wrapping it. The commit after
@@ -42,4 +52,7 @@ used as dependencies in [Security](security.md).
   only project functions, Pydantic models and the session dependency are accepted.
 - `p: Model = Depends()`: a base other than `BaseModel`, validators or other decorated methods, `model_config`,
   aliases, container fields (FastAPI reads those from the body) are refused.
-- `yield` inside `try/except` is refused (FastAPI raises the endpoint's exception there).
+- A request-scoped `yield` dependency depending on a `scope="function"` one is refused (FastAPI's
+  `DependencyScopeError`), as is a non-literal `scope=`.
+- `app.dependency_overrides` with anything else than a project function on both sides, or changed anywhere
+  else than at module level, is refused (an override set by a test, in-process, does not reach the binary).

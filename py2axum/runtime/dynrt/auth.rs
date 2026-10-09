@@ -334,3 +334,91 @@ pub fn totp_method(t: &Totp, name: &str, args: &[V], kwargs: &[(String, V)]) -> 
         _ => Err(Exc::attr_error(format!("'TOTP' object has no attribute '{name}'"))),
     }
 }
+
+// ---------------------------------------------------------------- pwdlib (Argon2)
+
+/// `pwdlib.PasswordHash.recommended()`: one Argon2 hasher with argon2-cffi's defaults (argon2id, t=3,
+/// m=65536 KiB, p=4, 32-byte hash, 16-byte salt).
+pub fn pwd_recommended() -> R {
+    Ok(V::native(Native::PwdHash))
+}
+
+const ARGON2_T: u32 = 3;
+const ARGON2_M: u32 = 65536;
+const ARGON2_P: u32 = 4;
+const ARGON2_LEN: usize = 32;
+
+fn str_or_bytes(v: Option<&V>, name: &str) -> R<Vec<u8>> {
+    match v {
+        Some(V::Str(s)) => Ok(s.as_bytes().to_vec()),
+        Some(V::Bytes(b)) => Ok(b.to_vec()),
+        Some(o) => Err(Exc::type_error(format!("{name} must be str or bytes, not {}", o.type_name()))),
+        None => Err(Exc::type_error(format!("missing required argument: '{name}'"))),
+    }
+}
+
+/// pwdlib's ARGON2_ENCODED_HASH_REGEX (identify)
+fn argon2_identify(h: &[u8]) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^\$(argon2(id|i|d))\$(?:v=\d+\$)?m=\d+,t=\d+,p=\d+(?:\$[^$]+(?:\$.+?)?)?$").unwrap()
+    });
+    std::str::from_utf8(h).map(|s| re.is_match(s)).unwrap_or(false)
+}
+
+fn argon2_hash(pw: &[u8]) -> R<String> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    let params = argon2::Params::new(ARGON2_M, ARGON2_T, ARGON2_P, Some(ARGON2_LEN)).map_err(|e| Exc::runtime(e.to_string()))?;
+    let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let salt: [u8; 16] = rand::random();
+    let salt = SaltString::encode_b64(&salt).map_err(|e| Exc::runtime(e.to_string()))?;
+    super::thread::blocking(|| a.hash_password(pw, &salt).map(|h| h.to_string())).map_err(|e| Exc::runtime(e.to_string()))
+}
+
+/// argon2-cffi's verify: a mismatch or an invalid hash is False for pwdlib
+fn argon2_verify(pw: &[u8], h: &[u8]) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let Ok(s) = std::str::from_utf8(h) else { return false };
+    let Ok(parsed) = PasswordHash::new(s) else { return false };
+    super::thread::blocking(|| argon2::Argon2::default().verify_password(pw, &parsed).is_ok())
+}
+
+/// argon2-cffi's check_needs_rehash: the hash's parameters differ from the hasher's
+fn argon2_needs_rehash(h: &[u8]) -> bool {
+    use argon2::password_hash::PasswordHash;
+    let Ok(s) = std::str::from_utf8(h) else { return true };
+    let Ok(p) = PasswordHash::new(s) else { return true };
+    let get = |k: &str| p.params.get_decimal(k);
+    p.algorithm.as_str() != "argon2id" || p.version != Some(0x13) || get("m") != Some(ARGON2_M) || get("t") != Some(ARGON2_T)
+        || get("p") != Some(ARGON2_P) || p.hash.map(|x| x.len()) != Some(ARGON2_LEN) || p.salt.map(|x| x.as_str().len()) != Some(22)
+}
+
+pub fn pwd_method(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    let get = |i: usize, k: &str| args.get(i).or_else(|| kwargs.iter().find(|(n, _)| n == k).map(|(_, v)| v));
+    let known: &[&str] = match name {
+        "hash" => &["password"],
+        "verify" | "verify_and_update" => &["password", "hash"],
+        _ => return Err(Exc::attr_error(format!("'PasswordHash' object has no attribute '{name}'"))),
+    };
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !known.contains(&k.as_str())) {
+        return Err(Exc::type_error(format!("py2axum: PasswordHash.{name}({k}=) is not supported")));
+    }
+    if args.len() > known.len() {
+        return Err(Exc::type_error(format!("PasswordHash.{name}() takes {} positional arguments", known.len() + 1)));
+    }
+    let pw = str_or_bytes(get(0, "password"), "password")?;
+    if name == "hash" {
+        return Ok(V::str(argon2_hash(&pw)?));
+    }
+    let h = str_or_bytes(get(1, "hash"), "hash")?;
+    if !argon2_identify(&h) {
+        return Err(Exc::msg(&UNKNOWN_HASH_ERROR, format!("This hash can't be identified. Make sure it's valid and that its \
+corresponding hasher is enabled. {}", String::from_utf8_lossy(&h))));
+    }
+    let ok = argon2_verify(&pw, &h);
+    if name == "verify" {
+        return Ok(V::Bool(ok));
+    }
+    let updated = if ok && argon2_needs_rehash(&h) { V::str(argon2_hash(&pw)?) } else { V::None };
+    Ok(V::tuple(vec![V::Bool(ok), updated]))
+}

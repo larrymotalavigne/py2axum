@@ -878,6 +878,7 @@ pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
         (&INVALID_REQUEST_ERROR, "sqlalchemy.exc"),
         (&ARGUMENT_ERROR, "sqlalchemy.exc"),
         (&OBJECT_DELETED_ERROR, "sqlalchemy.orm.exc"),
+        (&STALE_DATA_ERROR, "sqlalchemy.orm.exc"),
         (&CANCELLED_ERROR, "asyncio.exceptions"),
         (&JSON_DECODE_ERROR, "json.decoder"),
         (&JOSE_ERROR, "jose.exceptions"),

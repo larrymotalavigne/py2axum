@@ -50,6 +50,15 @@ STEPS: list = [
     # framework behaviour
     ("GET", "/nope", None),
     ("PUT", "/health", None),
+    # FastAPI(root_path="/api/v1"): stripped before routing when the path starts with it
+    ("GET", "/api/v1/health", None),
+    ("GET", "/api/v1", None),
+    ("GET", "/api/v1/", None),
+    ("GET", "/api/v1x/health", None),
+    ("GET", "/whereami/", None),
+    ("GET", "/api/v1/whereami/", None),
+    ("GET", "/api/v1/whereami?x=1", None),
+    ("GET", "/whereami", None),
 ]
 # enough rows for a > 1000-byte list: exercises GZipMiddleware(minimum_size=1000) and streaming
 STEPS += [("POST", "/users", {"email": f"bulk{i}@example.com", "name": f"Bulk {i}", "age": i}) for i in range(30)]

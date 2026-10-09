@@ -18,7 +18,8 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
 - Lax-mode validation with pydantic-core's error types, messages, locations and contexts (speedate for
   dates), smart unions (exactness, fields set), enums, literals, nested models, lists/sets/tuples/dicts,
   `Optional`, `Field` constraints (and pydantic 1's `min_items`/`max_items`, which `Field()` still maps to
-  `min_length`/`max_length`), aliases (`populate_by_name`), defaults and `default_factory`,
+  `min_length`/`max_length`), aliases (`alias=`, and `validation_alias=`/`serialization_alias=` naming a
+  different input and output key, `populate_by_name`; `AliasChoices`/`AliasPath` refused), defaults and `default_factory`,
   `validate_assignment` (an assignment runs the field's `before` validators, its type, its `after` validators
   with `info.data` holding every other field, then the model's `after` validators: one of those that raises
   leaves the value assigned, error at loc `()`, as pydantic-core does; refused with a `mode="before"` model
@@ -26,8 +27,11 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   a `mode="after"` one of the same field is refused), `extra=`, `from_attributes`, `str_strip_whitespace`/`to_lower`/`to_upper`,
   `use_enum_values`, `model_config` as a dict or `ConfigDict`, v1 `class Config` (v1-only keys ignored like
   Pydantic v2 does). The `str_*` settings also apply to the string an `EmailStr` validates. Refused: a
-  `default_factory` taking the validated data (`lambda data: ...`), length constraints on `Iterable[T]`
-  (validated lazily by pydantic, the length errors come at iteration).
+  `default_factory` taking the validated data (`lambda data: ...`), `Iterable[T]`, `Sequence[T]`,
+  `Collection[T]` as a field, parameter, `TypeAdapter` or response type (pydantic validates an `Iterable` lazily,
+  a one-shot iterator whose item errors come at iteration, and a `Sequence` keeps the input's type: annotate
+  `list[...]`; the `AsyncIterable[T]`/`Iterable[T]` return annotation of a generator endpoint is its stream item
+  type, see [Responses](responses.md)).
 - An Enum member given to a scalar field (an ORM enum column read into `status: str`...) as pydantic-core takes
   it: a `str`/`int` subclass member (`class X(str, Enum)`, `StrEnum`, `IntEnum`) is its value for `str`, `int`,
   `float`, `bool` and `Literal` (an `int` one is `str(value)` in a `str`), a plain member is `str(value)` in a
@@ -80,6 +84,11 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   An instance of the response model's own class is serialized as returned, private attributes included.
 
 The binary does not read `.env` files: see [Environment variables](../reference/environment.md).
+- `model_config` `val_json_bytes=` / `ser_json_bytes=` (`"utf8"`, `"base64"`, `"hex"`): a `str` input of a
+  `bytes` field of the model (inside containers too) decoded as pydantic-core does (URL-safe base64, the
+  standard alphabet when the input holds `+` or `/`, padding optional; its error messages, which differ
+  between pydantic-core 2.46 and 2.50), the JSON dump encoded (URL-safe base64 with padding, lowercase hex).
+  A nested model uses its own config.
 
 ## What stays in Python
 

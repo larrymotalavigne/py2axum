@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 
 import aiohttp
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +21,8 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
-app = FastAPI(lifespan=lifespan)
+# behind a proxy that strips /api/v1: the routes answer with and without the prefix (Starlette's get_route_path)
+app = FastAPI(lifespan=lifespan, root_path="/api/v1")
 app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
 app.include_router(upstream.router)
 
@@ -29,6 +30,11 @@ app.include_router(upstream.router)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/whereami/")
+async def whereami(request: Request):
+    return {"root_path": request.scope.get("root_path"), "path": request.url.path, "base_url": str(request.base_url).rsplit("/", 3)[1:]}
 
 
 @app.get("/users", response_model=list[UserOut])

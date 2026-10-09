@@ -61,6 +61,10 @@ Routes added by a `configure(app)` function are described in [Middleware](middle
   is shadowed by it in Python but would be served by the binary), or registrations of the app in another
   module or function than the mount (their order depends on imports or calls). WebSocket handshakes under
   the mount are not relayed (see [WebSockets](websockets.md)).
+- `FastAPI(root_path="/api/v1")` (a literal; `root_path_in_servers=` only changes the OpenAPI schema): the scope's
+  `root_path`, stripped from the path before routing when the path starts with it (Starlette's
+  `get_route_path`, so `/app` and `/api/v1/app` both match), part of `request.base_url`. Refused together with
+  WebSocket routes, `app.mount()` or Python-side routes.
 
 ## What stays in Python
 

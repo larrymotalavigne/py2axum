@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Body, File, Form, Request, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import select, tuple_
+from sqlalchemy import false, func, or_, select, tuple_
 
 from .db import DbDep
 from .models import Task, Ticket
@@ -142,6 +142,45 @@ async def jsonb_ops(body: dict, db: DbDep):
     else:
         cond = Ticket.data.has_all(value)
     return (await db.execute(select(Ticket.code).where(cond, Ticket.code.like("jq%")).order_by(Ticket.code))).scalars().all()
+
+
+@router.post("/json-index")
+async def json_index(body: dict, db: DbDep):
+    """an index of a JSON / JSONB column and its typed accessors (`CAST(col ->> key AS type)`)"""
+    elem = (Ticket.raw if body["col"] == "raw" else Ticket.data)[body["key"]]
+    acc = body["acc"]
+    if acc == "boolean":
+        x = elem.as_boolean()
+    elif acc == "string":
+        x = elem.as_string()
+    elif acc == "integer":
+        x = elem.as_integer()
+    elif acc == "float":
+        x = elem.as_float()
+    elif acc == "numeric":
+        x = elem.as_numeric(10, 2)
+    elif acc == "json":
+        x = elem.as_json()
+    else:
+        x = elem
+    stmt = select(Ticket.code, x.label("v")).where(Ticket.code.like("ji%")).order_by(Ticket.code)
+    return [[code, v] for code, v in (await db.execute(stmt)).all()]
+
+
+@router.get("/json-where")
+async def json_where(db: DbDep):
+    """the accessors in WHERE: a nullable JSON flag (coalesce(...).is_(True)) and comparisons"""
+    flag = func.coalesce(Ticket.raw["ok"].as_boolean(), false())
+    env = Ticket.raw["env"].as_string()
+    q = select(Ticket.code).where(Ticket.code.like("ji%")).order_by(Ticket.code)
+    return {
+        "flag": (await db.execute(q.where(flag.is_(True)))).scalars().all(),
+        "not_flag": (await db.execute(q.where(flag.is_(False)))).scalars().all(),
+        "not_ci": (await db.execute(q.where(or_(Ticket.raw.is_(None), env.is_(None), env != "ci")))).scalars().all(),
+        "n_gt": (await db.execute(q.where(Ticket.data["n"].as_integer() > 4))).scalars().all(),
+        "f_ge": (await db.execute(q.where(Ticket.data["f"].as_float() >= 1.5))).scalars().all(),
+        "first": (await db.execute(q.where(Ticket.data[0].as_string() == "a"))).scalars().all(),
+    }
 
 
 @router.get("/types")

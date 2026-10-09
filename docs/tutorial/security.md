@@ -25,6 +25,9 @@ hashes and signed JWTs, also native. Like every example on this site, it is comp
 
 How the binary itself behaves in front of untrusted clients (threat model, input limits, the hybrid relay) is
 described in [Security of the generated server](../advanced/security.md).
+- `pwdlib`'s `PasswordHash.recommended()` (Argon2id, argon2-cffi's defaults): `hash()`, `verify()`,
+  `verify_and_update()` (a hash of other parameters is rehashed); an unidentified hash is `UnknownHashError`.
+  Other hashers and `hash(salt=...)` are refused.
 
 ## What stays in Python
 

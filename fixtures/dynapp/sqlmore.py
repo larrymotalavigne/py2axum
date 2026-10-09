@@ -59,3 +59,16 @@ async def session_params(db: DbDep):
         "offset": str(when.utcoffset()),
         "local": str(await db.scalar(text("select (timestamptz '2026-06-01 12:00:00+00')::timestamp"))),
     }
+
+
+@router.get("/concat")
+async def concat(db: DbDep):
+    """`+` with a string: SQLAlchemy's `||` (a function of unknown type, a String column, either side)."""
+    from sqlalchemy import func
+
+    return {
+        "func": await db.scalar(select(func.upper("lowercase") + " suffix")),
+        "left": await db.scalar(select("prefix " + func.lower("ABC"))),
+        "col": (await db.scalars(select(Owner.name + "!").order_by(Owner.id))).all(),
+        "num": await db.scalar(select(func.abs(-2) + 3)),
+    }

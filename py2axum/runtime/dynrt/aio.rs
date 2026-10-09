@@ -34,6 +34,17 @@ pub async fn await_value(v: V) -> R {
 /// The call in `await obj.method(...)` on a value known only at run time: a synchronous `Session`'s
 /// methods return plain values, so CPython runs the call, then fails on the `await` (the effects stay).
 pub async fn call_method_awaited(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    // `await self.app(scope, receive, send)` in a raw middleware: the rest of the stack, run in place (no
+    // coroutine object in between)
+    if let V::Inst(i) = recv {
+        if kwargs.is_empty() && super::methods::find_method(i.desc.methods, name).is_none() {
+            if let Some(V::Native(n)) = i.field(name) {
+                if let Native::AsgiApp(slot) = &*n {
+                    return super::asgi::call_app(cx, slot, args).await;
+                }
+            }
+        }
+    }
     let sync = matches!(recv, V::Session(s) if s.is_sync());
     let v = call_method(cx, recv, name, args, kwargs).await?;
     if !sync {

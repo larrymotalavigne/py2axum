@@ -11,6 +11,8 @@ pub mod decimal;
 pub mod deque;
 pub mod dt;
 pub mod http;
+pub mod ical;
+pub mod htmlent;
 pub mod ini;
 pub mod email;
 pub mod stdlib;
@@ -25,6 +27,7 @@ pub mod pathio;
 pub mod pickle;
 pub mod rds;
 pub mod rmq;
+pub mod satable;
 pub mod tenacity;
 pub mod reldelta;
 pub mod xmld;
@@ -92,6 +95,8 @@ pub struct CxInner {
     pub ctxvars: parking_lot::Mutex<std::collections::HashMap<usize, V>>,
     /// the scope given to a raw ASGI app serving this request (`Request(scope, receive)`)
     pub asgi_scope: parking_lot::Mutex<Option<V>>,
+    /// the objects of a scope known to describe this request (`rawasgi::derive` skips comparing them)
+    pub asgi_seen: parking_lot::Mutex<Option<rawasgi::Seen>>,
     /// the WebSocket of a WebSocket route's connection (`ws::current`)
     pub ws: std::sync::OnceLock<V>,
     /// sentry_sdk: the request's isolation scope (the import's for a root context)
@@ -117,6 +122,7 @@ impl CxInner {
             in_trace: std::sync::atomic::AtomicBool::new(false),
             ctxvars: parking_lot::Mutex::new(std::collections::HashMap::new()),
             asgi_scope: parking_lot::Mutex::new(None),
+            asgi_seen: parking_lot::Mutex::new(None),
             ws: std::sync::OnceLock::new(),
             sentry: std::sync::OnceLock::new(),
             handling: parking_lot::Mutex::new(Vec::new()),

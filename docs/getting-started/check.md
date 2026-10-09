@@ -16,15 +16,20 @@ native       POST /auth/register            examples/bookshelf/app/routers/auth.
 native       GET /books                     examples/bookshelf/app/routers/books.py:39
 native       POST /books                    examples/bookshelf/app/routers/books.py:59
 refused      GET /books/export.zip          examples/bookshelf/app/routers/export.py:18
-             └ examples/bookshelf/app/routers/export.py:26: library call `zipfile.ZipFile()` is not supported (not in the py2axum library map)
+             └ examples/bookshelf/app/routers/export.py:28: library call `zipfile.ZipInfo()` is not supported (not in the py2axum library map) [P2A0201]
+               help: Use a supported library or the standard library for the same job (see Libraries and Standard library). Or leave the route to Python: --python-side '/books/export.zip'.
 native       GET /books/stats               examples/bookshelf/app/routers/books.py:68
 ...
 native       WEBSOCKET /ws/books/{book_id}  examples/bookshelf/app/routers/live.py:43
 
+What would make the most routes native (in this order):
+  +1   →   13/13  library zipfile [P2A0201]
+
 Blockers (routes touched, routes for which it is the only blocker):
-     1    1  library zipfile  (examples/bookshelf/app/routers/export.py:26)
+     1    1  library zipfile  (examples/bookshelf/app/routers/export.py:28)
 
 12/13 routes native (92.3 %), 0 python-side, 1 refused — generation would fail
+explain a code: py2axum check --explain P2A0201
 hint: --python-side auto leaves the refused routes to a Python process next to the binary
 ```
 
@@ -34,13 +39,24 @@ hint: --python-side auto leaves the refused routes to a Python process next to t
   stops the translation, with the `file:line` that causes it.
 - **python-side**: left to a Python process running next to the binary ([Hybrid mode](hybrid.md)).
 
-The blockers table ranks what to fix (or to leave to Python) by how many routes each one blocks.
-`--json` gives the same verdicts to scripts, and `--fail-under PCT` makes `check` fail in CI below a share of
-native routes: see [Command line](../reference/cli.md).
+Each refusal carries a stable [error code](../reference/errors.md) and a `help:` line: what to do about this
+construct, and the `--python-side` flag that leaves this route to Python. `py2axum check --explain P2A0201`
+prints why a class of construct is refused and what to do.
+
+*What would make the most routes native* orders the refused constructs greedily: supporting (or rewriting) the
+first one makes the most routes native, then the next one given the first, and so on, with the count of native
+routes after each step. The blockers table gives, for each construct, the routes it touches and those for which
+it is the only blocker.
+
+`--format json` gives the same verdicts to scripts (each route with its `code` and `suggestion`, plus the
+`unblock` list), `--format markdown` renders them as tables for a pull request comment or a CI job summary, and
+`--fail-under PCT` makes `check` fail in CI below a share of native routes: see
+[Command line](../reference/cli.md).
 
 ## When something is refused
 
-Every refusal names the construct and its `file:line`. In order of preference:
+Every refusal names the construct, its `file:line` and its [error code](../reference/errors.md). In order of
+preference:
 
 1. **Leave it to Python**: `--python-side auto`, or `--python-side PATH` for chosen routes. Correct by
    construction, at the cost of a Python process for those paths.
@@ -51,3 +67,6 @@ Every refusal names the construct and its `file:line`. In order of preference:
 
 A library version outside the tested ranges is refused for the whole application: use a version in range, or
 `--allow-untested-versions` after checking the behaviour with a conformance run.
+
+For a whole application, step by step (measure, fix or leave to Python, prove, switch reversibly), see
+[Migrating an existing application](migration.md).

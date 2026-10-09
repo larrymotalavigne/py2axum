@@ -40,7 +40,7 @@ fn b64url_decode(s: &str) -> R<Vec<u8>> {
 fn get<'a>(d: &'a V, key: &str) -> R<Option<V>> {
     match d {
         V::Dict(m) => Ok(m.lock().get(&Key::Str(Arc::from(key))).map(|(_, v)| v.clone())),
-        o => Err(Exc::type_error(format!("argument of type '{}' is not iterable", o.type_name()))),
+        o => Err(Exc::type_error(super::ops::not_container(o.type_name()))),
     }
 }
 

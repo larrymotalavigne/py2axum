@@ -232,6 +232,19 @@ pub enum PErr {
     RangeTz,
     DateTooSmall,
     DateTooLarge,
+    TzSign,
+    NaN,
+    TimeNumTooLarge,
+    TimeNegative,
+    DurNumber,
+    DurTRepeated,
+    DurFraction,
+    DurTimeUnit,
+    DurDateUnit,
+    DurDays,
+    DurTooLarge,
+    DurHoursTooLarge,
+    DurNumTooLarge,
 }
 
 impl PErr {
@@ -259,6 +272,19 @@ impl PErr {
             PErr::RangeMinute => "minute value is outside expected range of 0-59",
             PErr::RangeSecond => "second value is outside expected range of 0-59",
             PErr::RangeTz => "timezone offset must be less than 24 hours",
+            PErr::TzSign => "invalid timezone sign",
+            PErr::NaN => "NaN values not permitted",
+            PErr::TimeNumTooLarge => "numeric times may not exceed 86,399 seconds",
+            PErr::TimeNegative => "time in seconds should be positive",
+            PErr::DurNumber => "invalid digit in duration",
+            PErr::DurTRepeated => "`t` character repeated in duration",
+            PErr::DurFraction => "quantity fraction invalid in duration",
+            PErr::DurTimeUnit => "quantity invalid in time part of duration",
+            PErr::DurDateUnit => "quantity invalid in date part of duration",
+            PErr::DurDays => "\"day\" identifier in duration not correctly formatted",
+            PErr::DurTooLarge => "durations may not exceed 999,999,999 days",
+            PErr::DurHoursTooLarge => "durations may not exceed 999,999,999 hours",
+            PErr::DurNumTooLarge => "a numeric value in the duration is too large",
         }
     }
 }
@@ -458,6 +484,351 @@ pub fn parse_datetime(s: &str) -> Result<DateTime, PErr> {
     Ok(DateTime { wall, tz, fold: 0 })
 }
 
+
+/// speedate's `MM[:SS[.ffffff]]` after the hour: (minute, second, microsecond, next index). A missing or
+/// non-digit character is "invalid character in ..."; fraction digits beyond 6 are dropped.
+fn time_rest(b: &[u8], mut i: usize) -> Result<(u32, u32, u32, usize), PErr> {
+    let two = |b: &[u8], i: usize, e: PErr| -> Result<u32, PErr> {
+        if b.len() < i + 2 {
+            return Err(e);
+        }
+        digits(b, i, 2, e)
+    };
+    let mi = two(b, i, PErr::Minute)?;
+    i += 2;
+    let (mut sec, mut us) = (0, 0);
+    if i < b.len() && b[i] == b':' {
+        sec = two(b, i + 1, PErr::Second)?;
+        i += 3;
+        if i < b.len() && (b[i] == b'.' || b[i] == b',') {
+            i += 1;
+            let start = i;
+            let mut frac = String::new();
+            while i < b.len() && b[i].is_ascii_digit() {
+                if frac.len() < 6 {
+                    frac.push(b[i] as char);
+                }
+                i += 1;
+            }
+            if i == start {
+                return Err(PErr::FracMissing);
+            }
+            while frac.len() < 6 {
+                frac.push('0');
+            }
+            us = frac.parse().unwrap_or(0);
+        }
+    }
+    Ok((mi, sec, us, i))
+}
+
+/// speedate `Time::parse_str` (Pydantic's `time` from a str): `HH:MM[:SS[.f]]` then an optional `Z` or
+/// `±HH[:]MM`. Returns the wall time and the UTC offset in seconds when one is given.
+pub fn parse_time(s: &str) -> Result<(NaiveTime, Option<i32>), PErr> {
+    let b = s.as_bytes();
+    if b.len() < 5 {
+        return Err(PErr::TooShort);
+    }
+    let h = digits(b, 0, 2, PErr::Hour)?;
+    if b[2] != b':' {
+        return Err(PErr::TimeSep);
+    }
+    let (mi, sec, us, mut i) = time_rest(b, 3)?;
+    if h > 23 {
+        return Err(PErr::RangeHour);
+    }
+    if mi > 59 {
+        return Err(PErr::RangeMinute);
+    }
+    if sec > 59 {
+        return Err(PErr::RangeSecond);
+    }
+    let mut tz = None;
+    if i < b.len() {
+        match b[i] {
+            b'Z' | b'z' => {
+                tz = Some(0);
+                i += 1;
+            }
+            b'+' | b'-' => {
+                let sign: i32 = if b[i] == b'-' { -1 } else { 1 };
+                if b.len() < i + 3 {
+                    return Err(PErr::TzHour);
+                }
+                let th = digits(b, i + 1, 2, PErr::TzHour)? as i32;
+                i += 3;
+                if i < b.len() && b[i] == b':' {
+                    i += 1;
+                }
+                if b.len() < i + 2 {
+                    return Err(PErr::TzMinute);
+                }
+                let tm = digits(b, i, 2, PErr::TzMinute)? as i32;
+                i += 2;
+                let off = th * 3600 + tm * 60;
+                if off >= 86400 {
+                    return Err(PErr::RangeTz);
+                }
+                tz = Some(sign * off);
+            }
+            _ => return Err(PErr::TzSign),
+        }
+    }
+    if i < b.len() {
+        return Err(PErr::Extra);
+    }
+    Ok((NaiveTime::from_hms_micro_opt(h, mi, sec, us).ok_or(PErr::RangeSecond)?, tz))
+}
+
+/// speedate's numeric time (seconds since midnight, a UTC time): (wall time, offset 0)
+pub fn time_from_seconds(x: f64) -> Result<NaiveTime, PErr> {
+    if x.is_nan() {
+        return Err(PErr::NaN);
+    }
+    if x < 0.0 {
+        return Err(PErr::TimeNegative);
+    }
+    if x >= 86400.0 {
+        return Err(PErr::TimeNumTooLarge);
+    }
+    let whole = x.trunc() as u32;
+    let us = ((x - x.trunc()) * 1e6).round() as u32;
+    let (whole, us) = if us >= 1_000_000 { (whole + 1, us - 1_000_000) } else { (whole, us) };
+    if whole >= 86400 {
+        return Err(PErr::TimeNumTooLarge);
+    }
+    Ok(NaiveTime::from_num_seconds_from_midnight_opt(whole, us * 1000).ok_or(PErr::TimeNumTooLarge)?)
+}
+
+const MAX_DURATION_DAYS: i128 = 999_999_999;
+
+/// A signed duration in microseconds to a TimeDelta, within speedate's 999,999,999 days.
+fn duration_us(us: i128) -> Result<Duration, PErr> {
+    if us.abs() / 86_400_000_000 > MAX_DURATION_DAYS {
+        return Err(PErr::DurTooLarge);
+    }
+    // beyond i64 microseconds (~106 751 days): seconds, then the rest
+    Ok(Duration::seconds(us.div_euclid(1_000_000) as i64) + Duration::microseconds(us.rem_euclid(1_000_000) as i64))
+}
+
+/// A TimeDelta in microseconds, without the i64 limit of `num_microseconds`
+pub fn micros_wide(d: &Duration) -> i128 {
+    d.num_seconds() as i128 * 1_000_000 + d.subsec_nanos() as i128 / 1000
+}
+
+/// speedate's numeric duration (seconds, a float rounded to the microsecond)
+pub fn duration_from_seconds(x: f64) -> Result<Duration, PErr> {
+    if x.is_nan() {
+        return Err(PErr::NaN);
+    }
+    if !x.is_finite() || x.abs() / 86400.0 > (MAX_DURATION_DAYS + 1) as f64 {
+        return Err(PErr::DurTooLarge);
+    }
+    // whole seconds, then the fraction rounded to the microsecond (a huge float keeps its exact seconds)
+    let whole = x.trunc();
+    duration_us(whole as i128 * 1_000_000 + ((x - whole) * 1e6).round() as i128)
+}
+
+/// `digits` of a duration quantity (an overflow is "durations may not exceed 999,999,999 days")
+fn dur_number(b: &[u8], i: usize) -> Result<(u64, usize), PErr> {
+    match b.get(i) {
+        Some(c) if c.is_ascii_digit() => {}
+        _ => return Err(PErr::DurNumber),
+    }
+    let mut v: u64 = 0;
+    let mut j = i;
+    while let Some(c) = b.get(j).filter(|c| c.is_ascii_digit()) {
+        v = v.checked_mul(10).and_then(|v| v.checked_add((c - b'0') as u64)).filter(|v| *v <= u32::MAX as u64).ok_or(PErr::DurNumTooLarge)?;
+        j += 1;
+    }
+    Ok((v, j))
+}
+
+/// speedate `Duration::parse_str`: an ISO 8601 duration (`P1Y2M3W4DT5H6M7.5S`, a fraction on the last quantity
+/// only, `Y` = 365 days, `M` = 30), `[D[ ]d[ay[s]][,][ ]]HH:MM[:SS[.f]]` (hours unbounded), or `D[ ]d[ay[s]]`;
+/// an optional sign in front. Microseconds as signed total.
+pub fn parse_duration(s: &str) -> Result<Duration, PErr> {
+    let b = s.as_bytes();
+    let (neg, start) = match b.first() {
+        None => return Err(PErr::TooShort),
+        Some(b'+') => (false, 1),
+        Some(b'-') => (true, 1),
+        _ => (false, 0),
+    };
+    if start == b.len() {
+        return Err(PErr::TooShort);
+    }
+    let us: i128 = if b.get(start) == Some(&b'P') {
+        let (mut days, mut secs, mut micros, mut got_t, mut frac_seen, mut any) = (0i128, 0i128, 0i128, false, false, false);
+        let mut i = start + 1;
+        while i < b.len() {
+            if b[i] == b'T' {
+                if got_t {
+                    return Err(PErr::DurTRepeated);
+                }
+                got_t = true;
+                i += 1;
+                continue;
+            }
+            let (value, mut j) = dur_number(b, i)?;
+            if frac_seen {
+                return Err(PErr::DurFraction);
+            }
+            let mut fraction: Option<f64> = None;
+            if matches!(b.get(j), Some(b'.') | Some(b',')) {
+                // speedate: digit by digit, as f64
+                let (mut f, mut mult) = (0.0f64, 0.1f64);
+                j += 1;
+                while let Some(c) = b.get(j).filter(|c| c.is_ascii_digit()) {
+                    f += (c - b'0') as f64 * mult;
+                    mult /= 10.0;
+                    j += 1;
+                }
+                fraction = Some(f);
+                frac_seen = true;
+            }
+            let unit = b.get(j).copied();
+            let seconds_per = if got_t {
+                match unit {
+                    Some(b'H') => 3600i128,
+                    Some(b'M') => 60,
+                    Some(b'S') => 1,
+                    _ => return Err(PErr::DurTimeUnit),
+                }
+            } else {
+                match unit {
+                    Some(b'Y') => 365 * 86400i128,
+                    Some(b'M') => 30 * 86400,
+                    Some(b'W') => 7 * 86400,
+                    Some(b'D') => 86400,
+                    _ => return Err(PErr::DurDateUnit),
+                }
+            };
+            if seconds_per % 86400 == 0 {
+                days += value as i128 * (seconds_per / 86400);
+            } else {
+                secs += value as i128 * seconds_per;
+            }
+            if let Some(f) = fraction {
+                let extra = f * seconds_per as f64;
+                let full = extra.trunc();
+                secs += full as i128;
+                micros += ((extra - full) * 1_000_000.0).round() as i128;
+            }
+            any = true;
+            i = j + 1;
+        }
+        if !any {
+            return Err(PErr::TooShort);
+        }
+        days * 86_400_000_000 + secs * 1_000_000 + micros
+    } else if b[start..].iter().any(|c| *c == b'd' || *c == b'D') || b.len() - start < 5 {
+        // days, then an optional time
+        let (days, mut i) = dur_number(b, start).map_err(|e| if e == PErr::DurNumber { PErr::DurNumber } else { e })?;
+        if b.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        match b.get(i) {
+            Some(b'd') | Some(b'D') => match b.get(i + 1) {
+                Some(b'a') | Some(b'A') => match b.get(i + 2) {
+                    Some(b'y') | Some(b'Y') => {
+                        i += if matches!(b.get(i + 3), Some(b's') | Some(b'S')) { 4 } else { 3 };
+                    }
+                    _ => return Err(PErr::DurDays),
+                },
+                _ => i += 1,
+            },
+            _ => return Err(PErr::DurDays),
+        }
+        if b.get(i) == Some(&b',') {
+            i += 1;
+        }
+        if b.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        let t = if i < b.len() { duration_time(b, i)? } else { 0 };
+        days as i128 * 86_400_000_000 + t
+    } else {
+        duration_time(b, start)?
+    };
+    duration_us(if neg { -us } else { us })
+}
+
+/// speedate's duration time `H...H:MM[:SS[.f]]` (microseconds): at least 5 characters, any number of hour digits
+fn duration_time(b: &[u8], i: usize) -> Result<i128, PErr> {
+    if b.len() - i < 5 {
+        return Err(PErr::TooShort);
+    }
+    // the hours are what comes before the first `:` (none: "invalid character in hour", before any range check)
+    if !b[i..].contains(&b':') {
+        return Err(PErr::Hour);
+    }
+    let mut j = i;
+    let mut hours: i128 = 0;
+    while j < b.len() && b[j] != b':' {
+        if !b[j].is_ascii_digit() {
+            return Err(PErr::Hour);
+        }
+        hours = hours * 10 + (b[j] - b'0') as i128;
+        if hours > MAX_DURATION_DAYS {
+            return Err(PErr::DurHoursTooLarge);
+        }
+        j += 1;
+    }
+    if j >= b.len() {
+        return Err(PErr::Hour);
+    }
+    let (mi, sec, us, k) = time_rest(b, j + 1)?;
+    if mi > 59 {
+        return Err(PErr::RangeMinute);
+    }
+    if sec > 59 {
+        return Err(PErr::RangeSecond);
+    }
+    if k < b.len() {
+        return Err(PErr::Extra);
+    }
+    Ok(((hours * 3600 + mi as i128 * 60 + sec as i128) * 1_000_000) + us as i128)
+}
+
+/// Pydantic's JSON form of a timedelta (speedate's `Duration` display): `[-]P[nY][nD][T[nH][nM][n[.f]S]]`, `PT0S`
+pub fn delta_iso(d: &Duration) -> String {
+    let us = micros_wide(d);
+    let neg = us < 0;
+    let us = us.abs();
+    let mut days = us / 86_400_000_000;
+    let rem = us % 86_400_000_000;
+    let (secs, frac) = (rem / 1_000_000, rem % 1_000_000);
+    let mut s = String::from(if neg { "-P" } else { "P" });
+    if days >= 365 {
+        s += &format!("{}Y", days / 365);
+        days %= 365;
+    }
+    if days != 0 {
+        s += &format!("{days}D");
+    }
+    if secs != 0 || frac != 0 {
+        s += "T";
+        let (h, m, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+        if h != 0 {
+            s += &format!("{h}H");
+        }
+        if m != 0 {
+            s += &format!("{m}M");
+        }
+        if sec != 0 || frac != 0 {
+            if frac != 0 {
+                s += &format!("{sec}.{}S", format!("{frac:06}").trim_end_matches('0'));
+            } else {
+                s += &format!("{sec}S");
+            }
+        }
+    }
+    if us == 0 {
+        s += "T0S";
+    }
+    s
+}
 
 /// CPython's `repr(datetime)`: seconds and microseconds only when non-zero, then fold and tzinfo
 pub fn datetime_repr(d: &DateTime) -> String {

@@ -30,7 +30,7 @@ The `Dockerfile` takes build arguments, so it can often be used as is:
 ```bash
 docker build -f Dockerfile \
   --build-arg APP_DIR=. --build-arg PACKAGE=api \
-  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.5.1 \
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.6.0 \
   --build-arg PY2AXUM_FLAGS="--python-side auto" -t myapp .
 ```
 

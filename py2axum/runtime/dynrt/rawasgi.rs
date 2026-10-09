@@ -4,13 +4,18 @@
 //! `receive` callable (the body in one `http.request` message, then nothing until the client leaves) and a
 //! `send` callable whose `http.response.start` / `http.response.body` messages make the axum response
 //! (streamed when `more_body` is true). Starlette `Response` objects are ASGI apps too.
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
+use futures_util::task::AtomicWaker;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 
 use super::v::*;
 use super::Cx;
@@ -24,27 +29,100 @@ pub enum Msg {
 }
 
 /// The channel between one ASGI app (a raw route or a raw middleware layer) and the server: `receive` reads
-/// the request body, `send` posts the messages that make the response.
+/// the request body, `send` posts the messages that make the response. One allocation per layer: the
+/// messages wait in a queue read by one reader (the layer, then its streamed body).
 pub struct Chan {
-    tx: Mutex<Option<mpsc::UnboundedSender<Msg>>>,
+    msgs: Mutex<VecDeque<Msg>>,
+    /// the reader waiting for a message
+    reader: AtomicWaker,
     body: Mutex<Option<Bytes>>,
     /// the response is complete (uvicorn's `response_complete`): `receive` then returns `http.disconnect`
-    done: tokio::sync::watch::Sender<bool>,
+    done: AtomicBool,
+    done_notify: tokio::sync::Notify,
     /// `http.response.start` (or a whole response) was sent
-    started: std::sync::atomic::AtomicBool,
+    started: AtomicBool,
 }
 
 impl Chan {
-    fn new(tx: mpsc::UnboundedSender<Msg>, body: Bytes) -> Arc<Chan> {
+    fn new(body: Bytes) -> Arc<Chan> {
         Arc::new(Chan {
-            tx: Mutex::new(Some(tx)),
+            msgs: Mutex::new(VecDeque::new()),
+            reader: AtomicWaker::new(),
             body: Mutex::new(Some(body)),
-            done: tokio::sync::watch::channel(false).0,
-            started: std::sync::atomic::AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            done_notify: tokio::sync::Notify::new(),
+            started: AtomicBool::new(false),
         })
     }
     fn complete(&self) {
-        self.done.send_replace(true);
+        self.done.store(true, Ordering::Release);
+        self.done_notify.notify_waiters();
+    }
+    /// a message for the reader (late ones, once the client left, are never read: CPython's server
+    /// ignores them too)
+    fn post(&self, m: Msg) {
+        self.msgs.lock().push_back(m);
+        self.reader.wake();
+    }
+    fn pop(&self) -> Option<Msg> {
+        self.msgs.lock().pop_front()
+    }
+    /// the next message, once there is one
+    fn poll_msg(&self, cx: &mut Context<'_>) -> Poll<Msg> {
+        if let Some(m) = self.pop() {
+            return Poll::Ready(m);
+        }
+        self.reader.register(cx.waker());
+        match self.pop() {
+            Some(m) => Poll::Ready(m),
+            None => Poll::Pending,
+        }
+    }
+}
+
+type AppFut = Pin<Box<dyn Future<Output = R> + Send>>;
+
+/// The future of `app(scope, receive, send)`, polled by the layer itself while it waits for the response
+/// (no task per layer). Dropped unfinished (its code goes on after the response: a `finally` after
+/// `await self.app(...)`, a streamed body; or the client left), it finishes in a task of its own: never aborted.
+struct App(Option<AppFut>);
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn(f);
+            }
+        }
+    }
+}
+
+enum Step {
+    Msg(Msg),
+    /// the app returned (or raised) and every message it posted was read
+    Ended(R),
+}
+
+impl App {
+    /// the app's next message, or its end
+    fn step<'a>(&'a mut self, chan: &'a Chan) -> impl Future<Output = Step> + 'a {
+        std::future::poll_fn(move |cx| {
+            if let Some(m) = chan.pop() {
+                return Poll::Ready(Step::Msg(m));
+            }
+            let Some(f) = self.0.as_mut() else {
+                // it returned earlier, its messages all read
+                return Poll::Ready(Step::Ended(Ok(V::None)));
+            };
+            if let Poll::Ready(r) = f.as_mut().poll(cx) {
+                self.0 = None;
+                return Poll::Ready(match chan.pop() {
+                    Some(m) => Step::Msg(m),
+                    None => Step::Ended(r),
+                });
+            }
+            chan.poll_msg(cx).map(Step::Msg)
+        })
     }
 }
 
@@ -65,9 +143,21 @@ fn bytes_of(v: &V, what: &str) -> R<Vec<u8>> {
     }
 }
 
+/// the keys of ASGI messages and scopes, made once (looked up by reference: no allocation per lookup, no
+/// reference count shared between threads)
+static MSG_KEYS: std::sync::LazyLock<Vec<(&'static str, Key)>> = std::sync::LazyLock::new(|| {
+    ["type", "body", "more_body", "status", "headers", "method", "path", "query_string", "root_path", "state"]
+        .into_iter()
+        .map(|k| (k, Key::Str(Arc::from(k))))
+        .collect()
+});
+
 pub(crate) fn get(m: &V, k: &str) -> R<Option<V>> {
     match m {
-        V::Dict(dm) => Ok(dm.lock().get(&Key::Str(Arc::from(k))).map(|(_, v)| v.clone())),
+        V::Dict(dm) => Ok(match MSG_KEYS.iter().find(|(n, _)| *n == k) {
+            Some((_, key)) => dm.lock().get(key).map(|(_, v)| v.clone()),
+            None => dm.lock().get(&Key::Str(Arc::from(k))).map(|(_, v)| v.clone()),
+        }),
         o => Err(Exc::type_error(format!("py2axum: an ASGI message must be a dict, not {}", o.type_name()))),
     }
 }
@@ -79,8 +169,15 @@ pub async fn receive(c: &Arc<Chan>) -> R {
     match body {
         Some(b) => d(vec![("type", V::str("http.request")), ("body", V::Bytes(Arc::from(&b[..]))), ("more_body", V::Bool(false))]),
         None => {
-            let mut rx = c.done.subscribe();
-            let _ = rx.wait_for(|done| *done).await;
+            loop {
+                let n = c.done_notify.notified();
+                tokio::pin!(n);
+                n.as_mut().enable();
+                if c.done.load(Ordering::Acquire) {
+                    break;
+                }
+                n.await;
+            }
             d(vec![("type", V::str("http.disconnect"))])
         }
     }
@@ -111,7 +208,7 @@ pub async fn send(c: &Arc<Chan>, msg: &V) -> R {
             if !(100..=599).contains(&status) {
                 return Err(super::resp::status_drop(status));
             }
-            c.started.store(true, std::sync::atomic::Ordering::Relaxed);
+            c.started.store(true, Ordering::Relaxed);
             Msg::Start(status, headers)
         }
         "http.response.body" => {
@@ -124,26 +221,24 @@ pub async fn send(c: &Arc<Chan>, msg: &V) -> R {
         }
         other => return Err(Exc::runtime(format!("py2axum: ASGI message type '{other}' is not supported"))),
     };
-    let tx = c.tx.lock().clone();
-    if let Some(tx) = tx {
-        // the client left: CPython's server ignores late messages too
-        let _ = tx.send(m);
-    }
+    c.post(m);
     Ok(V::None)
 }
 
 /// `await send(...)` of a whole response from the inner stack, with a layer's own `send`: passed through
 /// unchanged; returns once its body is complete (a streamed one: when the server has taken its last part)
 pub async fn forward(c: &Arc<Chan>, resp: Response) -> R<()> {
-    c.started.store(true, std::sync::atomic::Ordering::Relaxed);
+    use axum::body::HttpBody;
+    c.started.store(true, Ordering::Relaxed);
+    if resp.body().size_hint().exact().is_some() {
+        c.post(Msg::Whole(resp)); // complete at once
+        return Ok(());
+    }
     let (tx_end, rx_end) = tokio::sync::oneshot::channel::<()>();
     let resp = on_end(resp, move || {
         let _ = tx_end.send(());
     });
-    let tx = c.tx.lock().clone();
-    if let Some(tx) = tx {
-        let _ = tx.send(Msg::Whole(resp));
-    }
+    c.post(Msg::Whole(resp));
     let _ = rx_end.await;
     Ok(())
 }
@@ -204,8 +299,67 @@ pub fn mw_scope(cx: &Cx) -> R {
         let st: Vec<(V, V)> = cx.req.state.lock().iter().map(|(k, v)| (V::str(k), v.clone())).collect();
         m.insert(Key::Str(Arc::from("state")), (V::str("state"), V::dict_from(st)?));
     }
+    *cx.asgi_seen.lock() = Seen::of(&s)?;
     *cx.asgi_scope.lock() = Some(s.clone());
     Ok(s)
+}
+
+/// The objects of the scope keys that describe a request (`method`, `path`, `query_string`, `root_path`,
+/// the `headers` list and its pairs), taken from a scope known to describe it: a scope holding these very
+/// objects (the same dict, or a copy, untouched) describes it too, without comparing contents. Strings,
+/// bytes and tuples are immutable; the list is checked pair by pair (`headers.append(...)` in place).
+pub struct Seen {
+    vals: [V; 4],
+    headers: V,
+    pairs: Vec<V>,
+}
+
+/// `method`, `path`, `query_string`, `root_path`, `headers`
+static SEEN_KEYS: std::sync::LazyLock<[Key; 5]> =
+    std::sync::LazyLock::new(|| ["method", "path", "query_string", "root_path", "headers"].map(|k| Key::Str(Arc::from(k))));
+
+/// the same immutable object (a header pair must be a tuple: a list could change in place)
+fn same_obj(a: &V, b: &V) -> bool {
+    match (a, b) {
+        (V::Str(x), V::Str(y)) => Arc::ptr_eq(x, y),
+        (V::Bytes(x), V::Bytes(y)) => Arc::ptr_eq(x, y),
+        (V::Tuple(x), V::Tuple(y)) => Arc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+impl Seen {
+    pub fn of(scope: &V) -> R<Option<Seen>> {
+        let V::Dict(m) = scope else { return Ok(None) };
+        let m = m.lock();
+        let k = &*SEEN_KEYS;
+        let at = |i: usize| m.get(&k[i]).map(|(_, v)| v.clone());
+        let (Some(a), Some(b), Some(c), Some(d), Some(headers)) = (at(0), at(1), at(2), at(3), at(4)) else {
+            return Ok(None);
+        };
+        let V::List(l) = &headers else { return Ok(None) };
+        let pairs = l.lock().clone();
+        Ok(Some(Seen { vals: [a, b, c, d], headers, pairs }))
+    }
+
+    fn matches(&self, scope: &V) -> bool {
+        let V::Dict(m) = scope else { return false };
+        let m = m.lock();
+        let k = &*SEEN_KEYS;
+        for (i, v) in self.vals.iter().enumerate() {
+            match m.get(&k[i]) {
+                Some((_, x)) if same_obj(x, v) => {}
+                _ => return false,
+            }
+        }
+        match (m.get(&k[4]), &self.headers) {
+            (Some((_, V::List(x))), V::List(y)) if Arc::ptr_eq(x, y) => {
+                let l = x.lock();
+                l.len() == self.pairs.len() && l.iter().zip(&self.pairs).all(|(a, b)| same_obj(a, b))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Runs the raw ASGI app `app` of the current request (a route).
@@ -214,50 +368,38 @@ pub async fn serve(cx: &Cx, app: &V) -> R<Response> {
     run(cx, app, scope, cx.req.body.clone()).await
 }
 
-/// Runs `app(scope, receive, send)` in its own task and makes the response of its messages. The task is
-/// never aborted: after the response, its code goes on (a `finally` after `await self.app(...)` runs).
+/// Runs `app(scope, receive, send)` and makes the response of its messages. The app is never aborted:
+/// after the response, its code goes on (a `finally` after `await self.app(...)` runs).
 pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    let chan = Chan::new(tx, body);
+    let chan = Chan::new(body);
     let args = vec![scope, V::native(Native::AsgiReceive(chan.clone())), V::native(Native::AsgiSend(chan.clone()))];
     let (cx2, app2, chan2) = (cx.clone(), app.clone(), chan.clone());
-    let mut task = tokio::spawn(async move {
+    let mut app = App(Some(Box::pin(async move {
         let r = match super::methods::call_value(&cx2, &app2, args, vec![]).await {
             Ok(v) => super::aio::await_value(v).await,
             Err(e) => Err(e),
         };
         if let Err(e) = &r {
-            if chan2.started.load(std::sync::atomic::Ordering::Relaxed) {
+            if chan2.started.load(Ordering::Relaxed) {
                 // the response has started: the server logs the exception (ServerErrorMiddleware re-raises it)
                 eprintln!("ERROR:    Exception in ASGI application\n{e:?}");
             }
         }
         r
-    });
-    let mut finished = false;
+    })));
     // the start message (or a whole response), or the app ending without one
-    let (status, headers) = loop {
-        tokio::select! {
-            biased;
-            m = rx.recv() => match m {
-                Some(Msg::Start(s, h)) => break (s, h),
-                Some(Msg::Whole(r)) => {
-                    let c = chan.clone();
-                    return Ok(on_end(r, move || c.complete()));
-                }
-                Some(Msg::Body(..)) => return Err(Exc::runtime("Expected ASGI message 'http.response.start', but got 'http.response.body'.")),
-                None => {}
-            },
-            r = &mut task, if !finished => {
-                finished = true;
-                let r = joined(r);
-                if rx.is_empty() {
-                    r?;
-                    // uvicorn: "ASGI callable returned without starting response"
-                    chan.complete();
-                    return Ok(plain_500());
-                }
-            }
+    let (status, headers) = match app.step(&chan).await {
+        Step::Msg(Msg::Start(s, h)) => (s, h),
+        Step::Msg(Msg::Whole(r)) => {
+            let c = chan.clone();
+            return Ok(on_end(r, move || c.complete()));
+        }
+        Step::Msg(Msg::Body(..)) => return Err(Exc::runtime("Expected ASGI message 'http.response.start', but got 'http.response.body'.")),
+        Step::Ended(r) => {
+            r?;
+            // uvicorn: "ASGI callable returned without starting response"
+            chan.complete();
+            return Ok(plain_500());
         }
     };
     let mut builder = Response::builder().status(StatusCode::from_u16(status).map_err(|e| Exc::value_error(e.to_string()))?);
@@ -269,23 +411,11 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
         builder = builder.header(k, v);
     }
     // the body: whole when the first part says so, else streamed
-    let first = loop {
-        tokio::select! {
-            biased;
-            m = rx.recv() => match m {
-                Some(Msg::Body(b, more)) => break Some((b, more)),
-                Some(Msg::Start(..)) => return Err(Exc::runtime("Unexpected ASGI message 'http.response.start' sent, after response already started.")),
-                Some(Msg::Whole(_)) => return Err(Exc::runtime("py2axum: a response sent after http.response.start")),
-                None => break None,
-            },
-            r = &mut task, if !finished => {
-                finished = true;
-                let _ = joined(r);
-                if rx.is_empty() {
-                    break None;
-                }
-            }
-        }
+    let first = match app.step(&chan).await {
+        Step::Msg(Msg::Body(b, more)) => Some((b, more)),
+        Step::Msg(Msg::Start(..)) => return Err(Exc::runtime("Unexpected ASGI message 'http.response.start' sent, after response already started.")),
+        Step::Msg(Msg::Whole(_)) => return Err(Exc::runtime("py2axum: a response sent after http.response.start")),
+        Step::Ended(_) => None,
     };
     let Some((first, more)) = first else {
         chan.complete();
@@ -306,32 +436,23 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
             self.0.complete();
         }
     }
-    let stream = futures_util::stream::unfold((Some(first), rx, Done(chan), false), |(pending, mut rx, done, finished)| async move {
+    // the rest of the body comes from the app, which goes on in its own task (`app` dropped here)
+    let stream = futures_util::stream::unfold((Some(first), Done(chan), false), |(pending, done, finished)| async move {
         if let Some(b) = pending {
-            return Some((Ok::<Bytes, std::io::Error>(b), (None, rx, done, finished)));
+            return Some((Ok::<Bytes, std::io::Error>(b), (None, done, finished)));
         }
         if finished {
             return None;
         }
         loop {
-            match rx.recv().await {
-                Some(Msg::Body(b, more)) => return Some((Ok(b), (None, rx, done, !more))),
-                Some(Msg::Start(..) | Msg::Whole(_)) => continue,
-                None => return None,
+            match std::future::poll_fn(|cx| done.0.poll_msg(cx)).await {
+                Msg::Body(b, more) => return Some((Ok(b), (None, done, !more))),
+                Msg::Start(..) | Msg::Whole(_) => continue,
             }
         }
     });
     use futures_util::StreamExt;
     Ok(builder.body(Body::from_stream(stream.fuse())).unwrap_or_else(super::web::bad_response))
-}
-
-/// the app task's result; a panic (a status uvicorn has no line for: the connection is dropped) goes on
-fn joined(r: Result<R, tokio::task::JoinError>) -> R {
-    match r {
-        Ok(r) => r,
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => Err(Exc::runtime(format!("ASGI task: {e}"))),
-    }
 }
 
 /// The response of the inner stack handed to a `send` the middleware wrapped: the messages a Starlette
@@ -460,6 +581,10 @@ fn quote_path(p: &str) -> String {
 /// (headers, method, path or query string rewritten, or a body read through a wrapped `receive`): a new
 /// request context for the rest of the stack (ContextVars and `request.state` carried over).
 pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
+    // the scope still holds the objects of one known to describe this request (the common case: handed down as is)
+    if body.is_none() && cx.asgi_seen.lock().as_ref().is_some_and(|s| s.matches(scope)) {
+        return Ok(None);
+    }
     let r = &cx.req;
     let method = str_of(get(scope, "method")?, "method")?;
     let path = str_of(get(scope, "path")?, "path")?;
@@ -468,7 +593,7 @@ pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
         None => String::new(),
     };
     if let Some(rp) = get(scope, "root_path")? {
-        if !matches!(&rp, V::Str(s) if s.is_empty()) {
+        if !matches!(&rp, V::Str(s) if &**s == super::web::root_path()) {
             return Err(Exc::runtime("py2axum: a raw middleware setting scope['root_path'] is not supported"));
         }
     }
@@ -484,6 +609,7 @@ pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
     }
     let same = body.is_none() && method == r.method && query == r.raw_query && path == super::web::unquote(&r.path) && headers == r.headers;
     if same {
+        *cx.asgi_seen.lock() = Seen::of(scope)?;
         return Ok(None);
     }
     let raw = if path == super::web::unquote(&r.path) { r.path.clone() } else { quote_path(&path) };
@@ -501,6 +627,7 @@ pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
         disconnected: std::sync::atomic::AtomicBool::new(false),
     };
     let inner = super::CxInner::new(cx.app.clone(), cell);
+    *inner.asgi_seen.lock() = Seen::of(scope)?;
     *inner.ctxvars.lock() = cx.ctxvars.lock().clone();
     if let Some(s) = cx.sentry.get() {
         let _ = inner.sentry.set(s.clone());

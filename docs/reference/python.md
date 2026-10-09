@@ -21,8 +21,11 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   lengths raises at the call, where CPython raises after yielding the common prefix.
 - Functions: keyword/default/`*args`/`**kwargs` binding with CPython's `TypeError`s, closures, lambdas,
   nested functions and decorators (`functools.wraps`, decorator factories; a decorated function is built
-  once at startup), recursion, `global` (one cell per process), generators, `match`.
-  Refused: `nonlocal`, a project decorator on a method.
+  once at startup), recursion, `global` (one cell per process), generators, `match`. A variable a nested
+  function or lambda reads is a cell, as in CPython: read when the inner function runs, not when it is defined
+  (`[lambda: i for i in range(3)]` all see the last `i`; a variable assigned after the `def` raises CPython's
+  `NameError` if read before). `nonlocal` rebinds a local of the enclosing function.
+  Refused: `nonlocal` of a parameter of the enclosing function, a project decorator on a method.
 - Classes: plain classes (`__init__`, methods, properties, static/class methods, class attributes,
   `__slots__`; single inheritance from another plain class and/or `abc.ABC`, `@abstractmethod` (instantiating
   a class left abstract raises CPython's `TypeError` when called by name), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `__post_init__`), exceptions (class attributes,
@@ -72,6 +75,8 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   functions are compiled without any of this.
 - A module-level function is one object (`is`, attributes set on it); a nested function naming itself reads
   its name when called, as CPython's closure cell.
+- `typing.TypedDict` classes: calling one builds a plain `dict` (keys neither checked nor completed, as in
+  CPython); as a Pydantic field or a response model, refused.
 - `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`; a builtin exception
 
 ## asyncio and threading

@@ -34,11 +34,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import DataError
 from sqlalchemy.orm import selectinload
 
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware import Middleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, ddl, decos, dunders, edges, enumcols, extras, kwargs, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, retrying, sec, small, sqlmore, stdmore, tracing, wsock
+from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, corpusx, ddl, decos, docsx, dunders, edges, enumcols, extras, kwargs, lazyimp, libs, life, mounted, outbound, pk, prom, pydmore, pyjwt_auth, rds, realworld, retrying, sec, small, sqlmore, stdmore, tracing, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -85,6 +88,7 @@ app.include_router(outbound.router)
 app.include_router(apiv.router, prefix=apiv.settings.API_PREFIX, dependencies=[Depends(apiv.require_user)])
 app.include_router(tracing.router)
 app.include_router(small.router)
+app.include_router(corpusx.router)
 app.include_router(edges.router)
 app.include_router(wsock.router)
 app.include_router(pyjwt_auth.router)
@@ -92,6 +96,19 @@ app.include_router(asgimw.router)
 app.include_router(pydmore.router)
 app.include_router(stdmore.router)
 app.include_router(kwargs.router)
+app.include_router(docsx.router)
+app.include_router(realworld.router)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exc_default(request, exc):
+    """FastAPI's default handlers, called by the application's own (fixtures/dynapp/corpusx.py)"""
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_default(request, exc):
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.exception_handler(wsock.WsBoom)

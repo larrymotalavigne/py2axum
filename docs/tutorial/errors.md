@@ -23,6 +23,8 @@ Like every example on this site, it is compiled and compared with FastAPI in CI 
   middleware; the exception is still logged) → user middleware (last added runs first) →
   `ExceptionMiddleware` (handlers by status code, then by the exception's MRO; FastAPI's defaults for
   `HTTPException` and `RequestValidationError`) → router (404/405 raised as `HTTPException`, hence catchable).
+  A route's `RequestValidationError` carries FastAPI's `exc.body` (the decoded JSON body, its bytes, or None);
+  on a form route it is not set (reading it is an `AttributeError`).
 - `@app.exception_handler(class | code)`, `app.add_exception_handler(class | code, handler)`, also when they are
   registered by a `configure(app)` function ([Middleware](middleware.md#what-is-native)).
 - `HTTPException(code)` without `detail`: the `http.HTTPStatus` phrase of CPython ≥ 3.13 ("Content Too
@@ -30,6 +32,8 @@ Like every example on this site, it is compiled and compared with FastAPI in CI 
 - `traceback.format_exception(...)` / `format_exception_only(exc)`: the exception's own line
   (`module.Class: message`), as CPython formats it for a traceback of `None`; `exc.__traceback__` is None
   (the binary has no Python frames), so frames and chained exceptions are not rendered.
+- FastAPI's default handlers called from an application's own: `await http_exception_handler(request, exc)`
+  and `await request_validation_exception_handler(request, exc)` (`fastapi.exception_handlers`).
 
 Validation errors (`RequestValidationError`, `ValidationError.errors()`) are described in
 [Models](models.md); exception classes of the project (class attributes, methods, `super().__init__` of

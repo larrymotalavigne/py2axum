@@ -708,6 +708,15 @@ pub fn is(a: &V, b: &V) -> bool {
     }
 }
 
+/// `x in y` on a value that is no container: CPython 3.14 says "not a container or iterable"
+pub fn not_container(type_name: &str) -> String {
+    if super::python() >= (3, 14) {
+        format!("argument of type '{type_name}' is not a container or iterable")
+    } else {
+        format!("argument of type '{type_name}' is not iterable")
+    }
+}
+
 pub fn contains(container: &V, item: &V) -> R<bool> {
     if let Some(t) = row_tuple(container) {
         return contains(&t, item);
@@ -721,7 +730,7 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
                 V::Enum(d, _) => std::ptr::eq(*d, e),
                 other => e.by_value(other).is_some(),
             },
-            _ => return Err(Exc::type_error(format!("argument of type 'type' is not iterable"))),
+            _ => return Err(Exc::type_error(not_container("type"))),
         },
         V::Str(s) => match &unenum(item) {
             V::Str(i) => s.contains(&**i),
@@ -732,6 +741,7 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
         V::Dict(d) => d.lock().contains_key(&Key::dict_key(item)?),
         V::Set(s) => s.lock().contains_key(&Key::set_elem(item)?),
         V::Native(n) => match &**n {
+            Native::SaColumns(t) => super::satable::contains(t, item)?,
             Native::Deque(d) => super::deque::items(d).iter().any(|x| eq_bool(x, item)),
             Native::IpNet(a, l) => super::net::contains(&(*a, *l), item),
             Native::RespHeaders(r) => super::resp::headers_contains(&r.headers, item)?,
@@ -740,9 +750,9 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
                 V::Str(k) => r.header(k).is_some(),
                 _ => false,
             },
-            _ => return Err(Exc::type_error(format!("argument of type '{}' is not iterable", container.type_name()))),
+            _ => return Err(Exc::type_error(not_container(container.type_name()))),
         },
-        _ => return Err(Exc::type_error(format!("argument of type '{}' is not iterable", container.type_name()))),
+        _ => return Err(Exc::type_error(not_container(container.type_name()))),
     })
 }
 
@@ -898,6 +908,9 @@ pub fn str_(v: &V) -> R<String> {
         if let Native::PydUrl(_, u) = &**n {
             return Ok(u.as_str().to_string());
         }
+        if matches!(&**n, Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_)) {
+            return super::satable::text(n, false);
+        }
         if let Native::YarlUrl(u) = &**n {
             return Ok(u.clone()); // yarl keeps the text it was given (no added `/`)
         }
@@ -967,6 +980,9 @@ pub fn repr(v: &V) -> R<String> {
     if let V::Native(n) = v {
         if let Native::PydUrl(name, u) = &**n {
             return Ok(format!("{name}('{}')", u.as_str()));
+        }
+        if matches!(&**n, Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_)) {
+            return super::satable::text(n, true);
         }
         if let Native::Deque(d) = &**n {
             return super::deque::repr(d);
@@ -1645,6 +1661,7 @@ pub fn getitem(v: &V, k: &V) -> R {
     }
     if let V::Native(n) = v {
         match &**n {
+            Native::SaColumns(t) => return super::satable::getitem(t, k),
             Native::Mime(m) => return super::mail::mime_getitem(m, k),
             Native::Deque(d) => return super::deque::getitem(d, k),
             Native::RespHeaders(r) => return super::resp::headers_getitem(&r.headers, k),
@@ -1711,6 +1728,7 @@ pub fn getitem(v: &V, k: &V) -> R {
             _ => return Err(Exc::type_error(format!("type '{}' is not subscriptable", c.name))),
         },
         V::Enum(e, i) if e.kind != EnumKind::Plain => getitem(&e.value(*i), k)?,
+        V::Col(..) | V::Sql(_) => super::orm::sql_getitem(v, k)?,
         _ => return Err(Exc::type_error(format!("'{}' object is not subscriptable", v.type_name()))),
     })
 }
@@ -1786,6 +1804,10 @@ pub fn iter(v: &V) -> R<Vec<V>> {
             Native::Deque(d) => super::deque::items(d),
             _ => vec![],
         },
+        V::Native(n) if matches!(&**n, Native::SaColumns(_)) => match &**n {
+            Native::SaColumns(t) => super::satable::iter(t),
+            _ => vec![],
+        },
         // `for line in io.BytesIO(...)` (and a StreamingResponse over one): its lines from the position
         V::Native(n) if matches!(&**n, Native::BytesIO(_)) => match &**n {
             Native::BytesIO(b) => super::files::bytesio_lines(b),
@@ -1827,6 +1849,10 @@ pub fn len(v: &V) -> R<usize> {
             _ => return Err(Exc::type_error("object of type 'type' has no len()")),
         },
         V::Enum(e, i) if e.kind != EnumKind::Plain => len(&e.value(*i))?,
+        V::Native(n) if matches!(&**n, Native::SaColumns(_)) => match &**n {
+            Native::SaColumns(t) => t.cols.len(),
+            _ => 0,
+        },
         V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => d.items.lock().len(),
             _ => 0,
@@ -1857,6 +1883,32 @@ pub fn unpack_star(v: &V, before: usize, after: usize) -> R<Vec<V>> {
     out.push(V::list(items[before..items.len() - after].to_vec()));
     out.extend_from_slice(&items[items.len() - after..]);
     Ok(out)
+}
+
+/// A cell: a local variable a nested function rebinds (`nonlocal`), shared by both scopes (one-slot list).
+pub fn cell_new() -> V {
+    V::List(Arc::new(Mutex::new(vec![V::Unbound])))
+}
+
+/// A parameter held in a cell.
+pub fn cell_of(v: V) -> V {
+    V::List(Arc::new(Mutex::new(vec![v])))
+}
+
+/// The value in a cell; `free`: read from the nested function (CPython's NameError for a free variable).
+pub fn cell_get(c: &V, name: &str, free: bool) -> R<V> {
+    let V::List(l) = c else { unreachable!("py2axum cell") };
+    match l.lock().first() {
+        Some(V::Unbound) | None if free => Err(Exc::msg(&NAME_ERROR, format!("cannot access free variable '{name}' where it is not associated with a value in enclosing scope"))),
+        Some(v) => bound(v, name),
+        None => bound(&V::Unbound, name),
+    }
+}
+
+/// The slot of a cell, assigned in place (`*cell_mut(&c) = v;`: the value is evaluated before the lock).
+pub fn cell_mut(c: &V) -> parking_lot::MappedMutexGuard<'_, V> {
+    let V::List(l) = c else { unreachable!("py2axum cell") };
+    parking_lot::MutexGuard::map(l.lock(), |v| &mut v[0])
 }
 
 pub fn bound(v: &V, name: &str) -> R<V> {

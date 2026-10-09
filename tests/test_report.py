@@ -168,10 +168,10 @@ def test_python_side_auto_global_error(tmp_path, capsys):
     """An error about the whole application cannot be avoided by moving routes: refused, with file:line."""
     pkg = write_project(tmp_path)
     main_py = pkg / "main.py"
-    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(dependencies=[])"))
+    main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(telemetry=True)"))
     assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "main.py" in err and "FastAPI(dependencies=...) is not supported" in err
+    assert "main.py" in err and "FastAPI(telemetry=...) is not supported" in err
     assert "only moves routes" in err
 
 

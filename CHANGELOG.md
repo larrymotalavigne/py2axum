@@ -5,6 +5,80 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-09
+
+FastAPI documentation corpus at 90.6 %, raw ASGI middlewares three times cheaper, error codes and `py2axum
+watch`, a builder Docker image, and the constructs the remaining routes of real applications needed.
+
+### Performance
+
+- Raw ASGI middlewares: the cost per layer drops from ~2.7 µs to ~0.85 µs. The binary advances the middleware's
+  future itself instead of spawning a task per layer (code left after the response, or a client gone, still
+  finishes in its own task, never aborted), the ASGI channels are a queue plus a waker, and a known-length body is
+  forwarded without a oneshot. On the reference app with 11 layers, `POST /describe` goes from ~24k to ~40k req/s.
+
+### Added
+
+- Error codes: every refusal has a stable code (`P2A0201`: library call not supported, ...) and the command line
+  prints it with the `file:line`, why the construct is refused, what to do and a link to its entry in the new
+  [error code reference](https://larrymotalavigne.github.io/py2axum/reference/errors/). `py2axum check --explain
+  CODE` prints the same in a terminal.
+- `py2axum check`: a suggestion per refused route (the alternative py2axum knows, the `--python-side` flag that
+  leaves it to Python), a summary of what would make the most routes native, `--format text|json|markdown`
+  (`--json` stays a synonym).
+- `py2axum watch`: regenerate, rebuild (debug profile, only the generated crate) and restart the binary on each
+  change of the project, with debounce; a failed cycle keeps the previous binary running.
+- Guide: [Migrating an existing application](https://larrymotalavigne.github.io/py2axum/getting-started/migration/),
+  from `check` to a reversible switch in production.
+
+- Coverage of the FastAPI documentation corpus: 79.6 % → 90.6 % of the exercised examples identical, none
+  differing ([coverage](https://larrymotalavigne.github.io/py2axum/coverage/)). Newly native:
+  `yield` dependencies with `try/except` around the `yield` (the request's exception is raised there, as FastAPI
+  does; one swallowed is `FastAPIError`), `Depends(scope="function")`, an instance with `__call__` as a
+  dependency, `app.dependency_overrides[f] = g` at module level, generator endpoints (JSON Lines,
+  `EventSourceResponse` with `ServerSentEvent`, `StreamingResponse`), `response_model_include=` /
+  `_exclude=` / `_exclude_unset=` / `_exclude_none=`, a `Response` class as the return annotation,
+  `FastAPI(default_response_class=)`, `FastAPI(root_path=)`, unannotated parameters (`Any`),
+  `fastapi.exception_handlers` defaults called from an application's handler, `TrustedHostMiddleware`,
+  `HTTPSRedirectMiddleware`, `model_config` `val_json_bytes`/`ser_json_bytes`, pwdlib's Argon2
+  `PasswordHash.recommended()`, `anyio.sleep`.
+
+- SQLAlchemy's JSON index and its typed accessors, on `JSON` and `JSONB` columns: `col["k"]` / `col[0]` with
+  `as_string()`, `as_integer()`, `as_float()`, `as_boolean()`, `as_numeric(precision, scale)`, `as_json()`
+  (`CAST(col ->> 'k' AS VARCHAR)`, as SQLAlchemy's PostgreSQL compiler renders it); `sqlalchemy.true()` and
+  `false()`. A JSON path index, `col[("a", "b")]`, is refused at translation.
+
+- Constructs of real applications: Pydantic `serialization_alias=` / `validation_alias=` (distinct input and
+  output names; `AliasChoices`/`AliasPath` refused), closures with cells as CPython builds them (late binding,
+  comprehensions included) and `nonlocal`, `TypedDict` called as a `dict` (refused as a `response_model`),
+  `Model.__table__` (columns and their real SQLAlchemy types, computed at translation), `StaleDataError` when a
+  flushed `UPDATE` matches no row, `html.unescape` with CPython's HTML5 tables, icalendar 7.0
+  (`Calendar`/`Event`/`Alarm`, `add`, `add_component`, `to_ical`, byte-identical output), `os.remove` /
+  `os.unlink`; the runtime's `OSError`s carry `errno`, `strerror`, `filename` and the subclass of their errno.
+- SQLAlchemy: `with engine.connect()` / `engine.begin()` on a synchronous `create_engine`, `executemany` through
+  `execute(text(...), [dicts])`, `||` for a string `+` on SQL expressions; `execute/scalars/scalar(stmt, params)`
+  outside `text()`, which failed at run time, is refused at translation with `file:line`.
+- asyncpg 0.32 in the supported range.
+- Docker: `ghcr.io/larrymotalavigne/py2axum`, a builder image (Python 3.14, py2axum, a pinned Rust toolchain and the
+  runtime's crates precompiled with the release profile), multi-arch, with SBOM and provenance; a multi-stage
+  example whose final image holds the binary alone ([Docker image](https://larrymotalavigne.github.io/py2axum/advanced/docker/)).
+- SQLAlchemy documentation corpus: the doctests of the 2.1.4 documentation replayed as routes against the binary
+  (480 examples, none differing; the starting point of the 0.7 work).
+
+### Fixed
+
+- A value stored in a `JSON` column (not `JSONB`, which PostgreSQL normalizes) was written as compact JSON,
+  `{"a":1}`, where SQLAlchemy writes `json.dumps`' text, `{"a": 1}`; `->>` on an object or a list returned the
+  other text.
+- A request-scoped `yield` dependency of a streamed response closed before the stream instead of after it
+  (without a session dependency).
+- An `HTTPException` with a no-body status (204, 304) lost its `headers=`.
+- Generator endpoints under FastAPI < 0.141 follow that version: JSON Lines and Server-Sent Events responses
+  ignore `status_code=` (200), and the items of a route declared on an `APIRouter` are neither validated nor
+  filtered by their `AsyncIterable[T]` type (`include_router` drops it), as FastAPI does.
+- `x in y` on a value that is no container raises Python 3.14's message ("is not a container or iterable")
+  when the project runs on 3.14.
+
 ## [0.5.1] — 2026-10-09
 
 ### Fixed

@@ -95,17 +95,32 @@ fn parts_of(p: &str) -> Vec<V> {
     out
 }
 
+/// CPython's OSError of a failed system call on `p`: the subclass of its errno, `[Errno n] strerror: 'p'`, and the
+/// `errno`, `strerror`, `filename` attributes
 fn os_err(e: std::io::Error, p: &str) -> Exc {
     use std::io::ErrorKind::*;
-    let (class, errno, text): (&'static Class, i32, &str) = match e.kind() {
-        NotFound => (&FILE_NOT_FOUND_ERROR, 2, "No such file or directory"),
-        AlreadyExists => (&FILE_EXISTS_ERROR, 17, "File exists"),
-        PermissionDenied => (&PERMISSION_ERROR, 13, "Permission denied"),
-        IsADirectory => (&IS_A_DIRECTORY_ERROR, 21, "Is a directory"),
-        _ => (&OS_ERROR, e.raw_os_error().unwrap_or(0), "OS error"),
+    let errno = e.raw_os_error();
+    let (class, errno, text): (&'static Class, i32, String) = match (errno, e.kind()) {
+        (Some(2), _) | (None, NotFound) => (&FILE_NOT_FOUND_ERROR, 2, "No such file or directory".into()),
+        (Some(17), _) | (None, AlreadyExists) => (&FILE_EXISTS_ERROR, 17, "File exists".into()),
+        (Some(13), _) | (None, PermissionDenied) => (&PERMISSION_ERROR, 13, "Permission denied".into()),
+        (Some(21), _) | (None, IsADirectory) => (&IS_A_DIRECTORY_ERROR, 21, "Is a directory".into()),
+        (Some(n), _) => {
+            // the C library's message, as os.strerror (std appends " (os error n)")
+            let s = e.to_string();
+            let s = s.strip_suffix(&format!(" (os error {n})")).unwrap_or(&s).to_string();
+            (if n == 1 { &PERMISSION_ERROR } else { &OS_ERROR }, n, s)
+        }
+        (None, _) => (&OS_ERROR, 0, e.to_string()),
     };
-    let text = if class.is_subclass(&OS_ERROR) && std::ptr::eq(class, &OS_ERROR) { e.to_string() } else { text.to_string() };
-    Exc::msg(class, format!("[Errno {errno}] {text}: {}", ops::str_repr(p)))
+    let exc = Exc::msg(class, format!("[Errno {errno}] {text}: {}", ops::str_repr(p)));
+    {
+        let mut a = exc.0.attrs.lock();
+        a.insert("errno".into(), V::Int(errno as i64));
+        a.insert("strerror".into(), V::str(&text));
+        a.insert("filename".into(), V::str(p));
+    }
+    exc
 }
 
 fn kw<'a>(kwargs: &'a [(String, V)], name: &str) -> Option<&'a V> {
@@ -138,6 +153,23 @@ fn absolute(p: &str) -> String {
         let cwd = std::env::current_dir().map(|d| d.to_string_lossy().to_string()).unwrap_or_else(|_| "/".into());
         join(&cwd, p)
     }
+}
+
+/// `os.remove(path)` / `os.unlink(path)`: a str or a Path (bytes paths are not supported)
+pub fn os_remove(name: &str, args: &[V]) -> R {
+    let [p] = args else {
+        return Err(Exc::type_error(format!("{name}() takes exactly 1 positional argument ({} given)", args.len())));
+    };
+    let p = match p {
+        V::Str(s) => s.to_string(),
+        V::Native(n) if matches!(&**n, Native::Path(_)) => ops::str_(p)?,
+        V::Bytes(_) => return Err(Exc::type_error(format!("py2axum: {name}() of a bytes path is not supported"))),
+        other => return Err(Exc::type_error(format!("{name}: path should be string, bytes or os.PathLike, not {}", other.type_name()))),
+    };
+    if p.contains('\0') {
+        return Err(Exc::value_error(format!("{name}: embedded null character in path")));
+    }
+    std::fs::remove_file(&p).map(|_| V::None).map_err(|e| os_err(e, &p))
 }
 
 pub fn path_method(p: &str, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {

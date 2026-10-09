@@ -651,6 +651,7 @@ pub static NAMESPACE: pyd::SchemaDesc = pyd::SchemaDesc {
     settings: None,
     init: None,
     private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
     computed: &[],
     json_schema: None,
 };

@@ -23,7 +23,7 @@ fn no_attr(v: &V, name: &str) -> Exc {
     Exc::attr_error(format!("'{}' object has no attribute '{}'", v.type_name(), name))
 }
 
-fn find_method(table: &'static [(&'static str, bool, pyd::MethodFn)], name: &str) -> Option<(bool, pyd::MethodFn)> {
+pub(crate) fn find_method(table: &'static [(&'static str, bool, pyd::MethodFn)], name: &str) -> Option<(bool, pyd::MethodFn)> {
     table.iter().find(|(n, _, _)| *n == name).map(|(_, p, f)| (*p, *f))
 }
 
@@ -45,9 +45,9 @@ fn deepcopy(v: &V) -> R {
         }
         V::Inst(i) => V::Inst(Arc::new(pyd::Inst {
             desc: i.desc,
-            vals: Mutex::new(i.vals.lock().iter().map(deepcopy).collect::<R<Vec<_>>>()?),
+            vals: super::pyd::Slots::new(i.vals.lock().iter().map(deepcopy).collect::<R<Vec<_>>>()?),
             set: Mutex::new(i.set.lock().clone()),
-            extra: Mutex::new(i.extra.lock().clone()),
+            extra: super::pyd::Slots::new(i.extra.lock().clone()),
         })),
         V::Obj(_) => return Err(Exc::type_error("py2axum: deepcopy of a mapped object is not supported")),
         V::Set(_) => return Err(Exc::type_error("py2axum: deepcopy of a set is not supported")),
@@ -67,6 +67,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::Module(m) => return (m.attr)(cx, name).await,
             Native::Jinja(j) if name == "filters" => return Ok(V::native(Native::JinjaFilters(j.clone()))),
             Native::Tenacity(t) => return super::tenacity::attr(t, name),
+            Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => return super::satable::attr(n, name),
             Native::RelDelta(r) => return super::reldelta::attr(r, name).ok_or_else(|| no_attr(v, name)),
             Native::Prom(p) => return super::prom::attr(p, name),
             Native::Routing(o) => return super::routing::attr(o, name),
@@ -242,8 +243,8 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 "headers" => V::native(Native::Headers(r.clone())),
                 "state" => V::native(Native::State(r.clone())),
                 "url" => V::native(Native::Url(r.clone())),
-                // root_path is always empty here: the origin and "/"
-                "base_url" => V::native(Native::HttpUrl(format!("{}/", ops::request_origin(r)))),
+                // the origin, the root_path, "/"
+                "base_url" => V::native(Native::HttpUrl(format!("{}{}/", ops::request_origin(r), web::root_path().trim_end_matches('/')))),
                 "method" => V::str(&r.method),
                 "query_params" => V::dict_from(r.query.iter().map(|(k, x)| (V::str(k), V::str(x))).collect())?,
                 "cookies" => cookies(r)?,
@@ -314,7 +315,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             },
             _ => Err(no_attr(v, name)),
         },
-        V::Session(_) if name == "bind" => Ok(V::native(Native::Engine)),
+        V::Session(s) if name == "bind" => Ok(V::native(Native::Engine(s.is_sync()))),
         V::List(_) | V::Dict(_) | V::Set(_) | V::Str(_) => match BUILTIN_METHODS.iter().find(|(t, m)| *t == v.type_name() && *m == name) {
             // `items.append` read as a value: called later with its receiver
             Some((_, m)) => Ok(V::native(Native::MethodOf(v.clone(), m))),
@@ -343,8 +344,13 @@ const BUILTIN_METHODS: &[(&str, &str)] = &[
 
 /// `request.cookies`: Starlette's `cookie_parser` (lenient, `http.cookies._unquote` on values)
 pub fn cookies(r: &web::ReqCell) -> R {
+    V::dict_from(cookie_map(r).into_iter().map(|(k, v)| (V::str(k), V::str(v))).collect())
+}
+
+/// Starlette's `cookie_parser` as a map (a `Cookie()` parameter reads it too)
+pub fn cookie_map(r: &web::ReqCell) -> indexmap::IndexMap<&str, String> {
     // insertion order, last value wins (a dict, as Starlette): indexed, a header of many cookies stays linear
-    let mut out: indexmap::IndexMap<&str, V> = indexmap::IndexMap::new();
+    let mut out: indexmap::IndexMap<&str, String> = indexmap::IndexMap::new();
     for raw in r.headers.iter().filter(|(k, _)| k == "cookie").map(|(_, v)| v) {
         for chunk in raw.split(';') {
             let (k, v) = match chunk.split_once('=') {
@@ -352,13 +358,13 @@ pub fn cookies(r: &web::ReqCell) -> R {
                 None => ("", chunk.trim()),
             };
             if !k.is_empty() || !v.is_empty() {
-                out.insert(k, V::str(cookie_unquote(v)));
+                out.insert(k, cookie_unquote(v));
             }
         }
         // Starlette reads the first Cookie header only
         break;
     }
-    V::dict_from(out.into_iter().map(|(k, v)| (V::str(k), v)).collect())
+    out
 }
 
 /// `http.cookies._unquote`
@@ -548,7 +554,19 @@ pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
         }
         V::Native(n) => match &**n {
             Native::State(r) => {
-                r.state.lock().insert(name.to_string(), val);
+                // shared by every request (`app.state.counter += 1` in a middleware): the shortest hold
+                let mut st = r.state.lock();
+                let old = match st.get_mut(name) {
+                    Some(slot) => Some(std::mem::replace(slot, val)),
+                    None => {
+                        drop(st);
+                        let key = name.to_string();
+                        r.state.lock().insert(key, val);
+                        return Ok(());
+                    }
+                };
+                drop(st);
+                drop(old);
                 Ok(())
             }
             Native::RespObj(r) if name == "status_code" => super::resp::set_status(r, &val),
@@ -592,6 +610,14 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         V::Native(n) if matches!(&**n, Native::Module(_)) => {
             let f = getattr(cx, recv, name).await?;
             call_value(cx, &f, args, kwargs).await
+        }
+        V::Native(n) if matches!(&**n, Native::ICal(_)) => {
+            let Native::ICal(c) = &**n else { unreachable!() };
+            super::ical::method(c, name, args, kwargs)
+        }
+        V::Native(n) if matches!(&**n, Native::SaColumns(_)) => {
+            let Native::SaColumns(t) = &**n else { unreachable!() };
+            super::satable::method(t, name, &args, &kwargs)
         }
         V::Native(n) if matches!(&**n, Native::Tenacity(_)) => {
             let Native::Tenacity(t) = &**n else { unreachable!() };
@@ -792,6 +818,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                     exclude_none: kw(&kwargs, "exclude_none").map(ops::truthy).transpose()?.unwrap_or(false),
                     exclude_unset: kw(&kwargs, "exclude_unset").map(ops::truthy).transpose()?.unwrap_or(false),
                     by_alias: kw(&kwargs, "by_alias").map(ops::truthy).transpose()?.unwrap_or(false),
+                    ..Default::default()
                 };
                 let by_alias = o.by_alias;
                 let mut d = pyd::dump(recv, o)?;
@@ -803,7 +830,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                     }
                     let names: Vec<String> = ops::iter(sel)?.iter().map(ops::str_).collect::<R<_>>()?;
                     let keys: Vec<&str> = i.desc.fields.iter().filter(|f| names.iter().any(|n| n == f.name))
-                        .map(|f| if by_alias { f.alias.unwrap_or(f.name) } else { f.name })
+                        .map(|f| if by_alias { f.out_key() } else { f.name })
                         .chain(i.desc.computed.iter().map(|(n, _)| *n).filter(|c| names.iter().any(|n| n == c)))
                         .collect();
                     if let V::Dict(m) = &d {
@@ -826,9 +853,9 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 let vals = if deep { vals.iter().map(deepcopy).collect::<R<Vec<_>>>()? } else { vals };
                 let inst = pyd::Inst {
                     desc: i.desc,
-                    vals: Mutex::new(vals),
+                    vals: super::pyd::Slots::new(vals),
                     set: Mutex::new(i.set.lock().clone()),
-                    extra: Mutex::new(i.extra.lock().clone()),
+                    extra: super::pyd::Slots::new(i.extra.lock().clone()),
                 };
                 // update= is applied as is: Pydantic does not validate it
                 if let Some(V::Dict(upd)) = kw(&kwargs, "update") {
@@ -947,7 +974,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             "close" | "aclose" => s.close().await.map(|_| V::None),
             "connection" => s.connection().await,
             // the engine the session is bound to (sync side for get_bind(), but the same process pool)
-            "get_bind" => Ok(V::native(Native::Engine)),
+            "get_bind" => Ok(V::native(Native::Engine(true))),
             _ => Err(Exc::attr_error(format!("'AsyncSession' object has no attribute '{name}' (not supported by py2axum)"))),
             }
         }
@@ -995,6 +1022,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::RespHeaders(r) => super::resp::headers_method(&r.headers, name, &args, &kwargs),
             Native::CellHeaders(c) => super::resp::headers_method(&c.headers, name, &args, &kwargs),
             Native::Totp(t) => super::auth::totp_method(t, name, &args, &kwargs),
+            Native::PwdHash => super::auth::pwd_method(name, &args, &kwargs),
             Native::Row(names, vals) if name == "_asdict" => V::dict_from(names.iter().zip(vals.iter()).map(|(k, x)| (V::str(k), x.clone())).collect()),
             Native::Row(_, vals) if name == "_tuple" => Ok(V::tuple(vals.to_vec())),
             Native::UrlParts(u) if name == "geturl" => Ok(V::str(super::stdlib::url_parts_geturl(u))),
@@ -1009,11 +1037,11 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 "close" => s.close_connection().await.map(|_| V::None),
                 _ => Err(no_attr(recv, name)),
             },
-            Native::Engine => match name {
-                // a connection: its own transaction, rolled back when the `async with` ends
-                "connect" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, false, Arc::downgrade(cx)))),
-                // a connection in a transaction: committed when the `async with` ends without an exception
-                "begin" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, false, Arc::downgrade(cx)).begin_block())),
+            Native::Engine(sync) => match name {
+                // a connection: its own transaction, rolled back when the `(async) with` ends
+                "connect" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, *sync, Arc::downgrade(cx)))),
+                // a connection in a transaction: committed when the `(async) with` ends without an exception
+                "begin" => Ok(V::Session(orm::Session::new(cx.app.pool.clone(), false, true, *sync, Arc::downgrade(cx)).begin_block())),
                 "dispose" => Ok(V::None),
                 _ => Err(no_attr(recv, name)),
             },

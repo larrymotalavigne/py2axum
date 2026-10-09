@@ -36,6 +36,18 @@ pub fn upload(filename: Option<String>, content_type: Option<String>, headers: V
     V::native(Native::Upload(Arc::new(Upload { filename, content_type, headers, file: bytesio(data) })))
 }
 
+/// `await upload.read()`: the rest of an UploadFile's content (from its position, which moves to the end)
+pub fn upload_read_all(v: &V) -> Option<Vec<u8>> {
+    let V::Native(n) = v else { return None };
+    let Native::Upload(u) = &**n else { return None };
+    let b = as_bio(&u.file);
+    let buf = b.buf.lock();
+    let mut pos = b.pos.lock();
+    let start = (*pos).min(buf.len());
+    *pos = buf.len();
+    Some(buf[start..].to_vec())
+}
+
 fn as_bio(v: &V) -> &BytesIO {
     match v {
         V::Native(n) => match &**n {

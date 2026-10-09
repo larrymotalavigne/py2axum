@@ -93,6 +93,9 @@ pub enum TD {
     Url(&'static UrlSpec),
     /// uuid.UUID
     Uuid,
+    /// bytes, with `Field(min_length=, max_length=)`
+    /// (min_length, max_length, the model's `val_json_bytes`: a str input is decoded with it)
+    Bytes(Option<usize>, Option<usize>, BytesMode),
     /// `Field(min_length=, max_length=)` on a list, set, tuple or dict: (container, min, max)
     Len(&'static TD, Option<usize>, Option<usize>),
 }
@@ -222,6 +225,16 @@ pub struct FieldDesc {
     pub env: Option<&'static str>,
     /// `Field(validate_default=True)`: an omitted field's default is validated like an input
     pub validate_default: bool,
+    /// `serialization_alias=` (or the name, beside a `validation_alias=`): the key of a dump `by_alias` when it
+    /// differs from the key read on input
+    pub ser: Option<&'static str>,
+}
+
+impl FieldDesc {
+    /// the key of this field in a dump `by_alias`
+    pub fn out_key(&self) -> &'static str {
+        self.ser.or(self.alias).unwrap_or(self.name)
+    }
 }
 
 #[derive(PartialEq)]
@@ -249,8 +262,8 @@ static VALINFO: SchemaDesc = SchemaDesc {
     name: "ValidationInfo",
     class: &VALINFO_CLASS,
     fields: &[
-        FieldDesc { name: "data", alias: None, td: &ANY_TD, default: Dflt::Required, env: None, validate_default: false },
-        FieldDesc { name: "field_name", alias: None, td: &STR_TD, default: Dflt::Required, env: None, validate_default: false },
+        FieldDesc { name: "data", alias: None, td: &ANY_TD, default: Dflt::Required, env: None, validate_default: false, ser: None },
+        FieldDesc { name: "field_name", alias: None, td: &STR_TD, default: Dflt::Required, env: None, validate_default: false, ser: None },
     ],
     from_attributes: false,
     extra: Extra::Ignore,
@@ -272,6 +285,7 @@ static VALINFO: SchemaDesc = SchemaDesc {
     settings: None,
     init: None,
     private: &[],
+    ser_bytes: BytesMode::Utf8,
     computed: &[],
     json_schema: None,
 };
@@ -315,6 +329,8 @@ pub struct SchemaDesc {
     pub settings: Option<SettingsDesc>,
     /// a plain class's `__init__`, or a model's own (pydantic-core calls it for a dict input)
     pub init: Option<MethodFn>,
+    /// `ser_json_bytes` of the model config
+    pub ser_bytes: BytesMode,
     /// `@computed_field` properties, serialized after the fields and the extras
     pub computed: &'static [(&'static str, MethodFn)],
     /// `model_json_schema()`, computed at translation time for the models used as values (None otherwise:
@@ -433,6 +449,8 @@ pub fn error_str(title: &str, errs: &[ErrDetail]) -> String {
 /// here and replayed by `settle`, which slots their errors exactly where Pydantic raises them.
 enum Step {
     Err(ErrDetail),
+    /// an input the runtime cannot represent (raised when the steps settle: a 500, never a wrong value)
+    Raise(Exc),
     /// field `field` of the instance in `slot` passed its type check: run its validators on `value`;
     /// `prior` = the earlier fields that passed theirs (`info.data`, once their own validators ran),
     /// filled only when a validator takes `info`
@@ -464,6 +482,10 @@ struct Errs<'a> {
 }
 
 impl Errs<'_> {
+    fn raise(&mut self, x: Exc) {
+        self.steps.push(Step::Raise(x));
+        self.n += 1;
+    }
     fn push(&mut self, kind: &'static str, loc: &[V], msg: impl Into<String>, input: &V, ctx: Option<Vec<(&'static str, V)>>) {
         self.steps.push(Step::Err(ErrDetail { kind, loc: loc.to_vec(), msg: msg.into(), input: input.clone(), ctx }));
         self.n += 1;
@@ -559,9 +581,26 @@ fn check_num_kind(x: f64, c: &NumC, loc: &[V], input: &V, e: &mut Errs, float: b
 
 pub struct Inst {
     pub desc: &'static SchemaDesc,
-    pub vals: Mutex<Vec<V>>,
+    pub vals: Slots<Vec<V>>,
     pub set: Mutex<Vec<bool>>,
-    pub extra: Mutex<IndexMap<String, V>>,
+    pub extra: Slots<IndexMap<String, V>>,
+}
+
+/// An instance's attributes. An instance shared by every request (a middleware's `self.app`, a service
+/// object at module level) is read by all of them at once: `read` lets readers in together (a mutex made
+/// them spin on each other); `lock` is the exclusive access every other use keeps.
+pub struct Slots<T>(parking_lot::RwLock<T>);
+
+impl<T> Slots<T> {
+    pub fn new(t: T) -> Self {
+        Slots(parking_lot::RwLock::new(t))
+    }
+    pub fn lock(&self) -> parking_lot::RwLockWriteGuard<'_, T> {
+        self.0.write()
+    }
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, T> {
+        self.0.read()
+    }
 }
 
 /// `TypeAdapter(td).validate_python(input, from_attributes=True)` (FastAPI's mode), validators
@@ -757,8 +796,12 @@ pub fn validate_sync(input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDe
     let (mut steps, mut slots) = (Vec::new(), Vec::new());
     let got = val(input, td, loc, &mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None });
     for st in steps {
-        if let Step::Err(d) = st {
-            errs.push(d);
+        match st {
+            Step::Err(d) => errs.push(d),
+            // nowhere to raise from here: reported, never a silently wrong value
+            Step::Raise(x) => errs.push(ErrDetail { kind: "py2axum_unsupported", loc: loc.to_vec(), msg: x.message(),
+                                                    input: input.clone(), ctx: None }),
+            _ => {}
         }
     }
     got
@@ -810,9 +853,9 @@ pub async fn assign_validated(cx: &super::Cx, inst: &Arc<Inst>, name: &str, v: V
             args.push(if vd.info == 1 {
                 V::Inst(Arc::new(Inst {
                     desc: &VALINFO,
-                    vals: Mutex::new(vec![data, V::str(fname)]),
+                    vals: Slots::new(vec![data, V::str(fname)]),
                     set: Mutex::new(vec![true, true]),
-                    extra: Mutex::new(IndexMap::new()),
+                    extra: Slots::new(IndexMap::new()),
                 }))
             } else {
                 V::native(Native::Kwargs(vec![("values".to_string(), data)]))
@@ -840,6 +883,7 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
     for st in steps {
         match st {
             Step::Err(d) => errs.push(d),
+            Step::Raise(x) => return Err(x),
             Step::ModelStart { slot } => {
                 starts.insert(slot, errs.len());
             }
@@ -899,9 +943,9 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
                         args.push(if vd.info == 1 {
                             V::Inst(Arc::new(Inst {
                                 desc: &VALINFO,
-                                vals: Mutex::new(vec![data, V::str(name)]),
+                                vals: Slots::new(vec![data, V::str(name)]),
                                 set: Mutex::new(vec![true, true]),
-                                extra: Mutex::new(IndexMap::new()),
+                                extra: Slots::new(IndexMap::new()),
                             }))
                         } else {
                             V::native(Native::Kwargs(vec![("values".to_string(), data)]))
@@ -1268,20 +1312,59 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 }
             }
         }
-        TD::Time => match input {
-            V::Time(t) => Some(V::Time(*t)),
-            _ => {
-                e.push("time_type", loc, "Input should be a valid time", input, None);
-                None
+        // pydantic-core's time validator (speedate): `HH:MM[:SS[.f]]` strings, numbers as seconds since midnight
+        TD::Time => {
+            if !matches!(input, V::Time(_)) {
+                e.floor(LAX);
             }
-        },
-        TD::Delta => match input {
-            V::Delta(d) => Some(V::Delta(*d)),
-            _ => {
-                e.push("time_delta_type", loc, "Input should be a valid timedelta", input, None);
-                None
+            let parsed = match input {
+                V::Time(t) => return Some(V::Time(*t)),
+                V::Str(s) => dt::parse_time(s),
+                V::Int(i) => dt::time_from_seconds(*i as f64).map(|t| (t, Some(0))),
+                V::Float(f) => dt::time_from_seconds(*f).map(|t| (t, Some(0))),
+                _ => {
+                    e.push("time_type", loc, "Input should be a valid time", input, None);
+                    return None;
+                }
+            };
+            match parsed {
+                Ok((t, None)) => Some(V::Time(t)),
+                // an aware time (`15:30:00Z`, a number: UTC): the runtime's times are naive (docs/supported.md)
+                Ok((_, Some(_))) => {
+                    e.raise(Exc::type_error("py2axum: a timezone-aware time (a UTC offset, or a number of seconds) is not supported"));
+                    None
+                }
+                Err(err) => {
+                    e.push("time_parsing", loc, format!("Input should be in a valid time format, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
+                    None
+                }
             }
-        },
+        }
+        // pydantic-core's timedelta validator (speedate, python mode): ISO 8601 or `[D days, ]HH:MM:SS` strings,
+        // numbers (and bools) as seconds
+        TD::Delta => {
+            if !matches!(input, V::Delta(_)) {
+                e.floor(LAX);
+            }
+            let parsed = match input {
+                V::Delta(d) => return Some(V::Delta(*d)),
+                V::Str(s) => dt::parse_duration(s),
+                V::Bool(b) => Ok(chrono::TimeDelta::seconds(*b as i64)),
+                V::Int(i) => dt::duration_from_seconds(*i as f64).and_then(|_| Ok(chrono::TimeDelta::seconds(*i))),
+                V::Float(f) => dt::duration_from_seconds(*f),
+                _ => {
+                    e.push("time_delta_type", loc, "Input should be a valid timedelta", input, None);
+                    return None;
+                }
+            };
+            match parsed {
+                Ok(d) => Some(V::Delta(d)),
+                Err(err) => {
+                    e.push("time_delta_parsing", loc, format!("Input should be a valid timedelta, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
+                    None
+                }
+            }
+        }
         TD::Dict(kv) => match input {
             V::Dict(d) => {
                 let items: Vec<(V, V)> = d.lock().values().cloned().collect();
@@ -1459,6 +1542,41 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
         TD::Decimal(c) => decimal_val(input, c, loc, e),
         TD::Url(spec) => url_val(input, spec, loc, e),
         TD::Uuid => uuid_val(input, loc, e),
+        // pydantic-core's bytes validator: bytes exactly, a str (UTF-8 encoded) leniently, then the length
+        TD::Bytes(min, max, mode) => {
+            let b: Arc<[u8]> = match input {
+                V::Bytes(b) => b.clone(),
+                V::Str(s) => {
+                    e.floor(LAX);
+                    match mode.decode(s) {
+                        Ok(b) => b,
+                        Err(err) => {
+                            let enc = mode.name();
+                            e.push("bytes_invalid_encoding", loc, format!("Data should be valid {enc}: {err}"), input,
+                                   Some(vec![("encoding", V::str(enc)), ("encoding_error", V::str(&err))]));
+                            return None;
+                        }
+                    }
+                }
+                _ => {
+                    e.push("bytes_type", loc, "Input should be a valid bytes", input, None);
+                    return None;
+                }
+            };
+            if let Some(m) = *min {
+                if b.len() < m {
+                    e.push("bytes_too_short", loc, format!("Data should have at least {m} byte{}", if m == 1 { "" } else { "s" }), input, Some(vec![("min_length", V::Int(m as i64))]));
+                    return None;
+                }
+            }
+            if let Some(m) = *max {
+                if b.len() > m {
+                    e.push("bytes_too_long", loc, format!("Data should have at most {m} byte{}", if m == 1 { "" } else { "s" }), input, Some(vec![("max_length", V::Int(m as i64))]));
+                    return None;
+                }
+            }
+            Some(V::Bytes(b))
+        }
         TD::Email(c) => match input {
             V::Str(s) => match super::email::validate(&str_settings(s, c)) {
                 Ok(v) => Some(V::str(v)),
@@ -1545,6 +1663,7 @@ fn label(td: &TD) -> String {
         TD::Decimal(_) => "decimal".into(),
         TD::Url(s) => format!("url[{}]", s.name),
         TD::Uuid => "uuid".into(),
+        TD::Bytes(..) => "bytes".into(),
     }
 }
 
@@ -1973,7 +2092,7 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
     e.fields_set = Some(set.iter().filter(|x| **x).count());
     let mut extra = extra;
     desc.private_defaults(&mut extra);
-    let inst = Arc::new(Inst { desc, vals: Mutex::new(vals), set: Mutex::new(set), extra: Mutex::new(extra) });
+    let inst = Arc::new(Inst { desc, vals: Slots::new(vals), set: Mutex::new(set), extra: Slots::new(extra) });
     if let Some(slot) = slot {
         e.slots[slot] = Some(inst.clone());
     }
@@ -2216,7 +2335,7 @@ pub async fn dataclass_new(cx: &super::Cx, desc: &'static SchemaDesc, args: Vec<
             (None, Dflt::Required) => unreachable!(),
         });
     }
-    let inst = V::Inst(Arc::new(Inst { desc, vals: Mutex::new(out), set: Mutex::new(vec![true; n]), extra: Mutex::new(IndexMap::new()) }));
+    let inst = V::Inst(Arc::new(Inst { desc, vals: Slots::new(out), set: Mutex::new(vec![true; n]), extra: Slots::new(IndexMap::new()) }));
     if let Some(f) = desc.post_init {
         f(cx, inst.clone(), vec![]).await?;
     }
@@ -2225,7 +2344,7 @@ pub async fn dataclass_new(cx: &super::Cx, desc: &'static SchemaDesc, args: Vec<
 
 impl Inst {
     pub fn field(&self, name: &str) -> Option<V> {
-        self.desc.field_index(name).map(|i| self.vals.lock()[i].clone()).or_else(|| self.extra.lock().get(name).cloned())
+        self.desc.field_index(name).map(|i| self.vals.read()[i].clone()).or_else(|| self.extra.read().get(name).cloned())
     }
     pub fn set_field(&self, name: &str, v: V) -> R<()> {
         if self.desc.frozen && self.desc.dataclass {
@@ -2289,9 +2408,9 @@ impl Inst {
         if !self.desc.computed.is_empty() {
             let me = Arc::new(Inst {
                 desc: self.desc,
-                vals: Mutex::new(vals.clone()),
+                vals: Slots::new(vals.clone()),
                 set: Mutex::new(self.set.lock().clone()),
-                extra: Mutex::new(self.extra.lock().clone()),
+                extra: Slots::new(self.extra.lock().clone()),
             });
             for (n, v) in computed_values(&me)? {
                 parts.push(format!("{n}={}", ops::repr(&v)?));
@@ -2335,6 +2454,93 @@ pub struct DumpOpts {
     pub exclude_none: bool,
     pub exclude_unset: bool,
     pub by_alias: bool,
+    /// the `ser_json_bytes` of the model being dumped (each model its own)
+    pub bytes: BytesMode,
+}
+
+/// `val_json_bytes` / `ser_json_bytes` of a model config: how bytes travel as a JSON string.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum BytesMode {
+    #[default]
+    Utf8,
+    Base64,
+    Hex,
+}
+
+impl BytesMode {
+    fn name(self) -> &'static str {
+        match self {
+            BytesMode::Utf8 => "utf8",
+            BytesMode::Base64 => "base64",
+            BytesMode::Hex => "hex",
+        }
+    }
+
+    /// pydantic-core: URL-safe base64 (padding optional), the standard alphabet when the input holds `+` or
+    /// `/`; hex (either case). The messages are pydantic-core's (measured on 2.50).
+    fn decode(self, s: &str) -> Result<Arc<[u8]>, String> {
+        use base64::engine::{general_purpose::GeneralPurpose, general_purpose::GeneralPurposeConfig, DecodePaddingMode};
+        use base64::{alphabet, DecodeError, Engine};
+        match self {
+            BytesMode::Utf8 => Ok(Arc::from(s.as_bytes())),
+            BytesMode::Base64 => {
+                let cfg = GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
+                let url = GeneralPurpose::new(&alphabet::URL_SAFE, cfg);
+                let std = GeneralPurpose::new(&alphabet::STANDARD, cfg);
+                let r = match url.decode(s) {
+                    Err(DecodeError::InvalidByte(_, b'+' | b'/')) => std.decode(s),
+                    r => r,
+                };
+                r.map(Arc::from).map_err(|err| match err {
+                    DecodeError::InvalidByte(off, b) => format!("Invalid symbol {b}, offset {off}."),
+                    DecodeError::InvalidLength(n) => format!("Invalid input length: {n}"),
+                    // pydantic-core 2.46 (pydantic 2.13) and 2.50 (2.14) word it differently (measured)
+                    DecodeError::InvalidLastSymbol(off, b) if super::pydantic_before(2, 14) => format!("Invalid last symbol {b}, offset {off}."),
+                    DecodeError::InvalidLastSymbol(off, b) => {
+                        let bits = alphabet_value(b);
+                        format!("Invalid last symbol 0x{b:02X} ('{}') at offset {off}, decoded as 0b{bits:08b}.", b as char)
+                    }
+                    DecodeError::InvalidPadding => "Invalid padding".into(),
+                })
+            }
+            BytesMode::Hex => {
+                let b = s.as_bytes();
+                if b.len() % 2 == 1 {
+                    return Err("Odd number of digits".into());
+                }
+                let nib = |i: usize| -> Result<u8, String> {
+                    (b[i] as char).to_digit(16).map(|d| d as u8)
+                        .ok_or_else(|| format!("Invalid character {:?} at position {i}", b[i] as char))
+                };
+                (0..b.len() / 2).map(|i| Ok(nib(2 * i)? << 4 | nib(2 * i + 1)?)).collect::<Result<Vec<u8>, String>>().map(Arc::from)
+            }
+        }
+    }
+
+    fn encode(self, b: &[u8]) -> R {
+        use base64::Engine;
+        Ok(match self {
+            BytesMode::Utf8 => match std::str::from_utf8(b) {
+                Ok(s) => V::str(s),
+                // pydantic-core's error (Rust's Utf8Error)
+                Err(err) => return Err(Exc::msg(&PYDANTIC_SERIALIZATION_ERROR, format!("Error serializing to JSON: {err}"))),
+            },
+            BytesMode::Base64 => V::str(base64::engine::general_purpose::URL_SAFE.encode(b)),
+            BytesMode::Hex => V::str(b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+        })
+    }
+}
+
+/// The 6-bit value of a base64 symbol (either alphabet).
+fn alphabet_value(b: u8) -> u8 {
+    match b {
+        b'A'..=b'Z' => b - b'A',
+        b'a'..=b'z' => b - b'a' + 26,
+        b'0'..=b'9' => b - b'0' + 52,
+        b'+' | b'-' => 62,
+        b'/' | b'_' => 63,
+        _ => 0,
+    }
 }
 
 /// `model_dump(...)`: a dict (python mode keeps objects, json mode makes everything JSON-able).
@@ -2348,6 +2554,7 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
             let vals = inst.vals.lock().clone();
             let set = inst.set.lock().clone();
             let mut items = Vec::new();
+            let o = DumpOpts { bytes: inst.desc.ser_bytes, ..o };
             for (i, f) in inst.desc.fields.iter().enumerate() {
                 if o.exclude_unset && !set[i] {
                     continue;
@@ -2355,7 +2562,7 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
                 if o.exclude_none && vals[i].is_none() {
                     continue;
                 }
-                let k = if o.by_alias { f.alias.unwrap_or(f.name) } else { f.name };
+                let k = if o.by_alias { f.out_key() } else { f.name };
                 items.push((V::str(k), dump(&vals[i], o)?));
             }
             for (k, ev) in inst.extra.lock().clone() {
@@ -2392,7 +2599,9 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
         V::DateTime(d) if o.json => V::str(d.pydantic()),
         V::Date(d) if o.json => V::str(dt::date_iso(d)),
         V::Time(t) if o.json => V::str(dt::time_iso(t)),
-        V::Delta(d) if o.json => V::str(delta_iso(d)),
+        V::Delta(d) if o.json => V::str(dt::delta_iso(d)),
+        // bytes in JSON mode: the model's ser_json_bytes (utf8: the text, else pydantic-core's error)
+        V::Bytes(b) if o.json => o.bytes.encode(b)?,
         // pydantic serializes a Decimal as its str() in JSON mode
         V::Decimal(d) if o.json => V::str(d.to_string()),
         V::Native(n) if o.json && matches!(&**n, Native::PydUrl(..) | Native::Uuid(_)) => V::str(ops::str_(v)?),
@@ -2424,29 +2633,6 @@ pub fn json_key(k: &V) -> R<String> {
 }
 
 /// Pydantic's ISO 8601 duration form (`PT1H`, `P1DT2S`...).
-fn delta_iso(d: &chrono::TimeDelta) -> String {
-    let us = dt::micros(d);
-    let neg = us < 0;
-    let us = us.abs();
-    let days = us / 86_400_000_000;
-    let rem = us % 86_400_000_000;
-    let secs = rem / 1_000_000;
-    let frac = rem % 1_000_000;
-    let mut s = String::from(if neg { "-P" } else { "P" });
-    if days > 0 {
-        s += &format!("{days}D");
-    }
-    if secs > 0 || frac > 0 || days == 0 {
-        s += "T";
-        if frac > 0 {
-            s += &format!("{}.{:06}S", secs, frac);
-        } else {
-            s += &format!("{secs}S");
-        }
-    }
-    s
-}
-
 /// FastAPI's `jsonable_encoder` (no response_model): datetimes via `isoformat()`.
 pub fn jsonable(v: &V) -> R {
     super::stack_guard()?;
@@ -2478,7 +2664,7 @@ pub fn jsonable(v: &V) -> R {
         V::DateTime(d) => V::str(d.isoformat('T', "auto")),
         V::Date(d) => V::str(dt::date_iso(d)),
         V::Time(t) => V::str(dt::time_iso(t)),
-        V::Delta(d) => V::Float(dt::micros(d) as f64 / 1e6),
+        V::Delta(d) => V::Float(dt::micros_wide(d) as f64 / 1e6),
         V::Decimal(d) => super::decimal::jsonable(d)?,
         V::Native(n) if matches!(&**n, Native::PydUrl(..) | Native::Uuid(_)) => V::str(ops::str_(v)?),
         // `vars(exc)` (dict(exc) fails): HTTPException's fields, then the attributes its `__init__` set
@@ -2655,11 +2841,11 @@ pub fn tz_utc() -> V {
 /// an instance before its state (`cls.__new__(cls)`, unpickling): fields None, none set
 pub fn object_new_blank(desc: &'static SchemaDesc) -> V {
     let n = desc.fields.len();
-    V::Inst(Arc::new(Inst { desc, vals: Mutex::new(vec![V::None; n]), set: Mutex::new(vec![false; n]), extra: Mutex::new(IndexMap::new()) }))
+    V::Inst(Arc::new(Inst { desc, vals: Slots::new(vec![V::None; n]), set: Mutex::new(vec![false; n]), extra: Slots::new(IndexMap::new()) }))
 }
 
 pub fn object_new(desc: &'static SchemaDesc) -> V {
-    V::Inst(Arc::new(Inst { desc, vals: Mutex::new(vec![]), set: Mutex::new(vec![]), extra: Mutex::new(IndexMap::new()) }))
+    V::Inst(Arc::new(Inst { desc, vals: Slots::new(vec![]), set: Mutex::new(vec![]), extra: Slots::new(IndexMap::new()) }))
 }
 
 
@@ -2701,7 +2887,7 @@ pub async fn adapter_method(cx: &super::Cx, td: &'static TD, name: &str, args: V
         _ => {
             let flag = |k: &str| -> R<bool> { kw(k).map(|v| ops::truthy(&v)).transpose().map(|b| b.unwrap_or(false)) };
             let json = name == "dump_json" || matches!(kw("mode"), Some(V::Str(m)) if &*m == "json");
-            let o = DumpOpts { json, exclude_none: flag("exclude_none")?, exclude_unset: flag("exclude_unset")?, by_alias: flag("by_alias")? };
+            let o = DumpOpts { json, exclude_none: flag("exclude_none")?, exclude_unset: flag("exclude_unset")?, by_alias: flag("by_alias")?, ..Default::default() };
             let d = dump(obj, o)?;
             if name == "dump_json" {
                 Ok(V::Bytes(Arc::from(to_json(&d, &RESPONSE, false)?.into_bytes().as_slice())))

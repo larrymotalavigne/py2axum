@@ -30,6 +30,93 @@ pub enum Mw {
     Asgi(V, Arc<Slot>),
     /// starlette_context's RawContextMiddleware
     Context(super::ctxmw::RawContext),
+    /// Starlette's HTTPSRedirectMiddleware
+    HttpsRedirect,
+    /// Starlette's TrustedHostMiddleware
+    TrustedHost(TrustedHost),
+}
+
+/// Starlette's TrustedHostMiddleware(allowed_hosts=..., www_redirect=...)
+pub struct TrustedHost {
+    pub hosts: Vec<String>,
+    pub www_redirect: bool,
+}
+
+/// starlette._utils.parse_host_header: (host, port) of a valid Host header
+fn parse_host(h: Option<String>) -> Option<(String, Option<String>)> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^(?P<host>[a-z0-9._~%!$&'()*+,;=-]+|\[(?:(?P<ipv6>[a-f0-9]*:[a-f0-9.:]+)|(?-i:v)[a-f0-9]+\.[a-z0-9._~!$&'()*+,;=:-]+)\])(?::(?P<port>[0-9]+))?$").unwrap()
+    });
+    let h = h?;
+    let c = re.captures(&h)?;
+    if let Some(ip) = c.name("ipv6") {
+        ip.as_str().parse::<std::net::Ipv6Addr>().ok()?;
+    }
+    Some((c["host"].to_string(), c.name("port").map(|p| p.as_str().to_string())))
+}
+
+/// `URL(scope=scope)` of a request whose Host header parsed (scheme http, the decoded path, the raw query)
+fn scope_url(cx: &Cx, netloc: &str) -> String {
+    let mut u = format!("http://{netloc}{}", web::unquote(&cx.req.path));
+    if !cx.req.raw_query.is_empty() {
+        u += "?";
+        u += &cx.req.raw_query;
+    }
+    u
+}
+
+fn redirect(url: String) -> R<Response> {
+    let obj = super::resp::new("RedirectResponse", &[V::str(url)], &[("status_code".to_string(), V::Int(307))])?;
+    let V::Native(n) = &obj else { unreachable!() };
+    let Native::RespObj(r) = &**n else { unreachable!() };
+    super::resp::into_response(r)
+}
+
+fn invalid_host() -> R<Response> {
+    Ok(Response::builder().status(400).header("content-type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from("Invalid host header")).unwrap())
+}
+
+impl TrustedHost {
+    fn check(&self, cx: &Cx) -> Option<R<Response>> {
+        if self.hosts.iter().any(|h| h == "*") {
+            return None;
+        }
+        let Some((host, port)) = parse_host(cx.req.header("host")) else { return Some(invalid_host()) };
+        let mut www = false;
+        for p in &self.hosts {
+            if host == *p || (p.starts_with('*') && host.ends_with(&p[1..])) {
+                return None;
+            }
+            if format!("www.{host}") == *p {
+                www = true;
+            }
+        }
+        if www && self.www_redirect {
+            let netloc = match &port { Some(p) => format!("{host}:{p}"), None => host };
+            return Some(redirect(scope_url(cx, &format!("www.{netloc}"))));
+        }
+        Some(invalid_host())
+    }
+}
+
+/// HTTPSRedirectMiddleware: every request is redirected (307) to its https URL, without the port if it is 80 or 443
+fn https_redirect(cx: &Cx) -> R<Response> {
+    let Some((host, port)) = parse_host(cx.req.header("host")) else {
+        return Err(Exc::runtime("py2axum: HTTPSRedirectMiddleware with an invalid Host header (Starlette builds the URL from the server address)"));
+    };
+    let port_n = match &port {
+        Some(p) => Some(p.parse::<u32>().ok().filter(|n| *n <= 65535).ok_or_else(|| Exc::value_error(format!("Port out of range 0-65535")))?),
+        None => None,
+    };
+    let netloc = if matches!(port_n, Some(80) | Some(443)) {
+        host.trim_start_matches('[').trim_end_matches(']').to_lowercase()
+    } else {
+        match &port { Some(p) => format!("{host}:{p}"), None => host }
+    };
+    let u = scope_url(cx, &netloc);
+    redirect(format!("https{}", &u["http".len()..]))
 }
 
 /// Where the `app` a raw middleware was built with leads: (the stack, the next layer), set once the
@@ -351,26 +438,33 @@ pub async fn app(
 
 type RespFut<'a> = Pin<Box<dyn Future<Output = R<Response>> + Send + 'a>>;
 
+/// The stack from layer `i` on. Each layer boxes only its own future (one `async` block for every kind
+/// of layer would be as large as the largest, the router's, and copied whole at every layer).
 fn chain<'a>(cx: &'a Cx, stack: &'a Arc<Stack>, i: usize, routes: &'static [RouteDef]) -> RespFut<'a> {
-    Box::pin(async move {
-        match stack.mws.get(i) {
-            None => match web::route(cx, routes).await {
+    match stack.mws.get(i) {
+        None => Box::pin(async move {
+            match web::route(cx, routes).await {
                 Ok(r) => Ok(r),
                 Err(e) => handle(cx, stack, e).await,
-            },
-            Some(Mw::Cors(c)) => c.call(cx, chain(cx, stack, i + 1, routes)).await,
-            Some(Mw::Dispatch(f)) => {
-                let next = V::native(Native::CallNext(Arc::new(Next { stack: stack.clone(), i: i + 1, routes })));
-                let ret = super::methods::call_value(cx, f, vec![super::request(cx), next], vec![]).await?;
-                to_response(&ret)
             }
-            Some(Mw::Asgi(inst, _)) => {
-                let scope = super::rawasgi::mw_scope(cx)?;
-                super::rawasgi::run(cx, inst, scope, cx.req.body.clone()).await
-            }
-            Some(Mw::Context(c)) => c.call(cx, chain(cx, stack, i + 1, routes)).await,
-        }
-    })
+        }),
+        Some(Mw::Cors(c)) => Box::pin(c.call(cx, chain(cx, stack, i + 1, routes))),
+        Some(Mw::Dispatch(f)) => Box::pin(async move {
+            let next = V::native(Native::CallNext(Arc::new(Next { stack: stack.clone(), i: i + 1, routes })));
+            let ret = super::methods::call_value(cx, f, vec![super::request(cx), next], vec![]).await?;
+            to_response(&ret)
+        }),
+        Some(Mw::Asgi(inst, _)) => Box::pin(async move {
+            let scope = super::rawasgi::mw_scope(cx)?;
+            super::rawasgi::run(cx, inst, scope, cx.req.body.clone()).await
+        }),
+        Some(Mw::Context(c)) => Box::pin(c.call(cx, chain(cx, stack, i + 1, routes))),
+        Some(Mw::HttpsRedirect) => Box::pin(std::future::ready(https_redirect(cx))),
+        Some(Mw::TrustedHost(t)) => match t.check(cx) {
+            Some(r) => Box::pin(std::future::ready(r)),
+            None => chain(cx, stack, i + 1, routes),
+        },
+    }
 }
 
 /// `await self.app(scope, receive, send)` in a raw middleware: the rest of the stack for the request the

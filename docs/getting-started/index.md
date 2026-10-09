@@ -10,6 +10,9 @@ own application.
    then do the same with your own application.
 3. [`py2axum check`](check.md): what translates, route by route, and what to do when something is refused.
 4. [Hybrid mode](hybrid.md): the routes left to a Python process next to the binary.
+5. [Watch mode](watch.md): regenerate, rebuild and restart the binary on each change while you port.
+6. [Migrating an existing application](migration.md): from uvicorn in production to the binary, step by step,
+   with a switch you can undo.
 
 Deploying the binary (Docker, Kubernetes) is covered in [Deployment](../advanced/deployment.md), its settings in
 [Environment variables](../reference/environment.md).

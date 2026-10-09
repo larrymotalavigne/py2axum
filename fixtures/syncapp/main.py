@@ -302,3 +302,38 @@ class Patterns:
 @app.get("/classattr")
 def classattr():
     return {"joined": Patterns.joined(), "n": len(Patterns.WORDS)}
+
+
+from sqlalchemy import text  # noqa: E402
+
+from .db import engine  # noqa: E402
+
+
+@app.post("/core/many")
+def core_many():
+    """A sync engine's connections (`with engine.begin()` / `engine.connect()`) and text() executemany."""
+    with engine.begin() as conn:
+        r = conn.execute(text("INSERT INTO authors (name, active, created_at) VALUES (:name, true, '2026-01-02')"),
+                         [{"name": "M1"}, {"name": "M2"}])
+        inserted = r.rowcount
+    with engine.connect() as conn:
+        r = conn.execute(text("UPDATE authors SET name = :new WHERE name = :old"),
+                         [{"new": "M1b", "old": "M1"}, {"new": "Mx", "old": "nobody"}])
+        updated = r.rowcount
+        conn.commit()
+    with engine.connect() as conn:  # not committed: rolled back when the block ends
+        conn.execute(text("UPDATE authors SET name = 'lost' WHERE name = :n"), [{"n": "M2"}])
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO authors (name, active, created_at) VALUES (:name, true, '2026-01-02')"),
+                         [{"name": "M3"}])
+            raise ValueError("rolled back")
+    except ValueError as e:
+        failed = str(e)
+    with engine.connect() as conn:
+        names = [row.name for row in conn.execute(text("SELECT name FROM authors WHERE name LIKE 'M%' ORDER BY name"))]
+        try:
+            conn.execute(text("SELECT :a"), [{"b": 1}])
+        except Exception as e:  # noqa: BLE001
+            missing = type(e).__name__
+    return {"inserted": inserted, "updated": updated, "failed": failed, "names": names, "missing": missing}

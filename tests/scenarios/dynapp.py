@@ -659,6 +659,7 @@ STEPS: list = [
     ("GET", "/sqlm/closed/rollback", None),
     ("GET", "/sqlm/closed/close", None),
     ("GET", "/sqlm/session", None),
+    ("GET", "/sqlm/concat", None),
     ("GET", "/colls/dup/a", None),
     ("GET", "/colls/dup/two/b?n=3", None),
     ("GET", "/colls/dup/two/b?n=x", None),
@@ -1127,6 +1128,71 @@ STEPS += [
     ("POST", "/edges/jsonb-ops", {"op": "has_any", "value": ["n", "x"]}),
     ("POST", "/edges/jsonb-ops", {"op": "has_all", "value": ["tags", "n"]}),
     ("POST", "/edges/jsonb-ops", {"op": "has_all", "value": []}),
+    # an index of a JSON / JSONB column and its typed accessors (as_boolean(), as_string(), ...)
+    ("POST", "/edges/jsonb/ji1", {"data": {"ok": True, "n": 5, "f": 1.5, "p": 3.14159, "s": "x"},
+                                  "raw": {"ok": True, "env": "ci", "n": 5, "f": 1.5, "p": "2.005", "o": {"a": 1}}}),
+    ("POST", "/edges/jsonb/ji2", {"data": {"ok": "false", "n": "7", "f": 2, "p": -1},
+                                  "raw": {"ok": False, "env": "prod", "n": "7", "f": "2.5e1", "o": [1, 2]}}),
+    ("POST", "/edges/jsonb/ji3", {"data": ["a", "b", True, 3], "raw": ["a", "b", "yes", 3]}),
+    ("POST", "/edges/jsonb/ji4", {"data": None, "raw": None}),
+    ("POST", "/edges/jsonb/ji5", {"data": {"n": None, "bad": "x"}, "raw": {"env": None, "ok": None, "bad": "x"}}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "ok", "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "ok", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "n", "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "n", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "n", "acc": "numeric"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "n", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "n", "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "n", "acc": "bare"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "f", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "f", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "p", "acc": "numeric"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "p", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "env", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "o", "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "o", "acc": "bare"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "o", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": 0, "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": 0, "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": 0, "acc": "bare"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": 2, "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": 2, "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": 3, "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "missing", "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "missing", "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "missing", "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "bad", "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "bad", "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "raw", "key": "bad", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "ok", "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "ok", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "n", "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "n", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "n", "acc": "numeric"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "n", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "n", "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "n", "acc": "bare"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "f", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "f", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "p", "acc": "numeric"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "p", "acc": "float"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "env", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "o", "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "o", "acc": "bare"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "o", "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": 0, "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": 0, "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": 0, "acc": "bare"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": 2, "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": 2, "acc": "string"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": 3, "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "missing", "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "missing", "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "missing", "acc": "json"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "bad", "acc": "integer"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "bad", "acc": "boolean"}),
+    ("POST", "/edges/json-index", {"col": "data", "key": "bad", "acc": "float"}),
+    ("GET", "/edges/json-where", None),
 ]
 
 
@@ -1501,6 +1567,117 @@ STEPS += [
     ("GET", "/sec/repeat?n=-2", None),
     ("GET", f"/sec/repeat?n={2**62}", None),
     ("GET", f"/sec/repeat?n={10**15}", None),
+    # Cookie() parameters (fixtures/dynapp/docsx.py, the FastAPI docs' cookie examples)
+    ("GET", "/docsx/cookies", None),
+    ("GET", "/docsx/cookies", None, {"cookie": "ads_id=abc; n=7; session-id=s1"}),
+    ("GET", "/docsx/cookies", None, {"cookie": 'ads_id="q\\"x\\073y"; n=zz; n=3'}),
+    ("GET", "/docsx/cookies", None, {"cookie": "n=nope; ads_id"}),
+    ("GET", "/docsx/cookie-required", None),
+    ("GET", "/docsx/cookie-required?q=x", None, {"cookie": "token=ab", "x-a": "y"}),
+    ("GET", "/docsx/cookie-required", None, {"cookie": "token=abcd", "x-a": "2"}),
+    # models of parameters
+    ("GET", "/docsx/pm/query?limit=10&offset=5&order_by=updated_at&tags=tag1&tags=tag2", None),
+    ("GET", "/docsx/pm/query", None),
+    ("GET", "/docsx/pm/query?limit=150&offset=-1&order_by=x", None),
+    ("GET", "/docsx/pm/query?limit=10&tool=plumbus&tool=x", None),
+    ("GET", "/docsx/pm/loose?q=a&page=2&extra=1&extra=2&other=", None),
+    ("GET", "/docsx/pm/loose?page=", None),
+    ("GET", "/docsx/pm/headers", None, {"host": "testserver", "save-data": "true", "if-modified-since": "yesterday", "traceparent": "123",
+                                         "x-tag": "one"}),
+    ("GET", "/docsx/pm/headers", None, {"host": "testserver", "save-data": "1"}),
+    ("GET", "/docsx/pm/headers", None, {"host": "testserver", "save_data": "true"}),
+    ("GET", "/docsx/pm/strict-headers", None, {"host": "testserver", "save-data": "true"}),
+    ("GET", "/docsx/pm/raw-headers", None, {"host": "testserver", "save_data": "true", "x_tag": "a"}),
+    ("GET", "/docsx/pm/cookies", None, {"cookie": "session_id=123; fatebook_tracker=good-list-of-cookies; x=1"}),
+    ("GET", "/docsx/pm/cookies", None, {"cookie": "fatebook_tracker=1"}),
+    ("POST", "/docsx/pm/form", b"username=Foo&password=secret&tags=a&tags=b&extra=e", {"content-type": "application/x-www-form-urlencoded"}),
+    ("POST", "/docsx/pm/form", b"username=Foo&remember=", {"content-type": "application/x-www-form-urlencoded"}),
+    ("POST", "/docsx/pm/form", b"", {"content-type": "application/x-www-form-urlencoded"}),
+    *[("POST", path, *_multipart(parts)) for path, parts in [
+        ("/docsx/files/one", [("file", "a.txt", "text/plain", "héllo wörld".encode()), ("token", "t")]),
+        ("/docsx/files/one", [("file", "as text"), ("token", "t")]),
+        ("/docsx/files/one", [("file", ""), ("token", "")]),
+        ("/docsx/files/opt", [("file", "a.bin", None, b"\xff\x00")]),
+        ("/docsx/files/opt", [("file", "a.bin", None, b"x")]),
+        ("/docsx/files/opt", [("other", "x")]),
+        ("/docsx/files/many", [("files", "a", None, b"ab"), ("files", "b", None, b"cde")]),
+        ("/docsx/files/many", [("files", "a", None, b"ab"), ("files", "text")]),
+        ("/docsx/files/many", [("other", "x")]),
+    ]],
+    ("POST", "/docsx/files/blob", {"data": "héllo"}),
+    ("POST", "/docsx/files/blob", {"data": 1}),
+    ("GET", "/docsx/classdep", None),
+    ("GET", "/docsx/classdep?q=a&skip=2&limit=5", None),
+    ("GET", "/docsx/classdep?skip=x&limit=99", None),
+    ("POST", "/docsx/encoder", {"title": "t", "when": "2024-01-02T03:04:05+02:00", "tags": ["a"], "price": "2.25"}),
+    ("POST", "/docsx/encoder", {"title": "t", "when": "2024-01-02T03:04:05.123456"}),
+    ("PUT", "/docsx/when", {"process_after": 300, "repeat_at": "15:30:00"}),
+    ("PUT", "/docsx/when", {"process_after": 1.5, "repeat_at": "15:30:00.123"}),
+    ("PUT", "/docsx/when", {"process_after": "P1DT2H3M4.5S", "repeat_at": "25:00"}),
+    ("PUT", "/docsx/when", {"process_after": "-1 day, 23:00:00"}),
+    ("PUT", "/docsx/when", {"process_after": "300", "repeat_at": "1530"}),
+    ("PUT", "/docsx/when", {"process_after": True, "repeat_at": True}),
+    ("PUT", "/docsx/when", {"process_after": 1e20, "repeat_at": None}),
+    *[("POST", "/docsx/schedule", {"every": v}) for v in [
+        300, -1, 0, 0.5, "PT90M", "P1Y38D", "P1W", "10:20", "1d", "100:00:00", "PT1.5H30M", "P", "-PT5S",
+        "10:20:30.1234567", "86399999913600"]],
+    ("POST", "/docsx/schedule", {"every": 86399999913600}),
+    ("POST", "/docsx/schedule", {"every": "1 day, 01:00:00", "at": "23:59:59.999999"}),
+    *[("GET", f"/docsx/models/{m}", None) for m in ("alexnet", "resnet", "lenet", "vgg")],
+    # the request's exception raised at a dependency's `yield`, Depends(scope=) (fixtures/dynapp/corpusx.py)
+    *[("GET", f"/corpusx/owner/{i}", None) for i in ("plumbus", "missing", "portal-gun")],
+    *[("GET", f"/corpusx/swallow/{i}", None) for i in ("plumbus", "foo", "portal-gun")],
+    ("GET", "/corpusx/log", None),
+    *[("GET", f"/corpusx/reraise/{i}", None) for i in ("plumbus", "portal-gun")],
+    ("GET", "/corpusx/log", None),
+    *[step for m in ("ok", "http", "value", "key", "ok?n=x") for step in
+      (("GET", f"/corpusx/any/{m}", None), ("GET", "/corpusx/log", None))],
+    ("GET", "/corpusx/scope/function", None),
+    # (the request-scoped exit code runs once the response is sent: a following /log races with it in Python)
+    ("GET", "/corpusx/scope/request", None),
+    ("GET", "/corpusx/scope/raises", None),
+    # unannotated parameters, a Response class as the return annotation, response_model_* options
+    ("GET", "/corpusx/untyped/7", None),
+    ("GET", "/corpusx/untyped/x?q=1&q=2&n=abc", None),
+    ("GET", "/corpusx/teleport", None),
+    ("GET", "/corpusx/teleport?to=https://example.com/a%20b", None),
+    ("GET", "/corpusx/json-ann", None),
+    ("GET", "/corpusx/resp-ann", None),
+    ("GET", "/corpusx/resp-ann?raw=1", None),
+    *[("GET", f"/corpusx/rm/{k}/{key}", None) for k in ("unset", "unset-model", "none", "include", "exclude", "ann")
+      for key in ("foo", "bar", "baz")],
+    # an instance with __call__ as a dependency, FastAPI's default exception handlers delegated to
+    ("GET", "/corpusx/checker", None),
+    ("GET", "/corpusx/checker?q=foobar&k=x&m=3", None),
+    ("GET", "/corpusx/checker?m=x", None),
+    ("GET", "/corpusx/checker-pre?m=2", None),
+    ("GET", "/corpusx/nope", None),
+    # val_json_bytes / ser_json_bytes (base64, hex)
+    *[("POST", "/corpusx/bytes/b64", {"description": "d", "data": d}) for d in (
+        "aGk=", "aGk", "aGk-_w==", "aGk+/w==", "aGk==", "a", "aG=k", "a+-/", "YR==", "", "é", 12, None)],
+    *[("POST", "/corpusx/bytes/hex", body) for body in (
+        {"data": "6869"}, {"data": "686"}, {"data": "zz"}, {"data": "6G"}, {"data": "ABcd", "more": ["00", "ff"]},
+        {"data": "00", "more": ["0"]}, {"data": "00", "opt": "0a"}, {"data": "00", "inner": {"description": "x", "data": "_w"}})],
+    ("POST", "/corpusx/bytes/plain", {"data": "aGk=", "inner": {"description": "x", "data": "aGk="}}),
+    ("GET", "/corpusx/bytes/out", None),
+    ("GET", "/corpusx/bytes/out?raw=", None),
+    # pwdlib's recommended Argon2 hasher
+    *[("GET", f"/corpusx/pwd?{q}", None) for q in ("", "password=nope", "which=own&password=x", "which=weak&password=pw",
+                                                   "which=weak&password=no", "which=bcrypt")],
+    # generator endpoints: JSON Lines, Server-Sent Events, raw (an exception mid-stream cuts the connection)
+    ("GET", "/corpusx/gen/jsonl", None),
+    ("GET", "/corpusx/gen/jsonl?n=0", None),
+    ("GET", "/corpusx/gen/jsonl?n=x", None),
+    ("GET", "/corpusx/gen/jsonl-bad", None),
+    ("GET", "/corpusx/gen/jsonl-any", None),
+    ("GET", "/corpusx/gen/sse", None),
+    ("GET", "/corpusx/gen/sse", None, {"last-event-id": "0"}),
+    ("GET", "/corpusx/gen/sse-items", None),
+    ("GET", "/corpusx/gen/sse-plain", None),
+    ("GET", "/corpusx/gen/sse-bad", None),
+    ("GET", "/corpusx/gen/sse-bad?kind=event", None),
+    ("GET", "/corpusx/gen/raw", None),
+    ("GET", "/corpusx/gen/raw-bad", None),
 ]
 
 
@@ -1524,3 +1701,36 @@ def _multipart_limits() -> list:
 
 
 STEPS += _multipart_limits()
+
+
+def _realworld_cases() -> list:
+    """fixtures/dynapp/realworld.py: aliases, closures and nonlocal, TypedDict, Model.__table__, StaleDataError, html.unescape."""
+    steps = [("GET", "/realworld/notices", None), ("POST", "/realworld/notices", None), ("GET", "/realworld/notices", None),
+             ("GET", "/realworld/notices/read", None), ("GET", "/realworld/notices/orm", None), ("GET", "/realworld/notices/first", None)]
+    for body in ({"userName": "a", "town": "Lyon", "zip_code": "69"}, {"user_name": "a", "c": "Lyon"}, {"userName": "a", "c": "x"},
+                 {}, {"userName": 3, "zip": "1"}):
+        steps += [("POST", "/realworld/renamed", body), ("POST", "/realworld/renamed/dump", body)]
+    for body in ({"fullName": "A B"}, {"full_name": "A B"}, {"name": "A B"}, {"fullName": 1}):
+        steps.append(("POST", "/realworld/populated", body))
+    steps += [("POST", "/realworld/nonlocal", {"codes": [" 45000000 ", "72000000", "45000000", ""]}),
+              ("POST", "/realworld/nonlocal", {"codes": []}),
+              ("GET", "/realworld/typeddict?amount=2.5", None), ("GET", "/realworld/typeddict?amount=-1", None),
+              ("PATCH", "/realworld/notices/1/fields", {"metadata": {"a": 1}, "lbl": "x", "extra_data": 1, "nid": 3}),
+              ("PATCH", "/realworld/notices/99/fields", {}),
+              ("POST", "/realworld/notices/2/stale", None), ("POST", "/realworld/notices/2/stale", None), ("GET", "/realworld/notices", None)]
+    texts = ["plain", "&amp &ampx &notit; &notin &#128;x &#0; &#xD800; &#1114112; &#11; &#x110000 &#65 &;&#; &#x;",
+             "&abcdefghijklmnopqrstuvwxyzabcdefghij; &\u00e9; &AMP;&#X41 &\tx &lt\n&gt\r&quot", "&#" + "0" * 4298 + "65;",
+             "&#" + "1" * 4301 + ";", "&#x" + "0" * 5000 + "41;", "caf&eacute; &CounterClockwiseContourIntegral; &nGt; &#x1F600;",
+             "&" * 5 + "amp;" * 3, 42, None]
+    steps.append(("POST", "/realworld/unescape", {"texts": texts}))
+    steps.append(("POST", "/realworld/notices/json", None))
+    items = [{"title": "Marché, lot 1; maintenance \\ logiciel", "day": "2026-11-30", "lines": ["Acheteur: Ville", "é" * 60]},
+             {"title": "x" * 200, "day": "2027-01-01", "before": {"hours": -3}},
+             {"title": "Questions — " + "à" * 50, "day": "2026-12-01", "lines": ["a\r\nb", "\\N"], "before": {"days": -1, "hours": 2}},
+             {"title": "t", "day": "2026-12-02", "before": {"seconds": 90}}, {"title": "z", "day": "2026-12-03", "before": {}}]
+    steps += [("POST", "/realworld/calendar.ics", {"items": items}), ("POST", "/realworld/calendar.ics", {"items": []}),
+              ("POST", "/realworld/remove", None)]
+    return steps
+
+
+STEPS += _realworld_cases()

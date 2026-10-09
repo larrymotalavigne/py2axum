@@ -34,7 +34,10 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   referenced column's), composite primary keys, `Identity()`, `JSON`/`JSONB` (`none_as_null=`; on `JSONB`, the
   operators `contains` (`@>`), `contained_by` (`<@`), `has_key` (`?`), `has_any` (`?|`), `has_all` (`?&`), their
   argument typed like SQLAlchemy types it: a list given to `has_any`/`has_all` is bound as JSONB, which PostgreSQL
-  rejects in both implementations),
+  rejects in both implementations; on both, an index by a str or an int, `col["k"]` / `col[0]`, and its accessors
+  `as_string()`, `as_integer()`, `as_float()`, `as_boolean()`, `as_numeric(precision, scale)`, `as_json()`, rendered
+  as SQLAlchemy renders them, `CAST(col ->> 'k' AS VARCHAR)`; a JSON path, `col[("a", "b")]`, is refused at
+  translation, and a bare index compared or used in arithmetic is refused at run time: compare an accessor),
   `Uuid`/`UUID` and `Mapped[uuid.UUID]` (read as `uuid.UUID`, a str bound to it is cast by PostgreSQL as with
   psycopg; `as_uuid=False` is refused),
   `Numeric` (`Decimal`, or float with `asdecimal=False`), `Enum` columns, `LargeBinary` (bytes), `ARRAY(String)`
@@ -57,7 +60,8 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `connection()` (a readiness probe: `close()` on it ends the transaction, then statements raise
   `ResourceClosedError` and `commit()` "This transaction is inactive" until `rollback()`/`close()`),
   `expire_on_commit`, savepoints (`begin_nested()` then `commit()`/`rollback()`), `session.bind`,
-  `get_bind()`. Server-generated values (identity, `server_default`, SQL defaults) are fetched with
+  `get_bind()`. A flushed UPDATE that matches no row (deleted by another statement) raises `StaleDataError`
+  (`sqlalchemy.orm.exc`), as SQLAlchemy does. Server-generated values (identity, `server_default`, SQL defaults) are fetched with
   `RETURNING` at insert, like `eager_defaults="auto"`.
 - Relationships (many-to-one, one-to-many), `lazy=` select/selectin/joined/noload/raise, `selectinload()`
   chains, `back_populates`/`backref`, cascades (save-update, delete, delete-orphan), `passive_deletes`,
@@ -78,7 +82,8 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   Python column defaults, `on_conflict_do_update(index_elements= | constraint=, set_=, where=)`,
   `on_conflict_do_nothing` (a `constraint=` name SQLAlchemy would not quote),
   `excluded`, `returning`), `text()` with `:named` parameters (and `text(...).bindparams(name=value)`, also inside
-  a `where()`), `Result.scalars/all/first/one/scalar/unique/
+  a `where()`; a list of dicts runs it once per dict, executemany: no rows, `rowcount` summed),
+  `+` with a string as `||` like SQLAlchemy, `Result.scalars/all/first/one/scalar/unique/
   mappings`, rows with attribute access (`row.total`, `_mapping`, `_asdict()`).
 - SQL typing like SQLAlchemy: arithmetic and `FILTER` keep the column type, `func.round`/`avg` untyped
   (Decimal); untyped integers are bound as int2/int4/int8 like psycopg; NUMERIC results are `Decimal`.
@@ -99,7 +104,7 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
 - `create_async_engine(...)` is the binary's pool (one database, `DATABASE_URL`; its options are ignored
   but `connect_args`, above);
   `async with engine.connect() as conn` (rolled back on exit), `async with engine.begin() as conn` (committed on
-  exit, rolled back when the block raises).
+  exit, rolled back when the block raises); the same with `with` on a `create_engine(...)` engine.
 - `await conn.run_sync(Base.metadata.create_all)` (e.g. in the lifespan): the DDL is compiled at translation
   time by SQLAlchemy itself (it must be installed next to py2axum; 2.x). The mapped classes of the base, from
   the modules the application imports (plus those imported in the calling function), are rebuilt as real
@@ -126,7 +131,16 @@ The session dependency is described in [Dependencies](dependencies.md); large li
 session are streamed ([Large list responses](../advanced/streaming.md)). The binary does not run migrations:
 run Alembic (or `create_all`, above) before it serves.
 
+- `Model.__table__` for introspection: the table's `name`, its `columns`/`c` (`key in`, `[key]` or index,
+  iteration, `len`, `keys()`, `values()`, `get()`), each column's `name`, `key`, `nullable`, `primary_key` and
+  `type`; a type supports `isinstance(col.type, JSON)` against any SQLAlchemy type class, `str()` and `repr()`
+  (computed by SQLAlchemy at translation time, which needs it installed next to py2axum). Any other attribute
+  raises a `TypeError` naming what is supported.
+
 ## What stays in Python
+
+- `execute(insert/update/delete/select(...), parameters)` (executemany, ORM bulk INSERT / UPDATE by primary
+  key) and `scalars()`/`scalar()` with parameters: refused at translation (only `execute(text(...), parameters)`).
 
 - `connect_args`: other libpq `options` switches are refused (a literal string, at translation; a
   computed one raises `ValueError` when the engine is created).
@@ -138,6 +152,9 @@ run Alembic (or `create_all`, above) before it serves.
 
 ## Differences
 
+- **Known difference:** the binary issues one UPDATE per modified object; when several stale rows of the
+  same table are flushed together, SQLAlchemy's `StaleDataError` message counts the whole batch
+  ("expected to update 2 row(s)"), the binary's the first object ("1 row(s)").
 - `parent.children.append(x)` sets the foreign key at flush but not `x.parent` before it
   (SQLAlchemy does it immediately through the backref event).
 - **Known difference:** `str()` of a database error stops at the message above, without

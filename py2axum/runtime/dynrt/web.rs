@@ -99,6 +99,8 @@ pub async fn param(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static 
             if vals.is_empty() { None } else { Some(V::list(vals)) }
         }
         "header" => cx.req.header(alias).map(V::str),
+        // `Cookie()`: `request.cookies` (Starlette's parser), the parameter's name as is
+        "cookie" => super::methods::cookie_map(&cx.req).get(alias).map(|v| V::str(v)),
         _ => {
             if list {
                 let vals: Vec<V> = cx.req.query.iter().filter(|(k, _)| k == alias).map(|(_, v)| V::str(v)).collect();
@@ -131,6 +133,29 @@ pub fn set_response_dump_json(on: bool) {
 
 fn response_dump_json() -> bool {
     RESPONSE_DUMP_JSON.load(Ordering::Relaxed)
+}
+
+static ROOT_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `FastAPI(root_path=...)` (set by main.rs): the scope's `root_path` of every request.
+pub fn set_root_path(p: &str) {
+    let _ = ROOT_PATH.set(p.to_string());
+}
+
+pub fn root_path() -> &'static str {
+    ROOT_PATH.get().map(String::as_str).unwrap_or("")
+}
+
+/// Starlette's `get_route_path`: the path without the root_path it starts with.
+pub fn route_path(path: &str) -> &str {
+    let root = root_path();
+    if root.is_empty() || !path.starts_with(root) {
+        return path;
+    }
+    if path.len() == root.len() {
+        return "";
+    }
+    if path.as_bytes()[root.len()] == b'/' { &path[root.len()..] } else { path }
 }
 
 static STARLETTE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
@@ -251,8 +276,8 @@ pub static CREDENTIALS: pyd::SchemaDesc = pyd::SchemaDesc {
     name: "HTTPAuthorizationCredentials",
     class: &CREDENTIALS_CLASS,
     fields: &[
-        pyd::FieldDesc { name: "scheme", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
-        pyd::FieldDesc { name: "credentials", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
+        pyd::FieldDesc { name: "scheme", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false, ser: None },
+        pyd::FieldDesc { name: "credentials", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false, ser: None },
     ],
     from_attributes: false,
     extra: pyd::Extra::Ignore,
@@ -274,6 +299,7 @@ pub static CREDENTIALS: pyd::SchemaDesc = pyd::SchemaDesc {
     settings: None,
     init: None,
     private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
     computed: &[],
     json_schema: None,
 };
@@ -293,8 +319,8 @@ pub static BASIC: pyd::SchemaDesc = pyd::SchemaDesc {
     name: "HTTPBasicCredentials",
     class: &BASIC_CLASS,
     fields: &[
-        pyd::FieldDesc { name: "username", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
-        pyd::FieldDesc { name: "password", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
+        pyd::FieldDesc { name: "username", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false, ser: None },
+        pyd::FieldDesc { name: "password", alias: None, td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false, ser: None },
     ],
     from_attributes: false,
     extra: pyd::Extra::Ignore,
@@ -316,6 +342,7 @@ pub static BASIC: pyd::SchemaDesc = pyd::SchemaDesc {
     settings: None,
     init: None,
     private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
     computed: &[],
     json_schema: None,
 };
@@ -345,9 +372,9 @@ fn http_basic(cx: &Cx, realm: Option<&str>, auto_error: bool) -> R {
     let Some((user, password)) = data.split_once(':') else { return denied() };
     Ok(V::Inst(Arc::new(pyd::Inst {
         desc: &BASIC,
-        vals: Mutex::new(vec![V::str(user), V::str(password)]),
+        vals: super::pyd::Slots::new(vec![V::str(user), V::str(password)]),
         set: Mutex::new(vec![true, true]),
-        extra: Mutex::new(IndexMap::new()),
+        extra: super::pyd::Slots::new(IndexMap::new()),
     })))
 }
 
@@ -377,9 +404,9 @@ pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
         Security::OAuth2Bearer => V::str(param),
         Security::HttpBearer => V::Inst(Arc::new(pyd::Inst {
             desc: &CREDENTIALS,
-            vals: Mutex::new(vec![V::str(scheme), V::str(param)]),
+            vals: super::pyd::Slots::new(vec![V::str(scheme), V::str(param)]),
             set: Mutex::new(vec![true, true]),
-            extra: Mutex::new(IndexMap::new()),
+            extra: super::pyd::Slots::new(IndexMap::new()),
         })),
         Security::HttpBasic(_) => unreachable!(),
     })
@@ -506,6 +533,132 @@ pub async fn form_field(cx: &Cx, form: &[(String, FormVal)], alias: &str, td: &'
     }
 }
 
+/// FastAPI's `field_annotation_is_sequence`: a list, set or tuple, or a union holding one.
+fn td_is_sequence(td: &TD) -> bool {
+    match td.bare() {
+        TD::List(_) | TD::Set(_) | TD::Tuple(_) => true,
+        TD::Optional(t) => td_is_sequence(t),
+        TD::Union(ts) => ts.iter().any(|t| td_is_sequence(t)),
+        _ => false,
+    }
+}
+
+/// A Pydantic model of query, header, cookie or form parameters (`Annotated[Model, Query()]`, ...), as
+/// FastAPI's `request_params_to_args` / `_extract_form_body`: each field read under its alias (a header's
+/// underscores turned into hyphens unless `convert_underscores=False`; a sequence field gets every value, an
+/// absent one its default when it has one), then every other received key (one value, or the list of them),
+/// and the whole dict validated as the model at `[source]` (`["body"]` for a form).
+pub async fn param_model(cx: &Cx, source: &str, td: &'static TD, convert: bool, form: Option<&[(String, FormVal)]>,
+                         errs: &mut Vec<ErrDetail>) -> R {
+    let desc = match td {
+        TD::Schema(d) => *d,
+        _ => return Err(Exc::type_error("a model of parameters must be a Pydantic model")),
+    };
+    let received: Vec<(String, V)> = match source {
+        "query" => cx.req.query.iter().map(|(k, v)| (k.clone(), V::str(v))).collect(),
+        "header" => cx.req.headers.iter().map(|(k, v)| (k.clone(), V::str(v))).collect(),
+        "cookie" => super::methods::cookie_map(&cx.req).into_iter().map(|(k, v)| (k.to_string(), V::str(v))).collect(),
+        _ => form.unwrap_or(&[]).iter().map(|(k, v)| (k.clone(), form_value(v))).collect(),
+    };
+    // Starlette: `Headers.get` is the first value, a multidict's (query, form) the last; cookies are a dict
+    let multi = source != "cookie";
+    let getlist = |key: &str| -> Vec<V> { received.iter().filter(|(k, _)| k == key).map(|(_, v)| v.clone()).collect() };
+    let get = |key: &str| -> Option<V> {
+        let mut it = received.iter().filter(|(k, _)| k == key).map(|(_, v)| v.clone());
+        if source == "header" { it.next() } else { it.last() }
+    };
+    let mut values: IndexMap<String, V> = IndexMap::new();
+    let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in desc.fields {
+        let valias = f.alias.unwrap_or(f.name);
+        let alias = if source == "header" && convert {
+            Some(if valias == f.name { valias.replace('_', "-") } else { valias.to_string() })
+        } else {
+            None
+        };
+        let look = alias.clone().unwrap_or_else(|| valias.to_string());
+        let look = if source == "header" { look.to_ascii_lowercase() } else { look };
+        let seq = td_is_sequence(f.td);
+        let raw = if seq && multi { Some(V::list(getlist(&look))) } else { get(&look) };
+        let missing = match &raw {
+            None => true,
+            Some(V::List(l)) if seq => l.lock().is_empty(),
+            _ => false,
+        };
+        let value = if !missing {
+            raw
+        } else {
+            match &f.default {
+                pyd::Dflt::Required => None,
+                pyd::Dflt::Value(d) | pyd::Dflt::Factory(d) => Some(d()),
+                pyd::Dflt::Dyn(d) => Some(d(cx, V::None, vec![]).await?),
+            }
+        };
+        if let Some(v) = value {
+            if !matches!(v, V::None) {
+                values.insert(valias.to_string(), v);
+            }
+        }
+        processed.insert(alias.map(|a| if source == "header" { a.to_ascii_lowercase() } else { a }).unwrap_or_else(|| valias.to_string()));
+        processed.insert(valias.to_string());
+    }
+    for (key, _) in received.iter() {
+        if processed.contains(key) || values.contains_key(key) {
+            continue;
+        }
+        let v = if multi {
+            let mut all = getlist(key);
+            if all.len() == 1 { all.remove(0) } else { V::list(all) }
+        } else {
+            get(key).unwrap_or(V::None)
+        };
+        values.insert(key.clone(), v);
+    }
+    let input = V::dict_from(values.into_iter().map(|(k, v)| (V::str(k), v)).collect())?;
+    let loc = vec![V::str(if source == "form" { "body" } else { source })];
+    Ok(pyd::validate(cx, &input, td, &loc, errs).await?.unwrap_or(V::None))
+}
+
+/// A `File()` parameter typed `bytes` (or `bytes | None`, `list[bytes]`), as FastAPI's `_extract_form_body`:
+/// an uploaded file is read whole; a text field is validated as is (Pydantic encodes a str); in a list, a text
+/// field has no `read()` (an AttributeError, a 500 in FastAPI).
+pub async fn form_file_bytes(cx: &Cx, form: &[(String, FormVal)], alias: &str, td: &'static TD, required: bool,
+                             default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
+    let loc = vec![V::str("body"), V::str(alias)];
+    let vals: Vec<&FormVal> = form.iter().filter(|(k, _)| k == alias).map(|(_, v)| v).collect();
+    let seq = td_is_sequence(td);
+    // `_get_multidict_value`: a File() is a Form(): an empty string is absent; an empty list too
+    let raw: Option<V> = if seq {
+        if vals.is_empty() {
+            None
+        } else {
+            let mut out = Vec::new();
+            for v in vals {
+                match v {
+                    FormVal::File(f) => out.push(V::Bytes(Arc::from(super::files::upload_read_all(f).unwrap_or_default()))),
+                    FormVal::Text(_) => return Err(Exc::attr_error("'str' object has no attribute 'read'")),
+                }
+            }
+            Some(V::list(out))
+        }
+    } else {
+        match vals.last() {
+            None => None,
+            Some(FormVal::Text(t)) if t.is_empty() => None,
+            Some(FormVal::Text(t)) => Some(V::str(t)),
+            Some(FormVal::File(f)) => Some(V::Bytes(Arc::from(super::files::upload_read_all(f).unwrap_or_default()))),
+        }
+    };
+    match raw {
+        None if required => {
+            errs.push(ErrDetail { kind: "missing", loc, msg: "Field required".into(), input: V::None, ctx: None });
+            Ok(V::None)
+        }
+        None => Ok(default()),
+        Some(v) => Ok(pyd::validate(cx, &v, td, &loc, errs).await?.unwrap_or(V::None)),
+    }
+}
+
 /// A `File()` / `UploadFile` parameter (one file, or `list[UploadFile]`).
 pub fn form_file(form: &[(String, FormVal)], alias: &str, list: bool, required: bool, dflt: fn() -> V, errs: &mut Vec<ErrDetail>) -> V {
     let loc = vec![V::str("body"), V::str(alias)];
@@ -543,6 +696,17 @@ pub fn form_file(form: &[(String, FormVal)], alias: &str, list: bool, required: 
 
 pub fn check(errs: Vec<ErrDetail>) -> R<()> {
     if errs.is_empty() { Ok(()) } else { Err(Exc::validation(&REQUEST_VALIDATION_ERROR, errs)) }
+}
+
+/// A route's RequestValidationError with FastAPI's `exc.body`: the decoded JSON body (or its bytes), None
+/// without one (`raise RequestValidationError(errors, body=body)` in fastapi/routing.py).
+pub fn check_body(errs: Vec<ErrDetail>, body: &Option<V>) -> R<()> {
+    if errs.is_empty() {
+        return Ok(());
+    }
+    let e = Exc::validation(&REQUEST_VALIDATION_ERROR, errs);
+    e.0.attrs.lock().insert("body".into(), body.clone().unwrap_or(V::None));
+    Err(e)
 }
 
 // ---------------------------------------------------------------- responses
@@ -593,28 +757,40 @@ fn no_body(status: u16) -> bool {
     status < 200 || status == 204 || status == 304
 }
 
+/// The route's `response_model_include=`, `_exclude=` (top-level field names of a model),
+/// `_exclude_unset=`, `_exclude_none=`: FastAPI hands them to the response field's serializer.
+pub struct RespDump {
+    pub include: Option<&'static [&'static str]>,
+    pub exclude: Option<&'static [&'static str]>,
+    pub exclude_unset: bool,
+    pub exclude_none: bool,
+}
+
+pub static RESP_DUMP: RespDump = RespDump { include: None, exclude: None, exclude_unset: false, exclude_none: false };
+
 /// Endpoint return value -> response (response_model validation + Pydantic JSON, or jsonable_encoder).
 pub async fn respond(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) -> R<Response> {
-    respond_as(cx, ret, model, Some(status), None).await
+    respond_as(cx, ret, model, Some(status), None, &RESP_DUMP).await
 }
 
 /// Same, with the route's `response_class=` (`cls` = its class name, None = JSONResponse) and its
 /// `status_code=` (None = not given: the class default, 307 for RedirectResponse). FastAPI builds
 /// `response_class(content, status_code=..., background=...)` from the encoded value, empties the body
 /// for a no-body status, then appends the `response` parameter's headers.
-pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Option<u16>, cls: Option<&'static str>) -> R<Response> {
+pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Option<u16>, cls: Option<&'static str>,
+                        opts: &'static RespDump) -> R<Response> {
     let Some(cls) = cls.filter(|c| *c != "JSONResponse") else {
-        return respond_json(cx, ret, model, status.unwrap_or(200)).await;
+        return respond_json(cx, ret, model, status.unwrap_or(200), opts).await;
     };
     if let V::Native(n) = &ret {
         if matches!(&**n, Native::RespObj(_) | Native::Streaming(_)) {
-            return respond_json(cx, ret, model, status.unwrap_or(200)).await;
+            return respond_json(cx, ret, model, status.unwrap_or(200), opts).await;
         }
     }
     if cls == "StreamingResponse" {
         return Err(Exc::runtime("py2axum: response_class=StreamingResponse with an endpoint that does not return a response is not supported"));
     }
-    let content = encode(cx, &ret, model).await?;
+    let content = encode(cx, &ret, model, opts).await?;
     let mut kwargs = Vec::new();
     if let Some(st) = cx.resp.status.lock().or(status) {
         kwargs.push(("status_code".to_string(), V::Int(st as i64)));
@@ -637,13 +813,31 @@ pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Opt
 }
 
 /// `serialize_response`: the response_model's JSON dump, or jsonable_encoder.
-async fn encode(cx: &Cx, ret: &V, model: Option<&'static TD>) -> R<V> {
+async fn encode(cx: &Cx, ret: &V, model: Option<&'static TD>, opts: &RespDump) -> R<V> {
     match model {
         Some(td) => {
             let prepared = prepare_for(ret, td)?;
             let mut errs = Vec::new();
             match pyd::validate(cx, &prepared, td, &[V::str("response")], &mut errs).await? {
-                Some(v) => pyd::dump(&v, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() }),
+                Some(v) => {
+                    let o = pyd::DumpOpts { json: true, by_alias: true, exclude_unset: opts.exclude_unset, exclude_none: opts.exclude_none, ..Default::default() };
+                    let d = pyd::dump(&v, o)?;
+                    if opts.include.is_none() && opts.exclude.is_none() {
+                        return Ok(d);
+                    }
+                    // a model's top-level fields (the translator refuses them on any other response model)
+                    let (V::Inst(i), V::Dict(m)) = (&v, &d) else { return Ok(d) };
+                    let key = |n: &&str| -> &'static str {
+                        i.desc.fields.iter().find(|f| f.name == *n).map(|f| f.out_key()).unwrap_or("")
+                    };
+                    let inc: Option<Vec<&str>> = opts.include.map(|l| l.iter().map(key).collect());
+                    let exc: Vec<&str> = opts.exclude.map(|l| l.iter().map(key).collect()).unwrap_or_default();
+                    let kept: Vec<(V, V)> = m.lock().values().filter(|(k, _)| match k {
+                        V::Str(s) => inc.as_ref().is_none_or(|inc| inc.contains(&&**s)) && !exc.contains(&&**s),
+                        _ => true,
+                    }).cloned().collect();
+                    V::dict_from(kept)
+                }
                 _ => {
                     let detail: Vec<String> = errs.iter().map(|e| format!("{}: {}", e.kind, e.msg)).collect();
                     Err(Exc::runtime(format!("ResponseValidationError: {}", detail.join("; "))))
@@ -654,7 +848,7 @@ async fn encode(cx: &Cx, ret: &V, model: Option<&'static TD>) -> R<V> {
     }
 }
 
-async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) -> R<Response> {
+async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16, opts: &RespDump) -> R<Response> {
     if let V::Native(n) = &ret {
         // a Response object is sent as is (no serialization, the `response` parameter is not merged)
         if let Native::RespObj(r) = &**n {
@@ -680,7 +874,7 @@ async fn respond_json(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) 
         }
         return Ok(b.body(Body::empty()).unwrap_or_else(bad_response));
     }
-    let content = encode(cx, &ret, model).await?;
+    let content = encode(cx, &ret, model, opts).await?;
     let style = if model.is_some() && response_dump_json() { &pyd::DUMP_JSON } else { &pyd::RESPONSE };
     Ok(json_body(status, pyd::to_json(&content, style, false)?, &headers))
 }
@@ -819,7 +1013,12 @@ pub fn try_error_response(e: Exc) -> R<Response> {
     if let Some((code, detail, headers)) = &e.http_info() {
         let body = V::dict_from(vec![(V::str("detail"), pyd::jsonable(detail).unwrap_or(V::None))]).unwrap();
         if no_body(*code) {
-            return Ok(Response::builder().status(*code).body(Body::empty()).unwrap());
+            // `Response(status_code=..., headers=exc.headers)`
+            let mut b = Response::builder().status(*code);
+            for (k, v) in headers {
+                b = b.header(k.as_str(), v.as_str());
+            }
+            return Ok(b.body(Body::empty()).unwrap_or_else(bad_response));
         }
         return Ok(json_body(*code, pyd::to_json(&body, &pyd::RESPONSE, true)?, headers));
     }
@@ -829,6 +1028,22 @@ pub fn try_error_response(e: Exc) -> R<Response> {
         return Ok(json_body(422, pyd::to_json(&body, &pyd::RESPONSE, true)?, &[]));
     }
     Ok(internal_error(e))
+}
+
+/// `fastapi.exception_handlers.http_exception_handler(request, exc)` and
+/// `request_validation_exception_handler(request, exc)`: FastAPI's default handlers, called by the application's
+/// own (`await http_exception_handler(request, exc)`); an exception of another kind is their AttributeError.
+pub fn default_exc_handler(exc: &V, which: &str) -> R {
+    let V::Exc(e) = exc else {
+        return Err(Exc::attr_error(format!("'{}' object has no attribute '{}'", exc.type_name(),
+                                           if which == "http" { "status_code" } else { "errors" })));
+    };
+    let ok = if which == "http" { e.http_info().is_some() } else { e.isinstance(&REQUEST_VALIDATION_ERROR) };
+    if !ok {
+        return Err(Exc::attr_error(format!("'{}' object has no attribute '{}'", e.0.class.name,
+                                           if which == "http" { "status_code" } else { "errors" })));
+    }
+    Ok(super::resp::from_response(try_error_response(e.clone())?))
 }
 
 /// a response the application gave headers HTTP cannot carry (CR, LF, NUL in a value, a bad name):
@@ -857,29 +1072,29 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
     let mut guard = TeardownGuard(Some(cx.clone()));
     let r = match run(cx).await {
         Ok(r) => r,
-        // the exception goes through the dependencies' exit code, then the session dependency:
-        // rollback (the transaction is dropped)
-        Err(e) => {
-            run_teardowns(cx, false).await;
-            return Err(e);
-        }
+        // the exception is raised at the dependencies' `yield` (function scope first), then the session
+        // dependency: rollback (the transaction is dropped)
+        Err(e) => return Err(throw_teardowns(cx, e).await),
     };
+    // `Depends(scope="function")`: its exit code runs before the response is sent, an exception there
+    // goes through the request-scoped ones
+    if let Some(e) = run_fn_teardowns(cx).await {
+        return Err(throw_teardowns(cx, e).await);
+    }
     let session = match cx.session.get() {
-        Some(V::Session(s)) if cx.app.commit_after => s.clone(),
-        _ => {
-            run_teardowns(cx, true).await;
-            tokio::spawn(super::resp::run_background(cx.clone()));
-            return Ok(r);
-        }
+        Some(V::Session(s)) if cx.app.commit_after => Some(s.clone()),
+        _ => None,
     };
-    // `yield s; await s.commit()`: FastAPI (>= 0.121, scope "request") runs it once the response is
-    // sent; a failure is logged and the client keeps its response. A full body is committed before
-    // being returned (same response, no read-after-write race), a stream at its end.
+    // the dependencies' exit code (and `yield s; await s.commit()`): FastAPI (>= 0.121, scope "request")
+    // runs it once the response is sent; a failure is logged and the client keeps its response. A full
+    // body is committed before being returned (same response, no read-after-write race), a stream at its end.
     use axum::body::HttpBody as _;
-    if r.body().size_hint().exact().is_some() {
+    if r.body().size_hint().exact().is_some() || (session.is_none() && cx.teardowns.lock().is_empty()) {
         run_teardowns(cx, true).await;
-        if let Err(e) = session.commit().await {
-            eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+        if let Some(session) = session {
+            if let Err(e) = session.commit().await {
+                eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+            }
         }
         tokio::spawn(super::resp::run_background(cx.clone()));
         return Ok(r);
@@ -890,10 +1105,17 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
     let cx = cx.clone();
     let tail = futures_util::stream::once(async move {
         run_teardowns(&cx, true).await;
-        if let Err(e) = session.commit().await {
-            eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+        match session {
+            Some(session) => {
+                if let Err(e) = session.commit().await {
+                    eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+                }
+                super::resp::run_background(cx.clone()).await;
+            }
+            None => {
+                tokio::spawn(super::resp::run_background(cx.clone()));
+            }
         }
-        super::resp::run_background(cx.clone()).await;
         drop(cx);
         Ok::<Bytes, axum::Error>(Bytes::new())
     });
@@ -905,7 +1127,7 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
 /// The `yield` of a dependency: hands the value to the request, then waits for its end.
 pub struct DepYield {
     val: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<V>>>,
-    resume: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    resume: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<Option<Exc>>>>,
 }
 
 impl DepYield {
@@ -913,20 +1135,25 @@ impl DepYield {
         let tx = self.val.lock().take().ok_or_else(|| Exc::runtime("generator didn't stop"))?;
         let _ = tx.send(v);
         let rx = self.resume.lock().take().expect("resume channel");
-        // dropped (the endpoint failed or the request was abandoned): the code after `yield` does not
-        // run, `finally` blocks do (in Python the exception is raised at the `yield`)
-        rx.await.map_err(|_| Exc::new(&GENERATOR_EXIT, vec![]))?;
-        Ok(V::None)
+        match rx.await {
+            Ok(None) => Ok(V::None),
+            // FastAPI throws the request's exception into the generator (`gen.athrow`): raised at the `yield`
+            Ok(Some(e)) => Err(e),
+            // dropped (the request was abandoned): the code after `yield` does not run, `finally` blocks do
+            Err(_) => Err(Exc::new(&GENERATOR_EXIT, vec![])),
+        }
     }
 }
 
 pub struct DepTeardown {
-    resume: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Sender<Option<Exc>>,
     task: tokio::task::JoinHandle<R>,
+    /// `Depends(scope="function")`: closed when the endpoint returns, before the response is sent
+    function: bool,
 }
 
 /// Solving a dependency written as a generator: its body runs as a task up to its `yield`.
-pub async fn dep_gen<F>(cx: &Cx, f: F) -> R
+pub async fn dep_gen<F>(cx: &Cx, function: bool, f: F) -> R
 where
     F: FnOnce(Cx, Arc<DepYield>) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send + 'static>>,
 {
@@ -936,7 +1163,7 @@ where
     let task = tokio::spawn(f(cx.clone(), y));
     match vrx.await {
         Ok(v) => {
-            cx.teardowns.lock().push(DepTeardown { resume: rtx, task });
+            cx.teardowns.lock().push(DepTeardown { resume: rtx, task, function });
             Ok(v)
         }
         Err(_) => match task.await {
@@ -947,12 +1174,59 @@ where
     }
 }
 
+fn take_teardowns(cx: &Cx, function: bool) -> Vec<DepTeardown> {
+    let mut all = cx.teardowns.lock();
+    let (take, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *all).into_iter().partition(|t| t.function == function);
+    *all = keep;
+    take
+}
+
+/// Close generators, last solved first (an AsyncExitStack): `exc` is thrown into each, what it raises
+/// replaces it, a generator that catches it without raising suppresses it (contextlib).
+/// Returns the exception left.
+async fn close_teardowns(tds: Vec<DepTeardown>, mut exc: Option<Exc>) -> Option<Exc> {
+    for td in tds.into_iter().rev() {
+        let _ = td.resume.send(exc.clone());
+        match td.task.await {
+            Ok(Ok(_)) => exc = None,
+            Ok(Err(e)) => exc = Some(e),
+            Err(e) => exc = Some(Exc::runtime(format!("generator dependency task: {e}"))),
+        }
+    }
+    exc
+}
+
+/// FastAPI's `request_response`: an exception swallowed by a dependency with yield leaves no response.
+fn not_awaited() -> Exc {
+    Exc::msg(&FASTAPI_ERROR, "Response not awaited. There's a high chance that the application code is raising an \
+exception and a dependency with yield has a block with a bare except, or a block with except Exception, and is not \
+raising the exception again. Read more about it in the docs: \
+https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/#dependencies-with-yield-and-except")
+}
+
+/// The request failed with `e`: it goes through the function-scoped generators, then the request-scoped
+/// ones; the exception that escapes is the one the exception handlers see.
+pub async fn throw_teardowns(cx: &Cx, e: Exc) -> Exc {
+    let exc = close_teardowns(take_teardowns(cx, true), Some(e)).await;
+    close_teardowns(take_teardowns(cx, false), exc).await.unwrap_or_else(not_awaited)
+}
+
+/// The endpoint returned: the function-scoped generators close (an exception there fails the request).
+pub async fn run_fn_teardowns(cx: &Cx) -> Option<Exc> {
+    let tds = take_teardowns(cx, true);
+    if tds.is_empty() {
+        return None;
+    }
+    close_teardowns(tds, None).await
+}
+
 /// End of the request: the dependencies' code after `yield`, last solved first (FastAPI's exit stack).
+/// The response is sent: an exception there is only logged.
 pub async fn run_teardowns(cx: &Cx, ok: bool) {
     let tds = std::mem::take(&mut *cx.teardowns.lock());
     for td in tds.into_iter().rev() {
         if ok {
-            let _ = td.resume.send(());
+            let _ = td.resume.send(None);
         } else {
             drop(td.resume);
         }
@@ -970,8 +1244,10 @@ pub async fn run_teardowns(cx: &Cx, ok: bool) {
 pub async fn run_ws_route(cx: &Cx, run: super::ws::WsRunFn) -> R<()> {
     let _guard = TeardownGuard(Some(cx.clone()));
     if let Err(e) = run(cx).await {
-        run_teardowns(cx, false).await;
-        return Err(e);
+        return Err(throw_teardowns(cx, e).await);
+    }
+    if let Some(e) = run_fn_teardowns(cx).await {
+        return Err(throw_teardowns(cx, e).await);
     }
     run_teardowns(cx, true).await;
     if let Some(V::Session(s)) = cx.session.get() {
@@ -1330,7 +1606,8 @@ fn quote_url(s: &str) -> String {
 /// (FastAPI apps raise them, for the exception handlers).
 pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
     let res = ROUTE_RES.get_or_init(|| routes.iter().map(|r| route_regex(r.pattern)).collect());
-    let path = unquote(&cx.req.path);
+    let full = unquote(&cx.req.path);
+    let path = route_path(&full);
     let mut partial: Option<&RouteDef> = None;
     for (r, re) in routes.iter().zip(res) {
         if let Some(caps) = re.captures(&path) {
@@ -1383,11 +1660,13 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
         return super::asgi::to_response(&ret);
     }
     if path != "/" {
-        // Starlette: `path.rstrip("/")`, every trailing slash (`/tasks/%2F` decodes to `/tasks//` -> `/tasks`)
-        let alt = if path.ends_with('/') { path.trim_end_matches('/').to_string() } else { format!("{path}/") };
-        if res.iter().any(|re| re.is_match(&alt)) || super::routing::added_is_match(&alt) {
+        // Starlette: `path.rstrip("/")`, every trailing slash (`/tasks/%2F` decodes to `/tasks//` -> `/tasks`), on
+        // the scope's path (root_path included), matched without the root_path
+        let alt_full = if path.ends_with('/') { full.trim_end_matches('/').to_string() } else { format!("{full}/") };
+        let alt = route_path(&alt_full);
+        if res.iter().any(|re| re.is_match(alt)) || super::routing::added_is_match(alt) {
             let host = cx.req.header("host").unwrap_or_default();
-            let mut url = format!("http://{host}{alt}");
+            let mut url = format!("http://{host}{alt_full}");
             if !cx.req.raw_query.is_empty() {
                 url += "?";
                 url += &cx.req.raw_query;
@@ -1686,4 +1965,257 @@ pub async fn starlette_vary(mut r: axum::response::Response) -> axum::response::
         }
     }
     r
+}
+
+// ---------------------------------------------------------------- generator endpoints (FastAPI >= 0.134)
+
+/// How a generator endpoint's items are sent: JSON Lines (the default response class), Server-Sent Events
+/// (`response_class=EventSourceResponse`) or as they are (`response_class=StreamingResponse`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GenMode {
+    Jsonl,
+    Sse,
+    Raw,
+}
+
+/// FastAPI's `_PING_INTERVAL`: an SSE stream idle that long gets a keep-alive comment.
+const SSE_PING: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A generator endpoint's response: `item` is the stream item type of its return annotation
+/// (`AsyncIterable[Item]`), each item validated and serialized with it; without one, `jsonable_encoder` and
+/// `json.dumps`. The body streams one item at a time; an exception of the generator (or of an item's
+/// validation) cuts the connection, as uvicorn does once the response has started.
+pub async fn gen_response(cx: &Cx, gen: V, mode: GenMode, item: Option<&'static TD>, status: u16) -> R<Response> {
+    let g = super::agen::as_gen(&gen).ok_or_else(|| Exc::type_error("py2axum: the generator endpoint returned no generator"))?;
+    let status = cx.resp.status.lock().unwrap_or(status);
+    let mut b = Response::builder().status(status);
+    match mode {
+        GenMode::Jsonl => b = b.header(header::CONTENT_TYPE, "application/jsonl"),
+        GenMode::Sse => {
+            b = b.header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+                .header("cache-control", "no-cache")
+                .header("x-accel-buffering", "no")
+        }
+        GenMode::Raw => {}
+    }
+    for (k, v) in cx.resp.headers.lock().iter() {
+        b = b.header(k.as_str(), v.as_str());
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let cx2 = cx.clone();
+    tokio::spawn(async move {
+        // the producer pulls one item at a time (`__anext__`), the consumer serializes it (an SSE consumer
+        // inserts a ping when the producer is idle)
+        let (itx, mut irx) = tokio::sync::mpsc::channel::<R>(1);
+        let g2 = g.clone();
+        tokio::spawn(async move {
+            loop {
+                let r = g2.asend(V::None).await;
+                let end = r.is_err();
+                if itx.send(r).await.is_err() {
+                    let _ = g2.aclose().await;
+                    break;
+                }
+                if end {
+                    break;
+                }
+            }
+        });
+        let fail = |e: &Exc| {
+            eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+            Err(std::io::Error::other("generator endpoint failed"))
+        };
+        loop {
+            let next = if mode == GenMode::Sse {
+                match tokio::time::timeout(SSE_PING, irx.recv()).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        if tx.send(Ok(Bytes::from_static(b": ping\n\n"))).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                irx.recv().await
+            };
+            let v = match next {
+                None => break,
+                Some(Ok(v)) => v,
+                Some(Err(e)) if e.isinstance(&STOP_ASYNC_ITERATION) => break,
+                Some(Err(e)) => {
+                    let _ = tx.send(fail(&e)).await;
+                    break;
+                }
+            };
+            let out = match gen_item(&cx2, &v, mode, item).await {
+                Ok(bytes) => Ok(bytes),
+                Err(e) => fail(&e),
+            };
+            let stop = out.is_err();
+            if tx.send(out).await.is_err() || stop {
+                break;
+            }
+        }
+    });
+    let body = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|x| (x, rx)) });
+    use futures_util::StreamExt;
+    Ok(b.body(Body::from_stream(body.fuse())).unwrap_or_else(bad_response))
+}
+
+/// FastAPI's `_serialize_data`: the stream item field's validation then `serialize_json`, else
+/// `json.dumps(jsonable_encoder(item))`.
+async fn gen_data(cx: &Cx, v: &V, item: Option<&'static TD>) -> R<String> {
+    match item {
+        Some(td) => {
+            let prepared = prepare_for(v, td)?;
+            let mut errs = Vec::new();
+            match pyd::validate(cx, &prepared, td, &[V::str("response")], &mut errs).await? {
+                Some(x) => pyd::to_json(&pyd::dump(&x, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() })?, &pyd::DUMP_JSON, false),
+                None => {
+                    let detail: Vec<String> = errs.iter().map(|e| format!("{}: {}", e.kind, e.msg)).collect();
+                    Err(Exc::runtime(format!("ResponseValidationError: {}", detail.join("; "))))
+                }
+            }
+        }
+        None => {
+            let s = super::libs::json_dumps(&pyd::jsonable(v)?, &[])?;
+            Ok(ops::str_(&s)?)
+        }
+    }
+}
+
+async fn gen_item(cx: &Cx, v: &V, mode: GenMode, item: Option<&'static TD>) -> R<Bytes> {
+    match mode {
+        GenMode::Jsonl => Ok(Bytes::from(gen_data(cx, v, item).await? + "\n")),
+        GenMode::Raw => match v {
+            V::Str(s) => Ok(Bytes::from(s.to_string())),
+            V::Bytes(b) => Ok(Bytes::from(b.to_vec())),
+            // StreamingResponse: `chunk.encode(self.charset)`
+            other => Err(Exc::attr_error(format!("'{}' object has no attribute 'encode'", other.type_name()))),
+        },
+        GenMode::Sse => {
+            if let V::Inst(i) = v {
+                if std::ptr::eq(i.desc, &SSE_EVENT) {
+                    let get = |k: &str| i.extra.lock().get(k).cloned().unwrap_or(V::None);
+                    let opt = |k: &str| -> R<Option<String>> { let x = get(k); if x.is_none() { Ok(None) } else { Ok(Some(ops::str_(&x)?)) } };
+                    let data = get("data");
+                    let data_str = if let Some(raw) = opt("raw_data")? {
+                        Some(raw)
+                    } else if !data.is_none() {
+                        let is_model = matches!(&data, V::Inst(d) if !d.desc.open && !d.desc.dataclass && d.desc.settings.is_none());
+                        Some(if is_model {
+                            ops::str_(&super::methods::call_method(cx, &data, "model_dump_json", vec![], vec![]).await?)?
+                        } else {
+                            gen_data(cx, &data, None).await?
+                        })
+                    } else {
+                        None
+                    };
+                    let retry = get("retry");
+                    return Ok(Bytes::from(sse_format(data_str, opt("event")?, opt("id")?,
+                                                     if retry.is_none() { None } else { Some(ops::str_(&retry)?) }, opt("comment")?)));
+                }
+            }
+            Ok(Bytes::from(sse_format(Some(gen_data(cx, v, item).await?), None, None, None, None)))
+        }
+    }
+}
+
+/// fastapi.sse.format_sse_event
+fn sse_format(data: Option<String>, event: Option<String>, id: Option<String>, retry: Option<String>, comment: Option<String>) -> String {
+    let split = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n").split('\n').map(str::to_string).collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    if let Some(c) = comment {
+        lines.extend(split(&c).into_iter().map(|l| format!(": {l}")));
+    }
+    if let Some(e) = event {
+        lines.push(format!("event: {e}"));
+    }
+    if let Some(d) = data {
+        lines.extend(split(&d).into_iter().map(|l| format!("data: {l}")));
+    }
+    if let Some(i) = id {
+        lines.push(format!("id: {i}"));
+    }
+    if let Some(r) = retry {
+        lines.push(format!("retry: {r}"));
+    }
+    lines.push(String::new());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+static SSE_EVENT_CLASS: Class = Class { name: "ServerSentEvent", qualname: "fastapi.sse.ServerSentEvent", bases: &[], kind: ClassKind::Schema(&SSE_EVENT) };
+/// `fastapi.sse.ServerSentEvent`: its attributes (data, raw_data, event, id, retry, comment) checked at
+/// construction like its validators
+pub static SSE_EVENT: pyd::SchemaDesc = pyd::SchemaDesc {
+    name: "ServerSentEvent",
+    class: &SSE_EVENT_CLASS,
+    fields: &[],
+    from_attributes: false,
+    extra: pyd::Extra::Allow,
+    validators: &[],
+    validate_assignment: false,
+    populate_by_name: false,
+    methods: &[],
+    open: true,
+    model_after: &[],
+    before: &[],
+    model_before: &[],
+    has_before: false,
+    frozen: false,
+    post_init: None,
+    hash: pyd::HashKind::Unhashable,
+    dataclass: false,
+    async_methods: &[],
+    slots: &[],
+    settings: None,
+    init: None,
+    private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
+    computed: &[],
+    json_schema: None,
+};
+
+/// `ServerSentEvent(data=..., raw_data=..., event=..., id=..., retry=..., comment=...)`: str fields are str or
+/// None, retry an int >= 0, event and id one line (id without NUL), data and raw_data exclusive. A value
+/// pydantic would coerce (a bytes, a numeric str for retry) is refused (TypeError) rather than guessed.
+pub fn sse_event(args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error("BaseModel.__init__() takes 1 positional argument but 2 were given"));
+    }
+    let o = pyd::object_new(&SSE_EVENT);
+    let fields = ["data", "raw_data", "event", "id", "retry", "comment"];
+    for f in fields {
+        super::methods::setattr(&o, f, V::None)?;
+    }
+    let bad = |m: String| Exc::msg(&VALUE_ERROR, format!("1 validation error for ServerSentEvent\n{m}"));
+    for (k, v) in kwargs {
+        if !fields.contains(&k.as_str()) {
+            return Err(Exc::type_error(format!("py2axum: ServerSentEvent({k}=) is not supported")));
+        }
+        match (k.as_str(), v) {
+            (_, V::None) | ("data", _) => {}
+            ("retry", V::Int(n)) if *n >= 0 => {}
+            ("retry", V::Int(_)) => return Err(bad("retry\n  Input should be greater than or equal to 0".into())),
+            ("retry", _) => return Err(Exc::type_error("py2axum: ServerSentEvent(retry=) must be an int")),
+            (_, V::Str(s)) => {
+                if (k == "event" || k == "id") && (s.contains('\r') || s.contains('\n')) {
+                    return Err(bad(format!("{k}\n  Value error, SSE '{k}' must be a single line")));
+                }
+                if k == "id" && s.contains('\0') {
+                    return Err(bad("id\n  Value error, SSE 'id' must not contain null characters".into()));
+                }
+            }
+            _ => return Err(Exc::type_error(format!("py2axum: ServerSentEvent({k}=) must be a str or None"))),
+        }
+        super::methods::setattr(&o, k, v.clone())?;
+    }
+    let has = |k: &str| kwargs.iter().any(|(n, v)| n == k && !v.is_none());
+    if has("data") && has("raw_data") {
+        return Err(bad("  Value error, Cannot set both 'data' and 'raw_data' on the same ServerSentEvent. Use 'data' for \
+JSON-serialized payloads or 'raw_data' for pre-formatted strings.".into()));
+    }
+    Ok(o)
 }

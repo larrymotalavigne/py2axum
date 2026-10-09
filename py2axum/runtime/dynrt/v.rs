@@ -85,6 +85,8 @@ pub enum Native {
     /// `request.client`: (host, port)
     Address(String, u16),
     Totp(super::auth::Totp),
+    /// `pwdlib.PasswordHash.recommended()`
+    PwdHash,
     /// `asyncio.create_task(coro)`: runs on its own; `add_done_callback`
     Task(Arc<super::web::Task>),
     HttpClient(Arc<super::http::Client>),
@@ -115,8 +117,9 @@ pub enum Native {
     PydUrl(&'static str, Arc<url::Url>),
     /// `alembic.config.Config(file)`
     IniConfig(Arc<super::ini::IniConfig>),
-    /// `create_async_engine(...)`: the binary's own pool (DATABASE_URL, DB_POOL_SIZE)
-    Engine,
+    /// `create_engine(...)` (true) / `create_async_engine(...)` (false): the binary's own pool (DATABASE_URL,
+    /// DB_POOL_SIZE); a sync engine's connections are sync
+    Engine(bool),
     /// a named tuple of a library (`psutil.virtual_memory()`): (type name, fields)
     Record(&'static str, Arc<Vec<(&'static str, V)>>),
     /// a method of a builtin value read as a value (`_pending.discard`)
@@ -179,6 +182,13 @@ pub enum Native {
     McpRun,
     /// `func` of sqlalchemy, `status` of fastapi...: a namespace of attributes.
     Namespace(&'static str),
+    /// `Model.__table__`, its column collection, a column, a column's type (see `satable`)
+    SaTable(&'static super::satable::TableInfo),
+    SaColumns(&'static super::satable::TableInfo),
+    SaColumn(&'static super::satable::ColInfo),
+    SaType(&'static super::satable::ColInfo),
+    /// `icalendar.Calendar()` / `Event()` / `Alarm()` (see `ical`)
+    ICal(Arc<super::ical::Comp>),
     /// Bound builtin type used as a value (`dict`, `str`) e.g. in isinstance.
     Type(&'static str),
     FieldInfo,
@@ -328,6 +338,7 @@ impl V {
                 Native::CallNext(_) => "function",
                 Native::Address(..) => "Address",
                 Native::Totp(_) => "TOTP",
+                Native::PwdHash => "PasswordHash",
                 Native::Task(_) => "Task",
                 Native::HttpClient(_) => "AsyncClient",
                 Native::HttpResp(_) => "Response",
@@ -344,7 +355,8 @@ impl V {
                 Native::Row(..) => "Row",
                 Native::UrlParts(u) => if u.parse { "ParseResult" } else { "SplitResult" },
                 Native::Record(n, _) => n,
-                Native::Engine => "AsyncEngine",
+                Native::Engine(true) => "Engine",
+                Native::Engine(false) => "AsyncEngine",
                 Native::IniConfig(_) => "Config",
                 Native::PydUrl(n, _) => n,
                 Native::MethodOf(..) => "builtin_function_or_method",
@@ -386,6 +398,8 @@ impl V {
                 Native::McpManager(_) => "StreamableHTTPSessionManager",
                 Native::McpRun => "_AsyncGeneratorContextManager",
                 Native::Namespace(_) => "module",
+                Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => super::satable::type_name(n),
+                Native::ICal(c) => super::ical::type_name(c),
                 Native::Type(_) => "type",
                 Native::FieldInfo => "FieldInfo",
                 Native::Func(_) | Native::PyFn(_) => "function",
@@ -742,6 +756,8 @@ builtin_exc!(ARITHMETIC_ERROR, "ArithmeticError", [EXCEPTION]);
 builtin_exc!(ZERO_DIVISION_ERROR, "ZeroDivisionError", [ARITHMETIC_ERROR]);
 builtin_exc!(OVERFLOW_ERROR, "OverflowError", [ARITHMETIC_ERROR]);
 builtin_exc!(RUNTIME_ERROR, "RuntimeError", [EXCEPTION]);
+builtin_exc!(FASTAPI_ERROR, "FastAPIError", [RUNTIME_ERROR]);
+builtin_exc!(UNKNOWN_HASH_ERROR, "UnknownHashError", [VALUE_ERROR]);
 builtin_exc!(RECURSION_ERROR, "RecursionError", [RUNTIME_ERROR]);
 builtin_exc!(MEMORY_ERROR, "MemoryError", [EXCEPTION]);
 builtin_exc!(ASSERTION_ERROR, "AssertionError", [EXCEPTION]);
@@ -783,6 +799,7 @@ builtin_exc!(MULTIPLE_RESULTS_FOUND, "MultipleResultsFound", [SQLALCHEMY_ERROR])
 builtin_exc!(MISSING_GREENLET, "MissingGreenlet", [SQLALCHEMY_ERROR]);
 builtin_exc!(INVALID_REQUEST_ERROR, "InvalidRequestError", [SQLALCHEMY_ERROR]);
 builtin_exc!(OBJECT_DELETED_ERROR, "ObjectDeletedError", [INVALID_REQUEST_ERROR]);
+builtin_exc!(STALE_DATA_ERROR, "StaleDataError", [SQLALCHEMY_ERROR]);
 builtin_exc!(ARGUMENT_ERROR, "ArgumentError", [SQLALCHEMY_ERROR]);
 builtin_exc!(CIRCULAR_DEPENDENCY_ERROR, "CircularDependencyError", [SQLALCHEMY_ERROR]);
 builtin_exc!(EXPAT_ERROR, "ExpatError", [EXCEPTION]);
@@ -877,6 +894,7 @@ builtin_exc!(AIO_CONNECTION_TIMEOUT, "ConnectionTimeoutError", [AIO_SERVER_TIMEO
 builtin_exc!(AIO_INVALID_URL, "InvalidURL", [AIO_CLIENT_ERROR, VALUE_ERROR]);
 builtin_exc!(UNICODE_DECODE_ERROR, "UnicodeDecodeError", [VALUE_ERROR]);
 builtin_exc!(UNICODE_ENCODE_ERROR, "UnicodeEncodeError", [VALUE_ERROR]);
+builtin_exc!(PYDANTIC_SERIALIZATION_ERROR, "PydanticSerializationError", [VALUE_ERROR]);
 builtin_exc!(FILE_NOT_FOUND_ERROR, "FileNotFoundError", [OS_ERROR]);
 builtin_exc!(FILE_EXISTS_ERROR, "FileExistsError", [OS_ERROR]);
 builtin_exc!(PERMISSION_ERROR, "PermissionError", [OS_ERROR]);

@@ -59,6 +59,8 @@ STEPS: list = [
     ("GET", "/authors/1/mentor", None),
     ("DELETE", "/authors/3", None),
     ("DELETE", "/authors/3", None),
+    ("POST", "/core/many", None),
+    ("GET", "/q/authors", None),
 ]
 
 

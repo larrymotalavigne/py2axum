@@ -1,7 +1,17 @@
 # Command line
 
-py2axum has two commands: generation (`py2axum <package>`), which writes a Cargo project, and
-`py2axum check <package>`, which runs the same translation without writing anything and reports route by route.
+py2axum has three commands: generation (`py2axum <package>`), which writes a Cargo project;
+`py2axum check <package>`, which runs the same translation without writing anything and reports route by route;
+and `py2axum watch <package>`, which regenerates, rebuilds and restarts the binary each time the project changes.
+
+When generation refuses a construct, it prints its [error code](errors.md), the `file:line`, why and what to do:
+
+```text
+error[P2A0201]: app/routers/export.py:28: library call `zipfile.ZipInfo()` is not supported (not in the py2axum library map)
+  = why: The call goes to a library the binary has no equivalent for: py2axum maps a closed list of library ...
+  = help: Use a supported library or the standard library for the same job (see Libraries and Standard ...
+  = see: https://larrymotalavigne.github.io/py2axum/reference/errors/#p2a0201
+```
 
 ## Generating a crate
 
@@ -42,11 +52,29 @@ py2axum check api --root . --python-side auto --fail-under 80     # in CI: exit 
 `check` takes the same `package`, `--root`, `--python-side` (`PATH`, `lifespan` or `auto`) and
 `--allow-untested-versions` as generation, and:
 
-- `--json`: machine-readable output on stdout, with the same verdicts;
-- `--fail-under PCT`: also exit 1 when fewer than `PCT` % of the routes are native.
+- `--format text|json|markdown`: the terminal report (default); machine-readable output on stdout, with the
+  same verdicts, each refused route's `code` and `suggestion`, and the `unblock` list (`--json` is a synonym);
+  or Markdown tables for a pull request comment or a CI job summary (`>> "$GITHUB_STEP_SUMMARY"`);
+- `--fail-under PCT`: also exit 1 when fewer than `PCT` % of the routes are native;
+- `--explain CODE`: print why a class of construct is refused and what to do ([Error codes](errors.md)), then
+  exit.
 
 Errors that concern the whole application (and versions outside the tested ranges) are listed apart: they
 refuse the generation whatever the routes. Exit status: 0 when generation would succeed (and native routes ≥
 `--fail-under`), 1 otherwise. Reading its output: [`py2axum check`](../getting-started/check.md).
 
 <!-- py2axum:check-help -->
+
+## `py2axum watch`
+
+```bash
+DATABASE_URL=postgresql://localhost/app py2axum watch api --root . --python-side auto -o build/api --run
+```
+
+`watch` takes generation's `package`, `-o`, `--root`, `--name`, `--python-side`, `--no-stream` and
+`--allow-untested-versions`, watches the Python files under `--root`, and on each change regenerates, copies
+the changed generated files only, builds the debug profile (incremental) and, with `--run`, restarts the binary.
+A failed cycle prints the error and keeps the previous binary running. Ctrl-C stops the binary and exits. Guide:
+[Watch mode](../getting-started/watch.md).
+
+<!-- py2axum:watch-help -->

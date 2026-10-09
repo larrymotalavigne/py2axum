@@ -22,6 +22,14 @@ a file read as `bytes`. Like every example on this site, it is compiled and comp
   string counts as absent like FastAPI; `UploadFile` in memory: `read`, `seek`, `filename`,
   `content_type`, `size`, `.file`).
 - `OAuth2PasswordRequestForm` is a form too ([Security](security.md)).
+- A `File()` parameter typed `bytes`, `bytes | None` or `list[bytes]` gets the uploaded file's content, as
+  FastAPI's `_extract_form_body` (a text field is validated as is, Pydantic encoding a `str`; a text field in a
+  `list[bytes]` is FastAPI's 500, `'str' object has no attribute 'read'`). `bytes` follows Pydantic: a `str` is
+  encoded to UTF-8 (lax), `min_length`/`max_length` count bytes, JSON output is the UTF-8 text (invalid UTF-8:
+  `PydanticSerializationError`, a 500).
+- A model of form fields (`Annotated[Model, Form()]`): its fields read from the form, every other field added,
+  then validated as the model at `["body"]` (FastAPI's `_extract_form_body`); refused next to another form or
+  body parameter.
 
 Sending a file back is `FileResponse` ([Responses](responses.md)); reading files on the server uses `pathlib`
 and `open()` ([Standard library](../reference/stdlib.md)). Multipart limits and the handling of uploaded file
@@ -30,4 +38,4 @@ names are in [Security § Request input](../advanced/security.md#request-input) 
 
 ## What stays in Python
 
-- A `File()` parameter typed `bytes`: only `UploadFile` and `list[UploadFile]` are translated.
+- A `File()` parameter of another type than `UploadFile`, `bytes` or a list of them is refused.

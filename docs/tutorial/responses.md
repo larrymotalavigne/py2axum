@@ -12,16 +12,21 @@ events stream. Like every example on this site, it is compiled and compared with
 --8<-- "docs_src/tutorial/responses.py"
 ```
 
-!!! note "Left to Python in this example"
-    `GET /responses/items/{item_id}` uses the route option `response_model_exclude_unset=True`, which py2axum
-    does not translate yet (nor `response_model_exclude_none=`): `py2axum check` reports it, and with
-    `--python-side auto` the binary relays it to the Python application ([hybrid mode](../getting-started/hybrid.md)).
-    Calling `model_dump(exclude_unset=True)` yourself is native.
-
 ## What is native
 
 - `response_model` (filtering, aliases), status codes, returned dicts, lists, models,
-  ORM objects (`from_attributes`).
+  ORM objects (`from_attributes`). The route options `response_model_exclude_unset=`,
+  `response_model_exclude_none=`, and `response_model_include=` / `response_model_exclude=` as a literal set or
+  list of the model's field names.
+- A `Response` class as the return annotation (`-> RedirectResponse`, `-> Response`) is no response model,
+  like FastAPI. `FastAPI(default_response_class=HTMLResponse)` (or `PlainTextResponse`, `JSONResponse`).
+- Generator endpoints (FastAPI ≥ 0.134, an endpoint that `yield`s): JSON Lines by default
+  (`application/jsonl`, each item validated with the item type of an `AsyncIterable[Item]`/`Iterable[Item]`
+  return annotation, else `json.dumps(jsonable_encoder(item))`), Server-Sent Events with
+  `response_class=EventSourceResponse` (`text/event-stream`, `ServerSentEvent(data=, raw_data=, event=, id=,
+  retry=, comment=)` or plain items as `data:`, a `: ping` comment after 15 s without an item), the items as they
+  are with `response_class=StreamingResponse`. An exception in the generator cuts the connection, as uvicorn
+  does once the response has started.
 - Returned `Response`, `JSONResponse`, `PlainTextResponse`, `HTMLResponse`, `RedirectResponse`,
   `FileResponse` are sent like Starlette 1.7 (header order, `ETag`/`Last-Modified` of `FileResponse`;
   no `Range`/partial `HEAD`). `JSONResponse(content=...)` serializes like Starlette (strict `json.dumps`:
@@ -46,9 +51,13 @@ Errors (`HTTPException`, exception handlers) are in [Handling errors](errors.md)
 
 ## What stays in Python
 
-- The route options `response_model_exclude_unset=` and `response_model_exclude_none=` are refused (the
-  `model_dump` options of the same names are native).
-- Other `response_class=` classes are refused at transpile time.
+- `response_model_include=`/`_exclude=` with a nested selection (a dict), a computed field, or on another
+  response model than a Pydantic model; `response_model_exclude_defaults=`, `response_model_by_alias=`.
+- A generator endpoint with another response class, or with `response_model_*` options.
+  `ServerSentEvent(...)` values pydantic would coerce (a `bytes`, a numeric string for `retry`) raise a
+  `TypeError` instead.
+- Other `response_class=` classes (`ORJSONResponse`, `UJSONResponse`, a project subclass) are refused at
+  transpile time.
 
 ## Differences
 

@@ -35,7 +35,8 @@ def literal(node: ast.AST, file: str):
     try:
         return ast.literal_eval(node)
     except Exception:
-        raise TranspileError("expected a literal value", node, file) from None
+        raise TranspileError("expected a literal value here (py2axum reads it without running the code): "
+                             "write the constant itself", node, file) from None
 
 
 @dataclass
@@ -338,7 +339,7 @@ class Frontend:
                         continue
                 edges.append((owner, child, node, file, _under_if(node, parents), m.name, scope is None))
         self.include_edges = edges
-        memo: dict[object, list[Mount]] = {"app": [Mount("")]}
+        memo: dict[object, list[Mount]] = {"app": [Mount("", deps=list(self.__dict__.get("app_deps", [])))]}
 
         def mounts_of(target, stack=()) -> list[Mount]:
             if target in memo:

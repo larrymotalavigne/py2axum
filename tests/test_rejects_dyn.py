@@ -267,6 +267,48 @@ def test_python_semantics_rejected(tmp_path, capsys, body, message):
     assert "main.py:" in err
 
 
+@pytest.mark.parametrize(
+    "call, message",
+    [
+        ("await s.execute(insert(Team), [{'name': 'a'}, {'name': 'b'}])", "execute(insert(...), parameters) is not supported"),
+        ("await s.execute(update(Team), [{'id': 1, 'name': 'a'}])", "execute(update(...), parameters) is not supported"),
+        ("stmt = insert(Team).returning(Team.id)\n    await s.execute(stmt, [{'name': 'a'}])",
+         "execute(insert(...), parameters) is not supported"),
+        ("await s.execute(select(Team).where(Team.id == 1), params={'x': 1})", "execute(select(...), parameters)"),
+        ("await s.scalars(insert(Team).returning(Team), [{'name': 'a'}])", ".scalars(statement, parameters) is not supported"),
+        ("await s.scalar(text('SELECT :x'), {'x': 1})", ".scalar(statement, parameters) is not supported"),
+    ],
+)
+def test_execute_with_parameters_rejected(tmp_path, capsys, call, message):
+    """executemany / ORM bulk INSERT and UPDATE: refused at translation (the runtime takes parameters for text()
+    only; it used to fail at run time with a 500)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    main_py = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import insert, select, text, update\n"
+                                            "from .models import Team")
+    main_py = main_py.replace("    t = await s.get(Team, team_id)\n", f"    {call}\n    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(main_py)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+def test_execute_text_with_parameters_translates(tmp_path):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    main_py = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import text\nfrom .models import Team")
+    main_py = main_py.replace("    t = await s.get(Team, team_id)\n",
+                              "    stmt = text('SELECT 1 WHERE 1 = :x')\n    await s.execute(stmt, {'x': 1})\n"
+                              "    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(main_py)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+
+
 def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
     """Field and model `after` validators run on assignment; a model `before` validator would get the whole data."""
     pkg = tmp_path / "proj"
@@ -414,16 +456,22 @@ def test_type_decorator_rejected(tmp_path, capsys, body, message):
     assert "models.py:" in err
 
 
-def test_generator_dependency_with_except_rejected(tmp_path, capsys):
+@pytest.mark.parametrize("dep_kw, message", [
+    ('scope="function"', 'dependency outer has a scope of "request", it cannot depend on dependencies with scope "function"'),
+    ("scope=SCOPE", 'Depends(scope=) must be the literal "function" or "request"'),
+])
+def test_generator_dependency_scope_rejected(tmp_path, capsys, dep_kw, message):
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(
-        "from fastapi import Depends, FastAPI\n\napp = FastAPI()\n\n\nasync def dep():\n    try:\n        yield 1\n"
-        "    except ValueError:\n        pass\n\n\n@app.get('/x')\nasync def x(v: int = Depends(dep)):\n    return {'v': v}\n")
+        "from fastapi import Depends, FastAPI\n\napp = FastAPI()\nSCOPE = 'function'\n\n\nasync def inner():\n"
+        "    yield 1\n\n\n"
+        f"async def outer(i: int = Depends(inner, {dep_kw})):\n    yield i\n\n\n"
+        "@app.get('/x')\nasync def x(v: int = Depends(outer)):\n    return {'v': v}\n")
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "`yield` inside try/except is not supported" in err
+    assert message in err
     assert "main.py:" in err
 
 
@@ -1428,8 +1476,7 @@ def test_sentry_init_in_factory_not_translatable_rejected(tmp_path, capsys):
         from fastapi import FastAPI
 
 
-        def init_sentry():
-            n = 0
+        def init_sentry(n=0):
             def bump():
                 nonlocal n
             bump()
@@ -1451,7 +1498,7 @@ def test_sentry_init_in_factory_not_translatable_rejected(tmp_path, capsys):
     '''))
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "`nonlocal` is not supported" in err and "main.py:9" in err
+    assert "`nonlocal n` naming a parameter of the enclosing function is not supported" in err and "main.py:8" in err
 
 
 
@@ -1485,7 +1532,7 @@ async def x():
     ("class M(BaseModel):\n    a: int = 1\n    b: int = Field(default_factory=lambda d: d['a'])\n\n\ndef use():\n    return M().b",
      "a default_factory taking the validated data", 14),
     ("from typing import Iterable\n\n\nclass M(BaseModel):\n    xs: Iterable[int] = Field(max_length=1)\n\n\ndef use():\n"
-     "    return M(xs=[1]).model_dump()", "length constraints on `Iterable[int]` are not supported", 16),
+     "    return M(xs=[1]).model_dump()", "`Iterable[int]` is not supported (pydantic validates it differently from a list)", 16),
 ])
 def test_library_ports_rejected(tmp_path, capsys, body, msg, line):
     pkg = tmp_path / "proj"
@@ -2038,6 +2085,171 @@ def test_engine_connect_args_generated(tmp_path):
     assert "g_proj_main__engine(cx)" in init[:init.index("\n}")]
 
 
+# constructions of the FastAPI documentation's examples (corpus/, docs/coverage.md) that were translated
+# without them before (a silent difference): each is now refused at its line of main.py
+DOCS_REFUSED = [
+    ('''
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
+
+
+class LoggingRoute(APIRoute):
+    pass
+
+
+app = FastAPI()
+app.router.route_class = LoggingRoute
+
+
+@app.get("/")
+async def root():
+    return {}
+''', "main.py:10: assigning `app.router.route_class` at module level is not supported (only `app.state` attributes)"),
+]
+
+
+@pytest.mark.parametrize("source, message", DOCS_REFUSED)
+def test_docs_corpus_refusals(tmp_path, capsys, source, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(source.lstrip("\n"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("route, message", [
+    ("async def r(f: Annotated[F, Query()], q: int = 0):",
+     "r: a model of query parameters is supported as the route's only query parameter, without dependencies"),
+    ("async def r(f: Annotated[F, Query()], u: int = Depends(dep)):",
+     "r: a model of query parameters is supported as the route's only query parameter, without dependencies"),
+    ("async def r(f: Annotated[F, Form()], g: Annotated[str, Form()]):",
+     "r: a model of form parameters is supported as the route's only form parameter, without dependencies"),
+    ("async def r(f: Annotated[F | None, Cookie()] = None):", "f: an optional or union model of cookies is not supported"),
+    ("async def r(f: Annotated[F, Header()] = F()):", "f: a default for a model of header parameters is not supported"),
+])
+def test_param_models_refused(tmp_path, capsys, route, message):
+    """A model of parameters is read field by field only alone in its source (FastAPI's `len(fields) == 1`)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from typing import Annotated\n\nfrom fastapi import Cookie, Depends, FastAPI, Form, Header, Query\n"
+        "from pydantic import BaseModel\n\n\nclass F(BaseModel):\n    a: int = 1\n\n\nasync def dep():\n    return 1\n\n\n"
+        f"app = FastAPI()\n\n\n@app.get('/')\n{route}\n    return 1\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra, message", [
+    ("@app.on_event(EVENT)\nasync def s():\n    pass\n", '@app.on_event(...) needs a literal "startup" or "shutdown"'),
+    ("@app.on_event('startup')\nasync def s(x=1):\n    pass\n", "@app.on_event(...) handler s must take no parameters"),
+])
+def test_on_event_refused(tmp_path, capsys, extra, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\n\nEVENT = 'startup'\napp = FastAPI()\n\n\n" + extra)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert message in capsys.readouterr().err
+
+
+def test_on_event_lifespan(tmp_path):
+    """FastAPI's default lifespan: startup handlers in order before serving, shutdown ones after."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\n\nitems = {}\napp = FastAPI()\n\n\n@app.on_event('startup')\nasync def a():\n"
+        "    items['a'] = 1\n\n\n@app.on_event('shutdown')\ndef b():\n    items.clear()\n\n\n@app.on_event('startup')\n"
+        "def c():\n    items['c'] = 2\n\n\n@app.get('/')\nasync def r():\n    return items\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    body = gen[gen.index("fn f_proj_main____py2axum_on_event_lifespan"):]
+    body = body[:body.index("\n}\n")]
+    assert body.index("__py2axum_on_event_a") < body.index("__py2axum_on_event_c") < body.index("__py2axum_on_event_b")
+
+
+def test_app_dependencies_first(tmp_path):
+    """`FastAPI(dependencies=[...])`: solved first for every route, then the include's, then the route's own."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import APIRouter, Depends, FastAPI\n\n\nasync def app_dep():\n    return 1\n\n\n"
+        "async def inc_dep():\n    return 2\n\n\nasync def own_dep():\n    return 3\n\n\n"
+        "app = FastAPI(dependencies=[Depends(app_dep)])\nrouter = APIRouter()\n\n\n"
+        "@router.get('/r', dependencies=[Depends(own_dep)])\nasync def r():\n    return 1\n\n\n"
+        "@app.get('/a')\nasync def a():\n    return 1\n\n\n"
+        "app.include_router(router, dependencies=[Depends(inc_dep)])\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    r = gen[gen.index("/// GET /r"):]
+    r = r[:r.index("\n}\n")]
+    assert r.index("dep_proj_main__app_dep") < r.index("dep_proj_main__inc_dep") < r.index("dep_proj_main__own_dep")
+    a = gen[gen.index("/// GET /a"):]
+    assert "dep_proj_main__app_dep" in a[:a.index("\n}\n")]
+
+
+def test_request_validation_error_body(tmp_path):
+    """`exc.body` of a route's RequestValidationError: the decoded body (FastAPI's `body=`), not for a form route."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI, Form\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\n\nclass I(BaseModel):\n"
+        "    a: int\n\n\n@app.post('/j')\nasync def j(i: I):\n    return i\n\n\n@app.post('/f')\nasync def f(a: int = Form()):\n"
+        "    return a\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    j, f = gen[gen.index("/// POST /j"):], gen[gen.index("/// POST /f"):]
+    assert "web::check_body(__errv, &__body)" in j[:j.index("\n}\n")]
+    assert "web::check(__errv)" in f[:f.index("\n}\n")]
+
+
+@pytest.mark.parametrize("src, message", [
+    # generator endpoints (FastAPI >= 0.134): JSON Lines, EventSourceResponse, StreamingResponse only
+    ("from fastapi.responses import HTMLResponse\n@app.get('/x', response_class=HTMLResponse)\nasync def x():\n    yield 'a'\n",
+     "a generator endpoint with response_class=HTMLResponse is not supported"),
+    ("from fastapi.sse import EventSourceResponse\n@app.get('/x', response_class=EventSourceResponse)\nasync def x():\n"
+     "    return {'a': 1}\n", "response_class=EventSourceResponse is only supported on a generator endpoint"),
+    ("@app.get('/x', response_model_exclude_none=True)\nasync def x():\n    yield 1\n",
+     "response_model_exclude_none= on a generator endpoint is not supported"),
+    # response_model_include/exclude: literal top-level field names of a model response_model
+    ("class M(BaseModel):\n    a: int\n@app.get('/x', response_model=list[M], response_model_include={'a'})\nasync def x():\n"
+     "    return []\n", "response_model_include= is only supported with a Pydantic model as the response model"),
+    ("class M(BaseModel):\n    a: int\n@app.get('/x', response_model=M, response_model_exclude={'b'})\nasync def x():\n"
+     "    return {'a': 1}\n", "response_model_exclude=: `b` is not a field of M"),
+    ("class M(BaseModel):\n    a: int\n@app.get('/x', response_model=M, response_model_include={'a': True})\nasync def x():\n"
+     "    return {'a': 1}\n", "response_model_include= must be a literal set or list of field names"),
+    # app.dependency_overrides at module level: project function to project function
+    ("def dep():\n    return 1\napp.dependency_overrides[dep] = lambda: 2\n@app.get('/x')\nasync def x(v: int = Depends(dep)):\n"
+     "    return v\n", "only a project function overridden by a project function is supported"),
+    # model_config bytes modes
+    ("class M(BaseModel):\n    b: bytes\n    model_config = {'val_json_bytes': 'base32'}\n@app.post('/x')\nasync def x(m: M):\n"
+     "    return 1\n", 'model_config val_json_bytes= must be "utf8", "base64" or "hex"'),
+    # TrustedHostMiddleware's own assertion, root_path with a WebSocket route
+    ("from fastapi.middleware.trustedhost import TrustedHostMiddleware\napp.add_middleware(TrustedHostMiddleware, "
+     "allowed_hosts=['ex*.com'])\n@app.get('/x')\nasync def x():\n    return 1\n", "domain wildcard patterns must be like"),
+    ("app2 = None\n@app.websocket('/ws')\nasync def ws(w: WebSocket):\n    await w.accept()\n",
+     "FastAPI(root_path=...) together with WebSocket routes"),
+    ("def __getattr__(n):\n    return n\n@app.get('/x')\nasync def x(q: Annotated[str, Query(min_length=2)] = None, u=Query(max_length=3)):\n"
+     "    return 1\n", "constraints without a type annotation are not supported"),
+])
+def test_corpus06_rejected(tmp_path, capsys, src, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    app = "FastAPI(root_path='/r')" if "root_path" in message else "FastAPI()"
+    (pkg / "main.py").write_text(
+        "from typing import Annotated\nfrom fastapi import Depends, FastAPI, Query, WebSocket\nfrom pydantic import BaseModel\n"
+        f"app = {app}\n" + src)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err, err
+    assert "main.py:" in err
+
+
 ITS_MAIN = """
 from fastapi import FastAPI
 from itsdangerous import URLSafeTimedSerializer
@@ -2123,3 +2335,101 @@ def test_dropped_arguments_rejected(tmp_path, capsys, stmt, msg):
     err = capsys.readouterr().err
     assert msg in err, err
     assert "main.py:20" in err
+
+
+def test_json_path_index_rejected(tmp_path, capsys):
+    """`Model.json_col[("a", "b")]` (JSON path, #>>) is refused; `col["k"].as_string()` translates."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", "data: Mapped[dict | None] = mapped_column(JSON)")
+                                   .replace("from sqlalchemy import ForeignKey", "from sqlalchemy import JSON, ForeignKey"))
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN) + textwrap.dedent('''
+        from sqlalchemy import select
+
+
+        @app.get("/one")
+        async def one(s: AsyncSession = Depends(db)):
+            return (await s.execute(select(Team.data["k"].as_string()))).scalars().all()
+
+
+        @app.get("/path")
+        async def path(s: AsyncSession = Depends(db)):
+            return (await s.execute(select(Team.data[("a", "b")].as_string()))).scalars().all()
+    '''))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "a JSON path index" in err and "main.py:" in err
+    assert "/one" not in err
+
+
+def _reject(tmp_path, capsys, src: str) -> str:
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(textwrap.dedent(src))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    return capsys.readouterr().err
+
+
+def test_alias_choices_rejected(tmp_path, capsys):
+    """validation_alias= other than a string (AliasChoices, AliasPath) reads several keys or a nested one."""
+    err = _reject(tmp_path, capsys, '''
+        from fastapi import FastAPI
+        from pydantic import AliasChoices, BaseModel, Field
+
+        app = FastAPI()
+
+
+        class M(BaseModel):
+            a: int = Field(validation_alias=AliasChoices("a", "b"))
+
+
+        @app.post("/m")
+        async def m(body: M):
+            return body
+    ''')
+    assert "Field(validation_alias=) other than a string is not supported" in err and "main.py:9" in err
+
+
+def test_nonlocal_outside_enclosing_function_rejected(tmp_path, capsys):
+    """`nonlocal` of a name the enclosing function does not bind (a global, a class attribute)."""
+    err = _reject(tmp_path, capsys, '''
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+
+        @app.get("/n")
+        async def n():
+            def inner():
+                def deepest():
+                    nonlocal total
+                    total = 1
+                deepest()
+            inner()
+            return {}
+    ''')
+    assert "`nonlocal total`: only a local variable of the enclosing function is supported" in err and "main.py:11" in err
+
+
+
+def test_typeddict_response_model_rejected(tmp_path, capsys):
+    """Calling a TypedDict builds a dict; as a response model Pydantic would validate it: refused."""
+    err = _reject(tmp_path, capsys, '''
+        from typing import TypedDict
+
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+
+        class Q(TypedDict):
+            ok: bool
+
+
+        @app.get("/q")
+        async def q() -> Q:
+            return Q(ok=1)
+    ''')
+    assert "is not a Pydantic model or an enum" in err and "main.py:14" in err

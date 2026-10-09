@@ -19,6 +19,8 @@ Arguments follow the same rule: one the runtime does not implement is refused (a
 | python-jose (3.5) | `jwt.encode/decode` with HMAC algorithms and decode options; identical tokens, same exceptions |
 | PyJWT (2.15) | `jwt.encode` (`algorithm=`, `headers=`, `sort_headers=`; datetimes of `exp`/`iat`/`nbf` encoded from a copy), `jwt.decode` / `decode_complete` (`algorithms=`, `options=` with every `verify_*`, `require`, `strict_aud`, `enforce_minimum_key_length`; `audience=`, `issuer=`, `subject=`, `leeway=` as a number or a timedelta), `get_unverified_header`, with HS256/HS384/HS512 and `none`: identical tokens, the same checks in the same order, the `jwt.exceptions` hierarchy and messages (`MissingRequiredClaimError.claim` included). Refused at transpile time: an asymmetric algorithm (RS*, ES*, PS*, EdDSA) written as a literal, `json_encoder=`, `detached_payload=`, `verify=`, extra keyword arguments, `PyJWK`/`PyJWKClient`. At run time an asymmetric algorithm raises a py2axum RuntimeError (500), and so does an HMAC key shaped like a DER structure (PyJWT tries it as a public key). `InsecureKeyLengthWarning` is not emitted. |
 | bcrypt (5.0), pyotp (2.9) | same hashes and codes |
+| pwdlib (0.2+, Argon2) | `PasswordHash.recommended()`: `hash`, `verify`, `verify_and_update` (see [Security](../tutorial/security.md)) |
+| anyio | `anyio.sleep(delay)` |
 | itsdangerous (2.2) | `URLSafeTimedSerializer(secret_key or key list, salt=)` with the default signer and serializer: `dumps(obj, salt)`, `loads(s, max_age, return_timestamp, salt)` (positional or keyword; `return_timestamp=True` gives `(payload, aware datetime in UTC)`), the exceptions' `payload` and `date_signed`. Any other argument, `loads_unsafe` and custom signers or serializers are refused at transpile time |
 | cryptography | `Fernet` (tokens readable both ways), `Fernet.generate_key()` |
 | jinja2, aiosmtplib, email | templates (minijinja with Jinja2's output), MIME messages, SMTP sending; `Jinja2Templates(directory=)` and `TemplateResponse(request, name, context, status_code, headers, media_type)` (`request` added to the context, date `strftime`/`isoformat` callable from a template; `env.filters[name] = f` with a project function or lambda, called synchronously during the render; `context_processors`, `env=` and `url_for` are not supported) |
@@ -28,4 +30,13 @@ Arguments follow the same rule: one the runtime does not implement is refused (a
 | psutil (7) | `cpu_percent`, `virtual_memory`, `disk_usage`, `pids` |
 | sentry-sdk 2.x | see [Sentry](../advanced/sentry.md) |
 | python-dateutil (2.9) | `relativedelta(years=, months=, weeks=, days=, hours=, minutes=, seconds=, microseconds=)` with integers: normalization, `repr`, attributes, `date`/`datetime` `+`/`-` (month-end clamping), `+`/`-`/`*`/`==` between deltas. Refused: absolute fields (`year=`, `day=`, `weekday=`...), `relativedelta(dt1, dt2)`; fractional days/hours raise a py2axum `TypeError` |
+| icalendar (7.0) | `Calendar()`, `Event()`, `Alarm()`, `add(name, value)` of a text property (`summary`, `description`, `uid`, `prodid`, `x-*`...: TEXT escaping), `url` (as is), a `date` (`dtstart`, `dtend`, `due`: `VALUE=DATE`) or a `timedelta` (`trigger`, `duration`), `add_component()`, `to_ical()`: byte-identical output (canonical property order, folding at 75 octets). Parameters, datetimes, other property types and reading properties back raise a `TypeError` |
 | xmltodict (1.0) | `parse(str or UTF-8 bytes, process_namespaces=, namespaces=)` with the default options (`@` attributes, `#text`, lists for repeated elements, whitespace stripped, comments and processing instructions ignored); `dict_constructor=` is accepted, the result is always made of dicts. Malformed XML raises `xml.parsers.expat.ExpatError` with expat's message and position for the usual errors (others may word or place it differently). A DOCTYPE is refused at run time; other options are refused |
+
+## File formats left to Python
+
+Libraries that write a file are translated only when their output is reproducible byte for byte. `fpdf2`
+(the PDF carries its creation date), `python-docx` and `openpyxl` (the zip entries carry the time they were
+written), `reportlab`, `weasyprint`, and the readers `xlrd`, `olefile`, `pdfplumber` stay in Python: declare
+the routes `--python-side auto` ([Hybrid mode](../getting-started/hybrid.md)).
+

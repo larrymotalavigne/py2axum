@@ -7,8 +7,8 @@ image holds the binary alone.
 
 | Tag | |
 |---|---|
-| `X.Y.Z` | one py2axum release (`0.5.1`); pin this in production builds |
-| `X.Y` | the latest patch release of a minor version (`0.5`) |
+| `X.Y.Z` | one py2axum release (`0.6.0`); pin this in production builds |
+| `X.Y` | the latest patch release of a minor version (`0.6`) |
 | `latest` | the latest release |
 
 Each tag is a multi-arch image (`linux/amd64`, `linux/arm64`) built by GitHub Actions from the release
@@ -30,7 +30,7 @@ What is inside:
 Mount the directory you run uvicorn from on `/app`, then name the application package:
 
 ```bash
-docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum:0.5 build app --python-side auto
+docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum:0.6 build app --python-side auto
 ```
 
 ```
@@ -69,7 +69,7 @@ builds with the image and ships the binary on `gcr.io/distroless/cc-debian12:non
 certificates; no shell, no package manager):
 
 ```dockerfile
-FROM ghcr.io/larrymotalavigne/py2axum:0.5 AS build
+FROM ghcr.io/larrymotalavigne/py2axum:0.6 AS build
 COPY --chown=py2axum:py2axum . /app/
 RUN py2axum-build app --name app --out /tmp/out --python-side auto
 
@@ -86,7 +86,7 @@ library behaviours follow them. The reference file takes build arguments (`APP_D
 
 ```bash
 docker build -f examples/docker/Dockerfile --build-arg APP_DIR=. --build-arg PACKAGE=api \
-  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.5.1 -t myapp .
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.6.0 -t myapp .
 ```
 
 [`compose.yaml`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/compose.yaml), next to
@@ -105,10 +105,11 @@ optimises them again with your code. Measured on the bookshelf example:
 
 | | |
 |---|---|
-| builder image | about 700 MB compressed (2.7 GB unpacked, 1 GB of it precompiled crates) |
-| bookshelf build (`docker run … build`), 6 vCPU arm64 | about 2 min, all in the final link |
+| builder image | about 700 MB compressed (2.1 GB unpacked on amd64, 2.7 GB on arm64; 1 GB of precompiled crates) |
+| bookshelf build (`docker run … build`), GitHub-hosted runner (4 vCPU, amd64) | 1 min 47, nearly all in the final link |
+| the same, 6 vCPU arm64 VM | about 2 min |
 | bookshelf binary | 15 MB |
-| final image on distroless (`examples/docker/Dockerfile`) | 68 MB unpacked, 15 MB compressed |
+| final image on distroless (`examples/docker/Dockerfile`) | 39 MB (amd64), 68 MB (arm64) unpacked |
 
 Pin `X.Y.Z` for reproducible builds: a newer py2axum may translate more routes, or the same routes
 differently. A version's image may be rebuilt (base image fixes), always with the same py2axum, Python and
@@ -120,7 +121,7 @@ Rust versions.
 from a published version or from a checkout:
 
 ```bash
-docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.5.1 -t py2axum .   # a release
+docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.6.0 -t py2axum .   # a release
 docker build -f docker/Dockerfile --build-arg PY2AXUM=/src -t py2axum .              # this checkout
 ```
 
