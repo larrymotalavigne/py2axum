@@ -12,7 +12,6 @@ Two sources are combined for each route:
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
