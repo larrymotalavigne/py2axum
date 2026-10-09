@@ -30,6 +30,9 @@ services:
     build:
       context: ../..
       dockerfile: examples/docker/Dockerfile
+      args:
+        # the builder image; CI builds it from the checkout first
+        PY2AXUM_IMAGE: ${PY2AXUM_IMAGE:-ghcr.io/larrymotalavigne/py2axum:latest}
     environment:
       DATABASE_URL: postgresql+psycopg://postgres@db/bookshelf
       PY2AXUM_PYTHON_URL: http://python:8000

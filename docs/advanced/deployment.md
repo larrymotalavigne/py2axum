@@ -7,13 +7,14 @@ the routes left to Python ([hybrid mode](../getting-started/hybrid.md)).
 
 ## Building with Docker
 
-A multi-stage build keeps the Python and Rust toolchains out of the final image: transpile, compile, then ship
-the binary alone (an image of a few tens of MB on `debian:bookworm-slim`). The reference files are in
+The [Docker image](docker.md) `ghcr.io/larrymotalavigne/py2axum` holds Python, py2axum, Rust and the runtime's
+precompiled dependencies: use it as the first stage of a multi-stage build, and ship the binary alone (an image
+of a few tens of MB on `gcr.io/distroless/cc-debian12`). The reference files are in
 [`examples/docker`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/docker), set up for the [bookshelf example](https://github.com/larrymotalavigne/py2axum/tree/main/examples/bookshelf) in hybrid mode:
 
 | File | |
 |---|---|
-| [`Dockerfile`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/Dockerfile) | transpile (`python:3.13-slim`), compile (`rust:1-bookworm`, cargo caches as BuildKit cache mounts), run: the binary alone on `debian:bookworm-slim`, as `nobody` |
+| [`Dockerfile`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/Dockerfile) | translate and compile in `ghcr.io/larrymotalavigne/py2axum`, then the binary alone on `gcr.io/distroless/cc-debian12:nonroot` |
 | [`Dockerfile.python`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/Dockerfile.python) | the same application under uvicorn, for the routes left to Python |
 | [`compose.yaml`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/compose.yaml) | PostgreSQL, the Python sidecar (not published) and the binary (port 8080, the only entry point) |
 
@@ -28,26 +29,26 @@ The `Dockerfile` takes build arguments, so it can often be used as is:
 
 ```bash
 docker build -f Dockerfile \
-  --build-arg APP_DIR=. --build-arg PACKAGE=api --build-arg NAME=api \
+  --build-arg APP_DIR=. --build-arg PACKAGE=api \
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.5.1 \
   --build-arg PY2AXUM_FLAGS="--python-side auto" -t myapp .
 ```
 
 - `APP_DIR` is the directory you run uvicorn from (the import root, `--root`), `PACKAGE` the package holding
-  the FastAPI application, `NAME` the binary's name.
+  the FastAPI application.
 - `PY2AXUM_FLAGS`: `--python-side auto` leaves every route that does not translate to Python; list them
   explicitly (`--python-side '/reports/{id}.pdf'`) to decide yourself when a route moves to the binary; leave
   it empty if everything translates (the build then fails on any refused construct, which is what you want
   in CI).
-- Replace the lines that install py2axum from this repository with `RUN pip install --no-cache-dir
-  "py2axum==<version>"`, and pin that version: a new py2axum can translate more routes, or the same ones
-  differently.
+- `PY2AXUM_IMAGE`: pin the py2axum version (`X.Y.Z`): a new py2axum can translate more routes, or the same
+  ones differently.
 - Copy your `uv.lock` (or requirements file) with the application: library behaviours follow its versions.
-- The first stage runs `py2axum check` before generating, so the build log lists every route's verdict.
+- The build runs `py2axum check` before generating, so the build log lists every route's verdict.
 
-The release profile uses fat LTO and one codegen unit: expect several minutes for the first `cargo build`. The
-BuildKit cache mounts keep the cargo registry and the target directory between builds, so later builds only
-recompile the generated code. The generated crate ships with the `Cargo.lock` py2axum is tested with
-(`cargo build --locked`).
+The release profile uses fat LTO and one codegen unit: the runtime's crates are precompiled in the image, but
+the final link optimises the whole program and takes a few minutes. The generated crate ships with the
+`Cargo.lock` py2axum is tested with (`cargo build --locked`). Without Docker, the same steps are
+`py2axum check`, `py2axum … -o crate` and `cargo build --release` ([first application](../getting-started/first-app.md)).
 
 ## Running it
 

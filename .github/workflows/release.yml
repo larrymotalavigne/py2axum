@@ -2,19 +2,24 @@ name: Publish to PyPI
 
 # Run by hand (Actions → Publish to PyPI → Run workflow) on the commit tagged for the release.
 # Uses PyPI Trusted Publishing: no token; the project's trusted publisher must name this repository,
-# this workflow (release.yml) and the `pypi` environment.
+# this workflow (release.yml) and the `pypi` environment. Then builds the Docker image of the published version
+# (docker.yml: ghcr.io/<owner>/py2axum:X.Y.Z, X.Y, latest).
 on:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - run: pip install build && python -m build
+      - id: version
+        run: python -c "import tomllib; print('version=' + tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])" >> "$GITHUB_OUTPUT"
       - name: the wheel installs and runs
         run: python -m venv /tmp/w && /tmp/w/bin/pip install dist/*.whl && /tmp/w/bin/py2axum --help
       - uses: actions/upload-artifact@v5
@@ -34,3 +39,12 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  docker:
+    needs: [build, publish]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.build.outputs.version }}

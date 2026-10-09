@@ -9,7 +9,7 @@
 # Needs: PostgreSQL (the database must exist; its tables are created from schema.sql), cargo, and a Python with
 # py2axum and examples/bookshelf/requirements.txt installed (plus httpx and websockets for the harness).
 # REF_PORT (9050) and CAND_PORT (9090) choose the ports; CARGO_TARGET_DIR is honoured; SKIP_BUILD=1 reuses
-# the last binary.
+# the last binary; BIN names a binary built elsewhere (with SKIP_BUILD=1, e.g. by the Docker image).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 DB=${DATABASE_URL:-postgresql://postgres@127.0.0.1/bookshelf}
@@ -19,7 +19,7 @@ CAND_PORT=${CAND_PORT:-9090}
 PY=${PYTHON:-python}
 LOG=${LOG:-/tmp/bookshelf-logs}
 CRATE=generated/bookshelf
-BIN=${CARGO_TARGET_DIR:-$CRATE/target}/release/bookshelf
+BIN=${BIN:-${CARGO_TARGET_DIR:-$CRATE/target}/release/bookshelf}
 mkdir -p "$LOG"
 
 if [ -z "${SKIP_BUILD:-}" ]; then

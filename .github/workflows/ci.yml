@@ -192,11 +192,15 @@ jobs:
           path: /tmp/docs-src-logs
 
   docker:
-    name: reference Docker build (examples/docker, hybrid)
+    name: builder image and reference Docker build (docker/, examples/docker, hybrid)
     runs-on: ubuntu-latest
+    env:
+      PY2AXUM_IMAGE: py2axum:ci
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
+      # the builder image of this checkout (docker/Dockerfile); the docker driver keeps it visible to compose
+      - name: builder image
+        run: docker build -f docker/Dockerfile --build-arg PY2AXUM=/src -t "$PY2AXUM_IMAGE" .
       - name: build and start (PostgreSQL, Python sidecar, binary)
         run: docker compose -f examples/docker/compose.yaml up --build --detach --wait --wait-timeout 1800
       - name: smoke test

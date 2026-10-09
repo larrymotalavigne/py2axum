@@ -8,6 +8,8 @@ py2axum has no dependencies: it reads your code, it never imports it. Install it
 (same virtual environment, same Python) or in a separate one: either works.
 
 You also need Rust and PostgreSQL to build and run the binary: see [What you need](index.md#what-you-need).
+Or skip the local install: the [Docker image](../advanced/docker.md) holds py2axum and Rust and builds the
+binary in one command (`docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum build app`).
 
 The examples are not part of the wheel. To follow this guide, clone the repository:
 

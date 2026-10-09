@@ -126,6 +126,7 @@ nav:
       - MCP servers: advanced/mcp.md
       - Performance: advanced/performance.md
       - Conformance and replay: advanced/conformance.md
+      - Docker image: advanced/docker.md
       - Deployment: advanced/deployment.md
       - Security: advanced/security.md
   - Reference:

@@ -83,6 +83,15 @@ native       WEBSOCKET /ws/books/{book_id}  examples/bookshelf/app/routers/live.
 hint: --python-side auto leaves the refused routes to a Python process next to the binary
 ```
 
+Or with Docker, nothing to install: the [builder image](https://larrymotalavigne.github.io/py2axum/advanced/docker/)
+(`linux/amd64`, `linux/arm64`) holds py2axum, Rust and the runtime's precompiled dependencies, and writes the
+binary to `dist/`; [`examples/docker`](examples/docker) uses it in a multi-stage build that ships the binary
+alone on a distroless image.
+
+```bash
+docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum build app --python-side auto
+```
+
 The [getting-started guide](https://larrymotalavigne.github.io/py2axum/getting-started/) walks through the example end to end: check, build, run,
 hybrid mode, comparison with FastAPI, Docker, runtime configuration, graceful shutdown and Sentry.
 

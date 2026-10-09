@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Translate a FastAPI application with py2axum and compile it: one command, one binary.
+#
+#   py2axum-build [PACKAGE] [--name NAME] [--out DIR] [--crate DIR] [--no-check] [py2axum options]
+#
+# Run from the directory you run uvicorn from (the import root, /app in the image). PACKAGE is the application
+# package (default: app). The binary lands in DIR/NAME (default: dist/<package name>). Other options go to
+# py2axum (--python-side, --no-stream, --allow-untested-versions, --root); `py2axum check` runs first and stops
+# the build, with file:line, when a route neither translates nor is left to Python.
+#
+# The runtime's dependencies are precompiled in CARGO_TARGET_DIR: only the application's crate is compiled.
+set -euo pipefail
+
+usage() { sed -n '2,11s/^# \{0,1\}//p' "$0"; }
+
+package=app name="" out="" crate="" check=1 root_given=0
+pass=() check_pass=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --name) name=$2; shift 2 ;;
+    --name=*) name=${1#*=}; shift ;;
+    --out) out=$2; shift 2 ;;
+    --out=*) out=${1#*=}; shift ;;
+    --crate) crate=$2; shift 2 ;;
+    --crate=*) crate=${1#*=}; shift ;;
+    --no-check) check=0; shift ;;
+    # options `py2axum check` understands too
+    --python-side|--root)
+      [ "$1" = --root ] && root_given=1
+      pass+=("$1" "$2"); check_pass+=("$1" "$2"); shift 2 ;;
+    --python-side=*|--root=*)
+      case "$1" in --root=*) root_given=1 ;; esac
+      pass+=("$1"); check_pass+=("$1"); shift ;;
+    --allow-untested-versions) pass+=("$1"); check_pass+=("$1"); shift ;;
+    -o|--out-dir|--report) echo "py2axum-build: $1 is not supported here (see --crate and --out)" >&2; exit 2 ;;
+    -*) pass+=("$1"); shift ;;
+    *) package=$1; shift ;;
+  esac
+done
+
+[ -d "$package" ] || { echo "py2axum-build: no package directory '$package' in $(pwd) (mount your application on /app?)" >&2; exit 2; }
+name=${name:-$(basename "$(cd "$package" && pwd)")}
+out=${out:-dist}
+[ "$root_given" = 1 ] || { pass+=(--root .); check_pass+=(--root .); }
+if [ -z "$crate" ]; then
+  crate=$(mktemp -d "${TMPDIR:-/tmp}/py2axum-crate.XXXXXX")
+  trap 'rm -rf "$crate"' EXIT
+fi
+
+start=$(date +%s)
+if [ "$check" = 1 ]; then
+  py2axum check "$package" "${check_pass[@]}"
+fi
+py2axum "$package" "${pass[@]}" -o "$crate" --name "$name"
+(cd "$crate" && cargo build --release --locked)
+mkdir -p "$out"
+cp "${CARGO_TARGET_DIR:-$crate/target}/release/$name" "$out/$name"
+echo "py2axum-build: $out/$name ($(du -h "$out/$name" | cut -f1), $(( $(date +%s) - start )) s)"
