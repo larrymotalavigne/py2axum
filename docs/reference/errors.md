@@ -31,6 +31,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0114](#p2a0114) | match statement |
 | [P2A0115](#p2a0115) | Syntax error |
 | [P2A0116](#p2a0116) | Decorator |
+| [P2A0117](#p2a0117) | Python 3.14 or 3.15 construct not supported |
 | [P2A0201](#p2a0201) | Library call not supported |
 | [P2A0202](#p2a0202) | Library value not supported |
 | [P2A0203](#p2a0203) | Method not implemented by the runtime |
@@ -38,6 +39,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0205](#p2a0205) | Keyword option not supported |
 | [P2A0206](#p2a0206) | Library exception class |
 | [P2A0207](#p2a0207) | MCP server construct not supported |
+| [P2A0208](#p2a0208) | Logging construct not supported |
 | [P2A0209](#p2a0209) | Option not supported |
 | [P2A0301](#p2a0301) | Application method or decorator |
 | [P2A0302](#p2a0302) | Middleware not supported |
@@ -73,6 +75,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0509](#p2a0509) | Table introspection |
 | [P2A0601](#p2a0601) | Library version outside the tested ranges |
 | [P2A0602](#p2a0602) | Cannot be left to Python |
+| [P2A0603](#p2a0603) | Not available on the project's Python |
 | [P2A0901](#p2a0901) | Internal transpiler error |
 | [P2A0999](#p2a0999) | Not supported |
 
@@ -238,6 +241,16 @@ Decorators are applied at translation time; only the decorators py2axum knows ar
 
 See [Python semantics](../reference/python.md).
 
+### P2A0117
+
+**Python 3.14 or 3.15 construct not supported**
+
+A construct of a recent Python (template strings, lazy imports of project modules) has no equivalent in the runtime yet, or would change when the module's top-level code runs.
+
+**What to do:** Use the construct the message suggests (an f-string, a plain import).
+
+See [python-versions.md](../python-versions.md).
+
 ## Libraries
 
 ### P2A0201
@@ -309,6 +322,16 @@ py2axum compiles the stateless, JSON-response subset of the MCP SDK's server (to
 **What to do:** Write tools as `async def` with `@server.tool()` and serve `streamable_http_app(stateless_http=True, json_response=True)`. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
 
 See [MCP servers](../advanced/mcp.md).
+
+### P2A0208
+
+**Logging construct not supported**
+
+The binary reproduces the `logging` module as the applications use it (see Logging): a record carries the call site itself, and only the standard handlers and formatters exist.
+
+**What to do:** Log from the function whose location you want in the record (or drop `stacklevel=`); use `StreamHandler`, `FileHandler`, `NullHandler` and `logging.Formatter` or python-json-logger. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+
+See [advanced/logging.md](../advanced/logging.md).
 
 ### P2A0209
 
@@ -592,7 +615,7 @@ See [SQL databases](../tutorial/sql.md#what-is-native).
 
 This `relationship()` configuration changes which SQL is emitted in a way the runtime does not reproduce.
 
-**What to do:** Use the supported options (`back_populates`, `foreign_keys`, `lazy='select'|'selectin'|'joined'|'raise'`, `cascade`, `order_by`, self-referential `remote_side`).
+**What to do:** Use the supported options (`back_populates`, `foreign_keys`, `lazy='select'|'selectin'|'joined'|'raise'`, `cascade`, `order_by`, self-referential `remote_side`, `secondary=` a module-level `Table(name, metadata, Column(...), ...)` without back_populates/backref or cascades).
 
 See [SQL databases](../tutorial/sql.md#what-is-native).
 
@@ -667,6 +690,16 @@ The binary is the only entry point of a hybrid deployment, and this construct ca
 **What to do:** Make the construct translate, or route it to Python at your ingress instead of through the binary.
 
 See [Hybrid mode](../getting-started/hybrid.md).
+
+### P2A0603
+
+**Not available on the project's Python**
+
+The construct appeared in a later Python than the one the project runs on (its `.python-version`, its `requires-python`, or `--python`): there, Python raises (AttributeError, TypeError), and the binary follows the project's Python.
+
+**What to do:** Check the Python py2axum detected (`--python X.Y` sets it), or write the construct of your Python.
+
+See [python-versions.md](../python-versions.md).
 
 ## Other
 

@@ -858,6 +858,8 @@ async def ssrf(host: str):
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         return {"error": str(e), "os": isinstance(e, OSError)}
+    except UnicodeError as e:  # the idna codec (3.12: UnicodeError, 3.13: UnicodeEncodeError)
+        return {"error": str(e), "type": type(e).__name__, "value_error": isinstance(e, ValueError)}
     out = []
     for _family, _type, _proto, _canon, sockaddr in infos:
         try:

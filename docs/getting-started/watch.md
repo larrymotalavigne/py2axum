@@ -15,13 +15,13 @@ python-side (auto): /books/export.zip (GET export_books) — examples/bookshelf/
 [py2axum watch 16:14:53] 56 generated file(s) changed
 [py2axum watch 16:17:17] built in 144.0 s
 [py2axum watch 16:17:17] started bookshelf_axum (pid 90848)
-listening on http://0.0.0.0:8080
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 [py2axum watch 16:19:41] changed: examples/bookshelf/app/routers/books.py
 [py2axum watch 16:19:43] translated in 2.0 s
 [py2axum watch 16:19:43] 1 generated file(s) changed
 [py2axum watch 16:19:51] built in 7.7 s
 [py2axum watch 16:19:51] started bookshelf_axum (pid 91304)
-listening on http://0.0.0.0:8080
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
 ```
 
 The first build compiles the dependencies (two to three minutes); after that, a change is served again in about

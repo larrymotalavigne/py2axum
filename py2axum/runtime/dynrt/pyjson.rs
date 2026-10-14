@@ -72,25 +72,17 @@ fn trailing_comma_messages() -> bool {
 
 /// A `\uXXXX` escape ending the text: before a CPython patch release (measured: 3.13.12 and 3.14.3
 /// still, 3.13.16 and 3.14.8 no longer), "Invalid \uXXXX escape"; since, the string is unterminated.
-/// The patch the application runs on is not known statically: the newest behaviour, unless
-/// `PY2AXUM_PYTHON_VERSION` (e.g. `3.14.0`) names an older patch. 3.12 kept the old one.
+/// The patch is the project's (`python_patch`: the transpiler's, or `PY2AXUM_PYTHON_VERSION`). 3.12 kept the
+/// old one.
 fn u_escape_at_end_is_invalid() -> bool {
-    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OLD.get_or_init(|| {
-        let (major, minor) = super::python();
-        if (major, minor) < (3, 13) {
-            return true;
-        }
-        let Ok(v) = std::env::var("PY2AXUM_PYTHON_VERSION") else { return false };
-        let n: Vec<u32> = v.split('.').map(|x| x.parse().unwrap_or(0)).collect();
-        let patch = n.get(2).copied().unwrap_or(u32::MAX);
-        match (n.first().copied(), n.get(1).copied()) {
-            (Some(3), Some(13)) => patch <= 12,
-            (Some(3), Some(14)) => patch <= 3,
-            (Some(3), Some(m)) => m < 13,
-            _ => false,
-        }
-    })
+    if let Some(unterminated) = super::python_feature("json_u_escape_unterminated") {
+        return !unterminated;
+    }
+    match super::python() {
+        (3, 13) => !super::python_at_least(3, 13, 13),
+        (3, 14) => !super::python_at_least(3, 14, 4),
+        v => v < (3, 13),
+    }
 }
 
 enum Frame {

@@ -18,8 +18,7 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
 - Lax-mode validation with pydantic-core's error types, messages, locations and contexts (speedate for
   dates), smart unions (exactness, fields set), enums, literals, nested models, lists/sets/tuples/dicts,
   `Optional`, `Field` constraints (and pydantic 1's `min_items`/`max_items`, which `Field()` still maps to
-  `min_length`/`max_length`), aliases (`alias=`, and `validation_alias=`/`serialization_alias=` naming a
-  different input and output key, `populate_by_name`; `AliasChoices`/`AliasPath` refused), defaults and `default_factory`,
+  `min_length`/`max_length`), aliases (below), defaults and `default_factory`,
   `validate_assignment` (an assignment runs the field's `before` validators, its type, its `after` validators
   with `info.data` holding every other field, then the model's `after` validators: one of those that raises
   leaves the value assigned, error at loc `()`, as pydantic-core does; refused with a `mode="before"` model
@@ -27,10 +26,9 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   a `mode="after"` one of the same field is refused), `extra=`, `from_attributes`, `str_strip_whitespace`/`to_lower`/`to_upper`,
   `use_enum_values`, `model_config` as a dict or `ConfigDict`, v1 `class Config` (v1-only keys ignored like
   Pydantic v2 does). The `str_*` settings also apply to the string an `EmailStr` validates. Refused: a
-  `default_factory` taking the validated data (`lambda data: ...`), `Iterable[T]`, `Sequence[T]`,
+  `Iterable[T]`, `MutableSequence[T]`,
   `Collection[T]` as a field, parameter, `TypeAdapter` or response type (pydantic validates an `Iterable` lazily,
-  a one-shot iterator whose item errors come at iteration, and a `Sequence` keeps the input's type: annotate
-  `list[...]`; the `AsyncIterable[T]`/`Iterable[T]` return annotation of a generator endpoint is its stream item
+  a one-shot iterator whose item errors come at iteration: annotate `list[...]`; the `AsyncIterable[T]`/`Iterable[T]` return annotation of a generator endpoint is its stream item
   type, see [Responses](responses.md)).
 - An Enum member given to a scalar field (an ORM enum column read into `status: str`...) as pydantic-core takes
   it: a `str`/`int` subclass member (`class X(str, Enum)`, `StrEnum`, `IntEnum`) is its value for `str`, `int`,
@@ -56,6 +54,73 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   attribute or keyword `attr` is a model class (a tool registry); anything else is refused.
 - `model_config frozen=True` (assignment raises `frozen_instance`; frozen models hash by value),
   `Field(validate_default=True)`, field options given in `Annotated[T, Field(...)]`.
+- Aliases: `alias=`, `validation_alias=` (a key, `AliasPath`, `AliasChoices`: the first path found wins, a
+  missing field is reported at the first one, the input keys a field did not consume are its extras) and
+  `serialization_alias=` apart; `validate_by_alias`/`validate_by_name` (`populate_by_name`), `serialize_by_alias`
+  (each model's own setting when `by_alias=` is not given). `alias_generator=`: `pydantic.alias_generators`
+  (`to_camel`, `to_pascal`, `to_snake`), a lambda or a one-`return` function of the name made of string operations,
+  or an `AliasGenerator(alias=, validation_alias=, serialization_alias=)` of those, evaluated at translation time
+  on the field names (a field that declares an alias keeps it, the generator fills the others, as pydantic does);
+  anything else is refused.
+- `Field(exclude=True)` (never dumped), `repr=False`, `frozen=True` (an assignment raises `frozen_field`),
+  `multiple_of=` (on `int`/`float`, checked before the bounds; a float within `|x| / 1e9`, like pydantic-core),
+  `union_mode="left_to_right"`, `discriminator="field"` (a discriminated union, possibly nested in another one:
+  the tag picks the member, `union_tag_not_found`/`union_tag_invalid` otherwise; string `Literal` tags only;
+  `Discriminator(fn)` with members tagged `Annotated[T, Tag('x')]`, the function called on the input, and its
+  `custom_error_type`/`_message`/`_context` of strings),
+  `model_config str_min_length=`/`str_max_length=`, `StringConstraints(ascii_only=True)` (pydantic 2.14).
+  A str is checked as pydantic-core does: stripped, then `ascii_only`, the lengths and the pattern, and only then
+  lowered or uppercased (`str_to_upper` with a lowercase `pattern` accepts lowercase input). The `str_*` and `use_enum_values` settings of a model apply to
+  the items and keys of its containers too.
+- Strict mode (`model_config strict=True`, `Field(strict=)`), with pydantic-core's python-mode rules (FastAPI
+  validates a decoded JSON body as Python data): only the exact type passes, with the type's own error
+  (`int_type`, `date_type`, `tuple_type`, `is_instance_of` for `Decimal`/`UUID`/enums...); an `int` is a valid
+  `float`. A model's strict config covers its fields' items, not the fields of another model it holds;
+  `Field(strict=True)` covers the field's own type (a list's items keep the model's mode). Refused:
+  `Field(strict=True)` on a union, `Field(strict=False)` on a container in a strict model. A strict URL refuses
+  what the `url` crate reports as a syntax violation (`url_syntax_violation`), as pydantic-core does.
+- `Field(default_factory=lambda data: ...)`: called with the fields validated before it; after an error of an
+  earlier field it is not called (`default_factory_not_called`; before pydantic 2.14 a `missing` field does not
+  count: the factory is called with what was validated, and what it raises is a 500).
+- Validators in a field's annotation (`Annotated[T, AfterValidator(f)]`, `BeforeValidator`, `PlainValidator`,
+  `WrapValidator`, directly or through a type alias), run like `@field_validator`s defined before the class's:
+  a function, a lambda, `info` (`data`, `field_name`, `context`: `None`) in an after validator.
+  `@field_validator(mode="plain")` and `PlainValidator` replace the type (and the validators before them);
+  `mode="wrap"` and `WrapValidator` get a `handler` that validates against the type (a `ValidationError` with
+  locations from the value, title `ValidatorCallable`; re-raised, its errors land under the field). Refused: a
+  wrap validator after other validators of the field, anything but `AfterValidator` after a `WrapValidator` in
+  the annotation, a validator of an item inside a container.
+- `PydanticCustomError(type, template, context)` raised by a validator: its own error (the template filled from the
+  context: a str as is, a bool as an int, other values by `repr`); `PydanticUseDefault` raised by a before or
+  wrap validator: the field's default (still in `model_fields_set`; no default is pydantic-core's schema error, a
+  500). `model_dump(context=)` reaches the serializers' `info.context`.
+- Serializers: `@field_serializer(*fields, mode="plain"|"wrap", when_used=)` (instance, class or static method,
+  `info` with `mode`, `field_name`, `context`: `None`), `PlainSerializer`/`WrapSerializer` in the annotation,
+  `@model_serializer(mode="plain"|"wrap")`, `Field(exclude_if=)`, `model_dump(exclude_defaults=True)` (a field
+  with a `@field_serializer` is never left out by it, as in pydantic-core). Serializers run while dumping and
+  must not await; their result is dumped by its value's type (the return annotation is not used).
+- Types: `tuple[A, B, C]`, `tuple[()]` (`missing` per position, `too_long` alone), `collections.deque[T]`,
+  `pydantic.SecretStr` (shown `**********` in `str`, `repr` and JSON dumps, `get_secret_value()`),
+  `UUID1`...`UUID8` (`uuid_version`), `fractions.Fraction` (CPython 3.12+'s grammar, exact from a float; dumped as
+  its `str()` in both modes), `complex` (CPython's `complex()` grammar; `repr()` like CPython, JSON like
+  pydantic-core: `1e20` is written `100000000000000000000`), `Callable` (`callable()`), `SkipValidation[T]` (the
+  value as given), `types.EllipsisType` and `MISSING` without a default (no JSON value is one), a plain class of
+  the project (`arbitrary_types_allowed`: an `isinstance` check; one defining `__get_pydantic_core_schema__` is
+  refused), a type alias assigned after the class that uses it (`MyInt = int` under
+  `from __future__ import annotations`), `RootModel[T]` / `RootModel` with `root: T` (the input and the dump are
+  the root value; validators, serializers and aliases on it are refused),
+  `frozenset[T]`, `collections.Counter[K]`, `collections.OrderedDict[K, V]`, `collections.abc.Sequence[T]` (a
+  str refused with `sequence_str`, a tuple stays a tuple), `type[Model]`, `type[BaseModel]`, `type[PlainClass]`
+  (`is_subclass_of`). A mutable default evaluated once (`deque()`, a model instance) is copied for each
+  instance, like pydantic's `smart_deepcopy`.
+- Generic models (`class Response(BaseModel, Generic[T])`, `class Response[T](BaseModel)`, a subclass of
+  `Parent[T]`): each `Response[int]` used is specialized at translation time, named like pydantic does
+  (`Response[int]`, in errors and `type(m).__name__`); the generic class used as such validates a parameter as
+  its default, else its bound, else `Any`. Its arguments must mean the same in the model's module; TypeVar
+  constraints are refused.
+- JSON dumps (responses, `model_dump(mode="json")`, `model_dump_json`) write a `float` field holding an int
+  (a default `0`) as a float, like pydantic-core's typed serializer; `model_fields_set` includes the extras of
+  an `extra="allow"` model.
 - `TypeAdapter(T)`: `validate_python` (ORM objects with `from_attributes`, iterables), `validate_json`,
   `dump_python`, `dump_json`, for types written in the source or known at run time.
 - `EmailStr` (rule-by-rule port of email-validator, same messages, except IDNA encoding and NFC normalization
@@ -92,8 +157,9 @@ The binary does not read `.env` files: see [Environment variables](../reference/
 
 ## What stays in Python
 
-- Not supported: `@computed_field(...)` options, `@field_serializer`/`@model_serializer`, nested
-  `exclude`/`include` dicts, strict mode.
+- Not supported: `@computed_field(...)` options, nested `exclude`/`include` dicts,
+  `Iterable[T]` (validated lazily by pydantic), `Json` (parsed by jiter, whose error messages are not
+  reproduced), classes with `__get_pydantic_core_schema__`, `create_model`, `ImportString`.
 - A union with a member that has validators (directly or in a nested model) is refused: Pydantic would try the
   next member when one raises.
 
@@ -106,3 +172,5 @@ The binary does not read `.env` files: see [Environment variables](../reference/
 - `jsonable_encoder` of an integral `Decimal` beyond 64 bits gives a float (Python: an int).
 - Validating a model that defines its own `__init__` from a dict (request body, `model_validate(dict)`,
   nested), where pydantic-core calls the `__init__`, raises a py2axum RuntimeError (500) instead.
+- A `Fraction` or `complex` written with non-ASCII digits (CPython reads any Unicode decimal digit) is a 500.
+- Arithmetic on a `Fraction` or `complex` value in the application's own code is not translated (a TypeError).

@@ -49,6 +49,15 @@ def _default_handler(which: str):
     return tmpl
 
 
+def _session(a, kw, sync: bool):
+    """`Session(engine)` / `AsyncSession(engine)`: a session of its own on the binary's pool."""
+    bad = sorted(set(kw) - {"bind", "expire_on_commit", "autoflush"})
+    if bad or len(a) > 1:
+        raise ValueError(f"{'Session' if sync else 'AsyncSession'}() is supported with the engine, bind=, "
+                         "expire_on_commit= and autoflush= only" + (f" (not {bad[0]}=)" if bad else ""))
+    return f"{RT}::orm::new_session(cx, {_argv(a)}, {_kwvec(kw)}, {'true' if sync else 'false'})"
+
+
 def _argv(args: list[str]) -> str:
     return "vec![" + ", ".join(args) + "]"
 
@@ -89,6 +98,22 @@ def _noargs(name, code):
             raise ValueError(f"{name}() takes no arguments here")
         return code
     return f
+
+
+def _bindparam(a, kw):
+    """`bindparam(key, value=...)`: the value from the execution's parameters (or `value`); the type comes from
+    the column it meets (type_=, expanding=, required=, callable_=... are refused)"""
+    if set(kw) - {"value"} or not 1 <= len(a) <= 2 or (len(a) == 2 and kw):
+        raise ValueError("bindparam(key, value=None): other arguments are not supported")
+    v = a[1] if len(a) == 2 else kw.get("value")
+    return f"{RT}::orm::bindparam(&{a[0]}, {f'Some(&{v})' if v else 'None'})"
+
+
+def _raiseload(name, kw):
+    """the `raiseload=` keyword of a column loader option (the only one it takes here)"""
+    if set(kw) - {"raiseload"}:
+        raise ValueError(f"{name}(): only the raiseload= keyword is supported")
+    return kw.get("raiseload", "V::Bool(false)")
 
 
 def _one(name):
@@ -140,6 +165,10 @@ VALUES: dict[str, str] = {
     **{f"prometheus_client.{n}": f'V::native({RT}::Native::ExtType("prometheus_client.{n}"))'
        for n in ("Counter", "Gauge", "Summary", "Histogram", "Info", "Enum", "CollectorRegistry")},
     **{f"tenacity.{n}": f'{RT}::tenacity::value("{n}")' for n in ("stop_never", "retry_always", "retry_never")},
+    "logging.root": f"{RT}::logging::logger_value({RT}::logging::root())",
+    "logging.lastResort": f"{RT}::logging::last_resort()",
+    "logging.raiseExceptions": "V::Bool(true)",
+    **{f"sys.{n}": f"{RT}::logging::stream({1 if 'out' in n else 2})" for n in ("stdout", "stderr", "__stdout__", "__stderr__")},
     **{f"logging.{n}": f"V::Int({v})" for n, v in (("NOTSET", 0), ("DEBUG", 10), ("INFO", 20), ("WARNING", 30), ("WARN", 30),
                                                     ("ERROR", 40), ("CRITICAL", 50), ("FATAL", 50))},
     "aio_pika.DeliveryMode.NOT_PERSISTENT": "V::Int(1)",
@@ -217,6 +246,7 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.StopAsyncIteration": "STOP_ASYNC_ITERATION",
     "builtins.NameError": "NAME_ERROR",
     "builtins.FileNotFoundError": "FILE_NOT_FOUND_ERROR",
+    "builtins.UnicodeError": "UNICODE_ERROR",
     "builtins.UnicodeDecodeError": "UNICODE_DECODE_ERROR",
     "builtins.UnicodeEncodeError": "UNICODE_ENCODE_ERROR",
     "builtins.ImportError": "IMPORT_ERROR",
@@ -274,6 +304,8 @@ EXCEPTIONS: dict[str, str] = {
     "fastapi.exceptions.ValidationException": "VALIDATION_EXCEPTION",
     "starlette.exceptions.HTTPException": "HTTP_EXCEPTION",
     "pydantic.ValidationError": "VALIDATION_ERROR",
+    **{f"pydantic_core{m}.{n}": c for m in ("", "._pydantic_core") for n, c in (("PydanticCustomError", "PYDANTIC_CUSTOM_ERROR"),
+                                                                               ("PydanticUseDefault", "PYDANTIC_USE_DEFAULT"))},
     "sqlalchemy.exc.SQLAlchemyError": "SQLALCHEMY_ERROR",
     "sqlalchemy.exc.DBAPIError": "DBAPI_ERROR",
     "sqlalchemy.exc.IntegrityError": "INTEGRITY_ERROR",
@@ -284,6 +316,9 @@ EXCEPTIONS: dict[str, str] = {
     "sqlalchemy.exc.NotSupportedError": "NOT_SUPPORTED_ERROR",
     "sqlalchemy.exc.NoResultFound": "NO_RESULT_FOUND",
     "sqlalchemy.exc.InvalidRequestError": "INVALID_REQUEST_ERROR",
+    "sqlalchemy.orm.exc.UnmappedInstanceError": "UNMAPPED_INSTANCE_ERROR",
+    "sqlalchemy.exc.StatementError": "STATEMENT_ERROR",
+    "sqlalchemy.exc.MissingGreenlet": "MISSING_GREENLET",
     "sqlalchemy.exc.CircularDependencyError": "CIRCULAR_DEPENDENCY_ERROR",
     "sqlalchemy.exc.ResourceClosedError": "RESOURCE_CLOSED_ERROR",
     "xml.parsers.expat.ExpatError": "EXPAT_ERROR",
@@ -305,6 +340,7 @@ EXCEPTIONS: dict[str, str] = {
     "sqlalchemy.orm.exc.NoResultFound": "NO_RESULT_FOUND",
     # sqlalchemy.orm.exc only (canonical() folds it into sqlalchemy.exc)
     "sqlalchemy.exc.StaleDataError": "STALE_DATA_ERROR",
+    "sqlalchemy.exc.DetachedInstanceError": "DETACHED_INSTANCE_ERROR",  # sqlalchemy.orm.exc (canonical())
     # what python-jose re-exports from jose and jose.jwt
     **{f"jose.{n}": c for n, c in (("ExpiredSignatureError", "EXPIRED_SIGNATURE_ERROR"), ("JOSEError", "JOSE_ERROR"),
                                    ("JWSError", "JWS_ERROR"), ("JWTError", "JWT_ERROR"))},
@@ -399,6 +435,24 @@ def _json_dumps(a, kw):
 
 # versions of the project's libraries (its uv.lock), filled by the dyn backend before compiling
 LIB_VERSIONS: dict[str, str] = {}
+# the Python the project runs on (dyn.target_python), set by the dyn backend before compiling
+PYTHON: tuple[int, int] = (3, 12)
+
+
+def _no_kw(name: str, kw, refused) -> str:
+    """Refuses keyword arguments the runtime does not implement (Python 3.15's `missing_as_none=`...)."""
+    for k in kw:
+        if k in refused:
+            raise ValueError(f"{name}({k}=) is not supported")
+    return ""
+
+
+def _since(version: tuple[int, int], what: str) -> str:
+    """Refuses a construct newer than the project's Python (it would raise there: AttributeError, TypeError)."""
+    if PYTHON < version:
+        raise ValueError(f"{what} needs Python {version[0]}.{version[1]} (the project runs on "
+                         f"{PYTHON[0]}.{PYTHON[1]}, where it raises)")
+    return ""
 
 
 def _bind(name, a, kw, params, allowed):
@@ -629,11 +683,17 @@ CALLS = {
     # decimal
     "decimal.Decimal": lambda a, kw: f"{RT}::decimal::new(&{_argv(a)}, &{_kwvec(kw)})",
     # base64
-    **{f"base64.{f}": (lambda f: lambda a, kw: f"{RT}::stdlib::base64(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
-       for f in ("b64encode", "b64decode", "standard_b64encode", "standard_b64decode", "urlsafe_b64encode",
-                 "urlsafe_b64decode", "b16encode", "b16decode", "b32encode", "b32decode")},
+    # the parameters the runtime reads, by function (3.15's wrapcol=, ignorechars=, canonical=... are refused;
+    # padded= follows the project's Python at run time)
+    **{f"base64.{f}": (lambda f, ps: lambda a, kw: (_bind(f, a, kw, ps, set(ps) | ({"padded"} if "decode" in f and "b16" not in f else set())),
+                                                     f"{RT}::stdlib::base64(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")[1])(f, ps)
+       for f, ps in (("b64encode", ["s", "altchars"]), ("b64decode", ["s", "altchars", "validate"]),
+                     ("standard_b64encode", ["s"]), ("standard_b64decode", ["s"]), ("urlsafe_b64encode", ["s"]),
+                     ("urlsafe_b64decode", ["s"]), ("b16encode", ["s"]), ("b16decode", ["s", "casefold"]),
+                     ("b32encode", ["s"]), ("b32decode", ["s", "casefold", "map01"]))},
     # urllib.parse
-    **{f"urllib.parse.{f}": (lambda f: lambda a, kw: f"{RT}::stdlib::urllib(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
+    **{f"urllib.parse.{f}": (lambda f: lambda a, kw: _no_kw(f, kw, ("missing_as_none",))
+                             or f"{RT}::stdlib::urllib(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
        for f in ("quote", "quote_plus", "unquote", "unquote_plus", "urlencode", "urlparse", "urlsplit")},
     # bcrypt 5.0, pyotp 2.9
     **{f"bcrypt.{f}": (lambda f: lambda a, kw: f"{RT}::auth::call(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
@@ -706,8 +766,8 @@ CALLS = {
        for m, c in (("multipart", "MIMEMultipart"), ("text", "MIMEText"), ("application", "MIMEApplication"), ("base", "MIMEBase"))},
     "email.encoders.encode_base64": lambda a, kw: f"{RT}::mail::encode_base64(&{a[0]})",
     # positional-only in CPython: keywords are a TypeError there, refused here
-    "unicodedata.normalize": lambda a, kw: f"{RT}::stdlib::unicodedata_normalize(crate::gen::UCD_UNASSIGNED, &{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("normalize(form, unistr): two positional arguments")),
-    "unicodedata.combining": lambda a, kw: f"{RT}::stdlib::unicodedata_combining(crate::gen::UCD_UNASSIGNED, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("combining(chr): one positional argument")),
+    "unicodedata.normalize": lambda a, kw: f"{RT}::stdlib::unicodedata_normalize(self::UCD_UNASSIGNED, &{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("normalize(form, unistr): two positional arguments")),
+    "unicodedata.combining": lambda a, kw: f"{RT}::stdlib::unicodedata_combining(self::UCD_UNASSIGNED, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("combining(chr): one positional argument")),
     "collections.deque": lambda a, kw: f"{RT}::deque::new(&{_argv(a)}, &{_kwvec(kw)})",
     "socket.getaddrinfo": lambda a, kw: f"{RT}::net::getaddrinfo(&{_argv(a)}, &{_kwvec(kw)})",
     "collections.Counter": lambda a, kw: f"{RT}::ops::counter(&{_argv(a)}, &{_kwvec(kw)})",
@@ -754,6 +814,7 @@ CALLS = {
                                 f"{('Some(&' + _bind('compile', a, kw, ['pattern', 'flags'], {'pattern', 'flags'})['flags'] + ')') if (len(a) > 1 or 'flags' in kw) else 'None'})",
     **{f"re.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::re_call(cx, \"{n}\", {_argv(a)}, {_kwvec(kw)}).await")(n)
        for n in ("search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split")},
+    "re.prefixmatch": lambda a, kw: _since((3, 15), "re.prefixmatch()") or f"{RT}::stdlib::re_call(cx, \"prefixmatch\", {_argv(a)}, {_kwvec(kw)}).await",
     "re.escape": lambda a, kw: f"{RT}::stdlib::escape(&{a[0]})",
     # io.StringIO, csv
     "io.StringIO": lambda a, kw: f"{RT}::stdlib::stringio_new({('Some(&' + _bind('StringIO', a, kw, ['initial_value'], {'initial_value'})['initial_value'] + ')') if (a or kw) else 'None'})",
@@ -791,18 +852,36 @@ CALLS = {
     # pathlib, uuid
     **{f"pathlib.{n}": (lambda a, kw: f"{RT}::pathio::path_new(&{_argv(a)})") for n in ("Path", "PurePath", "PosixPath", "PurePosixPath")},
     "uuid.uuid4": lambda a, kw: f"Ok::<V, Exc>({RT}::pathio::uuid4())",
+    "uuid.uuid7": lambda a, kw: (_since((3, 14), "uuid.uuid7()"), _bind("uuid7", a, kw, [], set()),
+                                 f"Ok::<V, Exc>({RT}::pathio::uuid7())")[2],
     "uuid.UUID": lambda a, kw: f"{RT}::pathio::uuid_new(&{_argv(a)}, &{_kwvec(kw)})",
+    "fractions.Fraction": lambda a, kw: f"{RT}::fraction::call(&{_argv(a)}, &{_kwvec(kw)})",
+    **dict.fromkeys(("pydantic.SecretStr", "pydantic.types.SecretStr"),
+                    lambda a, kw: f"{RT}::pyd::secret_new(&{_argv(a)}, &{_kwvec(kw)})"),
     # io
     "io.BytesIO": lambda a, kw: f"{RT}::files::bytesio_new({('Some(&' + _bind('BytesIO', a, kw, ['initial_bytes'], {'initial_bytes'})['initial_bytes'] + ')') if (a or kw) else 'None'})",
     # os (read-only environment)
     "os.getenv": lambda a, kw: _getenv("os.getenv", a, kw),
     "os.environ.get": lambda a, kw: _getenv("os.environ.get", a, kw),
     # logging / asyncio
-    "logging.basicConfig": lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + "Ok::<V, Exc>(V::None) }",
-    # module-level functions: the root logger
-    **{f"logging.{n}": (lambda n: lambda a, kw: f"{RT}::web::log(cx, \"root\", \"{n}\", &{_argv(a)}, &{_kwvec(kw)}).await")(n)
-       for n in ("debug", "info", "warning", "error", "exception", "critical", "log")},
-    "logging.getLogger": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::Logger(std::sync::Arc::from({RT}::ops::str_(&{a[0] if a else 'V::str(\"root\")'})?.as_str()))))",
+    # logging (dynrt/logging.rs): the module-level logging functions are compiled with their call site (dyn.py)
+    "logging.basicConfig": lambda a, kw: f"{RT}::logging::basic_config(&{_argv(a)}, &{_kwvec(kw)})",
+    "logging.getLogger": lambda a, kw: f"{RT}::logging::get_logger_v(&{_argv(a)}, &{_kwvec(kw)})",
+    **{f"logging.{n}": (lambda f: lambda a, kw: f"{RT}::logging::{f}(&{_argv(a)}, &{_kwvec(kw)})")(f) for n, f in (
+        ("StreamHandler", "stream_handler_new"), ("FileHandler", "file_handler_new"), ("NullHandler", "null_handler_new"),
+        ("Formatter", "formatter_new"), ("Filter", "filter_new"), ("LoggerAdapter", "adapter_new"), ("disable", "disable"))},
+    "logging.config.dictConfig": lambda a, kw: f"{RT}::logging::dict_config(&{a[0] if a else kw['config']})",
+    "logging.getLevelName": lambda a, kw: f"{RT}::logging::get_level_name(&{a[0] if a else kw['level']})",
+    "logging.addLevelName": lambda a, kw: (f"{{ let (__l, __n) = ({a[0] if a else kw['level']}, {a[1] if len(a) > 1 else kw['levelName']}); "
+                                           f"{RT}::logging::add_level_name(match __l {{ V::Int(i) => i, _ => 0 }}, &{RT}::ops::str_(&__n)?); Ok::<V, Exc>(V::None) }}"),
+    "logging.getLevelNamesMapping": lambda a, kw: f"{RT}::logging::level_names_mapping()",
+    "logging.getHandlerByName": lambda a, kw: f"{RT}::logging::handler_by_name(&{_argv(a)})",
+    "logging.getHandlerNames": lambda a, kw: f"{RT}::logging::handler_names()",
+    "logging.shutdown": lambda a, kw: f"{RT}::logging::shutdown()",
+    **{f"pythonjsonlogger.{m}.JsonFormatter": lambda a, kw: f"{RT}::logging::json_formatter_new(&{_argv(a)}, &{_kwvec(kw)})"
+       for m in ("json", "jsonlogger")},
+    **{f"uvicorn.logging.{c}Formatter": (lambda acc: lambda a, kw: f"{RT}::logging::uv_formatter_new({acc}, &{_argv(a)}, &{_kwvec(kw)})")(c == "Access")
+       for c in ("Default", "Access")},
     "asyncio.Queue": lambda a, kw: f"Ok::<V, Exc>({RT}::web::AQueue::new(match &{a[0] if a else kw.get('maxsize', 'V::Int(0)')} {{ V::Int(i) => *i as usize, _ => 0 }}))",
     "asyncio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0]}).await",
     "anyio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0] if a else kw.get('delay', 'V::Int(0)')}).await",
@@ -833,13 +912,18 @@ CALLS = {
     "sqlalchemy.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
     "sqlalchemy.future.select": lambda a, kw: f"{RT}::orm::select({_argv(a)})",
     "sqlalchemy.ext.asyncio.async_sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, false)",
+    "sqlalchemy.orm.Session": lambda a, kw: _session(a, kw, True),
+    "sqlalchemy.ext.asyncio.AsyncSession": lambda a, kw: _session(a, kw, False),
     "sqlalchemy.orm.sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, true)",
     "sqlalchemy.create_engine": lambda a, kw: _engine(a, kw, True),
     "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: _engine(a, kw, False),
     # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable
     "sqlalchemy.inspect": lambda a, kw: _sa_inspect(a, kw),
     "sqlalchemy.text": lambda a, kw: f"{RT}::orm::text(&{a[0]})",
-    "sqlalchemy.orm.aliased": lambda a, kw: f"{RT}::orm::aliased(&{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("aliased(Model) only")),
+    "sqlalchemy.orm.aliased": lambda a, kw: (f"{RT}::orm::aliased(&{a[0]})" if len(a) == 1 and not kw
+                                             else f"{RT}::orm::aliased_named(&{a[0]}, &{kw['name']})" if len(a) == 1 and set(kw) == {"name"}
+                                             else (_ for _ in ()).throw(ValueError("aliased(Model) or aliased(Model, name=...) only"))),
+    "sqlalchemy.orm.with_parent": lambda a, kw: f"{RT}::orm::with_parent(&{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("with_parent(instance, Parent.relationship) only")),
     "sqlalchemy.tuple_": lambda a, kw: f"{RT}::orm::tuple_({_argv(a)})",
     "sqlalchemy.and_": lambda a, kw: f"{RT}::orm::and_or(\"AND\", {_argv(a)})",
     "sqlalchemy.or_": lambda a, kw: f"{RT}::orm::and_or(\"OR\", {_argv(a)})",
@@ -854,9 +938,23 @@ CALLS = {
     "sqlalchemy.false": lambda a, kw: f"{RT}::orm::text(&V::str(\"false\"))" if not a and not kw else (_ for _ in ()).throw(ValueError("false() takes no arguments")),
     "sqlalchemy.delete": lambda a, kw: f"{RT}::orm::delete(&{a[0]})",
     "sqlalchemy.exists": lambda a, kw: f"{RT}::orm::exists(&{_argv(a)})",
-    **{f"sqlalchemy.orm.{n}": (lambda n: lambda a, kw: f"{RT}::orm::loader(\"{n}\", &{a[0]})")(n)
-       for n in ("selectinload", "joinedload", "subqueryload", "immediateload", "noload", "lazyload")},
+    **{f"sqlalchemy.orm.{n}": (lambda n: lambda a, kw: f"{RT}::orm::loader(\"{n}\", &{_one(n)(a, kw)})")(n)
+       for n in ("selectinload", "joinedload", "subqueryload", "immediateload", "noload", "lazyload", "defaultload")},
+    "sqlalchemy.orm.selectin_polymorphic": lambda a, kw: (
+        f"{RT}::orm::selectin_polymorphic(&{a[0]}, &{a[1]})" if len(a) == 2 and not kw
+        else (_ for _ in ()).throw(ValueError("selectin_polymorphic(Base, [Sub, ...]) only"))),
+    "sqlalchemy.orm.with_polymorphic": lambda a, kw: (
+        f"{RT}::orm::with_polymorphic(&{a[0]}, &{a[1]})" if len(a) == 2 and not kw
+        else (_ for _ in ()).throw(ValueError("with_polymorphic(Base, [Sub, ...] or \"*\") only: aliased=, flat=, "
+                                              "selectable= and polymorphic_on= are not supported"))),
     "sqlalchemy.orm.undefer": lambda a, kw: f"{RT}::orm::undefer(&{_one('undefer')(a, kw)})",
+    "sqlalchemy.orm.undefer_group": lambda a, kw: f"{RT}::orm::undefer_group(&{_one('undefer_group')(a, kw)})",
+    "sqlalchemy.orm.defer": lambda a, kw: f"{RT}::orm::defer(&{_one('defer')(a, {})}, &{_raiseload('defer', kw)})",
+    "sqlalchemy.orm.load_only": lambda a, kw: f"{RT}::orm::load_only({_argv(a)}, &{_raiseload('load_only', kw)})",
+    "dataclasses.astuple": lambda a, kw: f"{RT}::pyd::dataclass_convert(&{_one('astuple')(a, kw)}, false)",
+    "dataclasses.asdict": lambda a, kw: f"{RT}::pyd::dataclass_convert(&{_one('asdict')(a, kw)}, true)",
+    "sqlalchemy.bindparam": lambda a, kw: _bindparam(a, kw),
+    "sqlalchemy.sql.expression.bindparam": lambda a, kw: _bindparam(a, kw),
     "sqlalchemy.desc": lambda a, kw: f"{RT}::orm::order_fn(&{a[0]}, true)",
     "sqlalchemy.asc": lambda a, kw: f"{RT}::orm::order_fn(&{a[0]}, false)",
     "sqlalchemy.nullslast": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"nulls_last\", vec![], vec![])",
@@ -867,7 +965,8 @@ CALLS = {
     "sqlalchemy.orm.flag_modified": lambda a, kw: f"{RT}::orm::flag_modified(&{a[0]}, &{a[1]})",
     "sqlalchemy.distinct": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"distinct\", vec![], vec![])",
     # typing no-ops
-    "typing.cast": lambda a, kw: f"Ok::<V, Exc>({a[1]})",
+    # cast(type, value) is the value (the type only informs a type checker: read, never evaluated)
+    "typing.cast": lambda a, kw: (a[0], f"Ok::<V, Exc>({a[1]})")[1],
 }
 
 # namespaces whose attribute calls are generic: `func.count(...)` -> orm::func("count", ...)

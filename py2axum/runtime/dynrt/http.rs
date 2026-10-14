@@ -760,7 +760,8 @@ pub fn aenter(v: &V) -> R {
 /// `__aexit__`: the client is closed, an engine connection rolled back (the exception, if any, propagates)
 pub async fn aexit(v: &V) -> R {
     if let V::Session(s) = v {
-        s.rollback().await?;
+        // leaving `(async) with Session(...)` / `engine.connect()`: closed (objects detached, rolled back)
+        s.close().await?;
     }
     if let V::Native(n) = v {
         if let Native::HttpClient(c) = &**n {

@@ -146,6 +146,8 @@ pub struct Session {
     drained: Notify,
     hs: Mutex<Option<oneshot::Sender<Handshake>>>,
     handshake_complete: AtomicBool,
+    /// uvicorn's `handshake_complete` (accepted, or closed before accepting)
+    uv_handshake: AtomicBool,
     close_sent: AtomicBool,
     /// the peer has closed (its close frame arrived): sends fail (websockets' InvalidState)
     peer_closed: AtomicBool,
@@ -179,10 +181,13 @@ impl Session {
     }
 
     fn decide(&self, h: Handshake) -> bool {
-        match self.hs.lock().take() {
-            Some(tx) => tx.send(h).is_ok(),
-            None => false,
+        let Some(tx) = self.hs.lock().take() else { return false };
+        // the websockets library logs the handshake's response as it is sent (uvicorn's `send`)
+        match &h {
+            Handshake::Accept { .. } => super::uvicorn::ws_response(101),
+            Handshake::Reject(r) => super::uvicorn::ws_response(r.status().as_u16()),
         }
+        tx.send(h).is_ok()
     }
 
     fn client_disconnected() -> Exc {
@@ -213,6 +218,8 @@ impl Session {
                             }
                         }
                     }
+                    super::uvicorn::ws_handshake(&self.req, None);
+                    self.uv_handshake.store(true, Ordering::SeqCst);
                     let (tx, rx) = mpsc::unbounded_channel();
                     *self.out.lock() = Some(tx);
                     self.handshake_complete.store(true, Ordering::SeqCst);
@@ -222,6 +229,8 @@ impl Session {
                     Ok(())
                 }
                 "websocket.close" => {
+                    super::uvicorn::ws_handshake(&self.req, Some(403));
+                    self.uv_handshake.store(true, Ordering::SeqCst);
                     self.push(In::Disconnect(1006, None));
                     self.close_sent.store(true, Ordering::SeqCst);
                     self.handshake_complete.store(true, Ordering::SeqCst);
@@ -234,6 +243,7 @@ impl Session {
                         Some(o) => return Err(Exc::type_error(format!("py2axum: the status must be an int, not {}", o.type_name()))),
                         None => return Err(Exc::new(&KEY_ERROR, vec![V::str("status")])),
                     };
+                    super::uvicorn::ws_handshake(&self.req, Some(status));
                     if !(100..600).contains(&status) {
                         return Err(runtime_error(format!("Invalid HTTP status code '{status}' in response.")));
                     }
@@ -325,13 +335,14 @@ impl Session {
     fn finished(&self, r: R<()>) {
         if let Err(e) = &r {
             if !e.isinstance(&CLIENT_DISCONNECTED) {
-                eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+                super::uvicorn::exception(&e);
                 if self.initial_response.lock().is_none() && !self.handshake_complete.load(Ordering::SeqCst) {
                     self.decide(Handshake::Reject(plain(500, "Internal Server Error")));
                 }
             }
-        } else if !self.handshake_complete.load(Ordering::SeqCst) {
-            eprintln!("ERROR:py2axum:ASGI callable returned without completing handshake.");
+        } else if !self.uv_handshake.load(Ordering::SeqCst) {
+            // uvicorn's flag: set by an accept or a close, not by a denial response
+            super::uvicorn::error("ASGI callable returned without completing handshake.");
             if self.initial_response.lock().is_none() {
                 self.decide(Handshake::Reject(plain(500, "Internal Server Error")));
             }
@@ -535,6 +546,8 @@ pub async fn serve(app: Arc<super::AppState>, req: axum::extract::Request, route
     let res = RES.get_or_init(|| routes.iter().map(|r| super::web::route_regex(r.pattern)).collect());
     let path = super::web::unquote(&cx.req.path);
     let Some((route, re)) = routes.iter().zip(res).find(|(_, re)| re.is_match(&path)) else {
+        super::uvicorn::ws_handshake(&cx.req, Some(403));
+        super::uvicorn::ws_response(403);
         return plain(403, "");
     };
     if let Some(caps) = re.captures(&path) {
@@ -552,6 +565,7 @@ pub async fn serve(app: Arc<super::AppState>, req: axum::extract::Request, route
         drained: Notify::new(),
         hs: Mutex::new(Some(tx)),
         handshake_complete: AtomicBool::new(false),
+        uv_handshake: AtomicBool::new(false),
         close_sent: AtomicBool::new(false),
         peer_closed: AtomicBool::new(false),
         disconnected: AtomicBool::new(false),

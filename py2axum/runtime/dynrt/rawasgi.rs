@@ -54,13 +54,20 @@ impl Chan {
             started: AtomicBool::new(false),
         })
     }
+    /// the response is complete or abandoned: the messages nobody will read are dropped (a whole response
+    /// among them releases the `send` that forwarded it, which waits for its end)
     fn complete(&self) {
         self.done.store(true, Ordering::Release);
         self.done_notify.notify_waiters();
+        let late = std::mem::take(&mut *self.msgs.lock());
+        drop(late);
     }
-    /// a message for the reader (late ones, once the client left, are never read: CPython's server
-    /// ignores them too)
+    /// a message for the reader (late ones, once the response is complete or the client left, are never
+    /// read: CPython's server ignores them too, and they no longer pile up)
     fn post(&self, m: Msg) {
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
         self.msgs.lock().push_back(m);
         self.reader.wake();
     }
@@ -206,7 +213,7 @@ pub async fn send(c: &Arc<Chan>, msg: &V) -> R {
                 }
             }
             if !(100..=599).contains(&status) {
-                return Err(super::resp::status_drop(status));
+                return Err(super::resp::status_drop(status as i64));
             }
             c.started.store(true, Ordering::Relaxed);
             Msg::Start(status, headers)
@@ -382,15 +389,27 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
         if let Err(e) = &r {
             if chan2.started.load(Ordering::Relaxed) {
                 // the response has started: the server logs the exception (ServerErrorMiddleware re-raises it)
-                eprintln!("ERROR:    Exception in ASGI application\n{e:?}");
+                super::uvicorn::exception(&e);
             }
         }
         r
     })));
+    // a response abandoned (the client left, an error) before its body is handed over: complete, so that
+    // the app (finishing in its own task) sees `http.disconnect` instead of waiting forever in `receive()`
+    struct Abandoned(Option<Arc<Chan>>);
+    impl Drop for Abandoned {
+        fn drop(&mut self) {
+            if let Some(c) = self.0.take() {
+                c.complete();
+            }
+        }
+    }
+    let mut abandoned = Abandoned(Some(chan.clone()));
     // the start message (or a whole response), or the app ending without one
     let (status, headers) = match app.step(&chan).await {
         Step::Msg(Msg::Start(s, h)) => (s, h),
         Step::Msg(Msg::Whole(r)) => {
+            abandoned.0 = None; // complete when its body ends
             let c = chan.clone();
             return Ok(on_end(r, move || c.complete()));
         }
@@ -430,6 +449,7 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
         let one = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(first)]);
         return Ok(builder.body(Body::from_stream(one)).unwrap_or_else(super::web::bad_response));
     }
+    abandoned.0 = None; // the stream completes it
     struct Done(Arc<Chan>);
     impl Drop for Done {
         fn drop(&mut self) {
@@ -505,7 +525,7 @@ fn raw_headers(mut hs: Vec<(String, Vec<u8>)>) -> V {
 }
 
 fn plain_500() -> Response {
-    eprintln!("ERROR:    ASGI callable returned without starting response.");
+    super::uvicorn::error("ASGI callable returned without starting response.");
     Response::builder()
         .status(500)
         .header("content-type", "text/plain; charset=utf-8")
@@ -622,6 +642,8 @@ pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
         path_params: Mutex::new(vec![]),
         route: Mutex::new(None),
         client: r.client.clone(),
+        scheme: r.scheme.clone(),
+        http_version: r.http_version,
         body: body.unwrap_or_else(|| r.body.clone()),
         state: Mutex::new(r.state.lock().clone()),
         disconnected: std::sync::atomic::AtomicBool::new(false),

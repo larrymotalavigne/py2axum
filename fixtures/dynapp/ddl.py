@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
-from .db import engine
+from .db import DbDep, engine
 
 router = APIRouter(prefix="/ddl")
 
@@ -116,7 +116,7 @@ class DdlNote(DdlBase):
     item_id = Column(BigInteger, ForeignKey("ddl_items.id", ondelete="SET NULL"))
 
 
-TABLES = "ddl_tags, ddl_notes, ddl_items, ddl_owners"
+TABLES = "ddl_tags, ddl_notes, ddl_items, ddl_owners, ddl_readings"  # every ddl_% table the catalog reads
 TYPES = "tier, mood, item_level, kind"
 CATALOG = {
     "columns": "SELECT table_name, column_name, CAST(ordinal_position AS text), data_type, udt_name, "
@@ -178,3 +178,36 @@ async def partial():
 async def clash():
     """The index name SQLAlchemy creates is taken: the whole block rolls back."""
     return await rebuild(["DROP TABLE ddl_items CASCADE", "CREATE INDEX ix_items_lower_slug ON ddl_notes (body)"])
+
+
+class MapBase(DeclarativeBase):
+    """type_annotation_map on the base: the annotation's type is the map's (an explicit type still wins)."""
+    type_annotation_map = {dt.datetime: DateTime(timezone=True), str: String(40)}
+
+
+class Reading(MapBase):
+    __tablename__ = "ddl_readings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    at: Mapped[dt.datetime]
+    naive: Mapped[dt.datetime] = mapped_column(DateTime())
+    label: Mapped[str]
+    amount: Mapped[decimal.Decimal]
+    clock: Mapped[dt.time]
+
+
+@router.post("/readings")
+async def readings(db: DbDep):
+    """Columns typed by the base's map and by SQLAlchemy's default map (Decimal, time): what is read back."""
+    from sqlalchemy import delete, select
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MapBase.metadata.create_all)
+    await db.execute(delete(Reading))
+    db.add(Reading(id=1, at=dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc), naive=dt.datetime(2026, 1, 2, 3, 4, 5),
+                   label="a", amount=decimal.Decimal("12.50"), clock=dt.time(7, 8, 9)))
+    await db.commit()
+    r = (await db.scalars(select(Reading))).one()
+    return {"at": r.at, "naive": r.naive, "label": r.label, "amount": str(r.amount), "clock": r.clock.isoformat(),
+            "hm": [r.clock.hour, r.clock.minute, r.clock.strftime("%H:%M %p")],
+            "types": [type(r.at).__name__, r.at.tzinfo is not None, r.naive.tzinfo is not None,
+                      type(r.amount).__name__, type(r.clock).__name__]}

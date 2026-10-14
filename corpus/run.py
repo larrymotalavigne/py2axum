@@ -207,7 +207,7 @@ def documented(src: Path, d: dict) -> str | None:
     r, c = d["ref"], d["cand"]
     if {k for k in set(r) | set(c) if r.get(k) != c.get(k)} == {"body"} and _permuted_lists_only(r["body"], c["body"]):
         text = "".join(p.read_text() for p in ([src] if src.is_file() else src.rglob("*.py")))
-        if re.search(r"\b(set|frozenset|Set|FrozenSet)\[", text):
+        if re.search(r"\b(set|frozenset|Set|FrozenSet)\[|:\s*(set|frozenset)\b", text):
             return "order of a set's elements"
     big = [int(n) for n in re.findall(r"(?<![\d.\w])-?\d{19,}(?![\d.])", d.get("test") or "")]
     if c.get("status") == 500 and r.get("status") != 500 and any(not -2**63 <= n < 2**63 for n in big):
@@ -341,7 +341,7 @@ def main() -> int:
     errs = build.parallel(lambda e: build.generate(pkgs[e.id], work / "gen" / e.id, stamp), to_gen, args.jobs)
     gens = {}
     for ex, err in zip(to_gen, errs):
-        if err and "Traceback" not in err and (m := re.search(r"error: (\S+?:\d+): (.*)", err)):
+        if err and "Traceback" not in err and (m := re.search(r"error(?:\[P2A\d+\])?: (\S+?:\d+): (.*)", err)):
             # a refusal `check` did not foresee (itself a bug of check, but the example is refused)
             where, msg = unstage(m[1], ex), unstage(m[2], ex)
             results[ex.id].update(status="refused", reason="at generation", reasons=[

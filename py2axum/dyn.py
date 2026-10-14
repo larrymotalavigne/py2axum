@@ -31,12 +31,16 @@ BUILTIN_FUNCS = {
     "len", "str", "repr", "int", "float", "bool", "list", "tuple", "set", "frozenset", "dict", "sorted",
     "reversed", "min", "max", "sum", "any", "all", "next", "round", "abs", "enumerate", "zip", "range",
     "print", "isinstance", "getattr", "setattr", "hasattr", "iter", "open", "type", "chr", "ord", "divmod", "callable",
-    "hash", "id", "filter", "map", "issubclass", "vars", "anext",
+    "hash", "id", "filter", "map", "issubclass", "vars", "anext", "format",
 }
 BUILTIN_TYPES = {"str", "int", "float", "bool", "dict", "list", "tuple", "set", "frozenset", "bytes", "object"}
 
 
 _RS_SPECIAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+
+
+# the logging methods that make a record (their call site is passed along: dynrt/logging.rs)
+LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"})
 
 
 def rs(s: str) -> str:
@@ -268,6 +272,16 @@ class ModelInfo:
     methods: list[tuple[str, bool, Sym]] = field(default_factory=list)
     rels_raw: list[tuple] = field(default_factory=list)  # (name, Mapped[...] or None, relationship call, module)
     rels: list[dict] | None = None  # resolved by Project.resolve_rels (needs the target models)
+    eager_defaults: bool = False  # __mapper_args__ = {"eager_defaults": True}
+    # single-table inheritance: the mapped class it extends, the discriminator column (name) of the hierarchy,
+    # this class's polymorphic_identity
+    parent: Sym | None = None
+    poly_on: str | None = None
+    identity: str | None = None
+    poly_load: bool = False  # polymorphic_load="selectin" / "inline"
+    rels_decl: list[tuple] = field(default_factory=list)  # every relationship() declared, kept for subclasses
+    # joined table inheritance: (subclass table, its key column, parent table, parent key column) from the root down
+    joins: list[tuple] = field(default_factory=list)
 
 
 @dataclass
@@ -336,6 +350,31 @@ class Project:
                 for m in list(self.ix.modules.values()) for n in ast.walk(m.tree))
         return self.__dict__["_sentry"]
 
+    def tb_index(self, module: str, func: str, node) -> int:
+        """The index in `TB` of a traceback entry: the file, the instruction's line, the function, and the text
+        CPython prints under the `File` line (py2axum/tbfmt.py)."""
+        key = (module, func, node.lineno, node.end_lineno, node.col_offset, node.end_col_offset)
+        tbl = self.__dict__.setdefault("tb_table", {})
+        i = tbl.get(key)
+        if i is None:
+            from . import tbfmt
+            text = tbfmt.frame_text(self.src(module), node.lineno, node.end_lineno, node.col_offset, node.end_col_offset)
+            i = tbl[key] = len(tbl)
+            self.__dict__.setdefault("tb_rows", []).append(
+                f"    {RT}::trace::Pos {{ file: {rs(self.rel_file(module))}, line: {node.lineno}, func: {rs(func)}, text: {rs(text)} }},")
+        return i
+
+    def tracks_handling(self) -> bool:
+        """The project imports sentry_sdk, logging, sys or traceback: its `except` blocks record the exception
+        being handled (`sys.exc_info()`, `logger.exception`, `exc_info=True`, `capture_exception()`)."""
+        if self.__dict__.get("_handling") is None:
+            roots = {"sentry_sdk", "logging", "sys", "traceback"}
+            self.__dict__["_handling"] = any(
+                (isinstance(n, ast.Import) and any(a.name.split(".")[0] in roots for a in n.names))
+                or (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in roots)
+                for m in list(self.ix.modules.values()) for n in ast.walk(m.tree))
+        return self.__dict__["_handling"]
+
     def rel_file(self, module: str) -> str:
         """A module's path relative to --root (what the binary reports as its file)."""
         path = Path(self.src(module)).resolve()
@@ -397,6 +436,10 @@ class Project:
                                                     and k.value.args) else k.value
                             if k.arg == "backref" and isinstance(b, ast.Constant) and isinstance(b.value, str):
                                 names.add(b.value)
+                    elif isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", None)) == "aliased":
+                        # `aliased(User, name="u1")`: the key of its entity in a result row (`row.u1`)
+                        names |= {k.value.value for k in n.keywords if k.arg == "name" and isinstance(k.value, ast.Constant)
+                                  and isinstance(k.value.value, str)}
                     elif isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", None)) in ATTR_NAMING_CALLS:
                         # attributes named by a string or a keyword: `.label("total")`, `setattr(o, "x", v)`,
                         # `namedtuple("P", "a b")`, `SimpleNamespace(x=1)`, `getattr(o, "x")`
@@ -751,6 +794,10 @@ class Project:
                 ann, module, scope = d.value, t.module, None
             elif isinstance(d, ast.TypeAlias):
                 ann, module, scope = d.value, t.module, None
+            elif (isinstance(d, ast.Assign) and len(d.targets) == 1 and isinstance(d.value, ast.Name)
+                  and d.value.id in BUILTIN_TYPES and self.ix.resolve_expr(t.module, d.value) is None):
+                # `MyInt = int` (perhaps after the class that uses it, under `from __future__ import annotations`)
+                ann, module, scope = d.value, t.module, None
             else:
                 return ann, module
         return ann, module
@@ -830,7 +877,7 @@ class Project:
     def _num(self, cons: dict) -> str:
         def o(k):
             return f"Some({float(cons[k])!r}f64)" if k in cons else "None"
-        return f"{RT}::pyd::NumC {{ ge: {o('ge')}, gt: {o('gt')}, le: {o('le')}, lt: {o('lt')} }}"
+        return f"{RT}::pyd::NumC {{ ge: {o('ge')}, gt: {o('gt')}, le: {o('le')}, lt: {o('lt')}, mul: {o('multiple_of')} }}"
 
     def _dec(self, cons: dict, node, module: str) -> str:
         def bound(k):
@@ -847,11 +894,21 @@ class Project:
                 f"max_digits: {count('max_digits')}, decimal_places: {count('decimal_places')} }}")
 
     def _str(self, cons: dict) -> str:
-        mn = f"Some({cons['min_length']})" if "min_length" in cons else "None"
-        mx = f"Some({cons['max_length']})" if "max_length" in cons else "None"
+        # a field's own length constraints, else model_config's str_min_length / str_max_length
+        mn = f"Some({cons['min_length']})" if "min_length" in cons else f"Some({cons['_smin']})" if "_smin" in cons else "None"
+        mx = f"Some({cons['max_length']})" if "max_length" in cons else f"Some({cons['_smax']})" if "_smax" in cons else "None"
         p = f"Some(&{self.pat(cons['pattern'])})" if "pattern" in cons else "None"
         return (f"{RT}::pyd::StrC {{ min: {mn}, max: {mx}, pattern: {p}, strip: {str(bool(cons.get('_strip'))).lower()}, "
-                f"lower: {str(bool(cons.get('_lower'))).lower()}, upper: {str(bool(cons.get('_upper'))).lower()} }}")
+                f"lower: {str(bool(cons.get('_lower'))).lower()}, upper: {str(bool(cons.get('_upper'))).lower()}, "
+                f"ascii: {str(bool(cons.get('_ascii'))).lower()} }}")
+
+    CONFIG_CONS = {"_strip", "_lower", "_upper", "_smin", "_smax", "_enum_values", "_val_bytes"}
+
+    @classmethod
+    def _cfg(cls, cons: dict) -> dict:
+        """The model_config part of a field's constraints: it also applies to the items of its containers (the
+        core config of pydantic-core covers every str and enum the model validates)."""
+        return {k: v for k, v in cons.items() if k in cls.CONFIG_CONS}
 
     def _sized(self, td: str, cons: dict, node: ast.AST, module: str) -> str:
         """A container's `Field(min_length=, max_length=)` (pydantic's other constraints do not apply to it)."""
@@ -892,23 +949,64 @@ class Project:
                 for meta in args[1:]:
                     cons.update(self.annotated_meta(meta, module, scope))
                 return self._td_init(args[0], module, cons, scope)
-            if last in {"Sequence", "Iterable", "MutableSequence", "Collection"}:
+            if last in {"Iterable", "MutableSequence", "Collection"}:
                 # pydantic: a Sequence rejects a str (`sequence_str`) and keeps the input's type, an Iterable is a
                 # lazy validator: neither is a list
                 raise self.err(f"`{ast.unparse(ann)}` is not supported (pydantic validates it differently from a list): "
                                "use list[...]", ann, module)
             if last in {"list", "List"}:
-                return self._sized(f"{RT}::pyd::TD::List(Some(&{self._static_td(self._td_init(args[0], module, {}, scope))}))", cons, ann, module)
-            if last in {"set", "Set", "frozenset", "FrozenSet"}:
-                return self._sized(f"{RT}::pyd::TD::Set(Some(&{self._static_td(self._td_init(args[0], module, {}, scope))}))", cons, ann, module)
+                return self._sized(f"{RT}::pyd::TD::List(Some(&{self._static_td(self._td_init(args[0], module, self._cfg(cons), scope))}))", cons, ann, module)
+            if last in {"set", "Set"}:
+                return self._sized(f"{RT}::pyd::TD::Set(Some(&{self._static_td(self._td_init(args[0], module, self._cfg(cons), scope))}))", cons, ann, module)
+            if last in {"frozenset", "FrozenSet", "deque", "Deque", "Sequence"}:
+                inner = self._static_td(self._td_init(args[0], module, self._cfg(cons), scope))
+                base = "Set" if last in {"frozenset", "FrozenSet"} else "List"
+                kind = {"frozenset": "Frozen", "FrozenSet": "Frozen", "deque": "Deque", "Deque": "Deque", "Sequence": "Seq"}[last]
+                coll = f"{RT}::pyd::TD::Coll(&{self._static_td(f'{RT}::pyd::TD::{base}(Some(&{inner}))')}, {RT}::pyd::Coll::{kind})"
+                return self._sized(coll, cons, ann, module)
+            if last in {"Counter", "OrderedDict"} and len(args) in (1, 2):
+                k = self._static_td(self._td_init(args[0], module, self._cfg(cons), scope))
+                v = (self._static_td(f"{RT}::pyd::TD::Int({self._num({})})") if last == "Counter"
+                     else self._static_td(self._td_init(args[1], module, self._cfg(cons), scope)))
+                if (last == "Counter") != (len(args) == 1):
+                    raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
+                d = self._static_td(f"{RT}::pyd::TD::Dict(Some((&{k}, &{v})))")
+                return self._sized(f"{RT}::pyd::TD::Coll(&{d}, {RT}::pyd::Coll::{'Counter' if last == 'Counter' else 'Ordered'})", cons, ann, module)
             if last in {"tuple", "Tuple"}:
                 if not (len(args) == 2 and isinstance(args[1], ast.Constant) and args[1].value is Ellipsis):
-                    raise self.err(f"`{ast.unparse(ann)}`: only variable-length tuple[X, ...] is supported", ann, module)
-                return self._sized(f"{RT}::pyd::TD::Tuple(Some(&{self._static_td(self._td_init(args[0], module, {}, scope))}))", cons, ann, module)
+                    if any(isinstance(a, ast.Constant) and a.value is Ellipsis for a in args):
+                        raise self.err(f"`{ast.unparse(ann)}`: a variable tuple has one type", ann, module)
+                    if [k for k in cons if not k.startswith("_")]:
+                        raise self.err(f"constraints on `{ast.unparse(ann)}` are not supported", ann, module)
+                    # `tuple[()]`: an empty tuple
+                    elts = [] if len(args) == 1 and isinstance(args[0], ast.Tuple) and not args[0].elts else args
+                    tds = ", ".join(f"&{self._static_td(self._td_init(a, module, self._cfg(cons), scope))}" for a in elts)
+                    return f"{RT}::pyd::TD::TupleFix(&[{tds}])"
+                return self._sized(f"{RT}::pyd::TD::Tuple(Some(&{self._static_td(self._td_init(args[0], module, self._cfg(cons), scope))}))", cons, ann, module)
             if last in {"dict", "Dict", "Mapping"}:
-                k = self._static_td(self._td_init(args[0], module, {}, scope))
-                v = self._static_td(self._td_init(args[1], module, {}, scope))
+                k = self._static_td(self._td_init(args[0], module, self._cfg(cons), scope))
+                v = self._static_td(self._td_init(args[1], module, self._cfg(cons), scope))
                 return self._sized(f"{RT}::pyd::TD::Dict(Some((&{k}, &{v})))", cons, ann, module)
+            if isinstance(outer, Sym) and outer in self.fe.schema_syms:
+                return f"{RT}::pyd::TD::Schema(&{self.schema(self.generic_args(outer, ann, module, scope)).rust})"
+            if isinstance(outer, Ext) and outer.dotted in {"typing.Callable", "collections.abc.Callable"}:
+                return f"{RT}::pyd::TD::Callable"
+            if isinstance(outer, Ext) and outer.dotted in {"pydantic.SkipValidation", "pydantic.functional_validators.SkipValidation"}:
+                # no validation: the value as given
+                return f"{RT}::pyd::TD::Any"
+            if last in {"type", "Type"} and len(args) == 1:
+                t = self.resolve(module, args[0], scope)
+                if isinstance(t, Ext) and t.dotted in {"pydantic.BaseModel", "pydantic.main.BaseModel"}:
+                    return f"{RT}::pyd::TD::Subclass(\"BaseModel\", None)"
+                if isinstance(t, Sym) and t in self.fe.schema_syms:
+                    return f"{RT}::pyd::TD::Subclass({rs(t.name)}, Some(&{self.schema(t).cls}))"
+                if isinstance(t, Sym) and isinstance(self.ix.definition(t), ast.ClassDef):
+                    # a plain class: a value can only be one of the project's model classes, never this one
+                    node = self.ix.definition(t)
+                    if any(not (isinstance(b, ast.Name) and b.id == "object") for b in node.bases) or node.keywords:
+                        raise self.err(f"`{ast.unparse(ann)}` of a class with bases is not supported", ann, module)
+                    return f"{RT}::pyd::TD::Subclass({rs(t.name)}, None)"
+                raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
             if last == "Literal":
                 lits = []
                 for a in args:
@@ -926,6 +1024,12 @@ class Project:
                 return f"{RT}::pyd::TD::Literal(&[{', '.join(lits)}])"
             raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
         name = dotted(ann)
+        if name == "frozenset" and not isinstance(self.resolve(module, ann, scope), Sym):
+            return self._sized(f"{RT}::pyd::TD::Coll(&{self._static_td(f'{RT}::pyd::TD::Set(None)')}, {RT}::pyd::Coll::Frozen)", cons, ann, module)
+        if name == "complex" and not isinstance(self.resolve(module, ann, scope), Sym):
+            if [k for k in cons if not k.startswith("_")]:
+                raise self.err("constraints on `complex` are not supported", ann, module)
+            return f"{RT}::pyd::TD::Complex"
         if name in {"int", "float", "str", "bool", "dict", "list", "set", "tuple", "bytes", "Any", "object"} and not isinstance(self.resolve(module, ann, scope), Sym):
             if bad := [k for k in ("max_digits", "decimal_places") if k in cons]:
                 # pydantic raises TypeError at validation time ("Unable to apply constraint")
@@ -940,6 +1044,12 @@ class Project:
                 "datetime.time": f"{RT}::pyd::TD::Time",
                 "datetime.timedelta": f"{RT}::pyd::TD::Delta",
                 "uuid.UUID": f"{RT}::pyd::TD::Uuid",
+                **{f"pydantic{m}.UUID{n}": f"{RT}::pyd::TD::UuidV({n})" for m in ("", ".types") for n in range(1, 9)},
+                **dict.fromkeys(("pydantic.SecretStr", "pydantic.types.SecretStr"), f"{RT}::pyd::TD::Secret"),
+                **dict.fromkeys(("typing.Callable", "collections.abc.Callable"), f"{RT}::pyd::TD::Callable"),
+                "types.EllipsisType": f"{RT}::pyd::TD::Ellipsis",
+                "fractions.Fraction": f"{RT}::pyd::TD::Fraction",
+                **dict.fromkeys(("pydantic.MISSING", "pydantic.experimental.missing_sentinel.MISSING"), f"{RT}::pyd::TD::MissingSentinel"),
                 "typing.Any": f"{RT}::pyd::TD::Any",
                 # the str schema under EmailStr's validator gets the str_* settings of model_config
                 **dict.fromkeys(("pydantic.EmailStr", "pydantic.networks.EmailStr"), f"{RT}::pyd::TD::Email("
@@ -951,6 +1061,8 @@ class Project:
             if t.dotted in mapping:
                 return mapping[t.dotted]
             if t.dotted == "decimal.Decimal":
+                if "multiple_of" in cons:
+                    raise self.err("Field(multiple_of=) on a Decimal is not supported", ann, module)
                 return f"{RT}::pyd::TD::Decimal({self._dec(cons, ann, module)})"
             if t.package == "typing" and last in {"Dict", "List", "Set", "Tuple"}:
                 return self._scalar(last.lower(), cons, ann, module)
@@ -960,6 +1072,19 @@ class Project:
                 return f"{RT}::pyd::TD::Schema(&{self.schema(t).rust})"
             if self.enum_kind(t):
                 return f"{RT}::pyd::TD::Enum(&{self.enum(t)[0]}, {str(bool(cons.get('_enum_values'))).lower()})"
+            node = self.ix.definition(t)
+            if (isinstance(node, ast.ClassDef) and t not in self.fe.dataclass_syms and t not in self.fe.model_syms
+                    and not node.decorator_list and not node.keywords
+                    and all(isinstance(b, ast.Name) and b.id == "object" for b in node.bases)
+                    and not any(isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                and x.name.startswith(("__get_pydantic", "__get_validators__", "__modify_schema__"))
+                                for x in node.body)):
+                # an arbitrary type (`arbitrary_types_allowed`, else pydantic refuses the model): an isinstance check
+                return f"{RT}::pyd::TD::Instance({rs(t.name)})"
+            if isinstance(node, ast.ClassDef) and any(isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                                      and x.name.startswith("__get_pydantic") for x in node.body):
+                raise self.err(f"type `{t.qual}` customizes its Pydantic schema (__get_pydantic_core_schema__): not supported",
+                               ann, module)
             raise self.err(f"type `{t.qual}` is not a Pydantic model or an enum (other classes are not supported)", ann, module)
         raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
 
@@ -996,10 +1121,122 @@ class Project:
         if len(rest) == 1:
             inner = self._static_td(self._td_init(rest[0], module, cons, scope))
             return f"{RT}::pyd::TD::Optional(&{inner})" if none else self._td_init(rest[0], module, cons, scope)
+        ltr, disc, cons = cons.get("_ltr"), cons.get("_disc"), {k: v for k, v in cons.items() if k not in ("_ltr", "_disc")}
+        if disc is not None:
+            t = self._tagged(rest, disc, module, cons, scope, node)
+            return f"{RT}::pyd::TD::Optional(&{self._static_td(t)})" if none else t
         tds = ", ".join(f"&{self._static_td(self._td_init(p, module, cons, scope))}" for p in rest)
-        u = f"{RT}::pyd::TD::Union(&[{tds}])"
+        u = f"{RT}::pyd::TD::{'UnionLtr' if ltr else 'Union'}(&[{tds}])"
         self.__dict__.setdefault("union_src", {}).setdefault(u, (node, module))  # where a refusal points
         return f"{RT}::pyd::TD::Optional(&{self._static_td(u)})" if none else u
+
+    def _tagged(self, parts, disc, module, cons, scope, node) -> str:
+        """A discriminated union: each member's tags are the `Literal[...]` values of its discriminator field
+        (a member that is itself a union contributes all of its members' values)."""
+        dnode, dmodule = disc
+        custom, func = None, None
+        if isinstance(dnode, ast.Call):
+            t = self.resolve(dmodule, dnode.func)
+            if not (isinstance(t, Ext) and t.dotted.split(".")[-1] == "Discriminator" and len(dnode.args) == 1):
+                raise self.err(f"discriminator `{ast.unparse(dnode)}` is not supported", dnode, dmodule)
+            kw = {k.arg: k.value for k in dnode.keywords}
+            if set(kw) - {"custom_error_type", "custom_error_message", "custom_error_context"}:
+                raise self.err(f"Discriminator({', '.join(sorted(kw))}=) options are not supported", dnode, dmodule)
+            if kw:
+                ctx = self.const(kw["custom_error_context"], dmodule) if "custom_error_context" in kw else {}
+                ce_type = self.const(kw["custom_error_type"], dmodule) if "custom_error_type" in kw else None
+                ce_msg = self.const(kw["custom_error_message"], dmodule) if "custom_error_message" in kw else None
+                if not (isinstance(ce_type, str) and isinstance(ce_msg, str) and isinstance(ctx, dict)
+                        and all(isinstance(k, str) and isinstance(v, str) for k, v in ctx.items())):
+                    raise self.err("Discriminator custom errors: a type, a message and a dict of strings are supported",
+                                   dnode, dmodule)
+                custom = (ce_type, ce_msg, ctx)
+            dnode = dnode.args[0]
+        field = self.const(dnode, dmodule) if isinstance(dnode, ast.Constant) else None
+        if field is None:
+            # a function of the input returning the tag; the members are tagged `Annotated[T, Tag('x')]`
+            known = self.__dict__.setdefault("disc_syms", {})
+            if id(dnode) not in known:  # one function per discriminator (the fixpoint passes come back here)
+                known[id(dnode)] = Sym(dmodule, f"<disc_{len(known)}>")
+                self.__dict__.setdefault("lambda_validators", {})[known[id(dnode)]] = dnode
+            func = known[id(dnode)]
+            shown = "<lambda>()" if isinstance(dnode, ast.Lambda) else f"{ast.unparse(dnode).split('.')[-1]}()"
+            tags = []
+            for p in parts:
+                expanded, emod = self.expand_alias(p, module, scope)
+                tag = None
+                if isinstance(expanded, ast.Subscript) and (dotted(expanded.value) or "").split(".")[-1] == "Annotated":
+                    for m in expanded.slice.elts[1:]:
+                        mt = self.resolve(emod, m.func) if isinstance(m, ast.Call) else None
+                        if isinstance(mt, Ext) and mt.dotted.split(".")[-1] == "Tag" and len(m.args) == 1:
+                            tag = self.const(m.args[0], emod)
+                if not isinstance(tag, str):
+                    raise self.err(f"discriminated union member `{ast.unparse(p)}` needs a Tag('...')", p, module)
+                if any(tag == k for k, _ in tags):
+                    raise self.err(f"discriminated union: tag {tag!r} is in two members", node, module)
+                tags.append((tag, self._static_td(self._td_init(p, module, cons, scope))))
+            entries = ", ".join(f"({rs(v)}, &{td})" for v, td in tags)
+            return (f"{RT}::pyd::TD::Tagged(&{RT}::pyd::Tagged {{ key: {rs(shown)}, attr: \"\", tags: &[{entries}], "
+                    f"func: Some({method_wrapper(self, func)} as {RT}::pyd::MethodFn), custom: {self._custom(custom)} }})")
+        if not isinstance(field, str):
+            raise self.err(f"discriminator `{ast.unparse(dnode)}` is not supported (a field name only)", dnode, dmodule)
+        keys, tags = set(), []
+
+        def values(p, pmod, pscope):
+            expanded, emod = self.expand_alias(p, pmod, pscope)
+            if expanded is not p:
+                return values(expanded, emod, None)
+            if isinstance(p, ast.Constant) and isinstance(p.value, str):
+                return values(ast.parse(p.value, mode="eval").body, pmod, pscope)
+            if isinstance(p, ast.Subscript):
+                outer = self.resolve(pmod, p.value, pscope)
+                last = (outer.dotted if isinstance(outer, Ext) else (dotted(p.value) or "")).split(".")[-1]
+                args = p.slice.elts if isinstance(p.slice, ast.Tuple) else [p.slice]
+                if last == "Annotated":
+                    return values(args[0], pmod, pscope)
+                if last in {"Union", "Optional"}:
+                    return [v for a in self._flatten_union(args, pmod, pscope) for v in values(a, pmod, pscope)]
+            if isinstance(p, ast.BinOp) and isinstance(p.op, ast.BitOr):
+                return [v for a in self._flatten_union(self._union_parts(p), pmod, pscope) for v in values(a, pmod, pscope)]
+            t = self.resolve(pmod, p, pscope)
+            if not (isinstance(t, Sym) and t in self.fe.schema_syms):
+                raise self.err(f"discriminated union member `{ast.unparse(p)}` is not a Pydantic model", p, pmod)
+            info = self.schema(t)
+            f = next((f for f in info.fields if f["name"] == field), None)
+            ann, amod = f["ann"] if f else (None, None)
+            lit = self.expand_alias(ann, amod, None)[0] if f else None
+            if isinstance(lit, ast.Subscript) and (dotted(lit.value) or "").split(".")[-1] == "Annotated":
+                lit = lit.slice.elts[0]
+            if not (isinstance(lit, ast.Subscript) and (dotted(lit.value) or "").split(".")[-1] == "Literal"):
+                raise self.err(f"discriminated union: {t.name}.{field} must be a Literal[...] of strings", p, pmod)
+            vals = [self.const(a, amod) for a in (lit.slice.elts if isinstance(lit.slice, ast.Tuple) else [lit.slice])]
+            if not all(isinstance(v, str) for v in vals):
+                raise self.err(f"discriminated union: {t.name}.{field} tags other than strings are not supported", p, pmod)
+            if f.get("paths"):
+                raise self.err(f"discriminated union: {t.name}.{field} has an AliasPath/AliasChoices", p, pmod)
+            keys.add(f["alias"] or field)
+            if info.__dict__.get("before") or info.__dict__.get("model_before"):
+                raise self.err(f"discriminated union: {t.name} has mode='before' validators (not supported)", p, pmod)
+            return vals
+
+        for p in parts:
+            td = self._static_td(self._td_init(p, module, cons, scope))
+            for v in dict.fromkeys(values(p, module, scope)):  # a nested union: its members may share a tag
+                if any(v == k for k, _ in tags):
+                    raise self.err(f"discriminated union: tag {v!r} is in two members", node, module)
+                tags.append((v, td))
+        if len(keys) != 1:
+            raise self.err(f"discriminated union: the members' {field!r} fields have different aliases", node, module)
+        entries = ", ".join(f"({rs(v)}, &{td})" for v, td in tags)
+        return (f"{RT}::pyd::TD::Tagged(&{RT}::pyd::Tagged {{ key: {rs(keys.pop())}, attr: {rs(field)}, "
+                f"tags: &[{entries}], func: None, custom: {self._custom(custom)} }})")
+
+    @staticmethod
+    def _custom(custom) -> str:
+        if custom is None:
+            return "None"
+        t, m, ctx = custom
+        return f"Some(({rs(t)}, {rs(m)}, &[{', '.join(f'({rs(k)}, {rs(v)})' for k, v in ctx.items())}]))"
 
     def _scalar(self, name: str, cons: dict, ann: ast.AST, module: str) -> str:
         if name == "int":
@@ -1007,6 +1244,9 @@ class Project:
         if name == "float":
             return f"{RT}::pyd::TD::Float({self._num(cons)})"
         if name == "str":
+            if bad := [k for k in ("multiple_of", "ge", "gt", "le", "lt") if k in cons]:
+                # pydantic raises TypeError when it builds the schema ("Unable to apply constraint")
+                raise self.err(f"{bad[0]}= does not apply to `str`", ann, module)
             return f"{RT}::pyd::TD::Str({self._str(cons)})"
         if name == "bool":
             return f"{RT}::pyd::TD::Bool"
@@ -1030,7 +1270,8 @@ class Project:
             return f"{RT}::pyd::TD::Bytes({mn}, {mx}, {RT}::pyd::BytesMode::{mode})"
         raise TranspileError(f"unsupported type {name}")
 
-    FIELD_KW = {"ge", "gt", "le", "lt", "min_length", "max_length", "pattern", "regex", "max_digits", "decimal_places"}
+    FIELD_KW = {"ge", "gt", "le", "lt", "min_length", "max_length", "pattern", "regex", "max_digits", "decimal_places",
+                "multiple_of"}
     IGNORED_KW = {"description", "title", "examples", "example", "json_schema_extra", "deprecated", "include_in_schema",
                   "openapi_examples"}
 
@@ -1056,8 +1297,12 @@ class Project:
             elif kw.arg in {"default_factory", "alias", "embed", "convert_underscores", "validation_alias", "serialization_alias",
                             "validate_default"}:
                 opts[kw.arg] = kw.value
+            elif kw.arg in {"repr", "exclude", "frozen", "union_mode", "strict", "exclude_if"} and is_field:
+                opts[kw.arg] = kw.value
             elif kw.arg in self.IGNORED_KW:
                 pass
+            elif kw.arg == "discriminator" and is_field:
+                cons["_disc"] = (kw.value, module)  # the union below it is discriminated (`_union`)
             else:
                 raise self.err(f"unsupported option {kw.arg}= in {dotted(call.func)}()", kw, module)
         for k in ("min", "max"):
@@ -1073,7 +1318,7 @@ class Project:
                      "pydantic.json_schema.Examples", "pydantic.Examples"}
     ANNOTATED_TYPES = {"Gt": "gt", "Ge": "ge", "Lt": "lt", "Le": "le", "MinLen": "min_length", "MaxLen": "max_length"}
     STRING_CONSTRAINTS = {"strip_whitespace": "_strip", "to_upper": "_upper", "to_lower": "_lower",
-                          "min_length": "min_length", "max_length": "max_length", "pattern": "pattern"}
+                          "min_length": "min_length", "max_length": "max_length", "pattern": "pattern", "ascii_only": "_ascii"}
 
     def annotated_meta(self, meta: ast.AST, module: str, scope=None) -> dict:
         """The constraints one `Annotated[T, meta]` metadata adds ({} when it changes nothing); anything else
@@ -1089,6 +1334,10 @@ class Project:
             return self.field_cons(meta, module, scope)[0]
         if last in {"Depends", "Security"} and not isinstance(t, Sym):
             return {}
+        if isinstance(t, Ext) and t.dotted.startswith("pydantic") and last == "Tag":
+            return {}  # a member's tag: read by the discriminated union around it
+        if isinstance(t, Ext) and t.dotted.startswith("pydantic") and last == "Discriminator" and isinstance(meta, ast.Call):
+            return {"_disc": (meta, module)}
         if isinstance(t, Ext) and t.dotted in self.ANNOTATED_DOC:
             return {}
         if isinstance(t, Ext) and t.dotted.startswith("annotated_types.") and isinstance(meta, ast.Call):
@@ -1143,13 +1392,20 @@ class Project:
         expr_node = ast.Call(func=node, args=[], keywords=[]) if mode == "call" else node
         ast.copy_location(expr_node, node)
         fc = FnCompiler(self, module, None, name)
+        if mode == "data":
+            f = fc.expr(node)
+            self.items.append(
+                f"fn {name}<'a>(cx: &'a Cx, _s: V, a: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{ "
+                f"{' '.join(fc.lines)} let __f = {f}; {RT}::methods::call_value(cx, &__f, a, vec![]).await }}) }}"
+            )
+            return name
         code = fc.expr(expr_node)
         if mode == "once":
             g = f"G_{name}"
             self.items.append(
                 f"static {g}: {RT}::Global = {RT}::Global::new();\n"
                 f"fn {name}<'a>(cx: &'a Cx, _s: V, _a: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{ "
-                f"{g}.get(cx, |cx| Box::pin(async move {{ Ok({code}) }})).await }}) }}"
+                f"{RT}::methods::default_copy(&{g}.get(cx, |cx| Box::pin(async move {{ Ok({code}) }})).await?) }}) }}"
             )
         else:
             self.items.append(
@@ -1162,7 +1418,7 @@ class Project:
         if factory and self.takes_data(node, module):
             # pydantic passes the validated data to a factory with one positional parameter (and, since 2.14,
             # reports `default_factory_not_called` after an error of another field)
-            raise self.err("a default_factory taking the validated data (`lambda data: ...`) is not supported", node, module)
+            return f"Data({self.dyn_default(node, module, 'data')})"
         try:
             return f"{'Factory' if factory else 'Value'}({self.dflt(node, module, factory=factory)})"
         except TranspileError:
@@ -1431,11 +1687,17 @@ class Project:
         if sym in self.models:
             return self.models[sym]
         try:
-            return self._model(sym)
+            info = self._model(sym)
         except TranspileError as e:
             self.models.pop(sym, None)
             self.class_errors[sym] = e
             raise
+        if info.poly_on is not None:
+            # a row of the hierarchy can be of any mapped subclass: all of them are translated with it
+            for s2, n2 in self.fe.model_syms.items():
+                if s2 not in self.models and any(self.resolve(s2.module, b) == sym for b in n2.bases):
+                    self.model(s2)
+        return info
 
     def _model(self, sym: Sym) -> ModelInfo:
         node = self.fe.model_syms[sym]
@@ -1445,7 +1707,13 @@ class Project:
         self.models[sym] = info
         cols: list[dict] = []
         table = None
+        hybrids: dict[str, dict] = {}
+        info.__dict__["hybrids"] = hybrids
+        comps: list[tuple] = []  # composite() attributes, resolved once every column is known
+        info.__dict__["composites"] = []
         classes = [(sym, node)]
+        parent = None
+        joined = None  # the subclass's own __tablename__ (joined table inheritance)
         for b in node.bases:  # mixins: plain classes holding columns
             t = self.resolve(module, b)
             if isinstance(t, Sym) and t not in self.fe._declarative and t not in self.fe.model_syms:
@@ -1453,28 +1721,88 @@ class Project:
                 if isinstance(bn, ast.ClassDef):
                     classes.insert(0, (t, bn))
             elif isinstance(t, Sym) and t in self.fe.model_syms:
-                raise self.err(f"model {sym.name}: inheritance between mapped classes is not supported", b, module)
+                if parent is not None:
+                    raise self.err(f"model {sym.name}: more than one mapped base class is not supported", b, module)
+                parent = self.model(t)
+        if parent is not None:
+            # inheritance: the subclass starts with everything its mapped base has (columns in the same positions)
+            if parent.poly_on is None:
+                raise self.err(f"model {sym.name}: inheritance needs polymorphic_on in the __mapper_args__ of "
+                               f"{parent.sym.name}", node, module)
+            info.parent, info.poly_on = parent.sym, parent.poly_on
+            info.joins = list(parent.joins)
+            cols = [dict(c) for c in parent.cols]
+            for c in cols:
+                c.setdefault("table", parent.table)  # each inherited column keeps the table it lives in
+            table = parent.table
+            hybrids.update(parent.__dict__.get("hybrids", {}))
+            info.methods = list(parent.methods)
+            info.rels_raw = list(parent.rels_decl)
+            info.rels_decl = list(parent.rels_decl)
+            info.__dict__["inherited_rels"] = {r[0] for r in parent.rels_decl}
+            info.eager_defaults = parent.eager_defaults
         for csym, cnode in classes:
             for stmt in cnode.body:
                 if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                     n = stmt.targets[0].id
                     if n == "__tablename__":
                         table = literal(stmt.value, self.src(csym.module))
+                        if parent is not None and csym == sym:
+                            joined = stmt
                     elif n == "__abstract__":
                         raise self.err(f"model {sym.name}: abstract models are not supported", stmt, csym.module)
                     elif n == "__mapper_args__":
-                        if not (isinstance(stmt.value, ast.Dict) and not stmt.value.keys):
-                            raise self.err(f"model {sym.name}: __mapper_args__ is not supported (versioning, "
-                                           "polymorphism and eager defaults change the SQL)", stmt, csym.module)
+                        d = stmt.value
+                        keys = [literal(k, self.src(csym.module)) if isinstance(k, ast.Constant) else None
+                                for k in getattr(d, "keys", [])]
+                        allowed = {"eager_defaults", "polymorphic_identity", "polymorphic_on", "polymorphic_load"}
+                        if not isinstance(d, ast.Dict) or any(k not in allowed for k in keys):
+                            bad = next((k for k in keys if k not in allowed), None)
+                            raise self.err(f"model {sym.name}: __mapper_args__ key {bad!r} is not supported (eager_defaults, "
+                                           "polymorphic_on, polymorphic_identity and polymorphic_load only)", stmt, csym.module)
+                        for k, v in zip(keys, d.values):
+                            if k == "eager_defaults":
+                                ev = literal(v, self.src(csym.module))
+                                if ev not in (True, False, "auto"):
+                                    raise self.err(f"model {sym.name}: eager_defaults={ev!r} is not supported", v, csym.module)
+                                info.eager_defaults = ev is True
+                            elif k == "polymorphic_load":
+                                ev = literal(v, self.src(csym.module))
+                                if ev not in ("selectin", "inline") or parent is None:
+                                    raise self.err(f"model {sym.name}: polymorphic_load={ev!r} is not supported (\"selectin\" "
+                                                   "or \"inline\" on a subclass)", v, csym.module)
+                                # both load the subclass's columns with a query on the base (one SELECT or one join)
+                                info.poly_load = True
+                            elif k == "polymorphic_identity":
+                                ev = literal(v, self.src(csym.module))
+                                if not isinstance(ev, str):
+                                    raise self.err(f"model {sym.name}: polymorphic_identity={ev!r} is not supported (a string)",
+                                                   v, csym.module)
+                                info.identity = ev
+                            else:
+                                if parent is not None:
+                                    raise self.err(f"model {sym.name}: polymorphic_on on a subclass is not supported", v,
+                                                   csym.module)
+                                if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                                    info.poly_on = v.value
+                                elif isinstance(v, ast.Name):
+                                    info.poly_on = v.id
+                                else:
+                                    raise self.err(f"model {sym.name}: polymorphic_on must name a column of the class "
+                                                   "(its attribute name, or the column itself)", v, csym.module)
                     elif n == "__table_args__":
                         # constraints and indexes only matter to the DDL (Alembic/create_all); a schema does not
                         for x in ast.walk(stmt.value):
                             if isinstance(x, ast.Dict) and any(isinstance(k, ast.Constant) and k.value == "schema" for k in x.keys):
                                 raise self.err(f"model {sym.name}: __table_args__ schema is not supported", stmt, csym.module)
+                    elif isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] == "composite":
+                        comps.append((n, None, stmt.value, csym.module, stmt))
+                        cols.extend(self.composite_columns(sym, n, None, stmt.value, csym.module, stmt))
                     elif isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] in {"Column", "mapped_column", "deferred"}:
-                        cols.append(self.column(n, None, stmt.value, csym.module, stmt))
+                        cols.append(self.column(n, None, stmt.value, csym.module, stmt, self.tam_of(sym)))
                     elif isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] == "relationship":
                         info.rels_raw.append((n, None, stmt.value, csym.module))
+                        info.rels_decl.append(info.rels_raw[-1])
                     elif not n.startswith("__"):
                         raise self.err(f"model {sym.name}.{n}: only columns and relationships are supported in a "
                                        f"mapped class (`{ast.unparse(stmt.value)[:40]}`)", stmt, csym.module)
@@ -1482,16 +1810,36 @@ class Project:
                     n = stmt.target.id
                     if isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] == "relationship":
                         info.rels_raw.append((n, stmt.annotation, stmt.value, csym.module))
+                        info.rels_decl.append(info.rels_raw[-1])
                         continue
                     if n.startswith("__"):
+                        continue
+                    if isinstance(stmt.value, ast.Call) and (dotted(stmt.value.func) or "").split(".")[-1] == "composite":
+                        comps.append((n, stmt.annotation, stmt.value, csym.module, stmt))
+                        cols.extend(self.composite_columns(sym, n, stmt.annotation, stmt.value, csym.module, stmt))
                         continue
                     if (dotted(stmt.annotation) or "").split(".")[-1] == "ClassVar" or (
                             isinstance(stmt.annotation, ast.Subscript) and (dotted(stmt.annotation.value) or "").split(".")[-1] == "ClassVar"):
                         raise self.err(f"model {sym.name}.{n}: class variables in a mapped class are not supported", stmt, csym.module)
-                    cols.append(self.column(n, stmt.annotation, stmt.value, csym.module, stmt))
+                    cols.append(self.column(n, stmt.annotation, stmt.value, csym.module, stmt, self.tam_of(sym)))
+                elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and self.hybrid_part(stmt, csym.module, sym.name, hybrids):
+                    kind, target = self.hybrid_part(stmt, csym.module, sym.name, hybrids)
+                    # each function of a hybrid compiled on its own (the classic style repeats the name)
+                    nsym = Sym(csym.module, f"{cnode.name}.{stmt.name}~h{len(self.__dict__.setdefault('nested', {}))}")
+                    self.nested[nsym] = (stmt, None)
+                    self.function(nsym)  # compiled with the others (the model table is written last)
+                    if kind in ("property", "method"):
+                        hybrids[stmt.name] = {"name": stmt.name, "method": kind == "method", "get": nsym, "expr": None,
+                                              "set": None}
+                        info.methods = [m for m in info.methods if m[0] != stmt.name]
+                        info.methods.append((stmt.name, kind == "property", nsym))
+                    else:
+                        hybrids[target]["expr" if kind == "expression" else "set"] = nsym
                 elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if is_dunder(stmt.name) and stmt.name not in {"__str__", "__repr__"}:
+                    if is_dunder(stmt.name) and stmt.name not in {"__str__", "__repr__", "__init__"}:
                         raise self.err(f"model {sym.name}: method {stmt.name} is not supported", stmt, csym.module)
+                    if stmt.name == "__init__" and (stmt.decorator_list or isinstance(stmt, ast.AsyncFunctionDef)):
+                        raise self.err(f"model {sym.name}: a decorated or async __init__ is not supported", stmt, csym.module)
                     for d in stmt.decorator_list:
                         if dotted(d) not in {"property", "staticmethod", "classmethod"}:
                             raise self.err(f"model {sym.name}.{stmt.name}: decorator @{ast.unparse(d)} is not supported "
@@ -1500,6 +1848,40 @@ class Project:
                     info.methods.append((stmt.name, prop, Sym(csym.module, f"{cnode.name}.{stmt.name}")))
         if not table:
             raise self.err(f"model {sym.name} has no __tablename__", node, module)
+        if info.poly_on is not None and not any(c["name"] == info.poly_on for c in cols):
+            raise self.err(f"model {sym.name}: polymorphic_on={info.poly_on!r} is not a column of the class", node, module)
+        if parent is not None and info.identity is None:
+            raise self.err(f"model {sym.name}: a mapped subclass needs a polymorphic_identity", node, module)
+        if joined is not None:
+            # joined table inheritance: the subclass's key column (a foreign key to the parent's key) replaces the
+            # inherited one in its position (`Manager.id` is manager.id in SQL); its other columns live in its table
+            n_inh = len(parent.cols)
+            own = cols[n_inh:]
+            for c in own:
+                c["table"] = table
+            keep, linked = [], False
+            for c in own:
+                k = next((i for i, x in enumerate(cols[:n_inh]) if x["name"] == c["name"]), None)
+                if k is None:
+                    keep.append(c)
+                    continue
+                inh = cols[k]
+                if not (c["pk"] and inh["pk"] and c.get("fk") == inh["table"]
+                        and (c.get("fk_col") or inh.get("sql") or inh["name"]) == (inh.get("sql") or inh["name"])):
+                    raise self.err(f"model {sym.name}: column {c['name']} redefined in a subclass is not supported (only "
+                                   f"the key, as a foreign key to {inh['table']}.{inh.get('sql') or inh['name']})", joined,
+                                   module)
+                info.joins.append((table, c.get("sql") or c["name"], inh["table"], inh.get("sql") or inh["name"]))
+                cols[k] = c
+                linked = True
+            if not linked:
+                raise self.err(f"model {sym.name}: a joined subclass needs its primary key, a foreign key to the parent's "
+                               f"key, under the same attribute name", joined, module)
+            if len(parent.pks) != 1:
+                raise self.err(f"model {sym.name}: joined inheritance with a composite key is not supported", joined, module)
+            cols = cols[:n_inh] + keep
+        if parent is not None and len({c["name"] for c in cols}) != len(cols):
+            raise self.err(f"model {sym.name}: a column redefined in a subclass is not supported", node, module)
         pks = [i for i, c in enumerate(cols) if c["pk"]]
         if not pks:
             raise self.err(f"model {sym.name} has no primary key column", node, module)
@@ -1510,13 +1892,204 @@ class Project:
                     cols[i]["autoincrement"] = False
         info.table, info.cols, info.pk, info.pks = table, cols, pks[0], pks
         info.fk_tables = sorted({c["fk"] for c in cols if c.get("fk")})
+        for n, ann, call, cmod, stmt in comps:
+            info.__dict__["composites"].append(self.composite(sym, n, ann, call, cmod, stmt, cols))
         return info
+
+    COMPOSITE_KW = {"column_template"}
+
+    def composite_parts(self, sym: Sym, name: str, ann, call: ast.Call, module: str):
+        """`composite(...)`: (the class or callable building the value, None on all-NULL, its dataclass fields
+        [(name, annotation)] or None, the column arguments)."""
+        for k in call.keywords:
+            if k.arg not in self.COMPOSITE_KW:
+                raise self.err(f"composite {sym.name}.{name}: option {k.arg}= is not supported", k, module)
+        args = list(call.args)
+        colish = lambda a: (isinstance(a, ast.Call) and (dotted(a.func) or "").split(".")[-1] in {"Column", "mapped_column"}) \
+            or (isinstance(a, ast.Constant) and isinstance(a.value, str))
+        ctor, none = None, False
+        if args and not colish(args[0]) and not (isinstance(args[0], ast.Name) and self._class_column_name(sym, args[0].id)):
+            ctor = args.pop(0)
+        inner = ann.slice if isinstance(ann, ast.Subscript) and (dotted(ann.value) or "").split(".")[-1] == "Mapped" else None
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            inner = ast.parse(inner.value, mode="eval").body
+        if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.BitOr) and isinstance(inner.right, ast.Constant) and inner.right.value is None:
+            inner, none = inner.left, True
+        elif isinstance(inner, ast.Subscript) and (dotted(inner.value) or "").split(".")[-1] == "Optional":
+            inner, none = inner.slice, True
+        if ctor is None:
+            ctor = inner
+        if ctor is None:
+            raise self.err(f"composite {sym.name}.{name}: the class is needed (Mapped[Cls] or composite(Cls, ...))", call, module)
+        fields = None
+        t = self.resolve(module, ctor) if isinstance(ctor, (ast.Name, ast.Attribute)) else None
+        d = self.ix.definition(t) if isinstance(t, Sym) else None
+        if isinstance(d, ast.ClassDef) and any((dotted(x.func if isinstance(x, ast.Call) else x) or "").split(".")[-1] == "dataclass"
+                                               for x in d.decorator_list):
+            fields = [(st.target.id, st.annotation) for st in d.body if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)
+                      and "ClassVar" not in ast.unparse(st.annotation)]
+        return ctor, none, fields, args
+
+    def _class_column_name(self, sym: Sym, n: str) -> bool:
+        node = self.fe.model_syms.get(sym)
+        return node is not None and any(
+            (isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.target.id == n) or
+            (isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == n for t in st.targets)) for st in node.body)
+
+    def composite_columns(self, sym: Sym, name: str, ann, call: ast.Call, module: str, stmt) -> list[dict]:
+        """The columns a composite declares itself: `mapped_column("x1")` (typed by the dataclass field at its
+        position when it names no type) and those of `column_template="home_%s"`."""
+        ctor, _, fields, args = self.composite_parts(sym, name, ann, call, module)
+        tpl = next((k.value for k in call.keywords if k.arg == "column_template"), None)
+        out = []
+        for k, a in enumerate(args):
+            if isinstance(a, ast.Call) and (dotted(a.func) or "").split(".")[-1] in {"Column", "mapped_column"}:
+                if not (a.args and isinstance(a.args[0], ast.Constant) and isinstance(a.args[0].value, str)):
+                    raise self.err(f"composite {sym.name}.{name}: a column needs its name (mapped_column(\"x\"))", a, module)
+                fann = None
+                if len(a.args) == 1:
+                    if fields is None or k >= len(fields):
+                        raise self.err(f"composite {sym.name}.{name}: the column {a.args[0].value} needs a type (the class "
+                                       "is not a dataclass with a field at its position)", a, module)
+                    fann = ast.Subscript(value=ast.Name(id="Mapped", ctx=ast.Load()), slice=fields[k][1], ctx=ast.Load())
+                out.append(self.column(a.args[0].value, fann, a, module, stmt, self.tam_of(sym)))
+        if tpl is not None:
+            if not (isinstance(tpl, ast.Constant) and isinstance(tpl.value, str) and tpl.value.count("%s") == 1) or fields is None:
+                raise self.err(f"composite {sym.name}.{name}: column_template= needs a literal with one %s and a dataclass", call, module)
+            for fname, fann in fields[len(args):]:
+                col = ast.Call(func=ast.Name(id="mapped_column", ctx=ast.Load()), args=[ast.Constant(tpl.value % fname)], keywords=[])
+                out.append(self.column(tpl.value % fname, ast.Subscript(value=ast.Name(id="Mapped", ctx=ast.Load()), slice=fann,
+                                                                        ctx=ast.Load()), col, module, stmt, self.tam_of(sym)))
+        return out
+
+    def composite(self, sym: Sym, name: str, ann, call: ast.Call, module: str, stmt, cols: list[dict]) -> dict:
+        ctor, none, fields, args = self.composite_parts(sym, name, ann, call, module)
+        tpl = next((k.value.value for k in call.keywords if k.arg == "column_template"), None)
+        names = []
+        for a in args:
+            if isinstance(a, ast.Call) and (dotted(a.func) or "").split(".")[-1] in {"Column", "mapped_column"}:
+                names.append(a.args[0].value)
+            elif isinstance(a, ast.Constant):
+                names.append(a.value)
+            elif isinstance(a, ast.Name):
+                names.append(a.id)
+            else:
+                raise self.err(f"composite {sym.name}.{name}: `{ast.unparse(a)[:40]}` is not supported (columns, their "
+                               "names or attribute names)", a, module)
+        if tpl is not None:
+            names += [tpl % f for f, _ in fields[len(args):]]
+        idx = []
+        for n in names:
+            i = next((i for i, c in enumerate(cols) if c["name"] == n), None)
+            if i is None:
+                raise self.err(f"composite {sym.name}.{name}: no column {n}", call, module)
+            idx.append(i)
+        if isinstance(ctor, ast.Attribute):
+            # `Cls.factory` (a classmethod or staticmethod): called directly, through a lambda of as many parameters
+            ps = [f"_c{i}" for i in range(len(idx))]
+            ctor = ast.parse(f"lambda {', '.join(ps)}: {ast.unparse(ctor)}({', '.join(ps)})", mode="eval").body
+            ast.fix_missing_locations(ast.copy_location(ctor, stmt))
+            for n in ast.walk(ctor):
+                n.lineno, n.col_offset = stmt.lineno, getattr(n, "col_offset", 0)
+        return {"name": name, "cols": idx, "ctor": self.exc_attr(Sym(sym.module, f"{sym.name}~comp"), name, ast.Expr(value=ctor, lineno=stmt.lineno)),
+                "none": none}
+
+    HYBRID_PARTS = {"expression", "setter"}
+
+    def hybrid_part(self, fn, module: str, model: str, hybrids: dict) -> tuple[str, str] | None:
+        """What a method of a mapped class is to `sqlalchemy.ext.hybrid`: ("property"|"method", name) for
+        `@hybrid_property`/`@hybrid_method`, ("expression"|"setter", hybrid name) for `@x.expression`,
+        `@x.inplace.expression`, `@x.setter`, `@x.inplace.setter`; None for another method."""
+        found = None
+        for d in fn.decorator_list:
+            ref = self.resolve(module, d) if isinstance(d, (ast.Name, ast.Attribute)) else None
+            if isinstance(ref, Ext) and ref.dotted in {"sqlalchemy.ext.hybrid.hybrid_property", "sqlalchemy.ext.hybrid.hybrid_method"}:
+                found = ("property" if ref.dotted.endswith("property") else "method", fn.name)
+                continue
+            chain = []
+            node = d
+            while isinstance(node, ast.Attribute):
+                chain.insert(0, node.attr)
+                node = node.value
+            if isinstance(node, ast.Name) and node.id in hybrids and chain:
+                parts = [c for c in chain if c != "inplace"]
+                if len(parts) != 1 or parts[0] not in self.HYBRID_PARTS:
+                    raise self.err(f"model {model}.{fn.name}: @{ast.unparse(d)} is not supported (a hybrid's expression "
+                                   "and setter only)", d, module)
+                found = (parts[0], node.id)
+                continue
+            if found is not None and (dotted(d) or "") == "classmethod" :
+                continue  # `@x.expression` over `@classmethod` (both forms are SQLAlchemy's)
+            if found is not None:
+                raise self.err(f"model {model}.{fn.name}: decorator @{ast.unparse(d)} on a hybrid is not supported", d, module)
+        if found is not None and isinstance(fn, ast.AsyncFunctionDef):
+            raise self.err(f"model {model}.{fn.name}: an async hybrid is not supported", fn, module)
+        if found is not None and found[0] in ("expression", "setter") and found[1] != fn.name and \
+                not any(isinstance(d, ast.Attribute) and isinstance(d.value, ast.Attribute) and d.value.attr == "inplace"
+                        for d in fn.decorator_list):
+            # `@x.expression def other(cls)`: the class gets `other` as a copy of the hybrid (not modelled)
+            raise self.err(f"model {model}.{fn.name}: @{found[1]}.{found[0]} on a function of another name needs "
+                           f"`.inplace` ({found[1]}.inplace.{found[0]})", fn, module)
+        return found
 
     LAZY = {"select": "Select", "True": "Select", "selectin": "Selectin", "joined": "Selectin", "subquery": "Selectin",
             "immediate": "Selectin", "noload": "NoLoad", "None": "NoLoad", "raise": "Raise", "raise_on_sql": "Raise",
             "False": "Selectin"}
     REL_OPTIONS = {"back_populates", "backref", "foreign_keys", "lazy", "cascade", "uselist", "passive_deletes",
-                   "overlaps", "argument", "doc", "info", "order_by", "remote_side"}
+                   "overlaps", "argument", "doc", "info", "order_by", "remote_side", "secondary"}
+
+    def secondary_table(self, node: ast.AST, module: str, where: str) -> ModelInfo:
+        """`relationship(secondary=...)`: the association table, a module-level `Table(name, metadata, Column(...),
+        ...)` named by its variable or its table name, described like a mapped table (no class)."""
+        secs = self.__dict__.setdefault("secondaries", {})
+        sym, stmt = None, None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for m in self.ix.package_modules():
+                for st in m.tree.body:
+                    if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                            and isinstance(st.value, ast.Call) and (dotted(st.value.func) or "").split(".")[-1] == "Table"
+                            and st.value.args and isinstance(st.value.args[0], ast.Constant) and st.value.args[0].value == node.value):
+                        sym, stmt = Sym(m.name, st.targets[0].id), st
+        elif isinstance(node, (ast.Name, ast.Attribute)):
+            t = self.resolve(module, node)
+            d = self.ix.definition(t) if isinstance(t, Sym) else None
+            if isinstance(d, ast.Assign) and isinstance(d.value, ast.Call):
+                sym, stmt = t, d
+        if sym is None or not (isinstance(stmt.value, ast.Call) and isinstance(self.resolve(sym.module, stmt.value.func), Ext)
+                               and self.resolve(sym.module, stmt.value.func).dotted in {"sqlalchemy.Table", "sqlalchemy.schema.Table"}):
+            raise self.err(f"relationship {where}: secondary= must name a module-level Table(...) (its variable or its "
+                           "table name)", node, module)
+        return self.core_table(sym, stmt)
+
+    def core_table(self, sym: Sym, stmt: ast.Assign) -> ModelInfo:
+        """A module-level `Table(name, metadata, Column(...), ...)`: an association table (`secondary=`) or a Core
+        table used as a value (`insert(t)`, `select(t)`, `t.c.col`), described like a mapped table without class."""
+        secs = self.__dict__.setdefault("secondaries", {})
+        if sym in secs:
+            return secs[sym]
+        call = stmt.value
+        if len(call.args) < 2 or not isinstance(call.args[0], ast.Constant):
+            raise self.err(f"Table {sym.name}: Table(name, metadata, *columns) expected", call, sym.module)
+        if call.keywords:
+            raise self.err(f"Table {sym.name}: option {call.keywords[0].arg}= of Table() is not supported",
+                           call.keywords[0], sym.module)
+        cols = []
+        for a in call.args[2:]:
+            if isinstance(a, ast.Call) and (dotted(a.func) or "").split(".")[-1] == "Column":
+                if not (a.args and isinstance(a.args[0], ast.Constant) and isinstance(a.args[0].value, str)):
+                    raise self.err(f"Table {sym.name}: a Column needs its name first", a, sym.module)
+                cols.append(self.column(a.args[0].value, None, a, sym.module, stmt))
+            elif isinstance(a, ast.Call) and (dotted(a.func) or "").split(".")[-1] in {"PrimaryKeyConstraint", "UniqueConstraint", "Index"}:
+                continue  # the DDL's business
+            else:
+                raise self.err(f"Table {sym.name}: `{ast.unparse(a)[:40]}` is not supported in a Table() (Column(name, ...) "
+                               "and constraints only)", a, sym.module)
+        pks = [i for i, c in enumerate(cols) if c["pk"]] or [0]
+        base = f"{mod_ident(sym.module)}__{ident(sym.name)}"
+        info = ModelInfo(sym, f"MODEL_{base}", f"CLS_{base}", call.args[0].value, cols, pks[0],
+                         sorted({c["fk"] for c in cols if c.get("fk")}), pks, rels=[])
+        secs[sym] = info
+        return info
 
     def rel_order(self, v: ast.AST, tsym: Sym, tinfo, where: str, module: str) -> list[tuple[int, bool]]:
         """`relationship(order_by=...)`: target columns (Target.col, `.desc()`/`.asc()`, a list), or a string
@@ -1545,7 +2118,21 @@ class Project:
         rels = info.rels if info.rels is not None else []
         info.rels = rels
         raw, info.rels_raw = info.rels_raw, []
+        inherited = info.__dict__.get("inherited_rels", set())
+        if info.parent is not None and inherited:
+            # an inherited relationship is the parent's, resolved against the class that declares it (its
+            # columns keep their positions in the subclass)
+            parent = self.models[info.parent]
+            if parent.rels is None or parent.rels_raw or parent.__dict__.get("_pending_rels"):
+                self.resolve_rels(parent)
+            have = {r["name"] for r in rels}
+            rels.extend(dict(r) for r in parent.rels if r["name"] not in have)
+            raw = [x for x in raw if x[0] not in inherited]
         for name, ann, call, module in raw:
+            kind = (dotted(ann.value) or "").split(".")[-1] if isinstance(ann, ast.Subscript) else ""
+            if kind == "DynamicMapped":
+                raise self.err(f"relationship {info.sym.name}.{name}: DynamicMapped[...] is not supported "
+                               "(use WriteOnlyMapped[...])", ann, module)
             for kw in call.keywords:
                 if kw.arg not in self.REL_OPTIONS:
                     raise self.err(f"relationship {info.sym.name}.{name}: option {kw.arg}= is not supported", kw, module)
@@ -1557,6 +2144,17 @@ class Project:
                 target_node = self._rel_target_from_ann(ann)
             tsym = self._rel_target(target_node, module, call)
             tinfo = self.model(tsym)
+            lazy_kw = opts.get("lazy")
+            write_only = kind == "WriteOnlyMapped" or (isinstance(lazy_kw, ast.Constant) and lazy_kw.value == "write_only")
+            if write_only:
+                opts.pop("lazy", None)
+                for k in ("back_populates", "backref", "uselist"):
+                    if k in opts:
+                        raise self.err(f"relationship {info.sym.name}.{name}: {k}= on a write-only collection is not supported",
+                                       opts[k], module)
+            if "secondary" in opts:
+                self._secondary_rel(info, name, call, module, opts, tsym, tinfo, rels, write_only)
+                continue
             if "remote_side" in opts and tsym != info.sym:
                 raise self.err(f"relationship {info.sym.name}.{name}: remote_side= is only supported on a "
                                "self-referential relationship", opts["remote_side"], module)
@@ -1609,11 +2207,19 @@ class Project:
             if "all" in cascade:
                 cascade |= {"save-update", "merge", "refresh-expire", "expunge", "delete"}
             uselist = lit("uselist", not m2o)
+            if write_only and m2o:
+                raise self.err(f"relationship {info.sym.name}.{name}: a write-only many-to-one relationship is not supported",
+                               call, module)
+            if write_only and not lit("passive_deletes", False):
+                # without it SQLAlchemy loads the whole collection when the parent is deleted
+                raise self.err(f"relationship {info.sym.name}.{name}: a write-only collection needs passive_deletes=True",
+                               call, module)
             order = self.rel_order(opts["order_by"], tsym, tinfo, f"{info.sym.name}.{name}", module) if "order_by" in opts else []
             rels.append({"name": name, "target": tsym, "m2o": m2o, "local": li, "remote": ri, "uselist": bool(uselist), "order": order,
                          "lazy": self.LAZY[lazy], "back": lit("back_populates"), "delete": "delete" in cascade,
-                         "orphan": "delete-orphan" in cascade, "passive_deletes": bool(lit("passive_deletes", False))})
-            if "backref" in opts:
+                         "orphan": "delete-orphan" in cascade, "passive_deletes": bool(lit("passive_deletes", False)),
+                         "write_only": write_only, "refresh_expire": "refresh-expire" in cascade})
+            if "backref" in opts and name not in info.__dict__.get("inherited_rels", ()):
                 b = opts["backref"]
                 bname, bkw = (b.value, {}) if isinstance(b, ast.Constant) else (None, None)
                 if isinstance(b, ast.Call) and (dotted(b.func) or "").split(".")[-1] == "backref" and b.args:
@@ -1623,14 +2229,53 @@ class Project:
                     raise self.err(f"relationship {info.sym.name}.{name}: unsupported backref=", b, module)
                 bcascade = {c.strip() for c in str(bkw.get("cascade", "save-update, merge")).split(",")}
                 if "all" in bcascade:
-                    bcascade.add("delete")
+                    bcascade |= {"delete", "refresh-expire"}
                 rels[-1]["back"] = bname
                 trels = tinfo.rels if tinfo.rels is not None else tinfo.__dict__.setdefault("_pending_rels", [])
                 trels.append({"name": bname, "target": info.sym, "m2o": not m2o, "local": ri, "remote": li,
                               "uselist": bool(bkw.get("uselist", m2o)), "lazy": self.LAZY[str(bkw.get("lazy", "select"))],
                               "back": name, "delete": "delete" in bcascade, "orphan": "delete-orphan" in bcascade,
-                              "passive_deletes": bool(bkw.get("passive_deletes", False))})
+                              "passive_deletes": bool(bkw.get("passive_deletes", False)),
+                              "refresh_expire": "refresh-expire" in bcascade})
         rels.extend(info.__dict__.pop("_pending_rels", []))
+
+    def _secondary_rel(self, info, name, call, module, opts, tsym, tinfo, rels, write_only=False) -> None:
+        """A many-to-many relationship through an association table (`secondary=`)."""
+        where = f"{info.sym.name}.{name}"
+        for k in ("foreign_keys", "remote_side", "order_by"):
+            if k in opts:
+                raise self.err(f"relationship {where}: secondary= with {k}= is not supported", opts[k], module)
+        if tsym == info.sym:
+            raise self.err(f"relationship {where}: a self-referential many-to-many relationship is not supported", call, module)
+        sec = self.secondary_table(opts["secondary"], module, where)
+        left = [i for i, c in enumerate(sec.cols) if c.get("fk") == info.table]
+        right = [i for i, c in enumerate(sec.cols) if c.get("fk") == tinfo.table]
+        if len(left) != 1 or len(right) != 1:
+            raise self.err(f"relationship {where}: the secondary table {sec.table} needs one foreign key to {info.table} "
+                           f"and one to {tinfo.table}", opts["secondary"], module)
+        li = self._fk_target_col(sec.cols[left[0]], info, info, name, call, module)
+        ri = self._fk_target_col(sec.cols[right[0]], tinfo, info, name, call, module)
+        lit = lambda k, d=None: literal(opts[k], self.src(module)) if k in opts else d  # noqa: E731
+        lazy = str(lit("lazy", "select"))
+        if lazy not in self.LAZY:
+            raise self.err(f"relationship {where}: lazy={lazy!r} is not supported", opts["lazy"], module)
+        cascade = {c.strip() for c in str(lit("cascade", "save-update, merge")).split(",")}
+        if "all" in cascade:
+            cascade |= {"save-update", "merge", "refresh-expire", "expunge", "delete"}
+        # passive_deletes=True on a write-only collection: the association rows are left to ON DELETE
+        if "delete-orphan" in cascade or "delete" in cascade or (lit("passive_deletes", False) and not write_only):
+            raise self.err(f"relationship {where}: cascade delete / delete-orphan / passive_deletes on a many-to-many "
+                           "relationship is not supported", call, module)
+        if not lit("uselist", True):
+            raise self.err(f"relationship {where}: uselist=False on a many-to-many relationship is not supported", call, module)
+        for k in ("back_populates", "backref"):
+            if k in opts:
+                # SQLAlchemy keeps both collections in step as soon as one changes (instrumented lists): not modelled
+                raise self.err(f"relationship {where}: {k}= on a many-to-many relationship is not supported", opts[k], module)
+        rels.append({"name": name, "target": tsym, "m2o": False, "local": li, "remote": ri, "uselist": True, "order": [],
+                     "lazy": self.LAZY[lazy], "back": lit("back_populates"), "delete": False, "orphan": False,
+                     "passive_deletes": bool(lit("passive_deletes", False)), "secondary": (sec, left[0], right[0]),
+                     "write_only": write_only, "refresh_expire": "refresh-expire" in cascade})
 
     def _remote_side(self, v, info, name, module) -> set[int] | None:
         """`remote_side=`: column indexes of the model (id, [id], "id", "[Model.id]", a set or tuple of them)."""
@@ -1686,9 +2331,22 @@ class Project:
                 tgt = st.target if isinstance(st, ast.AnnAssign) else (st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else None)
                 if isinstance(tgt, ast.Name) and tgt.id == cname and isinstance(st.value, ast.Call):
                     try:
-                        return self.column(cname, getattr(st, "annotation", None), st.value, sym.module, st)["ty"]
+                        return self.column(cname, getattr(st, "annotation", None), st.value, sym.module, st,
+                                           self.tam_of(sym))["ty"]
                     except TranspileError:
                         return None
+        for m in self.ix.package_modules():  # a Core Table(name, metadata, Column("cname", Type), ...)
+            for st in m.tree.body:
+                if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.value, ast.Call)
+                        and (dotted(st.value.func) or "").split(".")[-1] == "Table" and st.value.args
+                        and isinstance(st.value.args[0], ast.Constant) and st.value.args[0].value == table):
+                    for a in st.value.args[2:]:
+                        if (isinstance(a, ast.Call) and (dotted(a.func) or "").split(".")[-1] == "Column" and a.args
+                                and isinstance(a.args[0], ast.Constant) and a.args[0].value == cname):
+                            try:
+                                return self.column(cname, None, a, m.name, st)["ty"]
+                            except TranspileError:
+                                return None
         return None
 
     def _fk_target_col(self, col, tinfo, info, name, call, module) -> int:
@@ -1810,16 +2468,69 @@ class Project:
 
         return ast.fix_missing_locations(Subst().visit(copy.deepcopy(ret))), module
 
-    def column(self, name: str, ann, call, module: str, stmt) -> dict:
+    def tam_of(self, sym: Sym, depth: int = 0) -> dict:
+        """The `type_annotation_map` of a mapped class's declarative base (its bases, first found): {annotation
+        key ("str", "datetime.datetime"...): (type expression, its module)}."""
+        cache = self.__dict__.setdefault("_tams", {})
+        if sym in cache:
+            return cache[sym]
+        out: dict = {}
+        node = self.ix.definition(sym)
+        for b in getattr(node, "bases", []) if depth < 10 else []:
+            t = self.resolve(sym.module, b)
+            bn = self.ix.definition(t) if isinstance(t, Sym) else None
+            if not isinstance(bn, ast.ClassDef):
+                continue
+            for st in bn.body:
+                tgt = st.target if isinstance(st, ast.AnnAssign) else st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else None
+                if isinstance(tgt, ast.Name) and tgt.id == "type_annotation_map":
+                    if not isinstance(st.value, ast.Dict) or None in st.value.keys:
+                        raise self.err(f"{t.name}.type_annotation_map: only a dict literal is supported", st, t.module)
+                    for k, v in zip(st.value.keys, st.value.values):
+                        key = self.annotation_key(k, t.module)
+                        if key is None:
+                            raise self.err(f"{t.name}.type_annotation_map: key `{ast.unparse(k)}` is not supported "
+                                           "(types written by name, or generics of them)", k, t.module)
+                        out[key] = (v, t.module)
+                    break
+            else:
+                out = self.tam_of(t, depth + 1)
+            if out:
+                break
+        cache[sym] = out
+        return out
+
+    BUILTIN_KEYS = {"int", "str", "bool", "float", "bytes", "dict", "list"}
+
+    def annotation_key(self, node, module: str) -> str | None:
+        """A Python type as `type_annotation_map` keys it: a builtin's name, else the dotted name of a library type."""
+        if isinstance(node, ast.Name) and node.id in self.BUILTIN_KEYS and self.resolve(module, node) is None:
+            return node.id
+        if isinstance(node, ast.Subscript):
+            # a generic (`dict[str, Any]`): matched as written, the exact annotation (as SQLAlchemy looks it up first)
+            origin = self.annotation_key(node.value, module)
+            return f"{origin}[{ast.unparse(node.slice)}]" if origin else None
+        t = self.resolve(module, node) if isinstance(node, (ast.Name, ast.Attribute)) else None
+        return t.dotted if isinstance(t, Ext) else None
+
+    def column(self, name: str, ann, call, module: str, stmt, tam: dict | None = None) -> dict:
         col = {"name": name, "ty": None, "nullable": None, "pk": False, "default": None, "server_default": False,
-               "onupdate": None, "fk": None, "autoincrement": True, "deferred": False, "jsonb": False}
+               "onupdate": None, "fk": None, "autoincrement": True, "deferred": False, "jsonb": False,
+               "group": None, "raiseload": False}
         if isinstance(call, ast.Call) and isinstance(self.resolve(module, call.func), Ext) and \
                 self.resolve(module, call.func).dotted in {"sqlalchemy.orm.deferred", "sqlalchemy.orm.strategy_options.deferred"}:
-            # `deferred(Column(...))`: left out of the entity's loaded state (read, then unloaded)
-            if len(call.args) != 1 or call.keywords or not isinstance(call.args[0], ast.Call):
-                raise self.err(f"column {name}: only deferred(Column(...)) is supported (no group, raiseload or "
-                               "extra columns)", call, module)
+            # `deferred(Column(...), group=, raiseload=)`: left out of the entity's loaded state (read, then unloaded)
+            if len(call.args) != 1 or not isinstance(call.args[0], ast.Call) or \
+                    any(k.arg not in {"group", "raiseload"} for k in call.keywords):
+                raise self.err(f"column {name}: only deferred(Column(...), group=, raiseload=) is supported (no "
+                               "extra columns or other options)", call, module)
             col["deferred"] = True
+            for k in call.keywords:
+                v = literal(k.value, self.src(module))
+                if k.arg == "group":
+                    col["group"] = str(v)
+                else:
+                    col["raiseload"] = bool(v)
             call = call.args[0]
         optional = False
         if ann is not None:
@@ -1845,10 +2556,25 @@ class Project:
                     col["ty"] = "Date"
                 elif isinstance(t, Ext) and t.dotted == "uuid.UUID":
                     col["ty"] = "Uuid"
+                elif isinstance(t, Ext) and t.dotted == "decimal.Decimal":
+                    col["ty"] = "Numeric"
+                elif isinstance(t, Ext) and t.dotted == "datetime.time":
+                    col["ty"] = "Time"
                 elif pn in {"dict", "list"}:
                     col["ty"] = "Json"
                 elif isinstance(t, Sym) and self.enum_kind(t):
                     col["ty"] = f"Enum(&{self.enum_col(t, False, t.name.lower())})"
+                key = self.annotation_key(p, module) if tam else None
+                if tam and key not in tam and isinstance(p, ast.Subscript) and self.annotation_key(p.value, module) in tam:
+                    # `list[int]` with only `list` in the map: SQLAlchemy's lookup by the generic's origin
+                    raise self.err(f"column {name}: `{ast.unparse(p)}` would take the type_annotation_map entry of "
+                                   f"`{ast.unparse(p.value)}`: not supported (map the generic as written)", stmt, module)
+                if tam and key in tam:
+                    # the base's type_annotation_map: its type for this annotation (an explicit type still wins)
+                    v, vmod = tam[key]
+                    inner_col = self.column(name, None, ast.copy_location(ast.Call(
+                        func=ast.Name("mapped_column", ast.Load()), args=[v], keywords=[]), v), vmod, stmt)
+                    col["ty"], col["jsonb"] = inner_col["ty"], inner_col["jsonb"]
         if call is not None:
             if not isinstance(call, ast.Call):
                 raise self.err(f"column {name}: expected mapped_column(...)", stmt, module)
@@ -1967,14 +2693,23 @@ class Project:
                     col["pk"] = bool(literal(kw.value, self.src(module)))
                 elif kw.arg == "nullable":
                     col["nullable"] = bool(literal(kw.value, self.src(module)))
-                elif kw.arg == "default":
-                    col["default"] = self.col_default(kw.value, module, name)
+                elif kw.arg in ("default", "insert_default"):
+                    # `default=None`: no default (the column stays out of the INSERT and of the instance dict)
+                    if not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
+                        col["default"] = self.col_default(kw.value, module, name)
                 elif kw.arg == "server_default":
                     col["server_default"] = True
                 elif kw.arg == "onupdate":
                     col["onupdate"] = self.col_default(kw.value, module, name)
                 elif kw.arg == "deferred":
-                    col["deferred"] = bool(literal(kw.value, self.src(module)))
+                    col["deferred"] = col["deferred"] or bool(literal(kw.value, self.src(module)))
+                elif kw.arg == "deferred_group":
+                    # a group or a raiseload implies deferred=True (SQLAlchemy's mapped_column)
+                    col["group"] = str(literal(kw.value, self.src(module)))
+                    col["deferred"] = True
+                elif kw.arg == "deferred_raiseload":
+                    col["raiseload"] = bool(literal(kw.value, self.src(module)))
+                    col["deferred"] = col["deferred"] or col["raiseload"]
                 elif kw.arg == "autoincrement":
                     col["autoincrement"] = bool(literal(kw.value, self.src(module)))
                     col["autoincrement_set"] = True
@@ -2100,7 +2835,8 @@ class Project:
         out = []
         for b in self.ix.definition(sym).bases:
             t = self.resolve(sym.module, b)
-            if (isinstance(t, Ext) and t.dotted == "abc.ABC") or dotted(b) == "object":
+            if (isinstance(t, Ext) and t.dotted in {"abc.ABC", "logging.Filter"}) or dotted(b) == "object":
+                # logging.Filter: the logging runtime calls the instance's own `filter(record)`
                 continue
             if isinstance(t, Sym) and t != sym and isinstance(self.ix.definition(t), ast.ClassDef) and self.is_plain_class(t):
                 out.append(t)
@@ -2395,15 +3131,101 @@ class Project:
         )
         return name
 
+    # ---------------------------------------------------------------- generic models
+
+    def typevars(self, node: ast.ClassDef, module: str) -> dict:
+        """The type parameters of a generic model, in order: name -> (bound, default) (AST or None).
+        `Generic[T, ...]` among the bases, or the class's own `[T]` (PEP 695)."""
+        out = {}
+        for tp in getattr(node, "type_params", []) or []:
+            if not isinstance(tp, ast.TypeVar):
+                raise self.err("only TypeVar type parameters are supported", tp, module)
+            out[tp.name] = (tp.bound, getattr(tp, "default_value", None))
+        for b in node.bases:
+            if not isinstance(b, ast.Subscript):
+                continue
+            t = self.resolve(module, b.value)
+            if not (isinstance(t, Ext) and t.dotted in {"typing.Generic", "typing_extensions.Generic"}):
+                continue
+            for a in (b.slice.elts if isinstance(b.slice, ast.Tuple) else [b.slice]):
+                if not isinstance(a, ast.Name):
+                    raise self.err(f"`{ast.unparse(b)}`: TypeVar names only", b, module)
+                d = self.ix.definition(Sym(module, a.id))
+                call = d.value if isinstance(d, (ast.Assign, ast.AnnAssign)) else None
+                ft = self.resolve(module, call.func) if isinstance(call, ast.Call) else None
+                if not (isinstance(ft, Ext) and ft.dotted.split(".")[-1] == "TypeVar"):
+                    raise self.err(f"`{a.id}` is not a TypeVar of this module", a, module)
+                kw = {k.arg: k.value for k in call.keywords}
+                if len(call.args) > 1 or set(kw) - {"bound", "default", "covariant", "contravariant"}:
+                    raise self.err(f"TypeVar `{a.id}`: constraints and options other than bound=/default= are not supported", call, module)
+                out[a.id] = (kw.get("bound"), kw.get("default"))
+        return out
+
+    def specialize(self, sym: Sym, node: ast.ClassDef, name: str, subst: dict, where, wmodule: str) -> Sym:
+        """A generic model with its type parameters replaced (`Response[int]`, named like pydantic does): a copy
+        of the class, compiled as a model of its own."""
+        import copy
+        s = Sym(sym.module, name)
+        if s in self.fe.schema_syms:
+            return s
+
+        class Sub(ast.NodeTransformer):
+            def visit_Name(self, n):
+                return copy.deepcopy(subst[n.id]) if n.id in subst else n
+
+        new = copy.deepcopy(node)
+        new.name = name
+        new.type_params = []
+        new.bases = [Sub().visit(b) for b in new.bases]
+        for st in new.body:
+            if isinstance(st, ast.AnnAssign):
+                st.annotation = Sub().visit(st.annotation)
+        new._py2axum_specialized = True
+        self.fe.schema_syms[s] = new
+        m = self.ix.module(sym.module)
+        if m is not None:
+            m.defs[name] = new
+        return s
+
+    def generic_args(self, sym: Sym, sub: ast.Subscript, module: str, scope=None) -> Sym:
+        """`Model[int]`: the specialized model. Its arguments are written in the model's own module (the same
+        names resolve to the same things there)."""
+        node = self.fe.schema_syms[sym]
+        tvars = self.typevars(node, sym.module)
+        if not tvars or getattr(node, "_py2axum_specialized", False):
+            raise self.err(f"`{ast.unparse(sub)}`: {sym.name} is not a generic model", sub, module)
+        args = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+        if len(args) != len(tvars):
+            raise self.err(f"`{ast.unparse(sub)}`: {len(tvars)} type parameter(s) expected", sub, module)
+        for a in args:
+            for n in ast.walk(a):
+                if isinstance(n, ast.Name) and self.resolve(module, n, scope) != self.resolve(sym.module, n):
+                    raise self.err(f"`{ast.unparse(sub)}`: `{n.id}` must mean the same in {sym.module}", n, module)
+        shown = ", ".join(ast.unparse(a).split(".")[-1] if isinstance(a, ast.Attribute) else ast.unparse(a) for a in args)
+        return self.specialize(sym, node, f"{sym.name}[{shown}]", dict(zip(tvars, args)), sub, module)
+
     def _schema(self, sym: Sym) -> SchemaInfo:
         node = self.fe.schema_syms[sym]
         module = sym.module
+        tvars = self.typevars(node, module) if not getattr(node, "_py2axum_specialized", False) else {}
+        if tvars:
+            # the generic model used as such: a parameter is its default, else its bound, else Any
+            fallback = {n: (d if d is not None else b if b is not None else ast.Name(id="object", ctx=ast.Load()))
+                        for n, (b, d) in tvars.items()}
+            self.specialize(sym, node, f"<generic {sym.name}>", fallback, node, module)
+            node = self.fe.schema_syms.pop(Sym(module, f"<generic {sym.name}>"))
         base = f"{mod_ident(module)}__{ident(sym.name)}"
         info = SchemaInfo(sym, f"SCHEMA_{base}", f"CLS_{base}", [], False, "Ignore")
         self.schemas[sym] = info
         fields: list[dict] = []
         for b in node.bases:
-            t = self.resolve(module, b)
+            if isinstance(b, ast.Subscript):
+                bt = self.resolve(module, b.value)
+                if isinstance(bt, Ext) and bt.dotted in {"typing.Generic", "typing_extensions.Generic"}:
+                    continue
+                t = self.generic_args(bt, b, module) if isinstance(bt, Sym) and bt in self.fe.schema_syms else bt
+            else:
+                t = self.resolve(module, b)
             if isinstance(t, Sym) and t in self.fe.schema_syms:
                 parent = self.schema(t)
                 fields = [dict(f) for f in parent.fields]
@@ -2420,11 +3242,17 @@ class Project:
                 info.__dict__["vinfo"] = dict(parent.__dict__.get("vinfo", {}))
                 if parent.__dict__.get("init") is not None:
                     info.__dict__["init"] = parent.__dict__["init"]
-                for k in ("strip", "lower", "upper", "enum_values", "validate_assignment", "populate_by_name"):
+                for k in ("strip", "lower", "upper", "smin", "smax", "strict", "field_sers", "model_ser", "root", "enum_values", "validate_assignment", "populate_by_name",
+                          "alias_gen", "validate_by_alias", "ser_by_alias"):
                     if k in parent.__dict__:
                         info.__dict__[k] = parent.__dict__[k]
             elif isinstance(t, Ext) and t.dotted.split(".")[-1] == "BaseSettings":
                 info.settings = True
+            elif isinstance(t, Ext) and t.dotted in {"pydantic.RootModel", "pydantic.root_model.RootModel"}:
+                info.__dict__["root"] = True
+                if isinstance(b, ast.Subscript):
+                    fields = [{"name": "root", "alias": None, "default": "Required", "env": None, "cons": {},
+                               "ann": (b.slice, module)}]
             elif not (isinstance(t, Ext) and t.dotted.split(".")[-1] == "BaseModel"):
                 raise self.err(f"schema {sym.name}: base class `{ast.unparse(b)}` is not supported", b, module)
         ns = self.class_namespace(sym, node, module)
@@ -2441,6 +3269,7 @@ class Project:
                     self.private_attr(info, sym, n, stmt.value, module)
                     continue
                 f = {"name": n, "alias": None, "default": "Required", "env": None}
+                ann = self.annotated_validators(info, sym, f, ann, module)
                 if ns:
                     # its default is the class body's final value (class-level `if`s, earlier attributes);
                     # never given a value in the body: required
@@ -2459,7 +3288,7 @@ class Project:
                         cons, opts = self.field_cons(stmt.value, module)
                         self.field_aliases(f, opts, module)
                     f["cons"] = cons
-                    f["ann"] = (ann, module)
+                    f.setdefault("ann", (ann, module))
                     fields = self.put_field(fields, f)
                     continue
                 cons, opts = {}, self.annotated_opts(ann, module)
@@ -2476,11 +3305,11 @@ class Project:
                     f["default"] = self.default_spec(opts["default_factory"], module, True)
                 self.field_aliases(f, opts, module)
                 if "validate_default" in opts and self.const(opts["validate_default"], module):
-                    if f["default"].startswith("Dyn("):
+                    if f["default"].startswith(("Dyn(", "Data(")):
                         raise self.err("Field(validate_default=True) with a computed default is not supported", opts["validate_default"], module)
                     f["validate_default"] = True
                 f["cons"] = cons
-                f["ann"] = (ann, module)
+                f.setdefault("ann", (ann, module))
                 fields = self.put_field(fields, f)
             elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                 n = stmt.targets[0].id
@@ -2518,21 +3347,33 @@ class Project:
                     dec = stmt.decorator_list[last.index("field_validator" if "field_validator" in last else "validator")]
                     names = [self.const(a, module) for a in dec.args]
                     before = False
+                    plain = wrap = False
                     for kw in dec.keywords:
                         if kw.arg == "mode":
                             mode = self.const(kw.value, module)
-                            if mode not in {"after", "before"}:
-                                raise self.err(f"field validators mode={mode!r} are not supported (after/before)", kw, module)
+                            if mode not in {"after", "before", "plain", "wrap"}:
+                                raise self.err(f"field validators mode={mode!r} are not supported", kw, module)
                             before = mode == "before"
+                            plain = mode == "plain"
+                            wrap = mode == "wrap"
                         elif kw.arg == "pre":
                             before = bool(self.const(kw.value, module))
                         elif kw.arg in {"each_item", "always"} and self.const(kw.value, module):
                             raise self.err(f"@validator({kw.arg}=True) is not supported", kw, module)
                         elif kw.arg not in {"mode", "pre", "each_item", "always", "allow_reuse", "check_fields"}:
                             raise self.err(f"@{last[0]}({kw.arg}=) is not supported", kw, module)
-                    kind = self.validator_info(stmt, "field_validator" not in last, before, sym, module)
+                    kind = self.validator_info(stmt, "field_validator" not in last, before, sym, module, wrap)
+                    if wrap:
+                        for n in names:
+                            if n == "*" or any(n in v[0] for v in info.validators + info.__dict__.get("before", [])):
+                                raise self.err(f"schema {sym.name}: a mode='wrap' validator of {n!r} after other validators "
+                                               "of the field is not supported", stmt, module)
+                            info.__dict__.setdefault("wrap_fields", {})[n] = msym
                     if kind:
                         info.__dict__.setdefault("vinfo", {})[msym] = kind
+                    if plain:
+                        # it replaces the field's validation: the type and the validators defined before it
+                        self.plain_validation(info, sym, names, stmt, module)
                     if before:
                         # pydantic wraps the field's schema in definition order: an `after` validator defined
                         # earlier sees the raw input (its errors report it); a `before` one defined later
@@ -2572,7 +3413,7 @@ class Project:
                         raise self.err(f"schema {sym.name}: only `def __init__(self, **data)` is supported", stmt, module)
                     info.__dict__["init"] = msym
                 elif "field_serializer" in last or "model_serializer" in last:
-                    raise self.err(f"schema {sym.name}: @{last[0]} is not supported", stmt, module)
+                    self.serializer(info, sym, stmt, last, msym, module)
                 elif is_dunder(stmt.name) and stmt.name not in DISPATCHED_DUNDERS:
                     raise self.err(f"schema {sym.name}: method {stmt.name} is not supported", stmt, module)
                 else:
@@ -2590,11 +3431,160 @@ class Project:
             if f.get("validate_default") and any(f["name"] in names for names, _ in info.__dict__.get("before", [])):
                 raise self.err(f"schema {sym.name}.{f['name']}: validate_default=True with a mode='before' validator "
                                "is not supported", node, module)
+        if info.__dict__.get("root"):
+            if [f["name"] for f in fields] != ["root"]:
+                raise self.err(f"schema {sym.name}: a RootModel has one field, `root`", node, module)
+            if (info.validators or info.__dict__.get("before") or info.__dict__.get("model_after")
+                    or info.__dict__.get("model_before") or info.__dict__.get("model_ser") or info.__dict__.get("field_sers")
+                    or info.extra != "Ignore" or fields[0].get("aliases")):
+                raise self.err(f"schema {sym.name}: validators, serializers, extra= or aliases on a RootModel are not "
+                               "supported", node, module)
+        self.apply_aliases(info, fields, node, module)
+        for f in fields:
+            if f["name"] in info.__dict__.get("plain_fields", ()):
+                f["any"] = True
+            if f["name"] in info.__dict__.get("wrap_fields", {}):
+                if f.get("any") or f.get("wrap"):
+                    raise self.err(f"schema {sym.name}.{f['name']}: a mode='wrap' validator with a plain or wrap "
+                                   "validator in its annotation is not supported", node, module)
+                f["wrap"] = info.__dict__["wrap_fields"][f["name"]]
         if info.__dict__.get("model_before") and info.__dict__.get("validate_assignment"):
             raise self.err(f"schema {sym.name}: validate_assignment=True with @model_validator(mode=\"before\") is not "
                            "supported (pydantic calls it on every assignment with the whole data)", node, module)
         info.fields = fields
         return info
+
+    def alias_value(self, node: ast.AST, module: str):
+        """A `validation_alias=`: a key (str), or the paths of an `AliasPath`/`AliasChoices` (list of lists)."""
+        if isinstance(node, ast.Call):
+            t = self.resolve(module, node.func)
+            last = t.dotted.split(".")[-1] if isinstance(t, Ext) and t.dotted.startswith("pydantic") else None
+            if last == "AliasPath" and node.args and not node.keywords:
+                path = [self.const(a, module) for a in node.args]
+                if not isinstance(path[0], str) or not all(isinstance(x, (str, int)) and not isinstance(x, bool) for x in path):
+                    raise self.err("AliasPath(...): a key first, then keys or list indexes", node, module)
+                return [path]
+            if last == "AliasChoices" and node.args and not node.keywords:
+                out = []
+                for a in node.args:
+                    v = self.alias_value(a, module)
+                    out += [[v]] if isinstance(v, str) else v
+                return out
+        v = self.const(node, module)
+        if not isinstance(v, str):
+            raise self.err("an alias must be a string, an AliasPath or an AliasChoices", node, module)
+        return v
+
+    def field_aliases(self, f: dict, opts: dict, module: str) -> None:
+        """The aliases a field declares (`alias=`, `validation_alias=`, `serialization_alias=`): kept apart, the
+        model's alias generator and config settle them (`apply_aliases`)."""
+        given = {}
+        if "alias" in opts:
+            v = self.const(opts["alias"], module)
+            if v is not None and not isinstance(v, str):
+                raise self.err("Field(alias=) must be a string", opts["alias"], module)
+            given["alias"] = v
+        if "validation_alias" in opts:
+            given["validation"] = self.alias_value(opts["validation_alias"], module)
+        if "serialization_alias" in opts:
+            v = self.const(opts["serialization_alias"], module)
+            if v is not None and not isinstance(v, str):
+                raise self.err("Field(serialization_alias=) must be a string", opts["serialization_alias"], module)
+            given["serialization"] = v
+        if "union_mode" in opts:
+            v = self.const(opts["union_mode"], module)
+            if v not in ("smart", "left_to_right"):
+                raise self.err("Field(union_mode=) must be 'smart' or 'left_to_right'", opts["union_mode"], module)
+            f["ltr"] = v == "left_to_right"
+        if "exclude_if" in opts:
+            s = Sym(module, f"<ex_{len(self.__dict__.setdefault('lambda_validators', {}))}_{f['name']}>")
+            self.lambda_validators[s] = opts["exclude_if"]
+            f["exclude_if"] = s
+        for k in ("repr", "exclude", "frozen", "strict"):
+            # strict=: the field's own mode (`apply_strict`); repr=False: left out of repr(); exclude=True: of every dump; frozen=True: assignment refused
+            if k in opts:
+                v = self.const(opts[k], module)
+                if not isinstance(v, bool):
+                    raise self.err(f"Field({k}=) must be True or False", opts[k], module)
+                f[k] = v
+        given = {k: v for k, v in given.items() if v is not None}
+        if "alias" in given:
+            # FieldInfo: `alias=` is also the validation and serialization alias the others leave unset
+            given.setdefault("validation", given["alias"])
+            given.setdefault("serialization", given["alias"])
+        if given:
+            f["aliases"] = given
+        f["alias"] = given.get("alias")
+
+    def alias_function(self, node: ast.AST, module: str):
+        """An alias generator as a Python function str -> str (evaluated now, on the field names)."""
+        from . import pydstatic
+        t = self.resolve(module, node)
+        if isinstance(t, Ext) and t.dotted in pydstatic.LIBRARY:
+            return pydstatic.LIBRARY[t.dotted]
+        fn = node if isinstance(node, ast.Lambda) else None
+        if fn is None and isinstance(t, Sym):
+            d = self.ix.definition(t)
+            fn, module = (d, t.module) if isinstance(d, ast.FunctionDef) else (None, module)
+        if fn is None:
+            raise self.err(f"alias generator `{ast.unparse(node)}` is not supported (a pydantic.alias_generators "
+                           "function, a lambda or a one-return function of the name)", node, module)
+        try:
+            return pydstatic.string_function(fn)
+        except pydstatic.NotStatic as x:
+            raise self.err(f"alias generator: `{ast.unparse(x.node)}` cannot be evaluated at translation time "
+                           "(string operations on the field name only)", x.node, module) from None
+
+    def apply_aliases(self, info: SchemaInfo, fields: list[dict], node, module: str) -> None:
+        """Each field's validation key or paths and serialization key, by pydantic's rules
+        (`_apply_alias_generator_to_field_info`: a field that declares an alias keeps it, the generator only
+        fills the others; `validate_by_alias=False` validates by name only)."""
+        gen = info.__dict__.get("alias_gen")
+        fns = {}
+        if gen is not None:
+            gnode, gmodule = gen
+            t = self.resolve(gmodule, gnode.func) if isinstance(gnode, ast.Call) else None
+            if isinstance(t, Ext) and t.dotted.split(".")[-1] == "AliasGenerator" and not gnode.args:
+                for k in gnode.keywords:
+                    if k.arg not in {"alias", "validation_alias", "serialization_alias"}:
+                        raise self.err(f"AliasGenerator({k.arg}=) is not supported", k, gmodule)
+                    if not (isinstance(k.value, ast.Constant) and k.value.value is None):
+                        fns[{"validation_alias": "validation", "serialization_alias": "serialization"}.get(k.arg, k.arg)] = \
+                            self.alias_function(k.value, gmodule)
+            else:
+                fns["alias"] = self.alias_function(gnode, gmodule)
+        by_alias = info.__dict__.get("validate_by_alias", True)
+        if not by_alias and not info.__dict__.get("populate_by_name"):
+            raise self.err(f"schema {info.sym.name}: validate_by_alias=False requires validate_by_name=True", node, module)
+        for f in fields:
+            given = dict(f.get("aliases", {}))
+            if fns:
+                from . import pydstatic
+                try:
+                    made = {k: fn(f["name"]) for k, fn in fns.items()}
+                except pydstatic.NotStatic as x:
+                    raise self.err(f"alias generator: `{ast.unparse(x.node)}` cannot be evaluated at translation time "
+                                   "(string operations on the field name only)", node, module) from None
+                except Exception as x:  # the generator itself fails on this name: pydantic would raise too
+                    raise self.err(f"alias generator failed on {f['name']!r}: {x!r}", node, module) from None
+                if "alias" not in given:
+                    given["alias"] = made.get("alias")
+                for k in ("validation", "serialization"):
+                    if k not in given:
+                        given[k] = made.get(k) or made.get("alias")
+            if given.get("alias") is not None and not isinstance(given["alias"], str):
+                raise self.err(f"schema {info.sym.name}.{f['name']}: the alias generator must return strings", node, module)
+            val = given.get("validation") or given.get("alias")
+            if not by_alias:
+                val = None
+            f["paths"] = []
+            if isinstance(val, list):
+                if len(val) == 1 and len(val[0]) == 1:
+                    val = val[0][0]
+                else:
+                    f["paths"], val = val, None
+            f["alias"] = val
+            f["ser"] = given.get("serialization") or given.get("alias")
 
     @staticmethod
     def put_field(fields: list[dict], f: dict) -> list[dict]:
@@ -2603,13 +3593,190 @@ class Project:
         out = [f if x["name"] == f["name"] else x for x in fields]
         return out if any(x["name"] == f["name"] for x in fields) else out + [f]
 
-    VALIDATION_INFO_ATTRS = {"data", "field_name"}
+    ANNOTATED_VALIDATORS = {"AfterValidator": "after", "BeforeValidator": "before", "PlainValidator": "plain",
+                            "WrapValidator": "wrap", "PlainSerializer": "ser", "WrapSerializer": "serwrap"}
 
-    def validator_info(self, fn, v1: bool, before: bool, sym, module) -> int:
+    def annotated_validators(self, info: SchemaInfo, sym: Sym, f: dict, ann, module: str):
+        """`Annotated[T, AfterValidator(fn), ...]` at the top of a field's annotation (directly or through a type
+        alias): the validators become the field's own, run like `@field_validator`s defined before the class's
+        (pydantic applies the decorators around the annotation's); the annotation without them is returned.
+        `PlainValidator` replaces the type and the validators before it."""
+        expanded, emod = self.expand_alias(ann, module)
+        if not (isinstance(expanded, ast.Subscript) and (dotted(expanded.value) or "").split(".")[-1] == "Annotated"
+                and isinstance(expanded.slice, ast.Tuple)):
+            return ann
+        args = expanded.slice.elts
+        keep, found = [], []
+        for meta in args[1:]:
+            t = self.resolve(emod, meta.func) if isinstance(meta, ast.Call) else None
+            mode = self.ANNOTATED_VALIDATORS.get(t.dotted.split(".")[-1]) if isinstance(t, Ext) and t.dotted.startswith("pydantic") else None
+            if mode is None:
+                if any(m == "wrap" for m, _ in found):
+                    raise self.err(f"`{ast.unparse(meta)}` after a WrapValidator in Annotated[...] is not supported", meta, emod)
+                keep.append(meta)
+                continue
+            if mode in ("ser", "serwrap"):
+                # a serializer: the field's dump, not its validation
+                if len(meta.args) != 1 or any(k.arg != "when_used" for k in meta.keywords):
+                    raise self.err(f"{ast.unparse(meta.func)}(...): a function and when_used= only are supported", meta, emod)
+                when = next((self.const(k.value, emod) for k in meta.keywords), "always")
+                vsym = Sym(emod, f"{sym.name}.<as_{f['name']}>")
+                self.__dict__.setdefault("lambda_validators", {})[vsym] = meta.args[0]
+                f["serializer"] = (vsym, mode == "serwrap", self.function_validator_info(meta.args[0], emod, 2 if mode == "serwrap" else 1),
+                                   self.WHEN_USED[when] if when in self.WHEN_USED else self.err_when(when, meta, emod))
+                continue
+            if len(meta.args) != 1 or meta.keywords:
+                raise self.err(f"{ast.unparse(meta.func)}(...): one function, no options, is supported", meta, emod)
+            if mode == "plain":
+                found, keep = [], []  # what it wraps is never run
+                f["any"] = True
+            if mode == "wrap" and (found or f.get("any") or f.get("wrap")):
+                raise self.err("a WrapValidator after other validators in Annotated[...] is not supported", meta, emod)
+            if found and found[0][0] == "wrap" and mode != "after":
+                raise self.err("only AfterValidator(...) may follow a WrapValidator in Annotated[...]", meta, emod)
+            found.append((mode, meta.args[0]))
+        if not found and not f.get("any"):
+            if len(keep) == len(args) - 1:
+                return ann
+            # serializers only: the annotation without them
+            new = (args[0] if not keep else
+                   ast.copy_location(ast.Subscript(value=expanded.value, slice=ast.Tuple(elts=[args[0], *keep], ctx=ast.Load()),
+                                                   ctx=ast.Load()), expanded))
+            f["ann"] = (new, emod)
+            return new
+        n = f["name"]
+        annot = self.__dict__.setdefault("annotated_syms", set())
+        # a field declared again in a subclass: the parent's annotation validators no longer apply
+        info.validators = [v for v in info.validators if not (v[1] in annot and v[0] == [n])]
+        info.__dict__["before"] = [v for v in info.__dict__.get("before", []) if not (v[1] in annot and v[0] == [n])]
+        afters, befores = [], []
+        for i, (mode, fn) in enumerate(found):
+            vsym = Sym(emod, f"{sym.name}.<av_{n}_{i}>")
+            annot.add(vsym)
+            self.__dict__.setdefault("lambda_validators", {})[vsym] = fn
+            kind = self.function_validator_info(fn, emod, 2 if mode == "wrap" else 1)
+            if mode == "wrap":
+                f["wrap"] = vsym
+            if mode == "before":
+                if kind:
+                    raise self.err("a BeforeValidator taking `info` is not supported", fn, emod)
+                befores.append(([n], vsym))
+            else:
+                if kind:
+                    info.__dict__.setdefault("vinfo", {})[vsym] = kind
+                afters.append(([n], vsym))
+        info.validators[0:0] = afters
+        info.__dict__["before"] = befores + info.__dict__.get("before", [])
+        if befores and afters:
+            raise self.err(f"schema {sym.name}.{n}: BeforeValidator and AfterValidator on one field are not supported", ann, module)
+        if f.get("any"):
+            f["ann"] = (ast.Name(id="object", ctx=ast.Load()), module)
+            return ann
+        if not keep:
+            f["ann"] = (args[0], emod)
+            return args[0]
+        new = ast.Subscript(value=expanded.value, slice=ast.Tuple(elts=[args[0], *keep], ctx=ast.Load()), ctx=ast.Load())
+        ast.copy_location(new, expanded)
+        f["ann"] = (new, emod)
+        return new
+
+    WHEN_USED = {"always": 0, "unless-none": 1, "json": 2, "json-unless-none": 3}
+
+    def err_when(self, when, node, module):
+        raise self.err(f"when_used={when!r} is not supported", node, module)
+
+    def serializer(self, info: SchemaInfo, sym: Sym, stmt, last: list, msym: Sym, module: str) -> None:
+        """`@field_serializer(*fields, mode=, when_used=)` / `@model_serializer(mode=, when_used=)`: called while
+        dumping (synchronously: the method must not await), with the value (a field's), a `handler` (wrap), an
+        `info` when it takes one."""
+        model = "model_serializer" in last
+        dec = stmt.decorator_list[last.index("model_serializer" if model else "field_serializer")]
+        args = dec.args if isinstance(dec, ast.Call) else []
+        kws = dec.keywords if isinstance(dec, ast.Call) else []
+        mode, when = "plain", "always"
+        for k in kws:
+            if k.arg == "mode":
+                mode = self.const(k.value, module)
+            elif k.arg == "when_used":
+                when = self.const(k.value, module)
+            elif k.arg == "return_type" or (k.arg == "check_fields" and not model):
+                pass
+            else:
+                raise self.err(f"@{last[0]}({k.arg}=) is not supported", k, module)
+        if mode not in ("plain", "wrap") or when not in self.WHEN_USED:
+            raise self.err(f"@{'model' if model else 'field'}_serializer(mode={mode!r}, when_used={when!r}) is not supported", dec, module)
+        if isinstance(stmt, ast.AsyncFunctionDef):
+            raise self.err(f"schema {sym.name}.{stmt.name}: an async serializer is not supported", stmt, module)
+        for d, ln in zip(stmt.decorator_list, last):
+            if ln not in {"field_serializer", "model_serializer", "classmethod", "staticmethod"}:
+                raise self.err(f"schema {sym.name}.{stmt.name}: decorator @{ast.unparse(d)} is not supported with a serializer", d, module)
+        a = stmt.args
+        pos = a.posonlyargs + a.args
+        lead = 0 if "staticmethod" in last else 1
+        required = len(pos) - len(a.defaults) - lead
+        base = (0 if model else 1) + (1 if mode == "wrap" else 0)
+        if required not in (base, base + 1) or a.vararg or a.kwonlyargs:
+            raise self.err(f"schema {sym.name}.{stmt.name}: unrecognized serializer signature", stmt, module)
+        entry = (msym, mode == "wrap", required == base + 1, self.WHEN_USED[when])
+        if model:
+            if args:
+                raise self.err("@model_serializer(...) takes no field names", dec, module)
+            info.__dict__["model_ser"] = entry
+            return
+        names = [self.const(x, module) for x in args]
+        if not names or "*" in names:
+            raise self.err("@field_serializer('*') or without field names is not supported", dec, module)
+        sers = {n: e for n, e in info.__dict__.get("field_sers", {}).items()}
+        for n in names:
+            sers[n] = entry
+        info.__dict__["field_sers"] = sers
+
+    def function_validator_info(self, fn, module: str, lead: int = 1) -> int:
+        """0 or 1: whether a validator function (a lambda, a project function) takes `info` after the value (and
+        the handler of a wrap validator: `lead` 2)."""
+        node = fn if isinstance(fn, ast.Lambda) else None
+        if node is None:
+            t = self.resolve(module, fn)
+            node = self.ix.definition(t) if isinstance(t, Sym) else None
+            if not isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                return 0
+            module = t.module
+        a = node.args
+        pos = a.posonlyargs + a.args
+        required = len(pos) - len(a.defaults) - (lead - 1)
+        if required not in (1, 2) or a.vararg or a.kwonlyargs:
+            raise self.err("unrecognized validator signature (the value, then optionally `info`)", node, module)
+        if required == 2 and not isinstance(node, ast.Lambda):
+            name = pos[lead].arg
+            for x in ast.walk(node):
+                if (isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == name
+                        and x.attr not in self.VALIDATION_INFO_ATTRS):
+                    raise self.err(f"ValidationInfo.{x.attr} is not supported (only "
+                                   f"{', '.join(sorted(self.VALIDATION_INFO_ATTRS))})", x, module)
+        return required - 1
+
+    def plain_validation(self, info: SchemaInfo, sym: Sym, names: list, stmt, module: str) -> None:
+        """`@field_validator(..., mode="plain")`: the field's type and the validators defined before it are
+        not run."""
+        for n in names:
+            if n == "*":
+                raise self.err("a mode='plain' validator on '*' is not supported", stmt, module)
+            if any(n in v[0] and v[0] != [n] for v in info.validators + info.__dict__.get("before", [])):
+                raise self.err(f"schema {sym.name}: field {n!r} has a validator shared with other fields before a "
+                               "mode='plain' one (not supported)", stmt, module)
+            info.validators = [v for v in info.validators if v[0] != [n]]
+            info.__dict__["before"] = [v for v in info.__dict__.get("before", []) if v[0] != [n]]
+            info.__dict__.setdefault("plain_fields", set()).add(n)
+
+    VALIDATION_INFO_ATTRS = {"data", "field_name", "context"}
+
+    def validator_info(self, fn, v1: bool, before: bool, sym, module, wrap: bool = False) -> int:
         """What a field validator receives besides the value, by pydantic's own rules (`inspect_validator`,
         `make_generic_v1_field_validator`): 0 nothing, 1 `info` (positional), 2 `values=info.data`."""
         a = fn.args
         pos = (a.posonlyargs + a.args)[1:]  # after cls
+        if wrap:
+            pos = pos[:1] + pos[2:]  # the handler, after the value
         required = [x.arg for x in pos[:len(pos) - len(a.defaults)]] if len(a.defaults) <= len(pos) else []
         if v1:
             names = {x.arg for x in pos + a.kwonlyargs}
@@ -2647,7 +3814,7 @@ class Project:
                 spec = self.default_spec(value.args[0], module, False)
         elif value is not None:
             spec = self.default_spec(value, module, False)
-        if spec is not None and spec.startswith("Dyn("):
+        if spec is not None and spec.startswith(("Dyn(", "Data(")):
             raise self.err(f"schema {sym.name}.{name}: a private attribute's default must be a literal or a factory", value, module)
         private = [p for p in info.__dict__.get("private", []) if p[0] != name]
         info.__dict__["private"] = private + ([(name, spec)] if spec is not None else [])
@@ -2688,24 +3855,15 @@ class Project:
                 raise self.err("class Config: only simple assignments are supported", stmt, module)
         self.config_items(info, items, module)
 
-    def field_aliases(self, f: dict, opts: dict, module: str) -> None:
-        """`alias=`, `validation_alias=`, `serialization_alias=` of a field: the key read on input (validation_alias,
-        else alias) and the key written by a dump `by_alias` (serialization_alias, else alias, else the name)."""
-        names = {}
-        for k in ("alias", "validation_alias", "serialization_alias"):
-            if k in opts:
-                v = None if isinstance(opts[k], ast.Call) else self.const(opts[k], module)
-                if not isinstance(v, str):
-                    # AliasPath / AliasChoices read several keys or a nested one
-                    raise self.err(f"Field({k}=) other than a string is not supported", opts[k], module)
-                names[k] = v
-        f["alias"] = names.get("validation_alias", names.get("alias"))
-        out = names.get("serialization_alias", names.get("alias", f["name"]))
-        f["ser"] = out if out != (f["alias"] or f["name"]) else None
-
     def config_items(self, info: SchemaInfo, keywords, module: str) -> None:
         for kw in keywords:
             v = self.const(kw.value, module) if kw.arg not in {"env_file", "json_encoders", "alias_generator"} else None
+            if kw.arg == "alias_generator":
+                info.__dict__["alias_gen"] = None if isinstance(kw.value, ast.Constant) and kw.value.value is None else (kw.value, module)
+                continue
+            if kw.arg in {"validate_by_alias", "serialize_by_alias"}:
+                info.__dict__["validate_by_alias" if kw.arg == "validate_by_alias" else "ser_by_alias"] = bool(v)
+                continue
             if kw.arg == "from_attributes":
                 info.from_attributes = bool(v)
             elif kw.arg == "extra":
@@ -2731,6 +3889,12 @@ class Project:
                 info.__dict__["lower"] = bool(v)  # the subclass's own config wins over the inherited one
             elif kw.arg == "str_to_upper":
                 info.__dict__["upper"] = bool(v)  # the subclass's own config wins over the inherited one
+            elif kw.arg == "strict":
+                info.__dict__["strict"] = bool(v)
+            elif kw.arg in {"str_min_length", "str_max_length"}:
+                if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < 0):
+                    raise self.err(f"model_config {kw.arg}= must be a non-negative int", kw, module)
+                info.__dict__["smin" if kw.arg == "str_min_length" else "smax"] = v
             elif kw.arg == "validate_assignment":
                 info.__dict__["validate_assignment"] = bool(v)
             elif kw.arg == "frozen":
@@ -2844,7 +4008,12 @@ class Project:
             fc = FnCompiler(self, sym.module, None, name)
             try:
                 value = node.value
-                code = fc.expr(value)
+                t = self.resolve(sym.module, value.func) if isinstance(value, ast.Call) else None
+                if isinstance(node, ast.Assign) and isinstance(t, Ext) and t.dotted in {"sqlalchemy.Table", "sqlalchemy.schema.Table"}:
+                    # a Core table: its descriptor, as an association table's
+                    code = f"V::Class(&{self.core_table(sym, node).cls})"
+                else:
+                    code = fc.expr(value)
                 body = "\n".join("        " + l for l in fc.lines)
                 self.items.append(
                     f"static G_{name}: {RT}::Global = {RT}::Global::new();\n"
@@ -3037,6 +4206,10 @@ class FnCompiler:
         self.cur_exc: list[str] = []
         self.gen = node is not None and not isinstance(node, ast.Lambda) and has_yield(node)
         self.extra_fns: list[str] = []
+        # tracebacks: the nodes being compiled (the innermost is where an exception passes), and the Rust
+        # name of the frame's id (a sub-compiler of the same Python frame shares its parent's)
+        self.pos_nodes: list = []
+        self.fid_name: str | None = parent.fid_name if (parent is not None and node is None) else None
 
     # ---------------------------------------------------------------- output
 
@@ -3049,8 +4222,38 @@ class FnCompiler:
     def tmp(self, prefix: str = "t") -> str:
         return f"__{prefix}{self.p.uid()}"
 
-    def q(self, r_expr: str) -> str:
+    def cur_pos_node(self):
+        fc = self
+        while fc is not None:
+            if fc.pos_nodes:
+                return fc.pos_nodes[-1]
+            fc = fc.parent
+        return None
+
+    def tb_at(self, r_expr: str) -> str:
+        """`r_expr` recording, when it fails, the traceback entry of the innermost node being compiled."""
+        node = self.cur_pos_node()
+        if node is None:
+            return r_expr
+        i = self.p.tb_index(self.module, self.py_func_name(), node)
+        return f"{RT}::trace::at(cx, {r_expr}, &self::TB[{i}], {self.fid_name or '0'})"
+
+    def q_method(self, r_expr: str, node: ast.Call) -> str:
+        """`q` for `obj.name(...)`: a missing attribute is located at `obj.name` (LOAD_ATTR), anything the call
+        raises at the whole call, as in CPython's tracebacks."""
+        if getattr(node.func, "end_col_offset", None) is None or getattr(node, "end_col_offset", None) is None:
+            return self.q(r_expr)
+        f = self.py_func_name()
+        # the call's position is the innermost node being compiled (`await obj.m()`: the await)
+        cur = self.cur_pos_node() or node
+        call, attr = self.p.tb_index(self.module, f, cur), self.p.tb_index(self.module, f, node.func)
+        return self.q(f"{RT}::trace::at_attr(cx, {r_expr}, &self::TB[{call}], &self::TB[{attr}], "
+                      f"{rs(node.func.attr)}, {self.fid_name or '0'})", located=True)
+
+    def q(self, r_expr: str, located: bool = False) -> str:
         """Unwrap a `R` expression, routing the error to the enclosing try or out of the function."""
+        if not located:
+            r_expr = self.tb_at(r_expr)
         if self.sinks:
             label, slot = self.sinks[-1]
             return f"tri!({r_expr}, {label}, {slot})"
@@ -3113,6 +4316,7 @@ class FnCompiler:
                     if self.p.resolve(self.module, ast.Name(local, ast.Load()), node) is None:
                         self.failed_imports.add(local)
         self.locals |= self.failed_imports
+        self.fid_name = "__fid"
         sig = ", ".join(f"mut v_{ident(p.name)}: V" for p in params)
         gen_param = (f", y: &{RT}::web::DepYield" if self.variant == "depgen" else f", y: &{RT}::web::Yielder") if self.gen else ""
         caps = "".join(f", {c}: V" for c in self.captures.values())
@@ -3129,8 +4333,9 @@ class FnCompiler:
         self.emit("#[allow(unreachable_code)]")
         self.emit("Ok(V::None)")
         head = f"pub async fn {self.name}(cx: &Cx{', ' + sig if sig else ''}{caps}{gen_param}) -> R {{"
-        # RecursionError rather than a stack overflow (the process would abort): dynrt::stack_guard
-        guard = f"    {RT}::stack_guard()?;"
+        # RecursionError rather than a stack overflow (the process would abort): dynrt::stack_guard; the
+        # frame's id (an address): a traceback records each frame once per invocation (dynrt/trace.rs)
+        guard = f"    {RT}::stack_guard()?;\n    let __fidv = 0u8;\n    let __fid = std::ptr::addr_of!(__fidv) as usize;"
         if traced:
             # sys.settrace: `call` on entry, `return` / `exception` on exit (dynrt/trace.rs)
             ln, qual = node.lineno, self.qualname() or node.name
@@ -3183,6 +4388,15 @@ class FnCompiler:
         return n
 
     def stmt(self, node: ast.stmt) -> None:
+        if getattr(node, "end_col_offset", None) is None:
+            return self.stmt_(node)
+        self.pos_nodes.append(node)
+        try:
+            return self.stmt_(node)
+        finally:
+            self.pos_nodes.pop()
+
+    def stmt_(self, node: ast.stmt) -> None:
         if self.__dict__.get("traced_fn") and getattr(node, "lineno", None):
             self.emit(f"__lnr.store({node.lineno}, std::sync::atomic::Ordering::Relaxed);")
         if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
@@ -3328,6 +4542,16 @@ class FnCompiler:
             raise self.err(f"unsupported statement `{type(node).__name__}`", node)
 
     def assign(self, target: ast.AST, val: str) -> None:
+        # a failing store (STORE_ATTR, STORE_SUBSCR) is located at its target in a traceback, as in CPython
+        if isinstance(target, (ast.Attribute, ast.Subscript)) and getattr(target, "end_col_offset", None) is not None:
+            self.pos_nodes.append(target)
+            try:
+                return self.assign_(target, val)
+            finally:
+                self.pos_nodes.pop()
+        return self.assign_(target, val)
+
+    def assign_(self, target: ast.AST, val: str) -> None:
         if isinstance(target, ast.Name):
             if self.set_global(target.id, val):
                 return
@@ -3447,12 +4671,11 @@ class FnCompiler:
                 raise self.err("bare `raise` outside an except block", node)
             self.emit(self.raise_code(f"{self.cur_exc[-1]}.clone()"))
             return
-        exc = node.exc
-        if isinstance(exc, (ast.Name, ast.Attribute)) and self.static_ref(exc) is not None and not isinstance(exc, ast.Call):
-            v = self.expr(exc)
-        else:
-            v = self.expr(exc)
-        self.emit(self.raise_code(f"{RT}::raise_v(&{v})"))
+        v = self.expr(node.exc)
+        # `raise X from Y`: Y the cause (None: no context shown)
+        cause = f"Some(&{self.expr(node.cause)})" if node.cause is not None else "None"
+        i = self.p.tb_index(self.module, self.py_func_name(), node)
+        self.emit(self.raise_code(f"{RT}::trace::raised(cx, {RT}::raise_v(&{v}), &self::TB[{i}], {cause})"))
 
     def for_stmt(self, node: ast.For) -> None:
         it = self.expr(node.iter)
@@ -3692,7 +4915,7 @@ class FnCompiler:
             self.ind += 1
             if h.name:
                 self.emit(f"{self.store_name(h.name, h)} = V::Exc({e}.clone());")
-            if self.p.uses_sentry():
+            if self.p.tracks_handling():
                 self.emit(f"let __hg{n} = {RT}::Handling::new(cx, &{e});")
             self.cur_exc.append(e)
             self.block(h.body)
@@ -3766,12 +4989,23 @@ class FnCompiler:
         # time; here a cell filled once the name is bound
         # (a cell variable needs none: the closure holds the cell the binding below fills)
         selfref = node.name in caps and node.name not in self.params and not self.is_cell(node.name)
+        # bound once, by this undecorated `def`: the name always holds this function, read through a weak
+        # reference (`SelfRef`: a strong one is a cycle `Arc` never frees); a cell variable gets a cell of it
+        weak = (node.name in caps and node.name not in self.params and not node.decorator_list
+                and self.bound_once(node))
+        selfref = selfref or weak
         cell = self.tmp("cell") if selfref else None
-        if selfref:
+        if weak:
+            self.emit(f"let {cell} = std::sync::Arc::new({RT}::SelfRef::default());")
+        elif selfref:
             self.emit(f"let {cell} = std::sync::Arc::new(std::sync::OnceLock::<V>::new());")
         held = [c for v, c in caps.items() if not (selfref and v == node.name)] + list(dflts.values())
         hold = "".join(f"let {c} = {c}.clone(); " for c in held)
-        if selfref:
+        if weak and self.is_cell(node.name):
+            hold += f"let {caps[node.name]} = {RT}::ops::cell_of({cell}_c.get()); "
+        elif weak:
+            hold += f"let {caps[node.name]} = {cell}_c.get(); "
+        elif selfref:
             hold += f"let {caps[node.name]} = {cell}_c.get().cloned().unwrap_or(V::Unbound); "
         bind = (f"let mut __s = {RT}::bind_params({rs(qual + '()')}, 0, args, kwargs, &[{spec}])?; let _ = &mut __s; "
                 + "".join(f"let __a{i} = {v}; " for i, v in enumerate(vals)))
@@ -3793,9 +5027,67 @@ class FnCompiler:
               + (" }" if cap_clone else "") + "))")
         for d in reversed(decos):
             fv = self.q(f"{RT}::methods::call_value(cx, &{d}, vec![{fv}], vec![]).await")
+        if weak:
+            t = self.tmp("f")
+            self.emit(f"let {t} = {fv};")
+            self.emit(f"{cell}.set(&{t});")
+            fv = t
         self.emit(f"{self.store_name(node.name, node)} = {fv};")
-        if selfref:
+        if selfref and not weak:
             self.emit(f"let _ = {cell}.set({self.load_local(node.name)});")
+
+    def bound_once(self, d) -> bool:
+        """Is the nested `def` `d` the only binding of its name in this function, run at most once per call
+        (not in a loop), never rebound by a nested function (`nonlocal`) nor deleted?"""
+        if self.node is None or self.comp_scopes:
+            return False
+        name, count = d.name, 0
+        for n in walk_scope(self.node):
+            found: set[str] = set()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                found.add(n.name)
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    target_names(t, found)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr, ast.For, ast.AsyncFor)):
+                target_names(n.target, found)
+            elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+                target_names(n.optional_vars, found)
+            elif isinstance(n, ast.Delete):
+                for t in n.targets:
+                    target_names(t, found)
+            elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name:
+                found.add(n.name)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                found |= {(a.asname or a.name).split(".")[0] for a in n.names}
+            elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+                return False
+            count += name in found
+        if count != 1 or any(isinstance(n, ast.Nonlocal) and name in n.names for n in ast.walk(self.node)):
+            return False
+
+        def in_loop(body, loop: bool) -> bool | None:
+            for st in body:
+                if st is d:
+                    return loop
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                inner = isinstance(st, (ast.For, ast.AsyncFor, ast.While))
+                for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    sub = getattr(st, field, None)
+                    if isinstance(sub, list) and sub:
+                        if field in ("handlers", "cases"):
+                            for h in sub:
+                                r = in_loop(h.body, loop or inner)
+                                if r is not None:
+                                    return r
+                        else:
+                            r = in_loop(sub, loop or (inner and field == "body"))
+                            if r is not None:
+                                return r
+            return None
+
+        return in_loop(self.node.body, False) is False
 
     def scope_root(self):
         """The outermost function enclosing this code: its local imports are visible to nested functions
@@ -3806,6 +5098,26 @@ class FnCompiler:
             if c.node is not None:
                 root = c.node
         return root
+
+    def py_func_name(self) -> str:
+        """`co_name` of the code being compiled: the function's name, `<lambda>`, `<module>` at module level."""
+        fc = self
+        while fc.node is None and fc.parent is not None:
+            fc = fc.parent
+        if fc.node is None:
+            return "<module>"
+        return "<lambda>" if isinstance(fc.node, ast.Lambda) else fc.node.name
+
+    def log_loc(self, node) -> str:
+        """A logging call site (`dynrt::logging::Loc`): file relative to --root, line, function name."""
+        for k in node.keywords:
+            if k.arg == "stacklevel" and not (isinstance(k.value, ast.Constant) and k.value.value == 1):
+                raise self.err(f"logging `stacklevel={ast.unparse(k.value)}` is not supported: the binary records "
+                               "the call site itself, not its callers", k.value)
+        from . import tbfmt
+        text = tbfmt.frame_text(self.p.src(self.module), node.lineno, node.end_lineno, node.col_offset, node.end_col_offset)
+        return (f"&{RT}::logging::Loc {{ file: {rs(self.p.rel_file(self.module))}, line: {node.lineno}, "
+                f"func: {rs(self.py_func_name())}, text: {rs(text)} }}")
 
     def qualname(self) -> str | None:
         """`__qualname__` of the function being compiled (prefix of its nested functions'), None at
@@ -3881,7 +5193,13 @@ class FnCompiler:
         m = getattr(self, "e_" + type(node).__name__, None)
         if m is None:
             raise self.err(f"unsupported expression `{ast.unparse(node)}`", node)
-        return m(node)
+        if getattr(node, "end_col_offset", None) is None:
+            return m(node)
+        self.pos_nodes.append(node)
+        try:
+            return m(node)
+        finally:
+            self.pos_nodes.pop()
 
     def e_Constant(self, node: ast.Constant) -> str:
         v = node.value
@@ -4094,7 +5412,34 @@ class FnCompiler:
         args = ", ".join(f"args.get({i}).cloned().unwrap_or(V::None)" for i in range(len(params)))
         return f"{RT}::func(std::sync::Arc::new(|cx: &Cx, args: Vec<V>| -> {RT}::BoxFut<'_> {{ Box::pin(async move {{ {rust}(cx{', ' + args if args else ''}).await }}) }}))"
 
+    def model_table(self, node: ast.AST, depth: int = 0) -> bool:
+        """`Model.__table__`, or a local variable bound only to one."""
+        if isinstance(node, ast.Attribute) and node.attr == "__table__":
+            ref = self.static_ref(node.value)
+            return isinstance(ref, Sym) and ref in self.p.fe.model_syms
+        if isinstance(node, ast.Name) and depth < 3 and self.is_local(node.id) and self.node is not None:
+            values = [a.value for a in ast.walk(self.scope_root())
+                      if isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == node.id for t in a.targets)]
+            return bool(values) and all(self.model_table(v, depth + 1) for v in values)
+        return False
+
+    TABLE_ATTRS = {"name", "columns", "c"}
+    COLUMNS_ATTRS = {"keys", "values", "get"}
+
+    def check_model_table(self, node: ast.Attribute) -> None:
+        """What the runtime gives of `Model.__table__` is its introspection (name, columns and their name, key,
+        nullable, primary_key, type): a Core use of the table (`t.c.id`, `t.join(...)`, `t.select()`) is refused here
+        rather than raising at run time."""
+        if self.model_table(node.value) and node.attr not in self.TABLE_ATTRS:
+            raise self.err(f"Model.__table__.{node.attr}: the Core use of a mapped class's table is not supported "
+                           "(introspection only: name, columns)", node)
+        if (isinstance(node.value, ast.Attribute) and node.value.attr in {"c", "columns"} and self.model_table(node.value.value)
+                and node.attr not in self.COLUMNS_ATTRS):
+            raise self.err(f"Model.__table__.{node.value.attr}.{node.attr}: a column of a mapped class's table is not "
+                           "supported (iterate the columns, or use Model.attribute)", node)
+
     def e_Attribute(self, node: ast.Attribute) -> str:
+        self.check_model_table(node)
         ref = self.static_ref(node)
         if ref is not None:
             if isinstance(ref, tuple) and ref[0] == "classattr" and self.p.enum_kind(ref[1]):
@@ -4103,6 +5448,8 @@ class FnCompiler:
                     return f"V::Enum(&{self.p.enum(ref[1])[0]}, {names.index(ref[2])})"
             if isinstance(ref, tuple) and ref[0] == "classattr":
                 sym, attr = ref[1], ref[2]
+                if sym in self.p.fe.model_syms and attr == "__mapper__":
+                    raise self.err(f"{sym.name}.__mapper__: the mapper of a mapped class is not supported", node)
                 if sym in self.p.fe.model_syms:
                     if attr == "__table__":
                         return f"V::native({RT}::v::Native::SaTable(&{self.p.sa_table(sym, node, self.module)}))"
@@ -4264,6 +5611,10 @@ class FnCompiler:
     def e_IfExp(self, node: ast.IfExp) -> str:
         return f"(if {self.truthy(node.test)} {{ {self.expr(node.body)} }} else {{ {self.expr(node.orelse)} }})"
 
+    def e_TemplateStr(self, node) -> str:
+        raise self.err("t-strings (template strings, PEP 750, Python 3.14) are not supported: the runtime has no "
+                       "string.templatelib.Template. Build the text with an f-string, or leave the route to Python", node)
+
     def e_JoinedStr(self, node: ast.JoinedStr) -> str:
         s = self.tmp("s")
         parts = [f"let mut {s} = String::new();"]
@@ -4366,20 +5717,35 @@ class FnCompiler:
             return " ".join(parts)
         raise self.err("unsupported comprehension target", target)
 
-    def e_ListComp(self, node) -> str:
+    def e_ListComp(self, node, star_msg: bool = True) -> str:
         out = self.tmp("l")
-        body = self.comprehension(node.generators, lambda: f"{out}.push({self.expr(node.elt)});", [node.elt])
+        if isinstance(node.elt, ast.Starred):
+            # Python 3.15 (PEP 798): `[*it for x in xs]` extends with each iterable; a list display words the
+            # error like `[*1]`, a set or a generator like iter()
+            elt = node.elt.value
+            body = self.comprehension(
+                node.generators,
+                lambda: f"{out}.extend({self.q(f'{RT}::ops::iter_star(&{self.expr(elt)}, {str(star_msg).lower()})')});", [elt])
+        else:
+            body = self.comprehension(node.generators, lambda: f"{out}.push({self.expr(node.elt)});", [node.elt])
         return f"{{ let mut {out}: Vec<V> = Vec::new(); {body} V::list({out}) }}"
 
-    e_GeneratorExp = e_ListComp
+    def e_GeneratorExp(self, node) -> str:
+        return self.e_ListComp(node, star_msg=False)
 
     def e_SetComp(self, node) -> str:
-        return self.q(f"{RT}::methods::b_set(&[{self.e_ListComp(node)}])")
+        return self.q(f"{RT}::methods::b_set(&[{self.e_ListComp(node, star_msg=False)}])")
 
     def e_DictComp(self, node) -> str:
         out = self.tmp("d")
-        body = self.comprehension(node.generators, lambda: f"{out}.push(({self.expr(node.key)}, {self.expr(node.value)}));",
-                                  [node.key, node.value])
+        if node.value is None:
+            # Python 3.15 (PEP 798): `{**m for x in xs}` merges each mapping, later keys win
+            body = self.comprehension(node.generators,
+                                      lambda: f"{out}.extend({self.q(f'{RT}::ops::mapping_pairs(&{self.expr(node.key)})')});",
+                                      [node.key])
+        else:
+            body = self.comprehension(node.generators, lambda: f"{out}.push(({self.expr(node.key)}, {self.expr(node.value)}));",
+                                      [node.key, node.value])
         return f"{{ let mut {out}: Vec<(V, V)> = Vec::new(); {body} {self.q(f'V::dict_from({out})')} }}"
 
     def e_NamedExpr(self, node: ast.NamedExpr) -> str:
@@ -4394,6 +5760,8 @@ class FnCompiler:
         sub = FnCompiler(self.p, self.module, node, "lambda", captures=caps, parent=self)
         params = fn_params(node)
         sub.params = {q.name for q in params}
+        lfid = self.tmp("fid")
+        sub.fid_name = lfid
         body = sub.expr(node.body)
         pre = " ".join(sub.lines)
         dflts: dict[int, str] = {}
@@ -4412,7 +5780,7 @@ class FnCompiler:
                            for i, q in enumerate(params)))
         cap_clone = " ".join(f"let {caps[v]} = {self.capture(v)};" for v in free)
         inner = "".join(f"let {c} = {c}.clone(); " for c in [*caps.values(), *dflts.values()])
-        run = f"{pre} Ok({body})"
+        run = f"let {lfid}v = 0u8; let {lfid} = std::ptr::addr_of!({lfid}v) as usize; {pre} Ok({body})"
         if self.p.traced():
             run = (f"let __tf = ({RT}::trace::enter(cx, {rs(self.module)}, {rs(qual)}, {rs(self.p.rel_file(self.module))}, {node.lineno}).await)?; "
                    f"let __r: R = async {{ {run} }}.await; {RT}::trace::leave(cx, __tf, __r, {node.lineno}).await")
@@ -4682,10 +6050,43 @@ class FnCompiler:
                  "sqlalchemy.update": "update", "sqlalchemy.delete": "delete", "sqlalchemy.select": "select",
                  "sqlalchemy.text": "text", "sqlalchemy.sql.text": "text"}
 
+    def sql_chain(self, node: ast.AST, depth: int = 0) -> set[str]:
+        """The methods called on a SQL construct expression (`insert(M).values(...).returning(...)`), through the
+        local variables bound to one."""
+        out = set()
+        while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            out.add(node.func.attr)
+            node = node.func.value
+        if isinstance(node, ast.Name) and depth < 3 and self.is_local(node.id) and self.node is not None:
+            for a in ast.walk(self.scope_root()):
+                if isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == node.id for t in a.targets):
+                    out |= self.sql_chain(a.value, depth + 1)
+        return out
+
+    JOINED_REFUSED = {"sqlalchemy.dialects.postgresql.insert": "insert", "sqlalchemy.orm.aliased": "aliased"}
+
+    def check_joined_construct(self, node: ast.Call) -> None:
+        """postgresql `insert(Sub)` (ON CONFLICT) / `aliased(Sub)` of a joined table inheritance subclass: refused."""
+        ref = self.static_ref(node.func) if isinstance(node.func, (ast.Name, ast.Attribute)) else None
+        what = self.JOINED_REFUSED.get(ref.dotted) if isinstance(ref, Ext) else None
+        if what is None or not node.args:
+            return
+        t = self.p.resolve(self.module, node.args[0]) if isinstance(node.args[0], (ast.Name, ast.Attribute)) else None
+        info = self.p.models.get(t) if isinstance(t, Sym) and t in self.p.fe.model_syms else None
+        if info is None and isinstance(t, Sym) and t in self.p.fe.model_syms:
+            info = self.p.model(t)
+        if info is not None and info.joins:
+            raise self.err(f"{what}({info.sym.name}) of a joined table inheritance subclass is not supported "
+                           "(several tables)", node)
+
     def sql_kind(self, node: ast.AST, depth: int = 0) -> str | None:
         """The statement a SQL construct expression builds (insert, update, delete, select, text), through its
         method chain (`.where(...).returning(...)`) and the local variables bound to one; None when unknown."""
         while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in ("insert", "update", "delete", "select") and not isinstance(node.func.value, ast.Call):
+                # `obj.collection.insert()` (WriteOnlyCollection), `table.insert()`
+                if not isinstance(self.static_ref(node.func), Ext):
+                    return node.func.attr
             node = node.func.value
         if isinstance(node, ast.Call):
             ref = self.static_ref(node.func)
@@ -4697,6 +6098,9 @@ class FnCompiler:
         return None
 
     def call(self, node: ast.Call, awaited: bool) -> str:
+        if isinstance(node.func, ast.Attribute):
+            self.check_model_table(node.func)
+        self.check_joined_construct(node)
         if isinstance(node.func, ast.Attribute) and node.func.attr == "run_sync":
             raise self.err("conn.run_sync(...) without `await` does nothing in Python: not supported", node)
         if isinstance(node.func, ast.Attribute) and node.func.attr in ("execute", "scalars", "scalar") and node.args and (
@@ -4704,12 +6108,30 @@ class FnCompiler:
             # parameters with an ORM / Core construct: executemany, ORM bulk INSERT / UPDATE by primary key
             params = node.args[1] if len(node.args) >= 2 else next(k.value for k in node.keywords if k.arg == "params")
             kind = self.sql_kind(node.args[0])
-            if node.func.attr != "execute" and not (isinstance(params, ast.Constant) and params.value is None):
+            given = not (isinstance(params, ast.Constant) and params.value is None)
+            chain = self.sql_chain(node.args[0])
+            if given and kind == "insert" and node.func.attr in ("execute", "scalars") and not chain & {
+                    "on_conflict_do_update", "on_conflict_do_nothing"}:
+                # insert().values(...) with a parameter list: one INSERT per dict, the values and the dict's columns
+                chain = set()
+            if given and kind == "update" and node.func.attr == "execute" and not chain & {"returning", "ordered_values"}:
+                # executemany with criteria / bindparam(): Core, one execution per dict (the runtime raises
+                # SQLAlchemy's InvalidRequestError for a list on an ORM entity through the Session)
+                chain = set()
+            if given and kind in ("insert", "update") and chain & {"where", "filter", "filter_by", "values", "ordered_values",
+                                                                    "on_conflict_do_update", "on_conflict_do_nothing"}:
+                # executemany of a statement with its own criteria/values (bindparam()): not modelled
+                raise self.err(f"{node.func.attr}({kind}(...).{sorted(chain & {'where', 'filter', 'filter_by', 'values', 'ordered_values', 'on_conflict_do_update', 'on_conflict_do_nothing'})[0]}(...), "
+                               "parameters) is not supported (ORM bulk INSERT / UPDATE by primary key take the bare "
+                               "statement)", node)
+            if given and kind == "update" and "returning" in chain:
+                raise self.err(f"{node.func.attr}(update(...).returning(...), parameters) is not supported", node)
+            if given and node.func.attr != "execute" and kind not in ("insert", "update"):
                 raise self.err(f".{node.func.attr}(statement, parameters) is not supported (the statement's own bound "
                                "values only; execute(text(...), parameters) takes parameters)", node)
-            if kind not in (None, "text") and not (isinstance(params, ast.Constant) and params.value is None):
-                raise self.err(f"{node.func.attr}({kind}(...), parameters) is not supported (bulk {kind.upper()} / executemany "
-                               "with a parameter list): only a text() statement takes parameters", node)
+            if given and kind not in (None, "text", "insert", "update", "delete", "select"):
+                raise self.err(f"{node.func.attr}({kind}(...), parameters) is not supported (executemany with a "
+                               "parameter list): only text(), insert() and update() statements take parameters", node)
         if isinstance(node.func, ast.Attribute) and node.func.attr == "model_json_schema":
             if node.args or node.keywords:
                 raise self.err(".model_json_schema() with arguments is not supported (pydantic's defaults only)", node)
@@ -4765,11 +6187,14 @@ class FnCompiler:
             self.p.method_edges(node.func.attr)
             args, kwargs = self.dyn_args(node)
             if not awaited and node.func.attr in self.p.async_method_names():
-                return self.q(f"{RT}::aio::call_method_lazy(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}).await")
+                return self.q_method(f"{RT}::aio::call_method_lazy(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}).await", node)
             if awaited:
                 # a synchronous Session's plain methods awaited by mistake: TypeError, like CPython
-                return self.q(f"{RT}::aio::call_method_awaited(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}).await")
-            return self.q(f"{RT}::methods::call_method(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}).await")
+                return self.q_method(f"{RT}::aio::call_method_awaited(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}).await", node)
+            if node.func.attr in LOG_METHODS:
+                # `logger.info(...)`: a logger (or adapter) records its call site; any other object's method runs as usual
+                return self.q_method(f"{RT}::logging::call_at(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}, {self.log_loc(node)}).await", node)
+            return self.q_method(f"{RT}::methods::call_method(cx, &{recv}, {rs(node.func.attr)}, {args}, {kwargs}).await", node)
         f = self.expr(node.func)
         args, kwargs = self.dyn_args(node)
         if not awaited:
@@ -4968,6 +6393,9 @@ class FnCompiler:
         args, kwargs = self.dyn_args(node)
         if sym in self.p.fe.model_syms:
             info = self.p.model(sym)
+            if any(n == "__init__" for n, _, _ in info.methods):
+                # the class's own constructor, on a new (transient) object
+                return self.q(f"{RT}::orm::construct_init(cx, &{info.rust}, {args}, {kwargs}).await")
             if node.args:
                 raise self.err(f"{sym.name}(): mapped classes take keyword arguments only", node)
             return self.q(f"{RT}::orm::construct(&{info.rust}, {kwargs})")
@@ -5124,6 +6552,10 @@ class FnCompiler:
             return self.dist_version(node)
         if name.startswith("sentry_sdk."):
             return self.sentry_call(name, node)
+        if name.startswith("logging.") and name[8:] in LOG_METHODS:
+            # logging.info(...): the root logger, with the call site (the record's pathname, lineno, funcName)
+            args, kwargs = self.dyn_args(node)
+            return self.q(f"{RT}::logging::module_log(cx, {rs(name[8:])}, {args}, {kwargs}, {self.log_loc(node)}).await")
         tmpl = libmap.CALLS.get(name)
         recv, _, meth = name.rpartition(".")
         if tmpl is None and self.object_value(recv, values=False) is not None:
@@ -5323,7 +6755,7 @@ class FnCompiler:
             "iter": f"{RT}::methods::b_list(&{args})", "hash": f"{RT}::methods::b_hash(&{args})",
             "type": f"{RT}::methods::b_type(&{args})",
             "chr": f"{RT}::methods::b_chr(&{args})", "ord": f"{RT}::methods::b_ord(&{args})",
-            "divmod": f"{RT}::methods::b_divmod(&{args})",
+            "divmod": f"{RT}::methods::b_divmod(&{args})", "format": f"{RT}::methods::b_format(&{args})",
             "bytes": f"{RT}::methods::b_bytes(&{args}, &{kwargs})",
             "open": f"{RT}::pathio::open(&{args}, &{kwargs})",
             "sorted": f"{RT}::methods::b_sorted(cx, &{args}[0], &{kwargs}).await",
@@ -5782,6 +7214,8 @@ class RouteBuilder:
                 p.required = False
                 factory = "default_factory" in opts
                 spec = self.p.default_spec(opts["default_factory" if factory else "default"], module, factory)
+                if spec.startswith("Data("):
+                    raise TranspileError(f"{name}: a default_factory taking data is not supported on a parameter", arg, src)
                 if spec.startswith("Dyn("):
                     p.dyn_default = spec[4:-1]
                 else:
@@ -5793,7 +7227,7 @@ class RouteBuilder:
 
             def complex_td(i: str, depth=0) -> bool:
                 # FastAPI's field_annotation_is_complex: model, mapping, sequence, or a union with one
-                if any(i.startswith(f"{RT}::pyd::TD::{k}") for k in ("Schema", "Dict", "List", "Set", "Tuple")):
+                if any(i.startswith(f"{RT}::pyd::TD::{k}") for k in ("Schema", "Dict", "List", "Set", "Tuple", "Coll", "Tagged")):
                     return True
                 if depth < 5 and (i.startswith(f"{RT}::pyd::TD::Optional") or i.startswith(f"{RT}::pyd::TD::Union")):
                     return any(complex_td(by_name[r], depth + 1) for r in re.findall(r"&(\w+)", i) if r in by_name)
@@ -6190,7 +7624,7 @@ class RouteBuilder:
             f"    let __errs = &mut __errv;\n"
             + "".join(f"    {line}\n" for line in lines)
             # a form route's `exc.body` (a FormData) is not set: reading it is an AttributeError, never a wrong value
-            + (f"    {RT}::web::check(__errv)?;\n" if form_route else f"    {RT}::web::check_body(__errv, &__body)?;\n")
+            + (f"    {RT}::web::check(cx, __errv)?;\n" if form_route else f"    {RT}::web::check_body(cx, __errv, &__body)?;\n")
             + (f"    {RT}::web::stream_list_ok(cx, {rs(endpoint)}, &{response_model});\n"
                if response_model and resp_cls in {None, "JSONResponse"} and self.p.__dict__.get("stream_lists", True)
                and has_list_return(fn) and dump is None else "")
@@ -6436,6 +7870,208 @@ def emit_descriptors(p: Project) -> list[str]:
     out.append("fn dflt_unbound() -> V { V::Unbound }")
     out.append("fn dflt_empty_str() -> V { V::str(\"\") }")
     # schemas (their TDs reference each other through statics)
+    errs, has_before = union_errors(p)
+    if errs:
+        raise errs[0][0]
+    for info in list(p.schemas.values()):
+        fields = []
+        wrap_tds = {}
+        for f in info.fields:
+            ann, module = f["ann"]
+            cons = dict(f.get("cons", {}))
+            if info.__dict__.get("strip"):
+                cons["_strip"] = True
+            if info.__dict__.get("lower"):
+                cons["_lower"] = True
+            if info.__dict__.get("upper"):
+                cons["_upper"] = True
+            for k in ("smin", "smax"):
+                if info.__dict__.get(k) is not None:
+                    cons["_" + k] = info.__dict__[k]
+            if f.get("ltr"):
+                cons["_ltr"] = True
+            if info.__dict__.get("enum_values"):
+                cons["_enum_values"] = True
+            if info.__dict__.get("val_json_bytes"):
+                cons["_val_bytes"] = info.__dict__["val_json_bytes"]
+            td = p._static_td(f"{RT}::pyd::TD::Any") if f.get("any") else p.td(ann, module, cons)
+            if "TD::MissingSentinel" in next((i for i, n in p.tds.items() if n == td), "") and f["default"] != "Required":
+                # a field left out of dumps while it holds the sentinel: not reproduced
+                raise p.err(f"schema {info.sym.name}.{f['name']}: a MISSING field with a default is not supported", ann, module)
+            if f.get("wrap"):
+                # a wrap validator decides: the field's type is what its handler validates
+                wrap_tds[f["wrap"]], td = td, p._static_td(f"{RT}::pyd::TD::Any")
+            td = apply_strict(p, info, f, td, ann, module)
+            alias = f"Some({rs(f['alias'])})" if f["alias"] else "None"
+            ser = f"Some({rs(f['ser'])})" if f.get("ser") else "None"
+            paths = ", ".join("&[" + ", ".join(f"{RT}::pyd::PK::S({rs(x)})" if isinstance(x, str) else f"{RT}::pyd::PK::I({x})"
+                                              for x in p_) + "]" for p_ in f.get("paths", []))
+            fields.append(
+                f"{RT}::pyd::FieldDesc {{ name: {rs(f['name'])}, alias: {alias}, ser: {ser}, paths: &[{paths}], td: &{td}, "
+                f"default: {RT}::pyd::Dflt::{f['default']}, env: None, validate_default: {str(bool(f.get('validate_default'))).lower()} }}"
+            )
+        validators = ", ".join(
+            f"{RT}::pyd::ValidatorDesc {{ fields: &[{', '.join(rs(n) for n in names)}], f: {method_wrapper(p, s)}, "
+            f"info: {info.__dict__.get('vinfo', {}).get(s, 0)}, "
+            f"wrap: {('Some(&' + wrap_tds[s] + ')') if s in wrap_tds else 'None'} }}"
+            for names, s in info.validators
+        )
+        methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
+        cattrs = info.__dict__.get("class_attrs", {})
+        if cattrs:
+            methods = ", ".join(x for x in [methods, *(f"({rs(n)}, true, {g}_prop as {RT}::pyd::MethodFn)" for n, g in cattrs.items())] if x)
+        out.append(
+            f"pub static {info.cls}: {RT}::v::Class = {RT}::v::Class {{ name: {rs(info.sym.name)}, qualname: {rs(info.sym.qual)}, "
+            f"bases: &[{('&' + info.__dict__['base_cls']) if info.__dict__.get('base_cls') else ''}], kind: {RT}::v::ClassKind::Schema(&{info.rust}) }};\n"
+            f"pub static {info.rust}: {RT}::pyd::SchemaDesc = {RT}::pyd::SchemaDesc {{ name: {rs(info.sym.name)}, class: &{info.cls}, "
+            f"fields: &[{', '.join(fields)}], from_attributes: {str(info.from_attributes).lower()}, "
+            f"extra: {RT}::pyd::Extra::{info.extra}, validators: &[{validators}], "
+            f"validate_assignment: {str(bool(info.__dict__.get('validate_assignment'))).lower()}, "
+            f"populate_by_name: {str(bool(info.__dict__.get('populate_by_name'))).lower()}, methods: &[{methods}], "
+            f"open: {str(bool(info.__dict__.get('open'))).lower()}, "
+            f"model_after: &[{', '.join(f'{method_wrapper(p, m)} as {RT}::pyd::MethodFn' for m in info.__dict__.get('model_after', []))}], "
+            f"before: &[{', '.join(f'{RT}::pyd::ValidatorDesc {{ fields: &[{chr(44).join(rs(n) for n in names)}], f: {method_wrapper(p, s_)}, info: 0, wrap: None }}' for names, s_ in info.__dict__.get('before', []))}], "
+            f"model_before: &[{', '.join(f'{method_wrapper(p, m)} as {RT}::pyd::MethodFn' for m in info.__dict__.get('model_before', []))}], "
+            f"has_before: {str(info.rust in has_before).lower()}, "
+            f"frozen: {str(bool(info.__dict__.get('frozen'))).lower()}, "
+            f"post_init: {('Some(' + method_wrapper(p, info.__dict__['post_init']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('post_init') else 'None'}, "
+            f"hash: {RT}::pyd::HashKind::{hash_kind(info)}, dataclass: {str(bool(info.__dict__.get('dataclass'))).lower()}, "
+            f"async_methods: {async_names(p, info.methods)}, "
+            f"slots: &[{', '.join(rs(x) for x in info.__dict__.get('slots', []))}], "
+            f"settings: {settings_desc(info)}, "
+            f"ser_bytes: {RT}::pyd::BytesMode::{ {'base64': 'Base64', 'hex': 'Hex'}.get(info.__dict__.get('ser_json_bytes') or '', 'Utf8') }, "
+            f"computed: &[{', '.join(computed_entry(p, info, n) for n in info.__dict__.get('computed', []))}], "
+            f"json_schema: {('Some(' + rs(p.json_schemas()[0][info.sym]) + ')') if info.sym in p.json_schemas()[0] else 'None'}, "
+            f"init: {('Some(' + method_wrapper(p, info.__dict__['init']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('init') else 'None'}, "
+            f"private: &[{', '.join(f'({rs(n)}, {RT}::pyd::Dflt::{d})' for n, d in info.__dict__.get('private', []))}], "
+            f"x: {schema_x(p, info)} }};"
+        )
+    # INSERT order: rank = 1 + the highest rank of the tables a model references (cycles cut)
+    secondaries = list(p.__dict__.get("secondaries", {}).values())
+    by_table = {m.table: m for m in [*p.models.values(), *secondaries]}
+    ranks: dict[str, int] = {}
+
+    def rank(table: str, seen: frozenset = frozenset()) -> int:
+        if table not in ranks:
+            refs = [t for t in by_table[table].fk_tables if t != table and t in by_table and t not in seen]
+            ranks[table] = 1 + max((rank(t, seen | {table}) for t in refs), default=-1)
+        return ranks[table]
+
+    for t in by_table:
+        rank(t)
+    for info in [*p.models.values(), *secondaries]:
+        cols = []
+        for c in info.cols:
+            d = f"{RT}::orm::ColDefault::{c['default']}" if c["default"] else f"{RT}::orm::ColDefault::None"
+            u = f"{RT}::orm::ColDefault::{c['onupdate']}" if c["onupdate"] else f"{RT}::orm::ColDefault::None"
+            cols.append(
+                f"{RT}::orm::ColDesc {{ name: {rs(c['name'])}, sql: {rs(c.get('sql') or c['name'])}, ty: {RT}::orm::ColTy::{c['ty']}, nullable: {str(c['nullable']).lower()}, "
+                f"pk: {str(c['pk']).lower()}, autoincrement: {str(c['autoincrement']).lower()}, default: {d}, "
+                f"server_default: {str(c['server_default']).lower()}, onupdate: {u}, deferred: {str(c['deferred']).lower()}, "
+                f"group: {'Some(' + rs(c['group']) + ')' if c.get('group') else 'None'}, raiseload: {str(c.get('raiseload', False)).lower()}, "
+                f"jsonb: {str(c['jsonb']).lower()}, "
+                f"table: {('Some(' + rs(c['table']) + ')') if c.get('table') and c['table'] != info.table else 'None'} }}"
+            )
+        methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
+        b = lambda x: str(bool(x)).lower()  # noqa: E731
+
+        def sec_of(r):
+            sec = r.get("secondary")
+            return f"Some((&{sec[0].rust}, {sec[1]}, {sec[2]}))" if sec else "None"
+
+        rels = ", ".join(
+            f"{RT}::orm::RelDesc {{ name: {rs(r['name'])}, target: &{p.models[r['target']].rust}, m2o: {b(r['m2o'])}, "
+            f"local: {r['local']}, remote: {r['remote']}, uselist: {b(r['uselist'])}, lazy: {RT}::orm::Lazy::{r['lazy']}, "
+            f"back: {'Some(' + rs(r['back']) + ')' if r['back'] else 'None'}, delete: {b(r['delete'])}, "
+            f"orphan: {b(r['orphan'])}, passive_deletes: {b(r['passive_deletes'])}, "
+            f"order: &[{', '.join(f'({i}, {b(d)})' for i, d in r.get('order', []))}], "
+            f"secondary: {sec_of(r)}, write_only: {b(r.get('write_only', False))}, "
+            f"refresh_expire: {b(r.get('refresh_expire', False))} }}"
+            for r in (info.rels or [])
+        )
+        fks = ", ".join(f"({i}, {rs(c['fk'])}, {rs(c.get('fk_col') or 'id')})" for i, c in enumerate(info.cols) if c.get("fk"))
+        out.append(
+            f"pub static {info.cls}: {RT}::v::Class = {RT}::v::Class {{ name: {rs(info.sym.name)}, qualname: {rs(info.sym.qual)}, "
+            f"bases: &[{('&' + p.models[info.parent].cls) if getattr(info, 'parent', None) else ''}], "
+            f"kind: {RT}::v::ClassKind::Model(&{info.rust}) }};\n"
+            f"pub static {info.rust}: {RT}::orm::ModelDesc = {RT}::orm::ModelDesc {{ name: {rs(info.sym.name)}, "
+            f"class_qualname: {rs(info.sym.qual)}, table: {rs(info.table)}, class: &{info.cls}, cols: &[{', '.join(cols)}], "
+            f"pk: {info.pk}, pks: &[{', '.join(str(i) for i in info.pks)}], fk_tables: &[{', '.join(rs(t) for t in info.fk_tables)}], "
+            f"fks: &[{fks}], "
+            f"rank: {ranks[info.table]}, "
+            f"methods: &[{methods}], class_methods: &[{', '.join(rs(n) for n in class_level_methods(p, info.methods))}], "
+            f"rels: &[{rels}], async_methods: {async_names(p, info.methods)}, hybrids: &[{hybrids_of(p, info)}], "
+            f"eager_defaults: {str(info.eager_defaults).lower()}, {poly_fields(p, info)}, "
+            f"core: {str(any(info is x for x in secondaries)).lower()}, "
+            f"composites: &[{', '.join(composite_desc(c) for c in info.__dict__.get('composites', []))}] }};"
+        )
+    # TDs last: emitting schemas may have created new ones
+    for init, name in p.tds.items():
+        out.append(f"static {name}: {RT}::pyd::TD = {init};")
+    return out
+
+
+def composite_desc(c: dict) -> str:
+    return (f"{RT}::orm::CompositeDesc {{ name: {rs(c['name'])}, cols: &[{', '.join(map(str, c['cols']))}], "
+            f"ctor: {c['ctor']} as {RT}::v::ClsAttr, none_on_null: {str(c['none']).lower()} }}")
+
+
+PLAIN_DECORATORS = {"lru_cache", "cache", "staticmethod", "classmethod", "property"}
+
+
+def async_names(p: "Project", methods) -> str:
+    """`&["m", ...]`: the methods of a class table that are `async def`s (not generators)."""
+    out = []
+    for n, prop, s in methods:
+        try:
+            node = p.fn_node(s)
+        except TranspileError:
+            continue
+        if isinstance(node, ast.AsyncFunctionDef) and not has_yield(node) and not prop:
+            out.append(rs(n))
+    return "&[" + ", ".join(out) + "]"
+
+# dunder methods the runtime dispatches to (str(), repr(), ==/!= and the containers' comparisons, `async for`)
+DISPATCHED_DUNDERS = {"__str__", "__repr__", "__eq__", "__aenter__", "__aexit__", "__enter__", "__exit__", "__call__",
+                      "__aiter__", "__anext__", "__getattr__", "__setattr__", "__composite_values__"}
+
+
+def is_dunder(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__")
+
+
+SCALAR_TDS = ("Int(", "Float(", "Str(", "Bool", "Date", "DateTime", "Time", "Delta", "Decimal(", "Uuid", "Enum(", "Bytes(", "Url(",
+              "Email(")
+
+
+def apply_strict(p, info, f, td: str, ann, module) -> str:
+    """Strict mode of a field: `model_config strict=True` covers its whole type (items included, nested models
+    excepted), `Field(strict=True)` the type itself (a container's items keep the model's mode), `Field(strict=
+    False)` in a strict model a scalar (an optional one included)."""
+    own, model = f.get("strict"), bool(info.__dict__.get("strict"))
+    if own is None:
+        return p._static_td(f"{RT}::pyd::TD::Strict(&{td}, true)") if model else td
+    init = next(i for i, n in p.tds.items() if n == td)
+    base = init
+    if base.startswith(f"{RT}::pyd::TD::Optional(&"):
+        base = next(i for i, n in p.tds.items() if n == base[len(f"{RT}::pyd::TD::Optional(&"):-1])
+    shape = base[len(f"{RT}::pyd::TD::"):]
+    if own:
+        if not (shape.startswith(SCALAR_TDS) or shape.startswith(("List(", "Tuple(", "TupleFix(", "Set(", "Dict(", "Len("))):
+            raise p.err(f"Field(strict=True) on `{ast.unparse(ann)}` is not supported (a scalar, a container, or "
+                        "an optional one)", ann, module)
+        inner = p._static_td(f"{RT}::pyd::TD::StrictTop(&{td})")
+        return p._static_td(f"{RT}::pyd::TD::Strict(&{inner}, true)") if model else inner
+    if model and not shape.startswith(SCALAR_TDS):
+        raise p.err(f"Field(strict=False) on `{ast.unparse(ann)}` in a strict model is not supported (scalars "
+                    "only)", ann, module)
+    return p._static_td(f"{RT}::pyd::TD::Strict(&{td}, false)")
+
+
+def union_errors(p) -> tuple[list, set]:
+    """The unions the runtime cannot validate as Pydantic does: (error, the union's TD), checked on every TD.
+    A member with `mode='before'` validators (directly or in a model it holds: the before pass does not enter a
+    union), or, for a smart union, with validators (a raising one would make Pydantic try the next member)."""
     # transitive `has_before`: a model with mode="before" validators, or containing one
     by_init = {v: k for k, v in p.tds.items()}
 
@@ -6470,144 +8106,45 @@ def emit_descriptors(p: Project) -> list[str]:
     # after validators run once the member is chosen: a raising one would make Pydantic try the next member
     has_after = closure({i.rust for i in p.schemas.values() if i.validators or i.__dict__.get("model_after")})
     names = {i.rust: i.sym.name for i in p.schemas.values()}
-    for init, td in p.tds.items():
-        if "TD::Union(" not in init:
+    out = []
+    for init, td in list(p.tds.items()):
+        if "TD::Union(" not in init and "TD::UnionLtr(" not in init and "TD::Tagged(" not in init:
             continue
         node, module = p.__dict__.get("union_src", {}).get(init, (None, None))
+        # a discriminated union never tries another member: only the before pass (not run inside it) matters
+        tagged = "TD::Tagged(" in init
         for bad, what in ((refs(td) & has_before, "mode='before' validators"),
-                          (refs(td) & has_after, "validators, which would make Pydantic try the next member when they raise")):
+                          (set() if tagged else refs(td) & has_after,
+                           "validators, which would make Pydantic try the next member when they raise")):
             if bad:
                 msg = f"a Union containing {names.get(sorted(bad)[0], sorted(bad)[0])} ({what}) is not supported"
-                raise p.err(msg, node, module) if node is not None else TranspileError(msg)
-    for info in list(p.schemas.values()):
-        fields = []
-        for f in info.fields:
-            ann, module = f["ann"]
-            cons = dict(f.get("cons", {}))
-            if info.__dict__.get("strip"):
-                cons["_strip"] = True
-            if info.__dict__.get("lower"):
-                cons["_lower"] = True
-            if info.__dict__.get("upper"):
-                cons["_upper"] = True
-            if info.__dict__.get("enum_values"):
-                cons["_enum_values"] = True
-            if info.__dict__.get("val_json_bytes"):
-                cons["_val_bytes"] = info.__dict__["val_json_bytes"]
-            td = p._static_td(f"{RT}::pyd::TD::Any") if f.get("any") else p.td(ann, module, cons)
-            alias = f"Some({rs(f['alias'])})" if f["alias"] else "None"
-            ser = f"Some({rs(f['ser'])})" if f.get("ser") else "None"
-            fields.append(
-                f"{RT}::pyd::FieldDesc {{ name: {rs(f['name'])}, alias: {alias}, td: &{td}, "
-                f"default: {RT}::pyd::Dflt::{f['default']}, env: None, validate_default: {str(bool(f.get('validate_default'))).lower()}, ser: {ser} }}"
-            )
-        validators = ", ".join(
-            f"{RT}::pyd::ValidatorDesc {{ fields: &[{', '.join(rs(n) for n in names)}], f: {method_wrapper(p, s)}, "
-            f"info: {info.__dict__.get('vinfo', {}).get(s, 0)} }}"
-            for names, s in info.validators
-        )
-        methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
-        cattrs = info.__dict__.get("class_attrs", {})
-        if cattrs:
-            methods = ", ".join(x for x in [methods, *(f"({rs(n)}, true, {g}_prop as {RT}::pyd::MethodFn)" for n, g in cattrs.items())] if x)
-        out.append(
-            f"pub static {info.cls}: {RT}::v::Class = {RT}::v::Class {{ name: {rs(info.sym.name)}, qualname: {rs(info.sym.qual)}, "
-            f"bases: &[{('&' + info.__dict__['base_cls']) if info.__dict__.get('base_cls') else ''}], kind: {RT}::v::ClassKind::Schema(&{info.rust}) }};\n"
-            f"pub static {info.rust}: {RT}::pyd::SchemaDesc = {RT}::pyd::SchemaDesc {{ name: {rs(info.sym.name)}, class: &{info.cls}, "
-            f"fields: &[{', '.join(fields)}], from_attributes: {str(info.from_attributes).lower()}, "
-            f"extra: {RT}::pyd::Extra::{info.extra}, validators: &[{validators}], "
-            f"validate_assignment: {str(bool(info.__dict__.get('validate_assignment'))).lower()}, "
-            f"populate_by_name: {str(bool(info.__dict__.get('populate_by_name'))).lower()}, methods: &[{methods}], "
-            f"open: {str(bool(info.__dict__.get('open'))).lower()}, "
-            f"model_after: &[{', '.join(f'{method_wrapper(p, m)} as {RT}::pyd::MethodFn' for m in info.__dict__.get('model_after', []))}], "
-            f"before: &[{', '.join(f'{RT}::pyd::ValidatorDesc {{ fields: &[{chr(44).join(rs(n) for n in names)}], f: {method_wrapper(p, s_)}, info: 0 }}' for names, s_ in info.__dict__.get('before', []))}], "
-            f"model_before: &[{', '.join(f'{method_wrapper(p, m)} as {RT}::pyd::MethodFn' for m in info.__dict__.get('model_before', []))}], "
-            f"has_before: {str(info.rust in has_before).lower()}, "
-            f"frozen: {str(bool(info.__dict__.get('frozen'))).lower()}, "
-            f"post_init: {('Some(' + method_wrapper(p, info.__dict__['post_init']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('post_init') else 'None'}, "
-            f"hash: {RT}::pyd::HashKind::{hash_kind(info)}, dataclass: {str(bool(info.__dict__.get('dataclass'))).lower()}, "
-            f"async_methods: {async_names(p, info.methods)}, "
-            f"slots: &[{', '.join(rs(x) for x in info.__dict__.get('slots', []))}], "
-            f"settings: {settings_desc(info)}, "
-            f"ser_bytes: {RT}::pyd::BytesMode::{ {'base64': 'Base64', 'hex': 'Hex'}.get(info.__dict__.get('ser_json_bytes') or '', 'Utf8') }, "
-            f"computed: &[{', '.join(computed_entry(p, info, n) for n in info.__dict__.get('computed', []))}], "
-            f"json_schema: {('Some(' + rs(p.json_schemas()[0][info.sym]) + ')') if info.sym in p.json_schemas()[0] else 'None'}, "
-            f"init: {('Some(' + method_wrapper(p, info.__dict__['init']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('init') else 'None'}, "
-            f"private: &[{', '.join(f'({rs(n)}, {RT}::pyd::Dflt::{d})' for n, d in info.__dict__.get('private', []))}] }};"
-        )
-    # INSERT order: rank = 1 + the highest rank of the tables a model references (cycles cut)
-    by_table = {m.table: m for m in p.models.values()}
-    ranks: dict[str, int] = {}
-
-    def rank(table: str, seen: frozenset = frozenset()) -> int:
-        if table not in ranks:
-            refs = [t for t in by_table[table].fk_tables if t != table and t in by_table and t not in seen]
-            ranks[table] = 1 + max((rank(t, seen | {table}) for t in refs), default=-1)
-        return ranks[table]
-
-    for t in by_table:
-        rank(t)
-    for info in p.models.values():
-        cols = []
-        for c in info.cols:
-            d = f"{RT}::orm::ColDefault::{c['default']}" if c["default"] else f"{RT}::orm::ColDefault::None"
-            u = f"{RT}::orm::ColDefault::{c['onupdate']}" if c["onupdate"] else f"{RT}::orm::ColDefault::None"
-            cols.append(
-                f"{RT}::orm::ColDesc {{ name: {rs(c['name'])}, sql: {rs(c.get('sql') or c['name'])}, ty: {RT}::orm::ColTy::{c['ty']}, nullable: {str(c['nullable']).lower()}, "
-                f"pk: {str(c['pk']).lower()}, autoincrement: {str(c['autoincrement']).lower()}, default: {d}, "
-                f"server_default: {str(c['server_default']).lower()}, onupdate: {u}, deferred: {str(c['deferred']).lower()}, "
-                f"jsonb: {str(c['jsonb']).lower()} }}"
-            )
-        methods = ", ".join(f"({rs(n)}, {str(prop).lower()}, {method_wrapper(p, s)} as {RT}::pyd::MethodFn)" for n, prop, s in info.methods)
-        b = lambda x: str(bool(x)).lower()  # noqa: E731
-        rels = ", ".join(
-            f"{RT}::orm::RelDesc {{ name: {rs(r['name'])}, target: &{p.models[r['target']].rust}, m2o: {b(r['m2o'])}, "
-            f"local: {r['local']}, remote: {r['remote']}, uselist: {b(r['uselist'])}, lazy: {RT}::orm::Lazy::{r['lazy']}, "
-            f"back: {'Some(' + rs(r['back']) + ')' if r['back'] else 'None'}, delete: {b(r['delete'])}, "
-            f"orphan: {b(r['orphan'])}, passive_deletes: {b(r['passive_deletes'])}, "
-            f"order: &[{', '.join(f'({i}, {b(d)})' for i, d in r.get('order', []))}] }}"
-            for r in (info.rels or [])
-        )
-        fks = ", ".join(f"({i}, {rs(c['fk'])}, {rs(c.get('fk_col') or 'id')})" for i, c in enumerate(info.cols) if c.get("fk"))
-        out.append(
-            f"pub static {info.cls}: {RT}::v::Class = {RT}::v::Class {{ name: {rs(info.sym.name)}, qualname: {rs(info.sym.qual)}, "
-            f"bases: &[], kind: {RT}::v::ClassKind::Model(&{info.rust}) }};\n"
-            f"pub static {info.rust}: {RT}::orm::ModelDesc = {RT}::orm::ModelDesc {{ name: {rs(info.sym.name)}, "
-            f"class_qualname: {rs(info.sym.qual)}, table: {rs(info.table)}, class: &{info.cls}, cols: &[{', '.join(cols)}], "
-            f"pk: {info.pk}, pks: &[{', '.join(str(i) for i in info.pks)}], fk_tables: &[{', '.join(rs(t) for t in info.fk_tables)}], "
-            f"fks: &[{fks}], "
-            f"rank: {ranks[info.table]}, "
-            f"methods: &[{methods}], class_methods: &[{', '.join(rs(n) for n in class_level_methods(p, info.methods))}], "
-            f"rels: &[{rels}], async_methods: {async_names(p, info.methods)} }};"
-        )
-    # TDs last: emitting schemas may have created new ones
-    for init, name in p.tds.items():
-        out.append(f"static {name}: {RT}::pyd::TD = {init};")
-    return out
+                out.append((p.err(msg, node, module) if node is not None else TranspileError(msg), td))
+                break
+    return out, has_before
 
 
-PLAIN_DECORATORS = {"lru_cache", "cache", "staticmethod", "classmethod", "property"}
+def schema_x(p, info) -> str:
+    """The `SchemaX` of a model (its rarer options)."""
+    names = lambda flag, value: ", ".join(rs(f["name"]) for f in info.fields if f.get(flag, not value) == value)  # noqa: E731
+    excl = [f"({rs(f['name'])}, {method_wrapper(p, f['exclude_if'])} as {RT}::pyd::MethodFn)"
+            for f in info.fields if f.get("exclude_if")]
 
-
-def async_names(p: "Project", methods) -> str:
-    """`&["m", ...]`: the methods of a class table that are `async def`s (not generators)."""
-    out = []
-    for n, prop, s in methods:
-        try:
-            node = p.fn_node(s)
-        except TranspileError:
-            continue
-        if isinstance(node, ast.AsyncFunctionDef) and not has_yield(node) and not prop:
-            out.append(rs(n))
-    return "&[" + ", ".join(out) + "]"
-
-# dunder methods the runtime dispatches to (str(), repr(), ==/!= and the containers' comparisons, `async for`)
-DISPATCHED_DUNDERS = {"__str__", "__repr__", "__eq__", "__aenter__", "__aexit__", "__enter__", "__exit__", "__call__",
-                      "__aiter__", "__anext__", "__getattr__", "__setattr__"}
-
-
-def is_dunder(name: str) -> bool:
-    return name.startswith("__") and name.endswith("__")
+    def ser(field: str, e, deco: bool) -> str:
+        s, wrap, info_arg, when = e
+        return (f"{RT}::pyd::Ser {{ field: {rs(field)}, f: {method_wrapper(p, s)}, wrap: {str(wrap).lower()}, "
+                f"info: {str(bool(info_arg)).lower()}, when: {when}, deco: {str(deco).lower()} }}")
+    sers = {f["name"]: (f["serializer"], False) for f in info.fields if f.get("serializer")}
+    # the decorator wins over the annotation's
+    sers.update({n: (e, True) for n, e in info.__dict__.get("field_sers", {}).items()})
+    for n in sers:
+        if not any(f["name"] == n for f in info.fields):
+            raise TranspileError(f"{info.sym.module}: schema {info.sym.name}: @field_serializer of an unknown field {n!r}")
+    ms = info.__dict__.get("model_ser")
+    return (f"{RT}::pyd::SchemaX {{ ser_by_alias: {str(bool(info.__dict__.get('ser_by_alias'))).lower()}, "
+            f"exclude: &[{names('exclude', True)}], norepr: &[{names('repr', False)}], frozen: &[{names('frozen', True)}], "
+            f"exclude_if: &[{', '.join(excl)}], field_ser: &[{', '.join(ser(n, e, d) for n, (e, d) in sers.items())}], "
+            f"model_ser: {('Some(' + ser('', ms, True) + ')') if ms else 'None'}, "
+            f"root: {str(bool(info.__dict__.get('root'))).lower()} }}")
 
 
 def settings_desc(info) -> str:
@@ -6889,6 +8426,13 @@ async fn serve() {{
     let app = Arc::new(dynrt::AppState {{ pool, expire_on_commit: {expire}, autoflush: {autoflush}, commit_after: {commit}, sync_session: {sync} }});
     dynrt::set_root(app.clone());
     dynrt::set_python({pymajor}, {pyminor});
+    dynrt::set_python_patch({pypatch});
+    dynrt::set_python_features(&[{pyfeatures}]);
+    dynrt::orm::set_sqlalchemy({sa_major}, {sa_minor});
+    dynrt::logging::init_clock();
+    dynrt::logging::set_source_root({source_root});
+    // uvicorn's Config.configure_logging(): its LOGGING_CONFIG and options, before the import
+    dynrt::uvicorn::configure_logging();
     dynrt::web::set_strict_content_type({strict_ct});
     dynrt::web::set_root_path({root_path});
     dynrt::web::set_starlette({starlette_major}, {starlette_minor});
@@ -6907,25 +8451,26 @@ async fn serve() {{
         std::process::exit(1);
     }}
     let router = gen::router(app.clone()){layers};
+    dynrt::uvicorn::started();
     // FastAPI(lifespan=...): its code before `yield` runs before the server listens, the rest after it stops
     let lcx = dynrt::root_cx();
+    dynrt::uvicorn::lifespan_info("Waiting for application startup.");
     let lifespan = match gen::lifespan(&lcx).await {{
         Ok(None) => None,
         Ok(Some(f)) => match dynrt::web::lifespan_start(&lcx, f).await {{
             Ok(cm) => Some(cm),
             Err(e) => {{
-                eprintln!("ERROR:    {{:?}}\nERROR:    Application startup failed. Exiting.", e);
+                dynrt::uvicorn::lifespan_failed(&e, "startup");
                 std::process::exit(3);
             }}
         }},
         Err(e) => {{
-            eprintln!("ERROR:    {{:?}}\nERROR:    Application startup failed. Exiting.", e);
+            dynrt::uvicorn::lifespan_failed(&e, "startup");
             std::process::exit(3);
         }}
     }};
-    let addr = format!("{{}}:{{}}", env_or("HOST", "0.0.0.0"), env_or("PORT", "8080"));
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    eprintln!("listening on http://{{addr}}");
+    dynrt::uvicorn::lifespan_info("Application startup complete.");
+    let listener = dynrt::uvicorn::bind().await;
     let pool = app.pool.clone();
     let serve = axum::serve(listener, router.with_state(app).into_make_service_with_connect_info::<std::net::SocketAddr>());
     // SIGTERM/SIGINT, as uvicorn: no new connection, idle keep-alive connections closed, in-flight requests
@@ -6939,11 +8484,16 @@ async fn serve() {{
         _ = dynrt::web::shutdown_deadline() => {{}}
     }}
     // FastAPI(lifespan=...): the code after `yield`
-    if let Some(cm) = lifespan {{
-        if let Err(e) = dynrt::web::lifespan_end(&lcx, cm).await {{
-            eprintln!("ERROR:    {{:?}}\nERROR:    Application shutdown failed. Exiting.", e);
-        }}
+    dynrt::uvicorn::lifespan_info("Waiting for application shutdown.");
+    let ended = match lifespan {{
+        Some(cm) => dynrt::web::lifespan_end(&lcx, cm).await,
+        None => Ok(()),
+    }};
+    match ended {{
+        Ok(()) => dynrt::uvicorn::lifespan_info("Application shutdown complete."),
+        Err(e) => dynrt::uvicorn::lifespan_failed(&e, "shutdown"),
     }}
+    dynrt::uvicorn::finished();
     // sentry_sdk initialised: the queued events are sent (the atexit integration of the Python SDK)
     dynrt::sentry::shutdown();
     // like the interpreter: the process ends here (threads still using the runtime included)
@@ -6993,6 +8543,14 @@ def finalize(p: Project) -> None:
                     method_wrapper(p, info.__dict__["post_init"])
                 for _, m in info.__dict__.get("before", []):
                     method_wrapper(p, m)
+                # serializers and exclude_if= run while dumping
+                for e in [*info.__dict__.get("field_sers", {}).values(), info.__dict__.get("model_ser"),
+                          *(f.get("serializer") for f in info.fields)]:
+                    if e:
+                        method_wrapper(p, e[0])
+                for f in info.fields:
+                    if f.get("exclude_if"):
+                        method_wrapper(p, f["exclude_if"])
                 computed = set(info.__dict__.get("computed", []))
                 for n, _, s in info.methods:
                     if n in computed:
@@ -7019,6 +8577,14 @@ def finalize(p: Project) -> None:
 def prepare(fe: Frontend, python_side: set[str]):
     """Run the discovery passes of the frontend that the dyn backend shares (no IR building)."""
     fe._load_imports()
+    for mod, node, names in fe.index.lazy:
+        project = sorted((n for n in names if fe.index.module(n) is not None), key=len)
+        if project:
+            fe._global(TranspileError(
+                f"`lazy` import of the project module `{project[-1]}` is not supported: the binary runs every project "
+                "module's top-level code at startup, Python 3.15 at its first use. Import it without `lazy` "
+                "(lazy imports of libraries are translated like plain imports)",
+                node, str(fe.index.modules[mod].path)))
     fe._classify()
     fe._discover_apps()
     collect = fe.collect
@@ -7426,20 +8992,28 @@ def _stack_relevant(fe: Frontend, module: str, node: ast.AST) -> bool:
 
 
 def target_python(root) -> tuple[int, int]:
-    """The Python the project runs on: the lower bound of `requires-python` in its uv.lock, else the
-    transpiler's own."""
-    import sys
-    d = Path(root).resolve()
-    for cand in (d, *d.parents):
-        lock = cand / "uv.lock"
-        if lock.is_file():
-            m = re.search(r'requires-python = ">=\s*(\d+)\.(\d+)', lock.read_text())
-            if m:
-                return int(m.group(1)), int(m.group(2))
-            break
-        if (cand / ".git").exists():
-            break
-    return sys.version_info[:2]
+    """The Python the project runs on (versions.target_python)."""
+    import os
+    return _target_python(str(Path(root).resolve()), os.environ.get("PY2AXUM_TARGET_PYTHON"))
+
+
+def python_features(root) -> dict[str, bool]:
+    """Behaviours of the project's Python probed on the transpiler's (versions.probe_features)."""
+    from .versions import probe_features
+    return probe_features(Path(root))
+
+
+def target_python_patch(root) -> str:
+    """The patch release of the project's Python, as a Rust u32 literal (`u32::MAX`: unknown)."""
+    from .versions import target_python_patch as _tpp
+    p = _tpp(Path(root))
+    return "u32::MAX" if p is None else str(p)
+
+
+@functools.lru_cache(maxsize=None)
+def _target_python(root: str, _forced) -> tuple[int, int]:
+    from .versions import target_python as _tp
+    return _tp(Path(root))
 
 
 def fastapi_at_least(root, version: tuple[int, int]) -> bool:
@@ -7450,6 +9024,15 @@ def fastapi_at_least(root, version: tuple[int, int]) -> bool:
 def fastapi_strict_content_type(root) -> bool:
     """FastAPI 0.132+ does not decode a body without Content-Type as JSON (`strict_content_type`, True by default)."""
     return fastapi_at_least(root, (0, 132))
+
+
+def _installed(name: str) -> str | None:
+    """the version of a distribution installed next to py2axum (the reference's, when the project locks none)"""
+    from importlib import metadata
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def locked_version(root, name: str) -> str | None:
@@ -7503,6 +9086,28 @@ def project_distribution(root) -> tuple[tuple[str, str], list[tuple[str, str]]] 
         if (cand / ".git").exists():
             return None
     return None
+
+
+def app_imports(fe: Frontend) -> set[str]:
+    """The modules importing the application runs (its module, their imports, transitively)."""
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        m = fe.index.module(name)
+        if m is None or name in seen:
+            return
+        seen.add(name)
+        parts = name.split(".")
+        for i in range(1, len(parts)):
+            visit(".".join(parts[:i]))
+        for spec in m.imports.values():
+            for t in ([spec[1]] if spec[0] == "module" else [spec[1], f"{spec[1]}.{spec[2]}"]):
+                visit(t)
+
+    for m in fe.index.package_modules():
+        if m.name in fe.app_vars:
+            visit(m.name)
+    return seen
 
 
 def import_order(fe: Frontend) -> list[str]:
@@ -7776,10 +9381,17 @@ def lifespan_fn(p: "Project", fe: Frontend) -> str:
             f"pub async fn lifespan(cx: &Cx) -> R<Option<V>> {{\n{body}\n    Ok(Some({code}))\n}}")
 
 
+def _configures_output(t) -> bool:
+    """`sentry_sdk.init`, or the `logging` module and the libraries configuring it (python-json-logger,
+    uvicorn's formatters): what an import-time or factory statement must not skip, since it decides what
+    the application prints and reports."""
+    return is_ext(t, "sentry_sdk.init") or (isinstance(t, Ext) and t.dotted.startswith(("logging.", "pythonjsonlogger.", "uvicorn.logging.")))
+
+
 def _reaches_sentry_init(p: "Project", module: str, call: ast.Call, depth: int = 4, seen=None) -> bool:
-    """Does this call run `sentry_sdk.init(...)`, directly or through project functions?"""
+    """Does this call run `sentry_sdk.init(...)` or configure logging, directly or through project functions?"""
     t = p.ix.resolve_expr(module, call.func)
-    if is_ext(t, "sentry_sdk.init"):
+    if _configures_output(t):
         return True
     if depth == 0 or not isinstance(t, Sym):
         return False
@@ -7793,8 +9405,9 @@ def _reaches_sentry_init(p: "Project", module: str, call: ast.Call, depth: int =
 
 def factory_sentry_init(p: "Project", fe: Frontend) -> None:
     """The statements of an app factory (`def create_app(): ... app = FastAPI()`) that initialise Sentry
-    (`init_sentry()`): run at startup with the module globals, as the factory runs them at import. The
-    factory's other plain statements are not translated (its middlewares and handlers are, by the stack)."""
+    (`init_sentry()`) or configure logging (`setup_logging()`): run at startup with the module globals, as the
+    factory runs them at import. The factory's other plain statements are not translated (its middlewares and
+    handlers are, by the stack)."""
     for m in fe.index.package_modules():
         for fn in m.tree.body:
             if not isinstance(fn, ast.FunctionDef) or not any(
@@ -7985,10 +9598,17 @@ def module_statements(p: "Project", fe: Frontend) -> None:
     """Module-level call statements (`INI.set_main_option(...)`, `logger.setLevel(...)`) of the modules the
     translation uses, compiled to run at startup in their place among the module's globals."""
     used = {k[0].module for k in p.fns if isinstance(k[0], Sym)} | {s.module for s in p.globals if isinstance(s, Sym)}
+    imported = app_imports(fe)
     for m in fe.index.package_modules():
-        if m.name not in used:
+        # a module the application imports but the translation does not use: only what configures its
+        # output runs (`setup_logging()` at import), as importing it does in Python
+        output_only = m.name not in used
+        if output_only and m.name not in imported:
             continue
         for st in m.tree.body:
+            if output_only and not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+                                    and _reaches_sentry_init(p, m.name, st.value)):
+                continue
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
                 f = st.value.func
                 if isinstance(f, ast.Attribute) and (f.attr in FRAMEWORK_CALLS or fe._is_app(m.name, f.value)):
@@ -8458,6 +10078,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         v = locked_version(fe.index.root, lib)
         if v:
             libmap.LIB_VERSIONS[lib] = v
+    libmap.PYTHON = target_python(fe.index.root)
     rb = RouteBuilder(proj)
     routes = []
     idx = 0
@@ -8558,6 +10179,30 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     lifespan = lifespan_fn(proj, fe)
     finalize(proj)
     if collect:
+        # a model holding a union the runtime refuses: its routes are refused (generation would fail)
+        bad = union_errors(proj)[0]
+        if bad:
+            by_init = {v: k for k, v in proj.tds.items()}
+
+            def tds_of(td, seen):
+                if td in seen:
+                    return seen
+                seen.add(td)
+                for t in re.findall(r"\bTD_\d+\b", by_init.get(td, "")):
+                    tds_of(t, seen)
+                return seen
+            for info in list(proj.schemas.values()):
+                reach = set()
+                for f in info.fields:
+                    if not f.get("any"):
+                        ann, module = f["ann"]
+                        try:
+                            tds_of(proj.td(ann, module, dict(f.get("cons", {}))), reach)
+                        except TranspileError:
+                            pass
+                for e, td in bad:
+                    if td in reach and info.sym not in proj.class_errors:
+                        proj.class_errors[info.sym] = e
         # a middleware that cannot be compiled blocks every route
         keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
                                  if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
@@ -8610,7 +10255,8 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     route_defs = [f"    {RT}::web::RouteDef {{ method: {rs(method.upper())}, pattern: {rs_marked(pattern)}, run: {handler}, "
                   f"node: {('Some(&' + nodes[(m.name, fn.lineno)] + ')') if (m.name, fn.lineno) in nodes else 'None'}, "
                   f"path: {rs_marked(path)}, src: ({rs(proj.rel_file(m.name) + ':' + str(fn.lineno))}, {rs(fn.name)}, {rs(m.name)}), "
-                  f"sync_endpoint: {str(not isinstance(fn, ast.AsyncFunctionDef)).lower()} }},"
+                  f"sync_endpoint: {str(not isinstance(fn, ast.AsyncFunctionDef)).lower()}, "
+                  f"first_line: {fn.decorator_list[0].lineno if fn.decorator_list else fn.lineno} }},"
                   for method, pattern, handler, path, fn, m, _ in routes]
     ws_defs = [f"    {RT}::ws::WsRouteDef {{ pattern: {rs_marked(pattern)}, run: {handler}, "
                f"node: {('Some(&' + nodes[(m.name, fn.lineno)] + ')') if (m.name, fn.lineno) in nodes else 'None'} }},"
@@ -8621,7 +10267,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     proj.items.append(str_classes())
     gen = [
         "// Generated by py2axum (dyn backend) from the FastAPI project. Do not edit.",
-        "#![allow(unused_mut, unused_variables, unused_imports, unreachable_code, dead_code, non_snake_case, unused_parens, unused_labels, unused_assignments, non_upper_case_globals, clippy::all)]",
+        "#![allow(unused_mut, unused_variables, unused_imports, unreachable_code, dead_code, non_snake_case, unused_parens, unused_braces, unused_labels, unused_assignments, non_upper_case_globals, clippy::all)]",
         f"use {RT}::{{self, Cx, Exc, R, V}};",
         "",
         *body,
@@ -8634,6 +10280,11 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         "/// the WebSocket routes, in declaration order",
         f"pub static WS_ROUTES: &[{RT}::ws::WsRouteDef] = &[",
         *ws_defs,
+        "];",
+        "",
+        "/// traceback entries: where an exception passes in the project's code (dynrt/trace.rs)",
+        f"pub static TB: &[{RT}::trace::Pos] = &[",
+        *proj.__dict__.get("tb_rows", []),
         "];",
         "",
         f"pub fn router(_app: std::sync::Arc<{RT}::AppState>) -> axum::Router<std::sync::Arc<{RT}::AppState>> {{",
@@ -8665,8 +10316,10 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     commit, expire, autoflush, sync = getattr(proj, "session_cfg", (False, proj.expire_on_commit, True, False))
     b = lambda x: str(x).lower()  # noqa: E731
     pyver = target_python(fe.index.root)
+    sa_ver = tuple(int(x) for x in re.findall(r"\d+", locked_version(fe.index.root, "sqlalchemy") or _installed("sqlalchemy") or "2.1")[:2])
     (out_dir / "src" / "main.rs").write_text(MAIN.format(expire=b(expire), autoflush=b(autoflush), commit=b(commit), sync=b(sync), layers=layers,
-                                                         pymajor=pyver[0], pyminor=pyver[1],
+                                                         pymajor=pyver[0], pyminor=pyver[1], pypatch=target_python_patch(fe.index.root),
+                                                         pyfeatures=", ".join(f"({rs(k)}, {str(v).lower()})" for k, v in python_features(fe.index.root).items()),
                                                          strict_ct=b(fe.__dict__.get("strict_ct", fastapi_strict_content_type(fe.index.root))),
                                                          root_path=rs(root_path_checked(fe, ws_routes)),
                                                          starlette_major=starlette_version(proj)[0], starlette_minor=starlette_version(proj)[1],
@@ -8676,7 +10329,9 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                                                           multipart=b(locked_version(fe.index.root, "python-multipart") is not None),
                                                           python_side=", ".join(rs_marked(x) for x in sorted({x for x in fe.__dict__.get("python_side", ()) if x.startswith("/")}
                                                                                                         | fe.__dict__.get("python_side_raw", set()))),
-                                                          mount_fallback=", ".join(rs(x) for x in sorted(set(fe.__dict__.get("mount_fallback", []))))))
+                                                          mount_fallback=", ".join(rs(x) for x in sorted(set(fe.__dict__.get("mount_fallback", [])))),
+                                                          source_root=rs(str(Path(fe.index.root).resolve())),
+                                                          sa_major=sa_ver[0], sa_minor=sa_ver[1]))
     (out_dir / "src" / "gen.rs").write_text("\n".join(gen) + "\n")
     if shutil.which("rustfmt"):
         subprocess.run(["rustfmt", "--edition", "2021", str(out_dir / "src" / "gen.rs"), str(out_dir / "src" / "main.rs")], check=False,
@@ -8686,8 +10341,8 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
 
 # keyword arguments the runtime implements for these methods (others raise TypeError at run time)
 METHOD_KWARGS = {
-    "model_dump": {"mode", "exclude_none", "exclude_unset", "by_alias", "exclude", "include"},
-    "model_dump_json": {"exclude_none", "exclude_unset", "by_alias", "exclude", "include"},
+    "model_dump": {"mode", "exclude_none", "exclude_unset", "exclude_defaults", "by_alias", "exclude", "include", "context"},
+    "model_dump_json": {"exclude_none", "exclude_unset", "exclude_defaults", "by_alias", "exclude", "include", "context"},
     "model_copy": {"update", "deep"},
     # itsdangerous.URLSafeTimedSerializer (dynrt/itsd.rs): the only runtime type with these methods
     "loads": {"max_age", "return_timestamp", "salt"},
@@ -8720,7 +10375,7 @@ METHOD_MAX_ARGS = {"loads": 4, "dumps": 2, "encode": 2, "decode": 2, "read_text"
 
 # calls whose string arguments or keywords name attributes of the objects they make or change
 ATTR_NAMING_CALLS = {"label", "setattr", "getattr", "hasattr", "namedtuple", "NamedTuple", "make_dataclass",
-                     "SimpleNamespace", "column", "literal_column", "alias", "type"}
+                     "SimpleNamespace", "column", "literal_column", "alias", "type", "Column", "mapped_column"}
 
 _RUNTIME_NAMES: set[str] | None = None
 _RUNTIME_ATTRS: set[str] | None = None
@@ -8803,6 +10458,36 @@ def runtime_names() -> set[str]:
         names |= set(re.findall(r"""["']([A-Za-z_][A-Za-z0-9_]*)["']""", Path(libmap.__file__).read_text()))
         _RUNTIME_NAMES = names
     return _RUNTIME_NAMES
+
+
+def poly_fields(p: Project, info) -> str:
+    """Single table inheritance fields of a ModelDesc: parent mapper, discriminator column, identity, descendants."""
+    if not isinstance(info, ModelInfo) or info.poly_on is None:
+        return "parent: None, poly_on: None, poly_load: false, identity: None, subs: &[], joins: &[]"
+
+    def ancestors(i):
+        while i.parent is not None:
+            i = p.models[i.parent]
+            yield i.sym
+
+    subs = [m.rust for m in p.models.values() if isinstance(m, ModelInfo) and info.sym in set(ancestors(m))]
+    pi = next(k for k, c in enumerate(info.cols) if c["name"] == info.poly_on)
+    parent = f"Some(&{p.models[info.parent].rust})" if info.parent else "None"
+    ident_ = f"Some({rs(info.identity)})" if info.identity is not None else "None"
+    joins = ", ".join(f"({rs(t)}, {rs(c)}, {rs(pt)}, {rs(pc)})" for t, c, pt, pc in info.joins)
+    return (f"parent: {parent}, poly_on: Some({pi}), poly_load: {str(info.poly_load).lower()}, identity: {ident_}, "
+            f"subs: &[{', '.join('&' + r for r in subs)}], "
+            f"joins: &[{joins}]")
+
+
+def hybrids_of(p: Project, info) -> str:
+    """`HybridDesc`s of a mapped class (`sqlalchemy.ext.hybrid`): instance function, class-level expression, setter."""
+    out = []
+    for h in info.__dict__.get("hybrids", {}).values():
+        opt = lambda s: f"Some({method_wrapper(p, s)} as {RT}::pyd::MethodFn)" if s else "None"  # noqa: E731
+        out.append(f"{RT}::orm::HybridDesc {{ name: {rs(h['name'])}, method: {str(h['method']).lower()}, "
+                   f"get: {method_wrapper(p, h['get'])} as {RT}::pyd::MethodFn, expr: {opt(h['expr'])}, set: {opt(h['set'])} }}")
+    return ", ".join(out)
 
 
 def class_level_methods(p: Project, methods) -> list[str]:

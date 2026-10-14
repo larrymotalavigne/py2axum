@@ -153,8 +153,10 @@ class Frontend:
                         for t in node.targets:
                             if isinstance(t, ast.Name):
                                 bases.add(Sym(m.name, t.id))
+        # a base written `Parent[T]` (a generic Pydantic model) counts as `Parent`
         resolved = {
-            sym: [self.index.resolve_expr(sym.module, b) for b in node.bases] for sym, node in classes.items()
+            sym: [self.index.resolve_expr(sym.module, b.value if isinstance(b, ast.Subscript) else b) for b in node.bases]
+            for sym, node in classes.items()
         }
         for sym, targets in resolved.items():
             if any(is_ext(t, *DECLARATIVE) for t in targets):
@@ -170,7 +172,8 @@ class Frontend:
                 if any(t in bases or t in models for t in targets):
                     models.add(sym)
                     changed = True
-                elif any(is_ext(t, "pydantic.BaseModel", "pydantic_settings.BaseSettings") or t in schemas for t in targets):
+                elif any(is_ext(t, "pydantic.BaseModel", "pydantic_settings.BaseSettings", "pydantic.RootModel") or t in schemas
+                         for t in targets):
                     schemas.add(sym)
                     changed = True
         # @dataclass classes (plain ones: options are checked by the dyn backend)

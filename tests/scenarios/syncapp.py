@@ -60,7 +60,26 @@ STEPS: list = [
     ("DELETE", "/authors/3", None),
     ("DELETE", "/authors/3", None),
     ("POST", "/core/many", None),
+    ("GET", "/relq", None),
+    ("POST", "/hybrid", None),
+    ("POST", "/reserved", None),
+    ("POST", "/eager-defaults", None),
+    ("POST", "/write-only", None),
+    ("POST", "/inherit/single", None),
+    ("POST", "/inherit/joined", None),
+    ("POST", "/bulk", None),
+    ("POST", "/own-session", None),
+    ("GET", "/expunge/1", None),
+    ("GET", "/expunge/99", None),
+    ("POST", "/m2m", None),
+    ("POST", "/defer", None),
+    ("POST", "/core", None),
+    ("POST", "/composite", None),
+    ("POST", "/joins", None),
+    ("POST", "/init", None),
+    ("POST", "/composite/factory", None),
     ("GET", "/q/authors", None),
+    ("POST", "/expire", None),
 ]
 
 
@@ -76,5 +95,9 @@ def reset(db: str) -> None:
         # added to an existing fixture table after its creation (create_all leaves existing tables alone)
         conn.exec_driver_sql("ALTER TABLE authors ADD COLUMN IF NOT EXISTS mentor_id INTEGER "
                              "REFERENCES authors(id) ON DELETE SET NULL")
-        conn.exec_driver_sql(f"TRUNCATE {', '.join(t.name for t in Base.metadata.sorted_tables)} RESTART IDENTITY CASCADE")
+        conn.exec_driver_sql(f"TRUNCATE {', '.join(chr(34) + t.name + chr(34) for t in Base.metadata.sorted_tables)} RESTART IDENTITY CASCADE")
     engine.dispose()
+
+
+# obj.__dict__ after an INSERT in a synchronous session (fixtures/syncapp/main.py /idict)
+STEPS += [("POST", "/idict", None)]

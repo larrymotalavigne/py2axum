@@ -58,7 +58,7 @@ fn parse_host(h: Option<String>) -> Option<(String, Option<String>)> {
 
 /// `URL(scope=scope)` of a request whose Host header parsed (scheme http, the decoded path, the raw query)
 fn scope_url(cx: &Cx, netloc: &str) -> String {
-    let mut u = format!("http://{netloc}{}", web::unquote(&cx.req.path));
+    let mut u = format!("{}://{netloc}{}", cx.req.scheme, web::unquote(&cx.req.path));
     if !cx.req.raw_query.is_empty() {
         u += "?";
         u += &cx.req.raw_query;
@@ -210,7 +210,7 @@ fn plain_500() -> Response {
 }
 
 fn log_exc(e: &Exc) {
-    eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+    super::uvicorn::exception(&e);
 }
 
 /// The ASGI application: one request through the whole stack.
@@ -356,7 +356,7 @@ async fn proxy(upstream: &str, req: axum::extract::Request) -> Response {
         }
         Err(e) => {
             // the path only: a query string can carry a token
-            eprintln!("ERROR:py2axum:python-side upstream {}: {}", parts.uri.path(), e.without_url());
+            super::uvicorn::error(&format!("py2axum: python-side upstream {}: {}", parts.uri.path(), e.without_url()));
             Response::builder().status(502).header("content-type", "text/plain; charset=utf-8").body(Body::from("Bad Gateway")).unwrap()
         }
     }
@@ -369,6 +369,18 @@ pub async fn app(
     ws_routes: &'static [super::ws::WsRouteDef],
     stack_fn: StackFn,
 ) -> Response {
+    // uvicorn's ProxyHeadersMiddleware: a trusted peer's X-Forwarded-For / X-Forwarded-Proto
+    let mut client = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| (c.0.ip().to_canonical().to_string(), c.0.port()));
+    let mut scheme = String::from("http");
+    super::uvicorn::proxy_headers(req.headers(), &mut client, &mut scheme);
+    let version = match req.version() {
+        axum::http::Version::HTTP_10 => "1.0",
+        axum::http::Version::HTTP_2 => "2",
+        _ => "1.1",
+    };
     // a WebSocket handshake: the scope `websocket` (the HTTP middlewares let it through; never relayed
     // to the Python side)
     if super::ws::is_upgrade(&req) {
@@ -379,12 +391,15 @@ pub async fn app(
         return super::ws::serve(app, req, ws_routes, ws_handle).await;
     }
     if python_side(req.uri().path()) {
-        return match std::env::var("PY2AXUM_PYTHON_URL") {
+        let line = AccessLine::of(&req, &client, version);
+        let r = match std::env::var("PY2AXUM_PYTHON_URL") {
             Ok(up) => proxy(&up, req).await,
             // no Python process: the path is not the binary's (the ingress routes it elsewhere), and a
             // translated route must not answer in its place (`/items/export` would reach `/items/{id}`)
             Err(_) => web::not_found().await,
         };
+        line.log(&app, r.status().as_u16()).await;
+        return r;
     }
     if under_mount(req.uri().path()) {
         if let Ok(up) = std::env::var("PY2AXUM_PYTHON_URL") {
@@ -392,21 +407,25 @@ pub async fn app(
             if get_stack(stack_fn, routes).await.is_ok()
                 && !web::full_match(req.uri().path(), req.method().as_str(), routes)
             {
-                return proxy(&up, req).await;
+                let line = AccessLine::of(&req, &client, version);
+                let r = proxy(&up, req).await;
+                line.log(&app, r.status().as_u16()).await;
+                return r;
             }
         }
     }
-    let client = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|c| (c.0.ip().to_canonical().to_string(), c.0.port()));
     let (parts, body) = req.into_parts();
     let bytes = match read_body(&parts.headers, body).await {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => {
+            AccessLine::of_parts(&parts.method, &parts.uri, &client, version).log(&app, r.status().as_u16()).await;
+            return r;
+        }
     };
     let mut cell = web::ReqCell::from_parts(parts.method.as_str(), &parts.uri, &parts.headers, vec![], bytes);
     cell.client = client;
+    cell.scheme = scheme;
+    cell.http_version = version;
     let stack = match get_stack(stack_fn, routes).await {
         Ok(s) => s,
         Err(e) => {
@@ -417,23 +436,66 @@ pub async fn app(
     let cx: Cx = Arc::new(CxInner::new(app, cell));
     // sentry_sdk's FastAPI integration (SentryAsgiMiddleware): nothing to do while it is not initialised
     let traced = super::sentry::active() && super::sentry::request_start(&cx).await;
+    let mut unhandled = vec![];
     let r = match chain(&cx, &stack, 0, routes).await {
         Ok(r) => r,
         Err(e) if super::resp::is_drop(&e) => {
-            panic!("py2axum: status code outside 100..599: no status line, the connection is dropped (as uvicorn does)")
+            // uvicorn: the access line (written before the status line), then its KeyError from `send`
+            let status = match e.args().first() {
+                Some(V::Int(i)) => *i,
+                _ => 0,
+            };
+            super::uvicorn::access_status(&cx, status).await;
+            super::uvicorn::asgi_exception(&cx, &e).await;
+            panic!("{}", super::uvicorn::DROP_PANIC)
         }
         Err(e) => {
-            let r = server_error(&cx, &stack, e.clone()).await;
+            let (r, raised) = server_error(&cx, &stack, e.clone()).await;
             if traced {
                 super::sentry::unhandled(&cx, &e).await;
             }
+            unhandled = raised;
             r
         }
     };
     if traced {
         super::sentry::request_end(&cx, r.status().as_u16()).await;
     }
+    super::uvicorn::access(&cx, r.status().as_u16()).await;
+    // uvicorn's `run_asgi` logs what left the application once the response was sent (after the access
+    // line), SentryAsgiMiddleware having captured it
+    for e in &unhandled {
+        super::uvicorn::request_exception(&cx, e);
+    }
     r
+}
+
+/// the access log line of a request served without a request context (relayed, refused early)
+struct AccessLine(Option<(Option<(String, u16)>, String, String, String, &'static str)>);
+
+impl AccessLine {
+    fn of(req: &axum::extract::Request, client: &Option<(String, u16)>, version: &'static str) -> AccessLine {
+        Self::of_parts(req.method(), req.uri(), client, version)
+    }
+
+    fn of_parts(method: &axum::http::Method, u: &axum::http::Uri, client: &Option<(String, u16)>, version: &'static str) -> AccessLine {
+        if !super::uvicorn::access_enabled() {
+            return AccessLine(None);
+        }
+        AccessLine(Some((client.clone(), method.to_string(), u.path().to_string(), u.query().unwrap_or("").to_string(), version)))
+    }
+
+    async fn log(self, app: &Arc<super::AppState>, status: u16) {
+        let Some((client, method, path, query, version)) = self.0 else { return };
+        let mut cell = web::ReqCell::empty();
+        cell.client = client;
+        cell.method = method;
+        cell.path = path;
+        cell.raw_query = query;
+        cell.http_version = version;
+        let cx: Cx = Arc::new(CxInner::new(app.clone(), cell));
+        super::uvicorn::access(&cx, status).await;
+    }
 }
 
 type RespFut<'a> = Pin<Box<dyn Future<Output = R<Response>> + Send + 'a>>;
@@ -459,6 +521,8 @@ fn chain<'a>(cx: &'a Cx, stack: &'a Arc<Stack>, i: usize, routes: &'static [Rout
             super::rawasgi::run(cx, inst, scope, cx.req.body.clone()).await
         }),
         Some(Mw::Context(c)) => Box::pin(c.call(cx, chain(cx, stack, i + 1, routes))),
+        // scope["scheme"] already https (X-Forwarded-Proto from a trusted proxy): no redirection
+        Some(Mw::HttpsRedirect) if cx.req.scheme == "https" => chain(cx, stack, i + 1, routes),
         Some(Mw::HttpsRedirect) => Box::pin(std::future::ready(https_redirect(cx))),
         Some(Mw::TrustedHost(t)) => match t.check(cx) {
             Some(r) => Box::pin(std::future::ready(r)),
@@ -567,6 +631,8 @@ async fn handle(cx: &Cx, stack: &Stack, e: Exc) -> R<Response> {
             if super::sentry::active() {
                 super::sentry::handled_exception(cx, &e).await;
             }
+            // the handler runs while the exception is being handled: one it raises chains to it (`__context__`)
+            let _handling = super::Handling::new(cx, &e);
             let ret = super::methods::call_value(cx, &h, vec![super::request(cx), V::Exc(e)], vec![]).await?;
             to_response(&ret)
         }
@@ -583,6 +649,8 @@ fn ws_handle(cx: &Cx, e: Exc) -> Pin<Box<dyn Future<Output = R<()>> + Send + '_>
     Box::pin(async move {
         use super::ws;
         let Some(stack) = STACK.get().cloned() else { return Err(e) };
+        // what the handlers raise chains to the exception they handle (`__context__`)
+        let _handling = super::Handling::new(cx, &e);
         let mut found: Option<V> = None;
         if let Some((code, ..)) = &e.http_info() {
             found = stack.handlers.iter().find(|(k, _)| matches!(k, HKey::Status(s) if s == code)).map(|(_, h)| h.clone());
@@ -597,7 +665,8 @@ fn ws_handle(cx: &Cx, e: Exc) -> Pin<Box<dyn Future<Output = R<()>> + Send + '_>
                 }
                 if std::ptr::eq(c, &HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
                     let Some(s) = ws::session(cx) else { return Err(e) };
-                    return ws::send_raw_response(&s, web::error_response(e)).await;
+                    let handled = e.clone();
+                    return ws::send_raw_response(&s, web::error_response(e)).await.map_err(|x| super::trace::with_context(x, &handled));
                 }
                 if std::ptr::eq(c, &WS_EXCEPTION) {
                     let attr = |k: &str| e.0.attrs.lock().get(k).cloned().unwrap_or(V::None);
@@ -621,20 +690,17 @@ fn ws_handle(cx: &Cx, e: Exc) -> Pin<Box<dyn Future<Output = R<()>> + Send + '_>
 
 /// ServerErrorMiddleware: the `Exception` handler's response (it bypasses the user middlewares), the
 /// exception logged anyway; without one, a plain 500.
-async fn server_error(cx: &Cx, stack: &Stack, e: Exc) -> Response {
+/// ServerErrorMiddleware: the 500 response, and the exceptions uvicorn then logs
+async fn server_error(cx: &Cx, stack: &Stack, e: Exc) -> (Response, Vec<Exc>) {
     if let Some(h) = &stack.server {
+        let _handling = super::Handling::new(cx, &e);
         let r = super::methods::call_value(cx, h, vec![super::request(cx), V::Exc(e.clone())], vec![]).await;
-        log_exc(&e);
         return match r.and_then(|v| to_response(&v)) {
-            Ok(r) => r,
-            Err(e2) => {
-                log_exc(&e2);
-                plain_500()
-            }
+            Ok(r) => (r, vec![e]),
+            Err(e2) => (plain_500(), vec![e, e2]),
         };
     }
-    log_exc(&e);
-    plain_500()
+    (plain_500(), vec![e])
 }
 
 // ---------------------------------------------------------------- CORSMiddleware

@@ -92,7 +92,7 @@ async def sock(host: str = "127.0.0.1", port: int = 9, timeout: float | None = 5
         with _socket.create_connection((host, port), timeout=timeout) as s:
             peer = list(s.getpeername())
         return {"ok": True, "peer": peer}
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         return {"ok": False, "type": type(e).__name__, "error": str(e), "timeout": isinstance(e, TimeoutError)}
 
 

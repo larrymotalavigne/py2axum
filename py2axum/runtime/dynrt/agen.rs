@@ -181,7 +181,7 @@ pub fn into_channel(g: Arc<AGen>) -> mpsc::Receiver<V> {
                 }
                 Err(e) => {
                     if !e.isinstance(&STOP_ASYNC_ITERATION) && !e.isinstance(&GENERATOR_EXIT) {
-                        eprintln!("ERROR:py2axum:exception in async generator: {:?}", e);
+                        super::uvicorn::exception(&e);
                     }
                     break;
                 }

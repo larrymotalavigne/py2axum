@@ -30,7 +30,7 @@ The `Dockerfile` takes build arguments, so it can often be used as is:
 ```bash
 docker build -f Dockerfile \
   --build-arg APP_DIR=. --build-arg PACKAGE=api \
-  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.6.0 \
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.7.0 \
   --build-arg PY2AXUM_FLAGS="--python-side auto" -t myapp .
 ```
 
@@ -52,7 +52,9 @@ the final link optimises the whole program and takes a few minutes. The generate
 
 ## Running it
 
-- Environment: `DATABASE_URL`, `HOST`, `PORT`, `PY2AXUM_PYTHON_URL` (hybrid mode), `PY2AXUM_LOG_LEVEL`,
+- Command line: uvicorn's options (`--host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'`,
+  `--log-level`, `--no-access-log`...), so the container command can keep them ([Logging](logging.md#running-the-binary-like-uvicorn)).
+- Environment: `DATABASE_URL`, `HOST`, `PORT`, `PY2AXUM_PYTHON_URL` (hybrid mode),
   `PY2AXUM_SHUTDOWN_TIMEOUT`, plus your application's own settings; the full list is in
   [Environment variables](../reference/environment.md). The binary does not
   read `.env` files.

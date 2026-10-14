@@ -28,8 +28,9 @@ pub fn isinstance(v: &V, t: &V) -> R<bool> {
             Native::Type(name) => Ok(super::methods::isinstance_builtin(v, name)),
             Native::ExtType(name) => Ok(match *name {
                 "pydantic.BaseModel" => matches!(v, V::Inst(i) if is_schema(i.desc.class)),
-                "sqlalchemy.ext.asyncio.AsyncSession" => matches!(v, V::Session(_)),
-                "sqlalchemy.orm.Session" | "sqlalchemy.ext.asyncio.AsyncConnection" => false,
+                "sqlalchemy.ext.asyncio.AsyncSession" => matches!(v, V::Session(s) if !s.is_sync()),
+                "sqlalchemy.orm.Session" => matches!(v, V::Session(s) if s.is_sync()),
+                "sqlalchemy.ext.asyncio.AsyncConnection" => false,
                 "sqlalchemy.ext.asyncio.AsyncEngine" => matches!(v, V::Native(m) if matches!(&**m, Native::Engine(false))),
                 "types.GenericAlias" => matches!(v, V::Native(m) if matches!(&**m, Native::TypeExpr(..))),
                 p if p.starts_with("prometheus_client.") => super::prom::isinstance(v, &p["prometheus_client.".len()..]),
@@ -97,11 +98,11 @@ impl Truth for V {
     }
 }
 
-static NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None };
-static NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false };
-static TD_INT: TD = TD::Int(NumC { ge: None, gt: None, le: None, lt: None });
-static TD_FLOAT: TD = TD::Float(NumC { ge: None, gt: None, le: None, lt: None });
-static TD_STR: TD = TD::Str(StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false });
+static NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None };
+static NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false };
+static TD_INT: TD = TD::Int(NumC { ge: None, gt: None, le: None, lt: None, mul: None });
+static TD_FLOAT: TD = TD::Float(NumC { ge: None, gt: None, le: None, lt: None, mul: None });
+static TD_STR: TD = TD::Str(StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false });
 static TD_BOOL: TD = TD::Bool;
 static TD_ANY: TD = TD::Any;
 static TD_NONE: TD = TD::NoneT;

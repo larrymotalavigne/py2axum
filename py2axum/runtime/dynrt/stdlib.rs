@@ -40,16 +40,23 @@ pub struct Match {
 }
 
 /// Python pattern syntax -> fancy-regex: (?P=name) backrefs, \Z, `$` (end or before a final newline).
-fn translate(p: &str, flags: i64) -> String {
+fn translate(p: &str, flags: i64) -> R<String> {
     let mut out = String::new();
     let chars: Vec<char> = p.chars().collect();
     let (mut i, mut in_class) = (0, false);
+    let py314 = super::python() >= (3, 14);
     while i < chars.len() {
         let c = chars[i];
         if c == '\\' && i + 1 < chars.len() {
             let n = chars[i + 1];
-            if !in_class && n == 'Z' {
+            if !in_class && (n == 'Z' || (n == 'z' && py314)) {
+                // `\z` is 3.14's synonym of `\Z`; before, an unknown escape
                 out += "\\z";
+            } else if n == 'z' {
+                return Err(Exc::msg(&RE_ERROR, format!("bad escape \\z at position {i}")));
+            } else if !in_class && n == 'B' && !py314 {
+                // before 3.14, `\B` never matched an empty string
+                out += "(?:(?!\\A\\z)\\B)";
             } else {
                 out.push(c);
                 out.push(n);
@@ -100,7 +107,7 @@ fn translate(p: &str, flags: i64) -> String {
     if flags & X != 0 {
         prefix.push('x');
     }
-    if prefix.is_empty() { out } else { format!("(?{prefix}){out}") }
+    Ok(if prefix.is_empty() { out } else { format!("(?{prefix}){out}") })
 }
 
 pub fn compile(pattern: &V, flags: Option<&V>) -> R {
@@ -115,7 +122,7 @@ pub fn compile(pattern: &V, flags: Option<&V>) -> R {
         Some(V::Int(f)) => *f,
         Some(o) => return Err(Exc::type_error(format!("flags must be int, not {}", o.type_name()))),
     };
-    let re = fancy_regex::Regex::new(&translate(&src, flags)).map_err(|e| Exc::msg(&RE_ERROR, format!("{e}")))?;
+    let re = fancy_regex::Regex::new(&translate(&src, flags)?).map_err(|e| Exc::msg(&RE_ERROR, format!("{e}")))?;
     let names = re.capture_names().map(|n| n.map(str::to_string)).collect();
     Ok(V::native(Native::Pattern(Arc::new(Pattern { src, flags, re, names }))))
 }
@@ -416,7 +423,7 @@ fn search_like(p: &Pattern, s: &V, mode: &str) -> R {
     // anchored forms: compile an anchored variant to keep backtracking semantics
     let anchored = fancy_regex::Regex::new(&format!(
         "\\A(?:{}){}",
-        translate(&p.src, p.flags),
+        translate(&p.src, p.flags)?,
         if mode == "fullmatch" { "\\z" } else { "" }
     ))
     .map_err(|e| Exc::msg(&RE_ERROR, format!("{e}")))?;
@@ -433,6 +440,12 @@ fn search_like(p: &Pattern, s: &V, mode: &str) -> R {
 }
 
 pub async fn pattern_method(cx: &super::Cx, p: &Arc<Pattern>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    // Python 3.15: prefixmatch() is match() under a clearer name
+    let name = match name {
+        "prefixmatch" if super::python() >= (3, 15) => "match",
+        "prefixmatch" => return Err(Exc::attr_error("'re.Pattern' object has no attribute 'prefixmatch'")),
+        n => n,
+    };
     let a = |i: usize, k: &str| args.get(i).or_else(|| kw(kwargs, k)).cloned();
     // search(string, pos, endpos); the other methods' pos/endpos: refused, never ignored
     if name == "search" && (args.len() > 1 || kwargs.iter().any(|(k, _)| k != "string")) {
@@ -1450,6 +1463,22 @@ fn b64enc(data: &[u8]) -> Vec<u8> {
 
 /// `binascii.a2b_base64(s, strict_mode=validate)` as CPython 3.13 decodes
 pub fn b64dec(s: &[u8], strict: bool) -> R<Vec<u8>> {
+    b64dec_padded(s, strict, true)
+}
+
+/// `padded=False` (Python 3.15's default for `urlsafe_b64decode`): a final group of 2 or 3 characters is
+/// complete without its `=`
+pub fn b64dec_padded(s: &[u8], strict: bool, padded: bool) -> R<Vec<u8>> {
+    // CPython's rewrite of the padding rules (security releases 3.13.13 and 3.14.4, then 3.15): padding no
+    // longer ends the input, excess `=` are skipped (non-strict)
+    let rewritten = super::python_feature("b64_padding_rfc").unwrap_or_else(|| match super::python() {
+        (3, 13) => super::python_at_least(3, 13, 13),
+        (3, 14) => super::python_at_least(3, 14, 4),
+        v => v >= (3, 15),
+    });
+    if rewritten {
+        return b64dec_rfc(s, strict, padded);
+    }
     let err = |m: String| Exc::msg(&BINASCII_ERROR, m);
     let val = |c: u8| B64.iter().position(|&x| x == c);
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
@@ -1505,7 +1534,75 @@ pub fn b64dec(s: &[u8], strict: bool) -> R<Vec<u8>> {
         if quad == 1 {
             return Err(err(format!("Invalid base64-encoded string: number of data characters ({count}) cannot be 1 more than a multiple of 4")));
         }
-        return Err(err("Incorrect padding".into()));
+        if padded {
+            return Err(err("Incorrect padding".into()));
+        }
+    }
+    Ok(out)
+}
+
+/// `binascii.a2b_base64` from 3.13.13 / 3.14.4 (RFC 4648 section 3.3), a port of Modules/binascii.c; `padded`:
+/// 3.15's parameter (false: `=` is no padding, a non-alphabet character)
+fn b64dec_rfc(s: &[u8], strict: bool, padded: bool) -> R<Vec<u8>> {
+    let err = |m: &str| Exc::msg(&BINASCII_ERROR, m.to_string());
+    let val = |c: u8| B64.iter().position(|&x| x == c);
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut quad, mut left, mut pads) = (0usize, 0u32, 0usize);
+    for (i, &c) in s.iter().enumerate() {
+        if padded && c == b'=' {
+            pads += 1;
+            if quad >= 2 && quad + pads <= 4 {
+                continue;
+            }
+            if !strict {
+                continue;
+            }
+            if quad == 1 {
+                break;
+            }
+            return Err(err(if quad == 0 && i == 0 { "Leading padding not allowed" } else { "Excess padding not allowed" }));
+        }
+        let Some(v) = val(c) else {
+            if strict {
+                return Err(err("Only base64 data is allowed"));
+            }
+            continue;
+        };
+        if pads > 0 && strict {
+            return Err(err(if quad + pads == 4 { "Excess data after padding" } else { "Discontinuous padding not allowed" }));
+        }
+        pads = 0;
+        let v = v as u32;
+        match quad {
+            0 => {
+                quad = 1;
+                left = v;
+            }
+            1 => {
+                quad = 2;
+                out.push(((left << 2) | (v >> 4)) as u8);
+                left = v & 0xf;
+            }
+            2 => {
+                quad = 3;
+                out.push(((left << 4) | (v >> 2)) as u8);
+                left = v & 0x3;
+            }
+            _ => {
+                quad = 0;
+                out.push(((left << 6) | v) as u8);
+                left = 0;
+            }
+        }
+    }
+    if quad == 1 {
+        return Err(Exc::msg(&BINASCII_ERROR, format!(
+            "Invalid base64-encoded string: number of data characters ({}) cannot be 1 more than a multiple of 4",
+            out.len() / 3 * 4 + 1
+        )));
+    }
+    if padded && quad != 0 && quad + pads < 4 {
+        return Err(err("Incorrect padding"));
     }
     Ok(out)
 }
@@ -1554,7 +1651,13 @@ pub fn base64(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             } else if let Some(a) = alt(1)? {
                 data = swap_chars(data, &a, b"+/");
             }
-            bytes(b64dec(&data, validate)?)
+            // `padded=` (3.15): False by default for urlsafe_b64decode, True for the others
+            let padded = match kwargs.iter().find(|(k, _)| k == "padded") {
+                Some((_, v)) if super::python() >= (3, 15) => ops::truthy(v)?,
+                Some(_) => return Err(Exc::type_error(format!("{name}() got an unexpected keyword argument 'padded'"))),
+                None => !(name == "urlsafe_b64decode" && super::python() >= (3, 15)),
+            };
+            bytes(b64dec_padded(&data, validate, padded)?)
         }
         "b16encode" => bytes(hex::encode_upper(encode_data(s)?).into_bytes()),
         "b16decode" => {
@@ -1568,8 +1671,19 @@ pub fn base64(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             hex::decode(&data).map_err(|_| Exc::msg(&BINASCII_ERROR, "Odd-length string")).and_then(bytes)
         }
         "b32decode" => {
-            let data = decode_data(s)?;
+            let mut data = decode_data(s)?;
             let casefold = arg(1, "casefold").map(ops::truthy).transpose()?.unwrap_or(false);
+            if let Some((k, _)) = kwargs.iter().find(|(k, _)| !matches!(k.as_str(), "s" | "casefold" | "map01")) {
+                return Err(Exc::type_error(format!("py2axum: b32decode({k}=) is not supported")));
+            }
+            // map01: the digit 0 is O, the digit 1 is the letter given (RFC 4648 section 2.4)
+            if let Some(m) = arg(2, "map01").filter(|v| !v.is_none()) {
+                let m = decode_data(m)?;
+                if m.len() != 1 {
+                    return Err(Exc::value_error("maketrans arguments must have same length"));
+                }
+                data = swap_chars(data, b"01", &[b'O', m[0]]);
+            }
             bytes(super::auth::b32decode(&String::from_utf8_lossy(&data), casefold)?)
         }
         "b32encode" => {

@@ -11,8 +11,8 @@ Python 3.7+; `pos`/`endpos` of a compiled pattern's methods refused), `csv` (sim
 `os.environ`/`os.getenv` (read-only), `os.path`, `os.remove`/`os.unlink` (str or Path; `OSError`s carry
 `errno`, `strerror`, `filename`), `math`, `random` (OS-seeded), `secrets`, `hashlib`,
 `hmac`, `base64`, `urllib.parse`, `string` constants, `time.time/monotonic/perf_counter`,
-`statistics.median`, `logging` (stderr, `LEVEL:logger:message`, level from `PY2AXUM_LOG_LEVEL`; level constants,
-`Logger.log` with a standard level),
+`statistics.median`, `logging` (loggers, handlers, formatters, filters, `basicConfig`, `dictConfig`,
+`LoggerAdapter`, tracebacks: see [Logging](../advanced/logging.md)), python-json-logger's `JsonFormatter`,
 `email.mime` (incl. `MIMEBase` with `set_payload` and `email.encoders.encode_base64`)/`email.utils` (`formataddr`, `formatdate`, `make_msgid`), `html.escape`, `html.unescape` (CPython's HTML5 entity table, longest-prefix rule and numeric references), `ipaddress.ip_address`/`ip_network` (prefix length, `strict=`; membership, str/repr; no netmask form, no IPv6 scope id), `socket.getaddrinfo` (the C library's answer; family and kind are plain ints, not `AddressFamily`/`SocketKind` members; `gaierror` carries only its message),
 codecs of `str.encode`, `bytes.decode` and `str(b, encoding)`: utf-8, utf-8-sig, latin-1 and ascii with their CPython aliases (`errors=` strict, ignore or replace when encoding, strict when decoding; any other codec raises), `unicodedata.normalize/combining` (the Unicode version of the Python that ran the translation: code points it
 leaves unassigned are left alone, as CPython does), `bytes()`, `pickle` (see below), `functools.wraps`, `inspect.iscoroutinefunction`,

@@ -197,7 +197,10 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
             Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) => Ok(v.clone()),
             Native::Sem(s) => sem_method(s, "__aenter__").await,
             Native::Acm(g) => super::agen::acm_enter(g).await,
-            Native::McpRun => Ok(V::None),
+            Native::McpRun => {
+                super::mcp::log("mcp.server.streamable_http_manager", "StreamableHTTP session manager started", vec![], None);
+                Ok(V::None)
+            }
             _ => Err(no_acm(v)),
         },
         V::Session(_) => Ok(v.clone()),
@@ -206,7 +209,51 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
 }
 
 fn no_acm(v: &V) -> Exc {
-    Exc::type_error(format!("'{}' object does not support the asynchronous context manager protocol", v.type_name()))
+    cm_protocol_error(v, true)
+}
+
+/// `async with v` (`asynchronous`) or `with v` on a value without that protocol: CPython names the type
+/// (`_thread.lock`), and from 3.14 the missing method and, when the value has the other protocol, the hint
+pub fn cm_protocol_error(v: &V, asynchronous: bool) -> Exc {
+    let name = match v {
+        V::Native(n) => match &**n {
+            Native::TLock(l) => if l.reentrant { "_thread.RLock" } else { "_thread.lock" },
+            // a class written in Python: its module and qualified name
+            // (3.14's message names it with its module)
+            Native::Sem(_) => if super::python() >= (3, 14) { "asyncio.locks.Semaphore" } else { "Semaphore" },
+            _ => v.type_name(),
+        },
+        _ => v.type_name(),
+    };
+    // the protocol the value has
+    let other = match v {
+        V::Session(s) => s.is_sync() == asynchronous,
+        V::Native(n) => if asynchronous {
+            matches!(&**n, Native::TLock(_) | Native::File(_) | Native::BytesIO(_) | Native::Socket(_) | Native::ZipW(_)
+                | Native::Prom(_) | Native::Sentry(_) | Native::Suppress(_) | Native::CtxToken(..))
+        } else {
+            matches!(&**n, Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) | Native::Sem(_) | Native::Acm(_))
+        },
+        // a project class: its own methods
+        V::Inst(_) | V::Obj(_) => super::ops::dunder(v, if asynchronous { "__exit__" } else { "__aexit__" }).is_some(),
+        _ => false,
+    };
+    cm_error(name, asynchronous, other)
+}
+
+/// The message of `cm_protocol_error` for a type name, and whether the value has the other protocol
+pub fn cm_error(name: &str, asynchronous: bool, other: bool) -> Exc {
+    let (kind, missed) = if asynchronous { ("asynchronous context manager", "__aexit__") } else { ("context manager", "__exit__") };
+    let mut msg = format!("'{name}' object does not support the {kind} protocol");
+    if super::python() >= (3, 14) {
+        msg += &format!(" (missed {missed} method)");
+        if other && asynchronous {
+            msg += " but it supports the context manager protocol. Did you mean to use 'with'?";
+        } else if other {
+            msg += " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?";
+        }
+    }
+    Exc::type_error(msg)
 }
 
 /// leaving `async with v`: `exc` when the body raised; the result suppresses it when true
@@ -223,7 +270,10 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
             let Native::Sem(s) = &**n else { unreachable!() };
             sem_method(s, "__aexit__").await
         }
-        V::Native(n) if matches!(&**n, Native::McpRun) => Ok(V::Bool(false)),
+        V::Native(n) if matches!(&**n, Native::McpRun) => {
+            super::mcp::log("mcp.server.streamable_http_manager", "StreamableHTTP session manager shutting down", vec![], None);
+            Ok(V::Bool(false))
+        }
         V::Native(n) if matches!(&**n, Native::Acm(_)) => {
             let Native::Acm(g) = &**n else { unreachable!() };
             super::agen::acm_exit(g, exc).await

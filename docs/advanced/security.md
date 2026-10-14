@@ -117,8 +117,9 @@ and the runtime's locks do not poison.
   `Internal Server Error`. No message, traceback, SQL text, constraint name or driver error reaches the client.
   `FastAPI(debug=True)` (and any non-literal `debug=`) is refused at compile time, so a debug page is never
   served.
-- On stderr, an unhandled exception is one line, `ERROR:py2axum:Exception in ASGI application: Class: message`.
-  Request headers, cookies and bodies are not logged. The SQL text of a failing statement is logged only with
+- On stderr, an unhandled exception is uvicorn's `ERROR:    Exception in ASGI application` with the traceback
+  of the project's frames ([Logging](logging.md)). Request headers, cookies and bodies are not logged (the
+  access line holds the client address, the method, the path and query string, and the status, as uvicorn's). The SQL text of a failing statement is logged only with
   `PY2AXUM_SQL_DEBUG` set (bound values are never logged). Nothing from the environment or the configuration is logged at
   start-up; a malformed `DATABASE_URL` stops the binary without printing it.
 - The Python-side relay logs a failing upstream with the request path only (a query string can carry a token)

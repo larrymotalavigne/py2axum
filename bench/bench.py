@@ -49,6 +49,10 @@ WORKERS = int(os.environ.get("WORKERS", cpu_count(SERVER_CPUS)))
 def pinned(cpus: str | None, cmd: list[str]) -> list[str]:
     return ["taskset", "-c", cpus, *cmd] if cpus else cmd
 
+# the binary takes uvicorn's options: the same logging as the Python servers measured (no access log, warnings
+# and above); BIN_LOG_FLAGS="" measures it with uvicorn's default logging (one access line per request)
+BIN_LOG_FLAGS = os.environ.get("BIN_LOG_FLAGS", " --no-access-log --log-level warning")
+
 SERVERS = {
     "FastAPI + Uvicorn": {
         "port": 8000,
@@ -62,7 +66,7 @@ SERVERS = {
     },
     "axum (généré)": {
         "port": 8080,
-        "cmd": os.environ.get("APP_BIN", "generated/app_axum/target/release/app_axum"),
+        "cmd": os.environ.get("APP_BIN", "generated/app_axum/target/release/app_axum") + BIN_LOG_FLAGS,
         "env": {"PORT": "8080", "TOKIO_WORKER_THREADS": str(WORKERS), "DB_POOL_SIZE": "32"},
     },
 }
@@ -72,7 +76,7 @@ DYNAPP_PORT = int(os.environ.get("DYNAPP_PORT", "8090"))
 DYNAPP = {
     "axum dynapp": {
         "port": DYNAPP_PORT,
-        "cmd": os.environ.get("DYNAPP_BIN", "generated/dynapp_axum/target/release/dynapp_axum"),
+        "cmd": os.environ.get("DYNAPP_BIN", "generated/dynapp_axum/target/release/dynapp_axum") + BIN_LOG_FLAGS,
         "env": {"PORT": str(DYNAPP_PORT), "TOKIO_WORKER_THREADS": str(WORKERS), "DB_POOL_SIZE": "32"},
     },
 }
@@ -98,7 +102,7 @@ BOOKSHELF = {
     },
     "py2axum binary": {
         "port": 9090,
-        "cmd": os.environ.get("BOOKSHELF_BIN", "generated/bookshelf/target/release/bookshelf"),
+        "cmd": os.environ.get("BOOKSHELF_BIN", "generated/bookshelf/target/release/bookshelf") + BIN_LOG_FLAGS,
         "env": {"PORT": "9090", "TOKIO_WORKER_THREADS": str(WORKERS)},
     },
 }

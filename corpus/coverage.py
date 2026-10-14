@@ -171,10 +171,20 @@ def render_sqlalchemy(data: dict, sq: list[dict]) -> list[str]:
          "methods). PostgreSQL, the database put back to the page's seed data before every request; the Python "
          "reference and the binary are compared as above. `reference-fails`: the Python reference fails on the "
          "route (mostly a lazy load under `AsyncSession`, which raises `MissingGreenlet`).", "",
-         "| Variant | Examples | " + " | ".join(STATUSES) + " | Share |",
+         "The examples are in three scopes. **ORM**: queries a route runs with the ORM (select, joins, aggregates, "
+         "CTE, subqueries, insert/update/delete, relationships, loader options, types, extensions); its share is the "
+         "one py2axum 1.0 requires (90 %). **Core**: the Core chapters of the Unified Tutorial (`Table`, `text()`). "
+         "**Outside API use**: a block about DDL, reflection, events or the pool, or about a session's state across "
+         "statements (identity map, `expunge`, pending sets), the way a script or a long-lived session works. Core and "
+         "outside are measured and published, without a threshold.", "",
+         "| Scope / variant | Examples | " + " | ".join(STATUSES) + " | Share |",
          "|---|" + "---:|" * (len(STATUSES) + 2)]
-    for name, group in (("sync", [r for r in sq if r.get("variant") == "sync"]),
-                        ("async", [r for r in sq if r.get("variant") == "async"]), ("**SQLAlchemy**", sq)):
+    rows = [("**SQLAlchemy ORM** (1.0 threshold: 90 %)", [r for r in sq if r.get("scope") == "orm"]),
+            ("SQLAlchemy Core (aimed at for 1.1)", [r for r in sq if r.get("scope") == "core"]),
+            ("outside API use (measured only)", [r for r in sq if r.get("scope") == "outside"]),
+            ("sync", [r for r in sq if r.get("variant") == "sync"]),
+            ("async", [r for r in sq if r.get("variant") == "async"]), ("all of SQLAlchemy", sq)]
+    for name, group in rows:
         c = Counter(r["status"] for r in group)
         o.append(f"| {name} | {len(group)} | " + " | ".join(str(c.get(s, 0)) for s in STATUSES) +
                  f" | **{share(group)} %** |")
@@ -236,17 +246,19 @@ def baseline_of(data: dict) -> dict:
     out = {"fastapi_share": share([r for r in rs if r["kind"] == "fastapi"]),
            "pydantic_share": share([r for r in rs if r["kind"] == "pydantic"]),
            "sqlalchemy_share": share([r for r in rs if r["kind"] == "sqlalchemy"]),
+           "sqlalchemy_orm_share": share([r for r in rs if r["kind"] == "sqlalchemy" and r.get("scope") == "orm"]),
            "identical": sorted(k for k, r in data["examples"].items() if r["status"] in ("identical", "documented"))}
     for kind in ("fastapi", "pydantic", "sqlalchemy"):
         if not any(r["kind"] == kind for r in rs):
             del out[f"{kind}_share"]
+            out.pop(f"{kind}_orm_share", None)
     return out
 
 
 def regressions(data: dict, base: dict) -> list[str]:
     now = baseline_of(data)
     out = []
-    for k in ("fastapi_share", "pydantic_share", "sqlalchemy_share"):
+    for k in ("fastapi_share", "pydantic_share", "sqlalchemy_share", "sqlalchemy_orm_share"):
         if k in now and now[k] < base.get(k, 0):
             out.append(f"{k}: {now[k]} % < baseline {base[k]} %")
     lost = sorted(set(base.get("identical", [])) - set(now["identical"]) & set(data["examples"]))
@@ -282,7 +294,7 @@ def main() -> int:
         if args.only_sqlalchemy and args.baseline.exists():
             old = json.loads(args.baseline.read_text())
             keep = [k for k in old.get("identical", []) if not k.startswith("sqla_")]
-            new = {**old, "sqlalchemy_share": new["sqlalchemy_share"],
+            new = {**old, "sqlalchemy_share": new["sqlalchemy_share"], "sqlalchemy_orm_share": new["sqlalchemy_orm_share"],
                    "identical": sorted(keep + [k for k in new["identical"] if k.startswith("sqla_")])}
         args.baseline.write_text(json.dumps(new, indent=1) + "\n")
     elif args.baseline and args.baseline.exists():
@@ -291,7 +303,7 @@ def main() -> int:
             print(f"regression: {b}", file=sys.stderr)
         rc = 1 if bad else 0
     b = baseline_of(data)
-    print(", ".join(f"{k.split('_')[0]} {v} % identical" for k, v in b.items() if k.endswith("_share")), file=sys.stderr)
+    print(", ".join(f"{k.removesuffix('_share')} {v} % identical" for k, v in b.items() if k.endswith("_share")), file=sys.stderr)
     return rc
 
 

@@ -44,7 +44,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-stream", action="store_true", help="buffer list responses instead of streaming them")
     ap.add_argument("--allow-untested-versions", action="store_true",
                     help="translate even if the project locks library versions outside the tested ranges")
+    from .versions import add_python_flag, apply_python_flag
+
+    add_python_flag(ap)
     args = ap.parse_args(argv)
+    apply_python_flag(args)
     if args.backend == "typed":
         print("error: --backend typed was removed in 0.4: use the default backend (drop --backend)", file=sys.stderr)
         return 2

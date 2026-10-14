@@ -122,6 +122,7 @@ nav:
       - advanced/index.md
       - How it works: advanced/how-it-works.md
       - Graceful shutdown: advanced/shutdown.md
+      - Logging: advanced/logging.md
       - Large list responses: advanced/streaming.md
       - Sentry: advanced/sentry.md
       - Prometheus metrics: advanced/metrics.md
@@ -140,6 +141,7 @@ nav:
       - Standard library: reference/stdlib.md
       - Libraries: reference/libraries.md
       - Versions: reference/versions.md
+      - Python versions: python-versions.md
       - Error codes: reference/errors.md
   - Coverage: coverage.md
   - Release notes: release-notes.md

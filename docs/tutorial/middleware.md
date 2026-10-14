@@ -73,6 +73,9 @@ adding a header to every response. Like every example on this site, it is compil
   pass as if the middleware let them through, its usual first line); a wrapped `receive` is read to the end of
   the body before the rest of the stack runs, and an original `receive` already consumed by an outer layer
   still yields the body (uvicorn would wait for the client to disconnect); the 500 for a middleware returning
-  without a response is produced by the layer, so outer middlewares see it (uvicorn produces it itself).
+  without a response is produced by the layer, so outer middlewares see it (uvicorn produces it itself); an
+  exception raised once the response has started (by a middleware after its `await self.app(...)`, or while
+  the body streams) does not go back through the raw middlewares wrapping `send` around it, so their frames
+  are missing from its traceback ([Logging](../advanced/logging.md)).
 
 GZip and streamed responses: see [Large list responses](../advanced/streaming.md#differences).

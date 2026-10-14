@@ -67,13 +67,25 @@ def _global(result: dict, e) -> None:
                              "code": e.code, "suggestion": suggestion(e, None)})
 
 
+def python_target(root: Path) -> dict:
+    """The Python the binary follows (docs/python-versions.md): its minor, its patch release when known, and the
+    behaviours probed on the transpiler's Python."""
+    try:
+        major, minor = versions.target_python(root)
+        patch = versions.target_python_patch(root)
+        probed = versions.probe_features(root)
+    except ValueError:
+        return {}
+    return {"version": f"{major}.{minor}" + (f".{patch}" if patch is not None else ""), "probed": probed}
+
+
 def run(package: Path, root: Path | None, python_side: list[str], backend: str = "auto",
         allow_untested: bool = False) -> dict:
     side = set(python_side)
     auto = "auto" in side
     side.discard("auto")
     result = {"package": str(package), "backend": "dyn", "python_side_auto": auto, "routes": [], "global": [],
-              "notes": []}
+              "notes": [], "python": python_target(root or package.resolve().parent)}
     codes: dict[str, str] = {}  # construction label -> error code
     if not allow_untested:
         c = errors.BY_CODE["P2A0601"]
@@ -186,7 +198,13 @@ def to_text(result: dict, color: bool = False) -> str:
 
     mark = {"native": c("32", "native     "), "python-side": c("33", "python-side"), "refused": c("31", "refused    ")}
     s = result["summary"]
-    o = [f"py2axum check {result['package']}", ""]
+    o = [f"py2axum check {result['package']}"]
+    py = result.get("python") or {}
+    if py:
+        probed = ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in py["probed"].items())
+        o.append(f"python {py['version']}" + (f" (probed on this Python: {probed})" if probed else
+                                              " (not probed: another minor, or a patch release named)"))
+    o.append("")
     if result["global"]:
         o.append(c("31", "Whole application — generation refused whatever the routes:"))
         for g in result["global"]:
@@ -281,7 +299,11 @@ def main(argv: list[str]) -> int:
                     help="also exit 1 when fewer than PCT %% of the routes are native")
     ap.add_argument("--allow-untested-versions", action="store_true",
                     help="do not refuse library versions outside the tested ranges")
+    from .versions import add_python_flag, apply_python_flag
+
+    add_python_flag(ap)
     args = ap.parse_args(argv)
+    apply_python_flag(args)
     if args.explain is not None:
         text = errors.explain(args.explain)
         if text is None:

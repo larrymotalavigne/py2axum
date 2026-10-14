@@ -34,6 +34,23 @@ pub struct AIncoming {
 }
 
 fn amqp_err(e: lapin::Error, connecting: bool) -> Exc {
+    if connecting {
+        // aiormq logs the transport's failure before raising it: `error when creating transport: %r`
+        let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+        while let Some(x) = src {
+            if let Some(io) = x.downcast_ref::<std::io::Error>() {
+                if let Some(errno) = io.raw_os_error() {
+                    let text = io.to_string();
+                    let text = text.split(" (os error").next().unwrap_or(&text).to_string();
+                    let repr = format!("<AMQPConnectionError: ({errno}, {})>", ops::str_repr(&text));
+                    super::logging::emit_sync("aiormq.connection", super::logging::ERROR, "error when creating transport: %s",
+                                              vec![V::str(repr)], vec![], None, &super::logging::NO_LOC);
+                }
+                break;
+            }
+            src = x.source();
+        }
+    }
     Exc::msg(if connecting { &AMQP_CONNECTION_ERROR } else { &AMQP_ERROR }, e.to_string())
 }
 

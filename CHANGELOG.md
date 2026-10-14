@@ -5,6 +5,104 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-14
+
+Pydantic documentation corpus at 90.8 % and SQLAlchemy ORM documentation corpus at 93.8 % (both past the 1.0
+threshold, none differing), logging identical to Python's, Python 3.15, and memory leaks found by a long soak.
+
+### Added
+
+- Pydantic: `validation_alias` (`AliasPath`, `AliasChoices`), `serialization_alias`, `alias_generator` (evaluated at
+  translation), `validate_by_alias`/`validate_by_name`/`serialize_by_alias`; `Field(exclude=, exclude_if=,
+  frozen=, multiple_of=, union_mode=, strict=, discriminator=)`; strict mode (config and field); discriminated
+  unions (by a `Literal` field or by `Discriminator(fn)` with `Tag`); `AfterValidator`/`BeforeValidator`/
+  `PlainValidator`/`WrapValidator`, `@field_validator(mode="plain"|"wrap")`, `@field_serializer`,
+  `@model_serializer`, `PlainSerializer`/`WrapSerializer`; specialised generic models, `RootModel`, `SecretStr`,
+  `UUID1`..`UUID8`, `Fraction`, `complex`, `deque`, `Counter`, `OrderedDict`, `Sequence`, fixed tuples,
+  `default_factory` taking the validated data, `PydanticCustomError`. Pydantic documentation corpus 52.1 → 90.8 %
+  (216/238); the messages of pydantic 2.12 and 2.13 are reproduced by the locked version.
+- SQLAlchemy ORM inheritance: single table (`polymorphic_on` / `polymorphic_identity`), joined table (one table
+  per class, flushed table by table), `of_type()`, `with_polymorphic()`, `selectin_polymorphic()`,
+  `polymorphic_load="selectin"|"inline"`.
+- SQLAlchemy ORM: deferred columns (`load_only`, `defer`, `undefer`, `undefer_group`, `defaultload`,
+  `deferred(group=)`, raise-loading), `composite()`, `@hybrid_property` / `@hybrid_method` (with `.expression`
+  and `.setter`), write-only collections (`WriteOnlyMapped`), `eager_defaults=True`, `Session(engine)` /
+  `AsyncSession(engine)` in an endpoint, `session.expire(obj[, names])`, `__init__` on a mapped class,
+  `filter_by()` on hybrids and composites, `and_()`/`with_parent()`/`add_columns()`/`aliased(name=)`, and Core
+  `Table()` objects used as values (`t.c`, `alias()`, `bindparam()`, executemany, `insert().values([...])`,
+  FULL OUTER JOIN). `dataclasses.astuple()` / `asdict()`, `typing.cast()`.
+- Logging identical to Python's: the `logging` hierarchy (levels, propagation, handlers, `Formatter` with `%`, `{`
+  and `$` styles, filters, `LoggerAdapter`, `basicConfig`, `dictConfig`, python-json-logger 4.0), uvicorn's
+  startup, shutdown and access lines and its command-line options, and tracebacks with the project's frames,
+  source lines and carets (`raise ... from`, `__context__`). The mcp SDK's own log lines are reproduced. Module
+  and factory statements that configure logging are translated. See
+  [Logging](https://larrymotalavigne.github.io/py2axum/advanced/logging/).
+- SQLAlchemy ORM: `relationship(secondary=<Table>)` (many-to-many: joins, lazy and `selectin` loading, `any()`,
+  association rows written at flush and deleted with their owner; `back_populates`/`backref`, cascades and
+  `order_by=` on it are refused), `session.expunge()` / `expunge_all()` (`DetachedInstanceError`), `expire_all()`,
+  `obj in session`, relationship criteria (`Child.parent == obj`, `Parent.children.contains(obj)`,
+  `join(Target, Model.rel)`, aliases), `execution_options(populate_existing=, autoflush=, yield_per=)`; bulk
+  `execute(insert(Model), [dicts])` (and with `returning(Model)`), bulk `update(Model)` by primary key,
+  `insert().values([dicts])` as SQLAlchemy builds it; results are exhausted and closed like SQLAlchemy's
+  (`ResourceClosedError`). `Model.__mapper__` and Core use of `Model.__table__` are refused at translation.
+- SQLAlchemy documentation corpus: the doctests of the 2.1.4 documentation replayed as routes against the binary;
+  ORM scope 93.8 % identical (243/276, the 1.0 threshold is 90 %), Core 88.7 %, none differing
+  ([coverage](https://larrymotalavigne.github.io/py2axum/coverage/)).
+- Python 3.15 is supported (3.12 to 3.15; [Python versions](https://larrymotalavigne.github.io/py2axum/python-versions/)
+  reviews every change of 3.14 and 3.15). The binary follows the project's Python: `--python X.Y`, else its
+  `.python-version`, else the Python running py2axum when `requires-python` allows it (it used to take the lowest
+  Python `requires-python` allowed). `sys.version_info` is folded against it at translation, and a branch it
+  rules out is never translated (version-gated imports work).
+- Python 3.14 and 3.15 constructs: comprehension unpacking (`[*x for x in xs]`, `{**m for m in ms}`), `lazy import`
+  of libraries, `case +1:`, `with var.set(x):`, `Path.copy()/move()`, `uuid.uuid7()`, `re.prefixmatch()`, `\z`,
+  `Counter ^ Counter`, `bytes.replace(count=)`, `format()` separators in the fractional part, json's exception
+  notes, `add_note()`/`__notes__`; and the messages that changed between 3.12 and 3.15 (ZeroDivisionError,
+  unpacking, `dict(seq)`, context managers, `strptime('%d')`, base32, unpadded `urlsafe_b64decode`,
+  `fromtimestamp`, `os.urandom`). Template strings and lazy imports of project modules are refused.
+
+### Security
+
+- `nh3.clean()` runs on `ammonia` 4.2.3 (was 4.2.1): RUSTSEC-2021-0157 (`url()` escaping in CSS style attributes)
+  and RUSTSEC-2021-0158 (SVG animation tags), both XSS in the sanitizer.
+
+### Fixed
+
+- Memory: a nested function that calls itself no longer keeps its closure alive (113 KiB per request with 100 KB
+  captured); ORM objects left by a failed flush, a rollback or a delete are released with their session; a
+  streamed response with a `yield` dependency cut by the client released its connection only at shutdown (each
+  cut kept a connection idle in transaction: 200 cuts blocked every route using the database); an abandoned raw
+  ASGI app is completed.
+- Sentry: an exception already captured for a request is not sent a second time by the `logging` integration
+  (uvicorn logs it after the response), and a record's `extra` leaves out sentry-sdk's common record attributes.
+- `session.close()` did nothing: objects are now detached and the transaction rolled back, like SQLAlchemy; a
+  session dropped with an open transaction rolls it back at once. Reserved table and column names (`"user"`,
+  `"order"`) are quoted.
+- `base64.b64decode` (and python-jose's padding) follows the padding rules CPython rewrote in its 3.13.13 and
+  3.14.4 security releases (data after the padding is decoded, excess `=` skipped), by the project's patch
+  release. Tracebacks in the logs print the exception's notes, and the `ValueError` an enum's `_missing_`
+  chains as `__context__` (`'x' is not a valid E`, "During handling of the above exception...").
+- `socket.getaddrinfo`, `socket.create_connection` and `asyncio.open_connection` check the host like CPython's
+  `idna` codec before any lookup (a label of 64 characters or an empty one: `UnicodeEncodeError`, `UnicodeError`
+  on 3.12); the binary passed it to the C library. `UnicodeError` exists as the base of the encode/decode errors.
+- Behaviours that changed inside a Python minor follow the project's patch release: `strptime('%e')` is a bad
+  directive before 3.13.6. The patch is the one `--python X.Y.Z` or `.python-version` names, else the Python
+  running py2axum when it runs the project's minor (`PY2AXUM_PYTHON_VERSION` overrides it at start).
+- Differences with Python on every version: `"a".count()` or `[1].count()` without an argument aborted the
+  request, `str.replace(count=)` was ignored, `bytes.replace` was missing, `base64.b32decode(map01=)` was ignored
+  and the base64 functions dropped unknown keyword arguments, `f"{n:_}"` grouped with commas, the builtin
+  `format()` was not translated, `FileResponse` guessed the media type from a table of 20 extensions (now
+  CPython's table of the project's Python and the host's `mime.types`, as `mimetypes` reads them), and the types
+  named by operator and context-manager errors (`Counter`, `_thread.lock`). The text of a type expression
+  (`repr(int | str)`) is refused instead of `<GenericAlias>`.
+- Async sessions: reading an attribute that needs IO (expired or deferred column, unloaded relationship) raises
+  what the locked SQLAlchemy raises: `MissingGreenlet` up to 2.0, a `StatementError` wrapping it since 2.1
+  (`except MissingGreenlet` is now translated, and does not catch it). `e.orig` is readable on SQLAlchemy errors
+  (the psycopg exception of a database error, the cause of a missing bind parameter or an unknown enum value).
+  The primary key of an object expired as a whole (commit, `expire_all()`) was read from memory; it now needs IO
+  like the other columns.
+- The declarative base's `type_annotation_map` was ignored: `Mapped[datetime]` became a `DateTime` without time
+  zone where the map said otherwise. It is applied, and `Mapped[Decimal]` / `Mapped[time]` map to `Numeric` / `Time`.
+
 ## [0.6.0] — 2026-10-09
 
 FastAPI documentation corpus at 90.6 %, raw ASGI middlewares three times cheaper, error codes and `py2axum

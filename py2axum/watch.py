@@ -267,12 +267,18 @@ def parser() -> argparse.ArgumentParser:
                     help="quiet time after the last change before a cycle starts (default 0.3 s)")
     ap.add_argument("--stop-timeout", type=float, default=5.0, metavar="S",
                     help="time the binary gets to exit after SIGTERM before it is killed (default 5 s)")
+    from .versions import add_python_flag
+
+    add_python_flag(ap)
     ap.add_argument("binary_args", nargs="*", metavar="-- ARG", help="arguments passed to the binary, after --")
     return ap
 
 
 def main(argv: list[str]) -> int:
+    from .versions import apply_python_flag
+
     args = parser().parse_args(argv)
+    apply_python_flag(args)
     if not args.package.is_dir():
         print(f"error: {args.package} is not a directory", file=sys.stderr)
         return 2

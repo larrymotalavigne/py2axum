@@ -3,8 +3,8 @@
 The runtime reproduces the behaviour of precise library versions (Pydantic's error messages and URLs,
 Starlette's routing and middlewares, SQLAlchemy's session), so py2axum only accepts the ranges its
 conformance suites run on. CI runs the test suite and the full `fixtures/dynapp` conformance (normal and
-forced-streaming passes) at both ends of every range: lowest versions on Python 3.12, highest on 3.14, and
-highest with pydantic 2.13 on 3.13 (every supported pydantic minor is run).
+forced-streaming passes) at both ends of every range: lowest versions on Python 3.12, highest on 3.14 and on
+3.15, and highest with pydantic 2.13 on 3.13 (every supported pydantic minor is run).
 
 | Library | Lowest tested | Highest tested | Accepted |
 |---|---|---|---|
@@ -20,14 +20,14 @@ highest with pydantic 2.13 on 3.13 (every supported pydantic minor is run).
 | mcp | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
 | asyncpg | 0.31.0 | 0.32.0 | `>=0.31.0,<0.33` |
 | icalendar | 7.0.0 | 7.0.0 | `>=7.0.0,<7.1` |
-| Python | 3.12 | 3.14 | `>=3.12,<3.15` |
+| Python | 3.12 | 3.15 | `>=3.12,<3.16` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;
 `asyncpg` the same way, by the conformance of a real application served with that driver (0.31.0 and 0.32.0),
 and `icalendar` by a real application's calendar export. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
-inside a range follow the project's version: CPython's messages (3.14 names the role of an unhashable dict key
-or set element and the expected input of a `math` domain error), Pydantic's (see below), Starlette's
-`CORSMiddleware`. The project's version is the one of its `uv.lock`, else its `==` pin in `requirements*.txt`
+inside a range follow the project's version: CPython's messages and behaviours (3.14 names the role of an
+unhashable dict key or set element and the expected input of a `math` domain error; the full list, from 3.12 to
+3.15, is in [Python versions](../python-versions.md)), Pydantic's (see below), Starlette's `CORSMiddleware`. The project's version is the one of its `uv.lock`, else its `==` pin in `requirements*.txt`
 or `pyproject.toml`, else the one installed next to py2axum (when the project's specifier allows it; otherwise
 the highest tested version the specifier allows).
 
@@ -56,6 +56,8 @@ The analysed project's versions are read from the first of these found at `--roo
 repository's root): `uv.lock` (exact versions), else `requirements*.txt` and the `pyproject.toml`
 dependencies. A locked or pinned version outside its range, or a specifier that excludes the whole range
 (`sqlalchemy<2`), is refused with `file:line`, by generation, `check` and `--report` alike. A specifier that
-overlaps the range (`fastapi>=0.100`) is accepted. `requires-python` must overlap 3.12–3.14, and its lower bound
+overlaps the range (`fastapi>=0.100`) is accepted. `requires-python` must overlap 3.12–3.15, and its lower bound
 must not be newer than the Python running py2axum (the parser only knows its own syntax). Libraries the project
-does not mention are not checked. `--allow-untested-versions` translates anyway, at your own risk.
+does not mention are not checked. The Python the project runs on (whose messages the binary reproduces) is
+`--python X.Y`, else the project's `.python-version`, else the Python running py2axum when `requires-python`
+allows it, else the lowest one it allows: see [Python versions](../python-versions.md). `--allow-untested-versions` translates anyway, at your own risk.

@@ -11,7 +11,7 @@ RUNTIME = Path(__file__).resolve().parent.parent / "py2axum" / "runtime"
 LEAK = re.compile(r"Box::leak|\.leak\(\)|mem::forget")
 FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)")
 # (file, enclosing function): each one caches what it leaks, keyed by the value
-ALLOWED = {("types.rs", "schema_td"), ("types.rs", "intern"), ("types.rs", "td_of")}
+ALLOWED = {("types.rs", "schema_td"), ("types.rs", "intern"), ("types.rs", "td_of"), ("v.rs", "psycopg_class")}
 
 
 def leaks() -> list[tuple[str, str, int]]:
@@ -33,3 +33,62 @@ def test_no_leak_outside_caches():
 
 def test_the_check_sees_the_caches():
     assert {(f, fn) for f, fn, _ in leaks()} >= {("types.rs", "schema_td"), ("types.rs", "intern")}
+
+
+# A nested function naming itself (recursion) held itself through its cell: the cell holds the function, the
+# function's closure the cell, a cycle CPython's GC frees and Arc never does (everything it captured leaked at
+# each call; PR #1 of the public repository, 11/10/2026). Bound once by an undecorated `def` run once per call,
+# the name always holds that function: it reads itself through a weak reference (`SelfRef`).
+SELFREF = '''
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+def deco(f):
+    return f
+
+
+@app.get("/{case}")
+async def route(case: str):
+    payload = "x" * 10
+
+    def once(k):
+        return len(payload) if k <= 0 else once(k - 1)
+
+    def looked(k):
+        return k if k <= 0 else looked(k - 1)
+
+    pick = lambda: looked  # noqa: E731
+
+    @deco
+    def decorated(k):
+        return k if k <= 0 else decorated(k - 1)
+
+    def rebound(k):
+        return k if k <= 0 else rebound(k - 1)
+
+    rebound = deco(rebound)
+    out = []
+    for i in range(2):
+        def looping(k):
+            return k if k <= 0 else looping(k - 1)
+
+        out.append(looping)
+    return {"v": once(2) + pick()(1) + decorated(1) + rebound(1) + out[0](1)}
+'''
+
+
+def test_self_naming_nested_function_is_weak(tmp_path):
+    from py2axum.__main__ import main
+
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(SELFREF)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    src = "".join(p.read_text() for p in sorted((tmp_path / "out" / "src").glob("*.rs")))
+    # `once` and `looked` (a cell variable: another closure reads it, it gets a cell of the weak reference);
+    # not `decorated`, `rebound`, `looping`: the name may hold something else than this function
+    assert src.count("SelfRef::default()") == 2
+    assert src.count("ops::cell_of(") >= 1

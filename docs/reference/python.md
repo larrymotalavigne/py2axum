@@ -28,10 +28,11 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   Refused: `nonlocal` of a parameter of the enclosing function, a project decorator on a method.
 - Classes: plain classes (`__init__`, methods, properties, static/class methods, class attributes,
   `__slots__`; single inheritance from another plain class and/or `abc.ABC`, `@abstractmethod` (instantiating
-  a class left abstract raises CPython's `TypeError` when called by name), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `__post_init__`), exceptions (class attributes,
+  a class left abstract raises CPython's `TypeError` when called by name), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `__post_init__`; `dataclasses.astuple()` / `asdict()`, recursive like CPython), exceptions (class attributes,
   methods, `super().__init__` of `HTTPException`), Enums (methods, `_missing_`). Special methods:
   `__str__`, `__repr__`, `__eq__` (used by `str()`, f-strings, `==`, `in`, `index`, `count`, `remove`),
-  `__enter__/__exit__`, `__aenter__/__aexit__`; they must not perform I/O (`def`); other special methods
+  `__enter__/__exit__`, `__aenter__/__aexit__`; they are `def`s (the only I/O one may do is a synchronous
+  session's lazy load, a `__repr__` reading a deferred column: done blocking, as CPython does); other special methods
   are refused. In containers, an exception raised by `__eq__` counts as "not equal" (CPython propagates it).
 - Types as values: `list[X]`, `X | None`, library classes (`BaseModel`, `AsyncSession`...),
   `isinstance`/`issubclass` with run-time types, `inspect.isclass`, `typing.get_args/get_origin/
@@ -75,6 +76,12 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   functions are compiled without any of this.
 - A module-level function is one object (`is`, attributes set on it); a nested function naming itself reads
   its name when called, as CPython's closure cell.
+- Memory: values are reference-counted, without CPython's cycle collector. A nested function that calls
+  itself (bound once by its `def`) refers to itself weakly and is freed as in CPython; ORM objects linked by
+  relationships are released when their session ends. Other reference cycles the application builds
+  (`a.append(a)`, two nested functions calling each other, a decorated nested function naming itself, an
+  object stored in a container it owns) are never freed: each request that builds one keeps it until the
+  process exits.
 - `typing.TypedDict` classes: calling one builds a plain `dict` (keys neither checked nor completed, as in
   CPython); as a Pydantic field or a response model, refused.
 - `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`; a builtin exception

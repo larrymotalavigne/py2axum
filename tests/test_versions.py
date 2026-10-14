@@ -21,7 +21,7 @@ def test_pyproject_mirrors_supported():
         assert extra.get(name) == versions.spec(name), name
     assert pp["project"]["requires-python"] == ">=3.12"
     classifiers = {c.rsplit(" ", 1)[1] for c in pp["project"]["classifiers"] if c.startswith("Programming Language :: Python :: 3.")}
-    assert classifiers == {"3.12", "3.13", "3.14"}
+    assert classifiers == {"3.12", "3.13", "3.14", "3.15"}
 
 
 def test_docs_list_every_range():
@@ -36,7 +36,7 @@ def test_ci_matrix_runs_both_ends():
         pytest.skip("the version matrix runs in the internal CI, not exported")
     ci = (ROOT / ".gitlab-ci.yml").read_text()
     assert "python -m py2axum.versions $END" in ci
-    assert 'PY: "3.12"' in ci and 'PY: "3.14"' in ci
+    assert 'PY: "3.12"' in ci and 'PY: "3.14"' in ci and 'PY: "3.15"' in ci
     assert versions.pins("min")[0] == "fastapi==0.137.0" and "psycopg[binary]==3.3.6" in versions.pins("max")
     for end in versions.MIDDLES:
         assert "END: " + end + " }" in ci  # each intermediate version has its job

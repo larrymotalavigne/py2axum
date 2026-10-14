@@ -281,6 +281,7 @@ class Example:
     handles: dict                 # names the route provides: {"session": "session", "conn": "conn", ...}
     excluded: str | None = None   # why it is not in the corpus
     segment: int = 0
+    scope: str = "orm"            # orm | core | outside (scope())
 
 
 def _names(node: ast.AST) -> tuple[set[str], set[str]]:
@@ -314,6 +315,49 @@ def _names(node: ast.AST) -> tuple[set[str], set[str]]:
             if not before:
                 reads.add(n.id)
     return reads, writes
+
+
+DECLARATIVE = {"DeclarativeBase", "DeclarativeBaseNoMeta", "MappedAsDataclass", "declarative_base", "registry"}
+
+
+def _orm_tainted(trees, kinds, rw, upto: int) -> set[str]:
+    """The names the definitions before `upto` bind that belong to a declarative base: the base, the mapped classes
+    (a `__tablename__`, or a base among those names), and every definition reading one of them."""
+    tainted: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for i in range(upto):
+            if kinds[i] != "def":
+                continue
+            names = _top_names(trees[i]) - {n for n in _top_names(trees[i]) if all(
+                isinstance(x, (ast.Import, ast.ImportFrom)) for x in trees[i].body)}
+            if not names or names <= tainted:
+                continue
+            orm = any(isinstance(n, ast.ClassDef) and (
+                any(ast.unparse(b).split(".")[-1] in DECLARATIVE or ast.unparse(b) in tainted for b in n.bases)
+                or any(isinstance(x, (ast.Assign, ast.AnnAssign)) and "__tablename__" in ast.unparse(x).split("=")[0]
+                       for x in n.body)) for n in trees[i].body)
+            if orm or rw[i][0] & tainted or any(
+                    isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.value, ast.Call)
+                    and ast.unparse(n.value.func).split(".")[-1] in DECLARATIVE for n in trees[i].body):
+                tainted |= names
+                changed = True
+    return tainted
+
+
+def _top_names(tree: ast.Module) -> set[str]:
+    """The names a module-level statement binds (not those of a class or function body)."""
+    out = set()
+    for n in tree.body:
+        if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            out |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                out |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+    return out
 
 
 def _call_name(node) -> str | None:
@@ -381,36 +425,74 @@ def plan(unit: str, section: str, stmts: list[Stmt]) -> tuple[list[Example], lis
     # where the latest definition of each name holds
     segs: list[dict] = [{"start": 0, "world": 0}]
     defined: dict[str, str] = {}
+    bases_seen: set[str] = set()
     for i, s in enumerate(stmts):
         new_setup = s.setup and i > 0 and not stmts[i - 1].setup
         # (even with the same body: a new class object, which the later definitions build on)
         redefined = kinds[i] == "def" and any(
             isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in defined
             for n in trees[i].body)
+        # a base class defined again (`class Base(DeclarativeBase)`): the classes built on the former one are
+        # another world too
+        new_base = redefined and any(
+            isinstance(n, ast.ClassDef) and n.name in bases_seen for n in trees[i].body)
         if new_setup or redefined:
-            segs.append({"start": i, "world": i if new_setup else segs[-1]["world"]})
-            if new_setup:
+            start = i
+            if new_base and not new_setup:
+                # the definitions just before it in the same code block (the classes the new base's models use)
+                # belong to the new world too
+                while (start - 1 > segs[-1]["world"] and kinds[start - 1] == "def"
+                       and stmts[start - 1].block == s.block and not stmts[start - 1].setup):
+                    start -= 1
+                while len(segs) > 1 and segs[-1]["start"] >= start:
+                    segs.pop()
+            segs.append({"start": start, "world": start if new_setup or new_base else segs[-1]["world"]})
+            if new_setup or new_base:
                 defined = {}
+                bases_seen = set()
+                for j in range(start, i):  # what they define stays known to this world
+                    for n in trees[j].body:
+                        if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                            defined[n.name] = ast.dump(n)
+                        if isinstance(n, ast.ClassDef):
+                            bases_seen |= {b.id for b in n.bases if isinstance(b, ast.Name)}
         if kinds[i] == "def":
             for n in trees[i].body:
                 if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                     defined[n.name] = ast.dump(n)
+                if isinstance(n, ast.ClassDef):
+                    bases_seen |= {b.id for b in n.bases if isinstance(b, ast.Name)}
     for k, g in enumerate(segs):
         end = segs[k + 1]["start"] if k + 1 < len(segs) else len(stmts)
         latest: dict[str, int] = {}
         keep = []
+        # what the former world defines on its declarative base (its models, tables, and what uses them) stays there;
+        # its other definitions (a plain class such as a composite's value object) are still in scope
+        tainted = _orm_tainted(trees, kinds, rw, g["world"])
         for i in range(end):
             if kinds[i] != "def":
                 continue
             if i < g["world"]:
                 if all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in trees[i].body):
                     keep.append(i)
-                continue
-            for name in rw[i][1]:
+                    continue
+                if not _top_names(trees[i]) or _top_names(trees[i]) & tainted or rw[i][0] & tainted:
+                    continue
+            for name in _top_names(trees[i]):
                 latest[name] = i
             keep.append(i)
-        g["defs"] = [i for i in keep if all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in trees[i].body)
-                     or any(latest.get(name) == i for name in rw[i][1])]
+        keep = [i for i in keep if all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in trees[i].body)
+                or any(latest.get(name) == i for name in _top_names(trees[i]))]
+        # a definition after those it uses (a class kept from before a redefinition of its base)
+        defines = {i: _top_names(trees[i]) for i in keep}
+        order, left = [], list(keep)
+        while left:
+            done = {n for i in order for n in defines[i]}
+            pending = {n for i in left for n in defines[i]}
+            nxt = next((i for i in left if not ((rw[i][0] & pending) - defines[i] - done)), left[0])
+            order.append(nxt)
+            left.remove(nxt)
+        g["defs"] = order
     seg_of = []
     for i in range(len(stmts)):
         seg_of.append(max(k for k, g in enumerate(segs) if g["start"] <= i))
@@ -726,21 +808,78 @@ def _route_stmt(s: Stmt, tree: ast.Module, own: bool) -> list[ast.stmt]:
 # --- the bench: prepare, check, generate, build, replay -------------------------------------------------------
 
 DOCS_URL = "https://docs.sqlalchemy.org/en/21/"
+# the scope of an example (decision of 09/10: the 1.0 threshold is 90 % of the "orm" examples; "core" and
+# "outside" are measured and published without a threshold, Core is aimed at for 1.1)
+CORE_PAGES = {"doc/build/tutorial/dbapi_transactions.rst", "doc/build/tutorial/data_insert.rst",
+              "doc/build/tutorial/data_select.rst", "doc/build/tutorial/data_update.rst"}
+OUTSIDE = [  # what a block does that an API route does not (on its own statements)
+    (r"create_all|drop_all|CREATE TABLE|DROP TABLE|ALTER TABLE", "DDL"),
+    (r"autoload_with|\binspect\(|reflect\(", "reflection, inspection"),
+    (r"\bexpunge(_all)?\(|session\.(new|dirty|deleted)\b|\bin session\b|\bin sess\b|identity_map|populate_existing|"
+     r"expire_all\(", "session state across statements (identity map, expunge, pending sets)"),
+    (r"\bevent\.|listens_for|\bpool\b|dispose\(", "events, pool"),
+]
+
+
+def scope(ex: "Example", stmts: list) -> str:
+    """orm | core | outside (API use: queries run by a route; outside: what a script or a long session does)."""
+    own = "\n".join(stmts[i].src for i in ex.block)
+    if any(re.search(pat, own) for pat, _ in OUTSIDE):
+        return "outside"
+    return "core" if ex.page in CORE_PAGES or ex.page.startswith("doc/build/core/") else "orm"
 ASYNC_NATIVE = {"asyncio"}  # pages written for asyncio: only the async variant applies
-PORT_BASE = 10300           # ports 10300-10399: two per worker slot
+# ports 10300-10399 (two per worker slot) and databases py2axum_sqla_*; PY2AXUM_SQLA_PORT_BASE and
+# PY2AXUM_SQLA_DB_SUFFIX isolate a second bench run on the same machine
+PORT_BASE = int(__import__("os").environ.get("PY2AXUM_SQLA_PORT_BASE", "10300"))
+DB_SUFFIX = __import__("os").environ.get("PY2AXUM_SQLA_DB_SUFFIX", "")
+# the app's tables; first, the tables of the unit's earlier segments it does not define again (argv[4:]):
+# a page that declares a new Base keeps using the tables created before it (`ForeignKey("user_account.id")`)
 SCHEMA = r'''
 import importlib, json, os, sys
 sys.path.insert(0, sys.argv[1])
-mod = importlib.import_module(sys.argv[2])
 from sqlalchemy import MetaData, create_engine
 from sqlalchemy.orm import DeclarativeBase, registry
-metas = []
-for v in list(vars(mod).values()):
-    m = v if isinstance(v, MetaData) else getattr(v, "metadata", None) if isinstance(v, (type, registry)) else None
-    if isinstance(m, MetaData) and all(m is not x for x in metas):
-        metas.append(m)
+
+def metas_of(name):
+    out = []
+    for v in list(vars(importlib.import_module(name)).values()):
+        m = v if isinstance(v, MetaData) else getattr(v, "metadata", None) if isinstance(v, (type, registry)) else None
+        if isinstance(m, MetaData) and all(m is not x for x in out):
+            out.append(m)
+    return out
+
+metas = metas_of(sys.argv[2])
+own = {t for m in metas for t in m.tables}
+
+def refs(table):
+    return {fk._colspec.split(".")[0] for fk in table.foreign_keys if isinstance(fk._colspec, str)}
+
+# only the earlier tables the app's foreign keys reference (and theirs, transitively)
+need = {r for m in metas for t in m.tables.values() for r in refs(t)} - own
+earlier = [t for name in sys.argv[4:] for m in metas_of(name) for t in m.tables.values()]
+done = False
+while not done:
+    done = True
+    for t in earlier:
+        if t.name in need:
+            new = refs(t) - own - need
+            if new:
+                need |= new
+                done = False
 e = create_engine(sys.argv[3])
-for m in metas:
+for name in sys.argv[4:]:
+    for m in metas_of(name):
+        tables = [t for t in m.tables.values() if t.name in need]
+        if tables:  # (an empty list means all of them to create_all)
+            need -= {t.name for t in tables}
+            m.create_all(e, tables=tables)
+from sqlalchemy import Table, inspect
+for m in metas:  # a foreign key to one of those tables: reflected into the metadata, as the doctest's database has it
+    for t in list(m.tables.values()):
+        for fk in t.foreign_keys:
+            ref = fk._colspec.split(".")[0] if isinstance(fk._colspec, str) else None
+            if ref and ref not in m.tables and inspect(e).has_table(ref):
+                Table(ref, m, autoload_with=e)
     m.create_all(e)
 e.dispose()
 '''
@@ -792,6 +931,7 @@ def prepare(repo: Path, work: Path, db: str, log, only: str | None = None) -> tu
         exs, segs, kinds, trees = plan(unit, section, stmts)
         for ex in exs:
             titles.setdefault(ex.page, _title(repo, ex.page))
+            ex.scope = scope(ex, stmts)
         variants = ["async"] if unit in ASYNC_NATIVE else ["sync", "async"]
         for ex in exs:
             if ex.excluded:
@@ -921,7 +1061,7 @@ def translate(apps: list[App], work: Path, stamp: str, jobs: int, log) -> tuple[
             err = build.generate(sub, work / "gen" / app.id, f"{stamp}-{build._tree_hash(sub)}")
             if not err:
                 break
-            m = re.search(r"error: (\S+?main\.py:\d+): (.*)", err)
+            m = re.search(r"error(?:\[P2A\d+\])?: (\S+?main\.py:\d+): (.*)", err)
             ex = _route_at(app, m.group(1)) if m and "Traceback" not in err else None
             if m and "Traceback" not in err and ex is None:
                 # a refusal of the definitions that `check` did not foresee: every route is refused
@@ -968,7 +1108,7 @@ class Db:
     def __init__(self, server: str, slot: int):
         import psycopg
 
-        self.name = f"py2axum_sqla_s{slot}"
+        self.name = f"py2axum_sqla_s{slot}{DB_SUFFIX}"
         self.plain = f"{server}/{self.name}"
         self.url = self.plain.replace("postgresql://", "postgresql+psycopg://", 1)
         with psycopg.connect(f"{server}/postgres", autocommit=True) as c:
@@ -978,14 +1118,14 @@ class Db:
         self.base: list[str] = []
         self.seed: dict = {}
 
-    def setup(self, app_root: Path, module: str, seed: dict | None) -> str | None:
+    def setup(self, app_root: Path, module: str, seed: dict | None, earlier: list[str] = ()) -> str | None:
         """A fresh schema from the app's metadata; the error when Python cannot create it."""
         c = self.conn
         c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() "
                   "AND pid <> pg_backend_pid()")
         c.execute("DROP SCHEMA public CASCADE")
         c.execute("CREATE SCHEMA public")
-        r = subprocess.run([sys.executable, "-c", SCHEMA, str(app_root), module, self.url], capture_output=True,
+        r = subprocess.run([sys.executable, "-c", SCHEMA, str(app_root), module, self.url, *earlier], capture_output=True,
                            text=True, timeout=120, env={**__import__("os").environ, "DATABASE_URL": self.url})
         if r.returncode:
             return (r.stderr.strip().splitlines() or ["?"])[-1]
@@ -996,6 +1136,10 @@ class Db:
 
     def reset(self) -> None:
         c = self.conn
+        # a session an example leaves open (reopened after its `with`, never closed: CPython frees it at the next
+        # garbage collection) keeps its transaction and its locks: ended first
+        c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() "
+                  "AND pid <> pg_backend_pid() AND state LIKE 'idle in transaction%'")
         with c.transaction():
             c.execute("SET LOCAL lock_timeout = '10s'")
             extra = [t for (t,) in c.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
@@ -1056,7 +1200,9 @@ def replay(app: App, work: Path, slot: int, binary: str, server: str) -> dict[st
     logs = work / "logs"
     logs.mkdir(exist_ok=True)
     try:
-        err = db.setup(work, f"pkgs.{app.id}_n.main", app.seed)
+        earlier = [f"pkgs.sqla_{app.unit}_s{k}_{app.variant}.main" for k in range(app.seg)
+                   if (work / "pkgs" / f"sqla_{app.unit}_s{k}_{app.variant}").is_dir()]
+        err = db.setup(work, f"pkgs.{app.id}_n.main", app.seed, earlier)
         if err:
             return {ex: {"status": "reference-fails", "error": f"schema: {err}"} for ex in app.native}
         ref_port, cand_port = PORT_BASE + 2 * slot, PORT_BASE + 2 * slot + 1
@@ -1133,9 +1279,9 @@ def bench(work: Path, server: str, jobs: int, bundle: int, stamp: str, log, only
     import psycopg
 
     with psycopg.connect(f"{server}/postgres", autocommit=True) as c:
-        if not c.execute("SELECT 1 FROM pg_database WHERE datname = 'py2axum_sqla_prep'").fetchone():
-            c.execute('CREATE DATABASE "py2axum_sqla_prep"')
-    prep = f"{server}/py2axum_sqla_prep".replace("postgresql://", "postgresql+psycopg://", 1)
+        if not c.execute("SELECT 1 FROM pg_database WHERE datname = %s", (f"py2axum_sqla_prep{DB_SUFFIX}",)).fetchone():
+            c.execute(f'CREATE DATABASE "py2axum_sqla_prep{DB_SUFFIX}"')
+    prep = f"{server}/py2axum_sqla_prep{DB_SUFFIX}".replace("postgresql://", "postgresql+psycopg://", 1)
     apps, skipped, titles = prepare(repo, work, prep, log, only)
     results, gens = translate(apps, work, stamp, jobs, log)
     binaries, failed = build.build_all(gens, work.parent, bundle, log, prefix="corpus_sqla") if gens else ({}, {})
@@ -1168,7 +1314,7 @@ def bench(work: Path, server: str, jobs: int, bundle: int, stamp: str, log, only
             out[f"sqla_{app.variant}__{ex.id}"] = {
                 "module": f"{app.id}{app.routes[ex.id]}", "source": f"{ex.page}:{ex.line}", "page": ex.page,
                 "title": titles.get(ex.page, ex.page), "section": ex.section, "kind": "sqlalchemy",
-                "variant": app.variant, "tests": ["replay"], **r}
+                "variant": app.variant, "scope": ex.scope, "tests": ["replay"], **r}
     # no machine path in the results (docs/coverage.md is public)
     roots = sorted({str(p) + "/" for p in (work, work.resolve(), repo, repo.resolve(), HERE.parent, Path(sys.prefix))},
                    key=len, reverse=True)

@@ -1,5 +1,6 @@
 """dyn backend: constructions outside the subset are refused with file:line, never approximated."""
 import json
+import sys
 import textwrap
 
 import pytest
@@ -28,6 +29,7 @@ class Team(Base):
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
+
 '''
 
 MAIN = '''
@@ -62,8 +64,13 @@ async def team(team_id: int, s: AsyncSession = Depends(db)):
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], lazy="dynamic")', "lazy='dynamic' is not supported"),
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], order_by="User.nope")', "order_by= must name columns of User"),
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], order_by=["User.id"])', "order_by= must name columns of User"),
-        ('members: Mapped[list["User"]] = relationship(secondary="team_users")', "option secondary= is not supported"),
+        ('members: Mapped[list["User"]] = relationship(secondary="team_users")', "secondary= must name a module-level Table"),
         ('ghost: Mapped["Nope"] = relationship("Nope")', "relationship target 'Nope': unknown mapped class"),
+        ('members: DynamicMapped["User"] = relationship(foreign_keys=[owner_id])', "DynamicMapped[...] is not supported"),
+        ('owner: WriteOnlyMapped["User"] = relationship(foreign_keys=[owner_id], passive_deletes=True)',
+         "a write-only many-to-one relationship is not supported"),
+        ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], lazy="write_only", back_populates="x")',
+         "back_populates= on a write-only collection is not supported"),
     ],
 )
 def test_relationship_rejected(tmp_path, capsys, rel, message):
@@ -76,6 +83,52 @@ def test_relationship_rejected(tmp_path, capsys, rel, message):
     err = capsys.readouterr().err
     assert message in err
     assert "models.py:" in err
+
+
+M2M_TABLES = '''
+
+from sqlalchemy import Column, Table  # noqa: E402
+
+team_users = Table("team_users", Base.metadata, Column("team_id", ForeignKey("teams.id"), primary_key=True),
+                   Column("user_id", ForeignKey("users.id"), primary_key=True))
+bad_users = Table("bad_users", Base.metadata, Column("team_id", ForeignKey("teams.id"), primary_key=True))
+'''
+
+
+@pytest.mark.parametrize(
+    "rel, message",
+    [
+        ('members: Mapped[list["User"]] = relationship(secondary=team_users, back_populates="teams")',
+         "back_populates= on a many-to-many relationship is not supported"),
+        ('members: Mapped[list["User"]] = relationship(secondary="team_users", backref="teams")',
+         "backref= on a many-to-many relationship is not supported"),
+        ('members: Mapped[list["User"]] = relationship(secondary=team_users, cascade="all, delete-orphan")',
+         "cascade delete / delete-orphan / passive_deletes on a many-to-many"),
+        ('members: Mapped[list["User"]] = relationship(secondary=bad_users)', "needs one foreign key to teams and one to users"),
+        ('members: Mapped[list["User"]] = relationship(secondary=team_users, order_by="User.id")',
+         "secondary= with order_by= is not supported"),
+    ],
+)
+def test_many_to_many_rejected(tmp_path, capsys, rel, message):
+    """relationship(secondary=): what is not modelled is refused (instrumented collections kept in step, cascades)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", rel) + M2M_TABLES)
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+
+
+def test_many_to_many_translates(tmp_path):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace(
+        "{rel}", 'members: Mapped[list["User"]] = relationship(secondary=team_users)') + M2M_TABLES)
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
 
 
 SESSION_MAIN = '''
@@ -177,14 +230,22 @@ def test_sync_session_dependency_rejected(tmp_path, capsys, maker, dep, param, m
     "decl, message",
     [
         ("total = column_property(id + 1)", "only columns and relationships are supported"),
-        ('__mapper_args__ = {"version_id_col": id}', "__mapper_args__ is not supported"),
+        ('__mapper_args__ = {"version_id_col": id}', "__mapper_args__ key 'version_id_col' is not supported"),
+        ('__mapper_args__ = {"polymorphic_on": "nope"}', "polymorphic_on='nope' is not a column of the class"),
+        ('__mapper_args__ = {"polymorphic_identity": 3}', "polymorphic_identity=3 is not supported"),
+        ('__mapper_args__ = {"eager_defaults": 1.5}', "eager_defaults=1.5 is not supported"),
         ("data: Mapped[dict] = mapped_column(JSON(astext_type=None, foo=1))", "JSON(foo=) is not supported"),
         ("codes: Mapped[list] = mapped_column(ARRAY(Integer))", "only ARRAY(String) is supported"),
         ("codes: Mapped[list] = mapped_column(ARRAY(String, as_tuple=True))", "ARRAY(as_tuple=) is not supported"),
         ("codes: Mapped[list] = mapped_column(JSON().with_variant(ARRAY(Integer), 'postgresql'))", "only ARRAY(String) is supported"),
-        ("@hybrid_property\n    def double(self):\n        return self.id * 2", "decorator @hybrid_property is not supported"),
+        ("@functools.cache\n    def double(self):\n        return self.id * 2", "decorator @functools.cache is not supported"),
         ("@validates('name')\n    def check(self, key, value):\n        return value", "decorator @validates('name') is not supported"),
-        ("blob: Mapped[bytes] = deferred(Column(LargeBinary), group='g')", "only deferred(Column(...)) is supported"),
+        ("blob: Mapped[bytes] = deferred(Column(LargeBinary), active_history=True)",
+         "only deferred(Column(...), group=, raiseload=) is supported"),
+        ("pos: Mapped[int] = composite(mapped_column('a'), return_none_on=None)", "option return_none_on= is not supported"),
+        ("pos = composite('name')", "the class is needed"),
+        ("pos: Mapped[User] = composite(mapped_column('a'))", "the column a needs a type"),
+        ("pos: Mapped[User] = composite(User, name.op('+'))", "is not supported (columns, their names or attribute names)"),
     ],
 )
 def test_model_declaration_rejected(tmp_path, capsys, decl, message):
@@ -194,10 +255,75 @@ def test_model_declaration_rejected(tmp_path, capsys, decl, message):
     models = textwrap.dedent(MODELS).replace("{rel}", decl).replace(
         "from sqlalchemy import ForeignKey, String",
         "from sqlalchemy import JSON, ForeignKey, Integer, String\nfrom sqlalchemy.dialects.postgresql import ARRAY\n"
-        "from sqlalchemy import Column, LargeBinary\nfrom sqlalchemy.orm import column_property, deferred, validates\n"
+        "from sqlalchemy import Column, LargeBinary\nfrom sqlalchemy.orm import column_property, composite, deferred, validates\n"
         "from sqlalchemy.ext.hybrid import hybrid_property")
     (pkg / "models.py").write_text(models)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "models.py:" in err
+
+
+JOINED_SUB = ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind"}',
+              'class Squad(Team):\n    __tablename__ = "squads"\n    id: Mapped[int] = mapped_column(ForeignKey("teams.id"), '
+              'primary_key=True)\n    __mapper_args__ = {"polymorphic_identity": "s"}')
+
+
+@pytest.mark.parametrize("stmt, message", [
+    ('await s.execute(pg_insert(Squad).on_conflict_do_nothing())', "insert(Squad) of a joined table inheritance subclass"),
+    ("await s.scalars(select(aliased(Squad)))", "aliased(Squad) of a joined table inheritance subclass"),
+    ("await s.scalars(select(with_polymorphic(Team, [Squad], aliased=True, flat=True)))",
+     "aliased=, flat=, selectable= and polymorphic_on= are not supported"),
+    ("await s.scalars(select(Team).options(selectin_polymorphic(Team, [Squad], extra=1)))",
+     "selectin_polymorphic(Base, [Sub, ...]) only"),
+])
+def test_joined_inheritance_construct_rejected(tmp_path, capsys, stmt, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", JOINED_SUB[0]) + "\n\n" + JOINED_SUB[1] + "\n")
+    main_src = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import insert, select\n"
+                                             "from sqlalchemy.dialects.postgresql import insert as pg_insert\n"
+                                             "from sqlalchemy.orm import aliased, selectin_polymorphic, with_polymorphic\nfrom .models import Team, Squad")
+    main_src = main_src.replace("    t = await s.get(Team, team_id)\n", f"    {stmt}\n    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(main_src)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "base_extra, sub, message",
+    [
+        ("", 'class Squad(Team):\n    __mapper_args__ = {"polymorphic_identity": "s"}',
+         "inheritance needs polymorphic_on in the __mapper_args__ of Team"),
+        ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind"}',
+         'class Squad(Team):\n    __tablename__ = "squads"\n    __mapper_args__ = {"polymorphic_identity": "s"}',
+         "a joined subclass needs its primary key, a foreign key to the parent's key"),
+        ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind"}',
+         'class Squad(Team):\n    __tablename__ = "squads"\n    id: Mapped[int] = mapped_column(primary_key=True)\n'
+         '    __mapper_args__ = {"polymorphic_identity": "s"}',
+         "column id redefined in a subclass is not supported (only the key, as a foreign key to teams.id)"),
+        ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind"}', "class Squad(Team):\n    size: Mapped[int]",
+         "a mapped subclass needs a polymorphic_identity"),
+        ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind"}',
+         'class Squad(Team):\n    __mapper_args__ = {"polymorphic_identity": "s", "polymorphic_on": "kind"}',
+         "polymorphic_on on a subclass is not supported"),
+        ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind"}',
+         'class Squad(Team):\n    __mapper_args__ = {"polymorphic_identity": "s", "polymorphic_load": "joined"}',
+         "polymorphic_load='joined' is not supported"),
+    ],
+)
+def test_inheritance_rejected(tmp_path, capsys, base_extra, sub, message):
+    """Mapped class inheritance: single table only, with a discriminator and an identity per subclass."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", base_extra) + "\n\n" + sub + "\n")
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace("from .models import Team", "from .models import Team, Squad")
+                                 .replace("s.get(Team, team_id)", "s.get(Squad, team_id)"))
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
@@ -250,7 +376,7 @@ def test_column_type_factory_other_module(tmp_path, capsys):
     [
         ("    it = iter([1, 2])\n    return {'a': next(it)}", "iter() stored in a variable is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicate()}", "method .frobnicate() is not implemented by the runtime"),
-        ("    d = {}\n    return {'a': d.model_dump(context={'x'})}", ".model_dump(context=) is not supported"),
+        ("    d = {}\n    return {'a': d.model_dump(round_trip=True)}", ".model_dump(round_trip=) is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicated}", "attribute .frobnicated is not provided by the runtime"),
         ("    import os\n    os.environ['X'] = '1'\n    return {}", "writing into os.environ is not supported"),
     ],
@@ -270,12 +396,11 @@ def test_python_semantics_rejected(tmp_path, capsys, body, message):
 @pytest.mark.parametrize(
     "call, message",
     [
-        ("await s.execute(insert(Team), [{'name': 'a'}, {'name': 'b'}])", "execute(insert(...), parameters) is not supported"),
-        ("await s.execute(update(Team), [{'id': 1, 'name': 'a'}])", "execute(update(...), parameters) is not supported"),
-        ("stmt = insert(Team).returning(Team.id)\n    await s.execute(stmt, [{'name': 'a'}])",
-         "execute(insert(...), parameters) is not supported"),
-        ("await s.execute(select(Team).where(Team.id == 1), params={'x': 1})", "execute(select(...), parameters)"),
-        ("await s.scalars(insert(Team).returning(Team), [{'name': 'a'}])", ".scalars(statement, parameters) is not supported"),
+        ("await s.execute(insert(Team).values(name='x').on_conflict_do_nothing(), [{'name': 'a'}])",
+         "execute(insert(...).on_conflict_do_nothing(...), parameters)"),
+        ("stmt = update(Team).returning(Team.id)\n    await s.execute(stmt, [{'id': 1, 'name': 'a'}])",
+         "execute(update(...).returning(...), parameters) is not supported"),
+        ("await s.scalars(select(Team), [{'name': 'a'}])", ".scalars(statement, parameters) is not supported"),
         ("await s.scalar(text('SELECT :x'), {'x': 1})", ".scalar(statement, parameters) is not supported"),
     ],
 )
@@ -286,7 +411,7 @@ def test_execute_with_parameters_rejected(tmp_path, capsys, call, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
-    main_py = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import insert, select, text, update\n"
+    main_py = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import delete, insert, select, text, update\n"
                                             "from .models import Team")
     main_py = main_py.replace("    t = await s.get(Team, team_id)\n", f"    {call}\n    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
@@ -294,6 +419,94 @@ def test_execute_with_parameters_rejected(tmp_path, capsys, call, message):
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "call, message",
+    [
+        ("await s.scalars(select(Team).options(load_only(Team.name, foo=1)))", "load_only(): only the raiseload= keyword"),
+        ("await s.scalars(select(Team).options(defer(Team.name, Team.id)))", "defer() takes exactly one positional argument"),
+        ("await s.scalars(select(Team).options(selectinload(Team.owner, recursion_depth=2)))",
+         "selectinload() takes exactly one positional argument"),
+        ("await s.scalars(select(Team).options(undefer_group('g', 'h')))", "undefer_group() takes exactly one positional"),
+        ("await s.execute(select(Team).where(Team.name == bindparam('n', type_=None)), {'n': 'a'})",
+         "bindparam(key, value=None): other arguments are not supported"),
+        ("await s.scalars(select(aliased(Team, flat=True)))", "aliased(Model) or aliased(Model, name=...) only"),
+        ("await s.scalars(select(Team).where(with_parent(Team.owner)))", "with_parent(instance, Parent.relationship) only"),
+    ],
+)
+def test_loader_option_arguments_rejected(tmp_path, capsys, call, message):
+    """Column and relationship loader options: an argument the runtime would not honour is refused, never ignored."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", 'owner: Mapped["User"] = relationship(foreign_keys=[owner_id])'))
+    main_py = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import bindparam, select\n"
+                                            "from sqlalchemy.orm import aliased, defer, load_only, selectinload, undefer_group, with_parent\n"
+                                            "from .models import Team")
+    main_py = main_py.replace("    t = await s.get(Team, team_id)\n", f"    {call}\n    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(main_py)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize("body, message", [
+    ("    t = Team.__table__\n    return {'x': str(t.c.id)}", "Model.__table__.c.id: a column of a mapped class's table"),
+    ("    return {'x': str(Team.__table__.join(Team.__table__))}", "Model.__table__.join: the Core use"),
+])
+def test_model_table_core_use_rejected(tmp_path, capsys, body, message):
+    """Model.__table__ is introspection only: its Core use is refused at translation (a TypeError at run time before)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom .models import Team\n\napp = FastAPI()\n\n\n"
+                                 "@app.get('/x')\nasync def x():\n" + body + "\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert message in capsys.readouterr().err
+
+
+def test_session_in_endpoint_options_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    main_py = textwrap.dedent(MAIN).replace("    t = await s.get(Team, team_id)\n",
+                                            "    async with AsyncSession(engine, info={}) as s2:\n        pass\n"
+                                            "    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(main_py)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "AsyncSession() is supported with the engine" in err and "P2A0505" in err
+
+
+HYBRID = '''
+    @hybrid_property
+    def label(self):
+        return self.name
+'''
+
+
+@pytest.mark.parametrize("extra, message", [
+    ("    @label.inplace.update_expression\n    def _u(cls, value):\n        return []\n", "@label.inplace.update_expression is not supported"),
+    ("    @label.inplace.comparator\n    def _c(cls):\n        return None\n", "@label.inplace.comparator is not supported"),
+    ("    @label.expression\n    def other(cls):\n        return cls.name\n", "needs `.inplace`"),
+])
+def test_hybrid_rejected(tmp_path, capsys, extra, message):
+    """sqlalchemy.ext.hybrid: expression and setter only."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    models = textwrap.dedent(MODELS).replace("{rel}", "").replace(
+        "from sqlalchemy.orm import", "from sqlalchemy.ext.hybrid import hybrid_property\nfrom sqlalchemy.orm import", 1)
+    models = models.replace('    name: Mapped[str] = mapped_column(String(50))\n', '    name: Mapped[str] = mapped_column(String(50))\n'
+                            + HYBRID + extra, 1)
+    (pkg / "models.py").write_text(models)
+    (pkg / "main.py").write_text(textwrap.dedent(MAIN))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert message in capsys.readouterr().err
 
 
 def test_execute_text_with_parameters_translates(tmp_path):
@@ -354,6 +567,22 @@ def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
         ("    n: int\n\n    @computed_field\n    @cached_property\n    def m(self) -> int:\n        return 1",
          "is not supported with @computed_field"),
         ("    n: int\n\n    def __init__(self, n):\n        super().__init__(n=n)", "only `def __init__(self, **data)` is supported"),
+        ("    model_config = ConfigDict(alias_generator=lambda n: n.encode().hex())\n    a: int",
+         "alias generator: `n.encode().hex()` cannot be evaluated at translation time"),
+        ("    model_config = ConfigDict(alias_generator=str.upper)\n    a: int", "alias generator `str.upper` is not supported"),
+        ("    model_config = ConfigDict(validate_by_alias=False)\n    a: int = Field(alias='A')",
+         "validate_by_alias=False requires validate_by_name=True"),
+        ("    a: int = Field(validation_alias=AliasPath(0, 'x'))", "AliasPath(...): a key first"),
+        ("    a: int | str = Field(strict=True)", "Field(strict=True) on `int | str` is not supported"),
+        ("    model_config = ConfigDict(strict=True)\n    a: list[int] = Field(strict=False)",
+         "Field(strict=False) on `list[int]` in a strict model is not supported"),
+        ("    a: str = Field(multiple_of=2)", "multiple_of= does not apply to `str`"),
+        ("    a: Decimal = Field(multiple_of=2)", "Field(multiple_of=) on a Decimal is not supported"),
+        ("    a: int = Field(union_mode='random')", "Field(union_mode=) must be 'smart' or 'left_to_right'"),
+        ("    p: Cat | Dog = Field(discriminator=Discriminator(lambda v: 'c'))", "needs a Tag('...')"),
+        ("    p: Cat | Plain = Field(discriminator='kind')", "Plain.kind must be a Literal[...] of strings"),
+        ("    p: Cat | Num = Field(discriminator='kind')", "Num.kind tags other than strings are not supported"),
+        ("    p: Cat | Cat2 = Field(discriminator='kind')", "tag 'c' is in two members"),
     ],
 )
 def test_schema_declaration_rejected(tmp_path, capsys, body, message):
@@ -361,8 +590,12 @@ def test_schema_declaration_rejected(tmp_path, capsys, body, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(
-        "from decimal import Decimal\nfrom functools import cached_property\n"
-        "from fastapi import FastAPI\nfrom pydantic import BaseModel, Field, computed_field\n\napp = FastAPI()\n\n\n"
+        "from decimal import Decimal\nfrom functools import cached_property\nfrom typing import Literal\n"
+        "from fastapi import FastAPI\nfrom pydantic import AliasPath, BaseModel, ConfigDict, Discriminator, Field, computed_field\n\n"
+        "app = FastAPI()\n\n\n"
+        "class Cat(BaseModel):\n    kind: Literal['c']\n\n\nclass Cat2(BaseModel):\n    kind: Literal['c', 'd']\n\n\n"
+        "class Dog(BaseModel):\n    kind: Literal['d']\n\n\nclass Plain(BaseModel):\n    kind: str\n\n\n"
+        "class Num(BaseModel):\n    kind: Literal[1]\n\n\n"
         f"class In(BaseModel):\n{body}\n\n\n@app.post('/x')\nasync def x(b: In):\n    return b\n")
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
@@ -1529,8 +1762,6 @@ async def x():
     ("class M(BaseModel):\n    _p: list = PrivateAttr(default=[], init=False)\n\n\ndef use():\n    return M().model_dump()",
      "PrivateAttr() supports default= and default_factory= only", 13),
     ("class E(str, enum.Enum):\n    A = ('a', 'utf-8')\n\n\ndef use():\n    return E.A.value", "member value ('a', 'utf-8') is not supported", 12),
-    ("class M(BaseModel):\n    a: int = 1\n    b: int = Field(default_factory=lambda d: d['a'])\n\n\ndef use():\n    return M().b",
-     "a default_factory taking the validated data", 14),
     ("from typing import Iterable\n\n\nclass M(BaseModel):\n    xs: Iterable[int] = Field(max_length=1)\n\n\ndef use():\n"
      "    return M(xs=[1]).model_dump()", "`Iterable[int]` is not supported (pydantic validates it differently from a list)", 16),
 ])
@@ -2203,8 +2434,8 @@ def test_request_validation_error_body(tmp_path):
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     j, f = gen[gen.index("/// POST /j"):], gen[gen.index("/// POST /f"):]
-    assert "web::check_body(__errv, &__body)" in j[:j.index("\n}\n")]
-    assert "web::check(__errv)" in f[:f.index("\n}\n")]
+    assert "web::check_body(cx, __errv, &__body)" in j[:j.index("\n}\n")]
+    assert "web::check(cx, __errv)" in f[:f.index("\n}\n")]
 
 
 @pytest.mark.parametrize("src, message", [
@@ -2372,26 +2603,6 @@ def _reject(tmp_path, capsys, src: str) -> str:
     return capsys.readouterr().err
 
 
-def test_alias_choices_rejected(tmp_path, capsys):
-    """validation_alias= other than a string (AliasChoices, AliasPath) reads several keys or a nested one."""
-    err = _reject(tmp_path, capsys, '''
-        from fastapi import FastAPI
-        from pydantic import AliasChoices, BaseModel, Field
-
-        app = FastAPI()
-
-
-        class M(BaseModel):
-            a: int = Field(validation_alias=AliasChoices("a", "b"))
-
-
-        @app.post("/m")
-        async def m(body: M):
-            return body
-    ''')
-    assert "Field(validation_alias=) other than a string is not supported" in err and "main.py:9" in err
-
-
 def test_nonlocal_outside_enclosing_function_rejected(tmp_path, capsys):
     """`nonlocal` of a name the enclosing function does not bind (a global, a class attribute)."""
     err = _reject(tmp_path, capsys, '''
@@ -2433,3 +2644,164 @@ def test_typeddict_response_model_rejected(tmp_path, capsys):
             return Q(ok=1)
     ''')
     assert "is not a Pydantic model or an enum" in err and "main.py:14" in err
+PYD_CORPUS_MAIN = """
+from collections.abc import Iterable
+from typing import Annotated, Any, Generic, TypeVar
+
+from fastapi import FastAPI
+from pydantic import (AfterValidator, BaseModel, Discriminator, Field, PlainSerializer, Tag, WrapValidator,
+                      field_serializer, field_validator, model_serializer)
+
+app = FastAPI()
+T = TypeVar("T")
+C = TypeVar("C", int, str)
+
+
+class Base(BaseModel):
+    n: int = 0
+
+
+class Holder(BaseModel, Generic[T]):
+    item: T
+
+
+def w(v, handler):
+    return handler(v)
+
+
+{body}
+
+
+@app.post("/x")
+async def x(b: In):
+    return b
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("class In(BaseModel):\n    a: Annotated[int, AfterValidator(lambda v: v), WrapValidator(w)] = 0",
+     "a WrapValidator after other validators in Annotated[...] is not supported"),
+    ("class In(BaseModel):\n    a: Annotated[int, WrapValidator(w), Field(ge=0)] = 0",
+     "after a WrapValidator in Annotated[...] is not supported"),
+    ("class In(BaseModel):\n    a: int = 0\n\n    @field_validator('a')\n    @classmethod\n    def f(cls, v):\n        return v\n\n"
+     "    @field_validator('a', mode='wrap')\n    @classmethod\n    def g(cls, v, handler):\n        return handler(v)",
+     "a mode='wrap' validator of 'a' after other validators of the field is not supported"),
+    ("class In(BaseModel):\n    a: Annotated[int, PlainSerializer(str, when_used='sometimes')] = 0", "when_used='sometimes' is not supported"),
+    ("class In(BaseModel):\n    a: int = 0\n\n    @field_serializer('*')\n    def s(self, v):\n        return v",
+     "@field_serializer('*') or without field names is not supported"),
+    ("class In(BaseModel):\n    a: int = 0\n\n    @model_serializer\n    async def s(self):\n        return {}",
+     "an async serializer is not supported"),
+    ("class In(BaseModel):\n    h: Holder[int, str]", "1 type parameter(s) expected"),
+    ("class Box(BaseModel, Generic[C]):\n    c: C\n\n\nclass In(BaseModel):\n    b: Box[int]",
+     "constraints and options other than bound=/default= are not supported"),
+    ("class In(BaseModel):\n    b: Base[int]", "Base is not a generic model"),
+    ("class In(BaseModel):\n    k: type[ValueError]", "unsupported type annotation `type[ValueError]`"),
+    ("class In(BaseModel):\n    t: tuple[int, str, ...]", "a variable tuple has one type"),
+    ("class In(BaseModel):\n    xs: Iterable[int]", "`Iterable[int]` is not supported"),
+    ("class In(BaseModel):\n    p: Base | Holder[int] = Field(discriminator=Discriminator(lambda v: 'x'))",
+     "needs a Tag('...')"),
+    ("class In(BaseModel):\n    p: Annotated[Base, Tag('b')] | Annotated[Holder[int], Tag('h')] = "
+     "Field(discriminator=Discriminator(lambda v: 'b', custom_error_type='t'))",
+     "Discriminator custom errors: a type, a message and a dict of strings are supported"),
+    ("from pydantic import MISSING\n\n\nclass In(BaseModel):\n    f: MISSING = MISSING", "library value `pydantic.MISSING` is not supported"),
+    ("class Odd:\n    @classmethod\n    def __get_pydantic_core_schema__(cls, s, h):\n        return h(int)\n\n\n"
+     "class In(BaseModel):\n    o: Odd", "customizes its Pydantic schema"),
+    ("from pydantic import RootModel\n\n\nclass In(RootModel[list[int]]):\n    @field_validator('root')\n    @classmethod\n"
+     "    def v(cls, x):\n        return x", "validators, serializers, extra= or aliases on a RootModel are not supported"),
+    ("class In(BaseModel):\n    c: complex = Field(0, ge=1)", "constraints on `complex` are not supported"),
+])
+def test_pydantic_corpus_constructions_rejected(tmp_path, capsys, body, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PYD_CORPUS_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:" in err
+
+
+# ------------------------------------------------------------------ Python versions (docs/python-versions.md)
+
+PYVER_APP = """
+import base64
+import re
+import sys
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/x")
+async def x(t: str):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("re.prefixmatch('a', t)", "re.prefixmatch() needs Python 3.15 (the project runs on 3.12"),
+    ("urlsplit(t, missing_as_none=True)", "urlsplit(missing_as_none=) is not supported"),
+    ("base64.b64encode(t.encode(), wrapcol=76)", "b64encode(wrapcol=) is not supported"),
+    ("sys.version_info.micro", "library value `sys.version_info.micro` is not supported"),
+    ("sys.version_info >= (3, 12, 4)", "library value `sys.version_info` is not supported"),
+])
+def test_python_version_dependent_rejected(tmp_path, capsys, monkeypatch, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PYVER_APP.format(stmt=stmt))
+    monkeypatch.setenv("PY2AXUM_TARGET_PYTHON", "3.12")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:14" in err
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="t-strings need the 3.14 parser")
+def test_t_string_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PYVER_APP.format(stmt="t'hello {t}'"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "t-strings (template strings, PEP 750, Python 3.14) are not supported" in err and "main.py:14" in err, err
+
+
+@pytest.mark.skipif(sys.version_info < (3, 15), reason="`lazy import` needs the 3.15 parser")
+def test_lazy_import_of_a_project_module_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "helper.py").write_text("X = 1\n")
+    (pkg / "main.py").write_text("lazy import json\nlazy from proj import helper\n" + PYVER_APP.format(stmt="helper.X"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "`lazy` import of the project module `proj.helper` is not supported" in err and "main.py:2" in err, err
+
+@pytest.mark.parametrize(
+    "head, body, message",
+    [
+        ("", "    logging.getLogger(__name__).info('x', stacklevel=2)\n    return {}", "logging `stacklevel=2` is not supported"),
+        ("", "    logging.warning('x', stacklevel=n)\n    return {}", "logging `stacklevel=n` is not supported"),
+        ("", "    logging.config.fileConfig('logging.ini')\n    return {}", "library call `logging.config.fileConfig()` is not supported"),
+        ("import logging.handlers\n", "    logging.handlers.RotatingFileHandler('x.log')\n    return {}",
+         "library call `logging.handlers.RotatingFileHandler()` is not supported"),
+        ("class H(logging.Handler):\n    def emit(self, record):\n        pass\n\n\n", "    logging.getLogger().addHandler(H())\n    return {}",
+         "base `logging.Handler`"),
+    ],
+)
+def test_logging_rejected(tmp_path, capsys, head, body, message):
+    """docs/advanced/logging.md: what the runtime does not reproduce is refused at translation, with file:line"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "import logging\nimport logging.config\nfrom fastapi import FastAPI\n\n" + head + "app = FastAPI()\nn = 2\n\n\n"
+        "@app.get('/x')\nasync def x():\n" + body + "\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err

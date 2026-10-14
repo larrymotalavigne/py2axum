@@ -49,10 +49,13 @@ without `send_default_pii`).
   default `failed_request_status_codes` / `http_methods_to_capture` are supported.
 - `LoggingIntegration(level=, event_level=)` (also a default integration): records at or above `level`
   become breadcrumbs and at or above `event_level` events (`logentry`, `logger`, `exc_info` as an
-  exception with mechanism `logging`), from every logger. The binary does not know the project's logging
-  configuration: the records that reach Sentry are those passing `PY2AXUM_LOG_LEVEL` (default `INFO`), so
-  set it to the level of the project's root logger (Python's default is `WARNING`) for the same
-  breadcrumbs.
+  exception with mechanism `logging`), from every logger, after the logger's own level and filters, as in
+  Python ([Logging](logging.md)): under uvicorn's configuration the root logger is at `WARNING`, so INFO
+  records of a logger without a level of its own become no breadcrumb, in both. A record's `extra` is its
+  attributes but the SDK's `COMMON_RECORD_ATTRS` (a Formatter's `message` stays out, `asctime` goes in).
+  uvicorn's `Exception in ASGI application` record is logged after the request's scope is left (its
+  breadcrumb goes to the import's scope), and sends no event for an exception the request already reported:
+  DedupeIntegration remembers per task, as in Python.
 - `SqlalchemyIntegration`: accepted; it adds no child span in the binary. `AsyncioIntegration`: only when
   `init()` runs at import time (Python then has no running loop to patch and leaves tasks alone); an
   exception never retrieved from a task is reported through the `asyncio` logger, as in Python.

@@ -857,6 +857,7 @@ pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
     let table: &[(&'static Class, &'static str)] = &[
         (&HTTP_EXCEPTION, "fastapi.exceptions"),
         (&REQUEST_VALIDATION_ERROR, "fastapi.exceptions"),
+        (&RESPONSE_VALIDATION_ERROR, "fastapi.exceptions"),
         (&VALIDATION_EXCEPTION, "fastapi.exceptions"),
         (&BAD_GZIP_FILE, "gzip"),
         (&ZLIB_ERROR, "zlib"),
@@ -877,8 +878,11 @@ pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
         (&MISSING_GREENLET, "sqlalchemy.exc"),
         (&INVALID_REQUEST_ERROR, "sqlalchemy.exc"),
         (&ARGUMENT_ERROR, "sqlalchemy.exc"),
+        (&NO_FOREIGN_KEYS_ERROR, "sqlalchemy.exc"),
         (&OBJECT_DELETED_ERROR, "sqlalchemy.orm.exc"),
+        (&UNMAPPED_INSTANCE_ERROR, "sqlalchemy.orm.exc"),
         (&STALE_DATA_ERROR, "sqlalchemy.orm.exc"),
+        (&DETACHED_INSTANCE_ERROR, "sqlalchemy.orm.exc"),
         (&CANCELLED_ERROR, "asyncio.exceptions"),
         (&JSON_DECODE_ERROR, "json.decoder"),
         (&JOSE_ERROR, "jose.exceptions"),
@@ -924,6 +928,66 @@ pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
         (&DECIMAL_INVALID_OPERATION, "decimal"),
         (&QUEUE_FULL, "asyncio.queues"),
         (&QUEUE_EMPTY, "asyncio.queues"),
+        (&FASTAPI_ERROR, "fastapi.exceptions"),
+        (&UNKNOWN_HASH_ERROR, "pwdlib.exceptions"),
+        (&BINASCII_ERROR, "binascii"),
+        (&PYDANTIC_SERIALIZATION_ERROR, "pydantic_core._pydantic_core"),
+        (&PYDANTIC_CUSTOM_ERROR, "pydantic_core._pydantic_core"),
+        (&PYDANTIC_USE_DEFAULT, "pydantic_core._pydantic_core"),
+        (&RE_ERROR, "re"),
+        (&CSV_ERROR, "_csv"),
+        (&SMTP_EXCEPTION, "smtplib"),
+        (&HTTPX_HTTP_ERROR, "httpx"),
+        (&HTTPX_REQUEST_ERROR, "httpx"),
+        (&HTTPX_TRANSPORT_ERROR, "httpx"),
+        (&HTTPX_TIMEOUT_EXCEPTION, "httpx"),
+        (&HTTPX_CONNECT_TIMEOUT, "httpx"),
+        (&HTTPX_READ_TIMEOUT, "httpx"),
+        (&HTTPX_NETWORK_ERROR, "httpx"),
+        (&HTTPX_CONNECT_ERROR, "httpx"),
+        (&HTTPX_UNSUPPORTED_PROTOCOL, "httpx"),
+        (&HTTPX_TOO_MANY_REDIRECTS, "httpx"),
+        (&HTTPX_DECODING_ERROR, "httpx"),
+        (&HTTPX_STATUS_ERROR, "httpx"),
+        (&HTTPX_INVALID_URL, "httpx"),
+        (&SOCKET_GAIERROR, "socket"),
+        (&REQUESTS_EXCEPTION, "requests.exceptions"),
+        (&REQUESTS_CONNECTION_ERROR, "requests.exceptions"),
+        (&VAPID_EXCEPTION, "py_vapid"),
+        (&GOOGLE_AUTH_ERROR, "google.auth.exceptions"),
+        (&GOOGLE_TRANSPORT_ERROR, "google.auth.exceptions"),
+        (&GOOGLE_DEFAULT_CREDENTIALS_ERROR, "google.auth.exceptions"),
+        (&GOOGLE_MALFORMED_ERROR, "google.auth.exceptions"),
+        (&GOOGLE_INVALID_VALUE, "google.auth.exceptions"),
+        (&AIO_CLIENT_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_RESPONSE_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_CONTENT_TYPE_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_TOO_MANY_REDIRECTS, "aiohttp.client_exceptions"),
+        (&AIO_CONNECTION_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_OS_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_CONNECTOR_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_SERVER_CONNECTION_ERROR, "aiohttp.client_exceptions"),
+        (&AIO_SERVER_TIMEOUT, "aiohttp.client_exceptions"),
+        (&AIO_CONNECTION_TIMEOUT, "aiohttp.client_exceptions"),
+        (&AIO_INVALID_URL, "aiohttp.client_exceptions"),
+        (&PACKAGE_NOT_FOUND, "importlib.metadata"),
+        (&FROZEN_INSTANCE_ERROR, "dataclasses"),
+        (&EXPAT_ERROR, "xml.parsers.expat"),
+        (&RESOURCE_CLOSED_ERROR, "sqlalchemy.exc"),
+        (&CIRCULAR_DEPENDENCY_ERROR, "sqlalchemy.exc"),
+        (&DECIMAL_EXCEPTION, "decimal"),
+        (&DECIMAL_CONVERSION_SYNTAX, "decimal"),
+        (&DECIMAL_DIVISION_BY_ZERO, "decimal"),
+        (&DECIMAL_DIVISION_UNDEFINED, "decimal"),
+        (&PICKLE_ERROR, "_pickle"),
+        (&PICKLING_ERROR, "_pickle"),
+        (&UNPICKLING_ERROR, "_pickle"),
+        (&WS_DISCONNECT, "starlette.websockets"),
+        (&WS_EXCEPTION, "fastapi.exceptions"),
+        (&CLIENT_DISCONNECTED, "starlette.requests"),
+        (&AMQP_ERROR, "aiormq.exceptions"),
+        (&AMQP_CONNECTION_ERROR, "aiormq.exceptions"),
+        (&AMQP_QUEUE_EMPTY, "aio_pika.exceptions"),
     ];
     table.iter().find(|(k, _)| std::ptr::eq(*k, c)).map(|(_, m)| *m)
 }
@@ -1263,7 +1327,8 @@ async fn capture(cx: &Cx, o: &Opts, i: &Arc<Iso>, extra: Option<Scope>, mut c: C
     }
     // DedupeIntegration: the same exception object twice in a row is sent once
     if let Some(e) = &c.exc {
-        let mut last = i.last_exc.lock();
+        let owner = TASK_ISO.with(|t| t.borrow().clone()).unwrap_or_else(|| i.clone());
+        let mut last = owner.last_exc.lock();
         if last.as_ref().is_some_and(|l| Arc::ptr_eq(&l.0, &e.0)) {
             return None;
         }
@@ -2047,6 +2112,20 @@ pub fn context_exit(cx: &Cx, saved: Option<Option<Exc>>) {
     if let (Some(i), Some(s)) = (cx.sentry.get(), saved) {
         *i.last_exc.lock() = s;
     }
+}
+
+thread_local! {
+    /// the request whose task runs a synchronous capture on another isolation scope: DedupeIntegration's
+    /// last exception is a ContextVar, the request's task's, not the scope's
+    static TASK_ISO: std::cell::RefCell<Option<Arc<Iso>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f` captures synchronously (one poll, this thread) in the task of the request `cx`
+pub fn in_request_task<T>(cx: &Cx, f: impl FnOnce() -> T) -> T {
+    let prev = TASK_ISO.with(|t| t.replace(cx.sentry.get().cloned()));
+    let r = f();
+    TASK_ISO.with(|t| *t.borrow_mut() = prev);
+    r
 }
 
 /// The response is ready: the transaction, when sampled.

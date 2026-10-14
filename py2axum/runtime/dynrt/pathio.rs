@@ -97,7 +97,7 @@ fn parts_of(p: &str) -> Vec<V> {
 
 /// CPython's OSError of a failed system call on `p`: the subclass of its errno, `[Errno n] strerror: 'p'`, and the
 /// `errno`, `strerror`, `filename` attributes
-fn os_err(e: std::io::Error, p: &str) -> Exc {
+pub fn os_err(e: std::io::Error, p: &str) -> Exc {
     use std::io::ErrorKind::*;
     let errno = e.raw_os_error();
     let (class, errno, text): (&'static Class, i32, String) = match (errno, e.kind()) {
@@ -293,8 +293,56 @@ pub fn path_method(p: &str, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
         }
         "as_posix" | "__fspath__" => Ok(V::str(p)),
         "is_absolute" => Ok(V::Bool(p.starts_with('/'))),
+        // Python 3.14: copy(target), copy_into(dir), move(target), move_into(dir) → the new Path
+        "copy" | "copy_into" | "move" | "move_into" if super::python() >= (3, 14) => {
+            if args.len() != 1 || kwargs.iter().any(|(k, _)| k != "follow_symlinks" && k != "preserve_metadata") {
+                return Err(Exc::type_error(format!("py2axum: Path.{name}(target) only")));
+            }
+            if kwargs.iter().any(|(k, v)| (k == "follow_symlinks" && !ops::truthy(v).unwrap_or(true)) || (k == "preserve_metadata" && ops::truthy(v).unwrap_or(false))) {
+                return Err(Exc::type_error(format!("py2axum: Path.{name}(follow_symlinks=False / preserve_metadata=True) is not supported")));
+            }
+            let t = fspath(&args[0])?;
+            let dst = if name.ends_with("_into") { join(&t, name_of(p)) } else { t };
+            if std::fs::symlink_metadata(p).is_err() {
+                return Err(os_err(std::io::Error::from(std::io::ErrorKind::NotFound), p));
+            }
+            if name.starts_with("move") {
+                if let Err(e) = std::fs::rename(p, &dst) {
+                    if e.raw_os_error() != Some(18) {
+                        return Err(os_err(e, p));
+                    }
+                    copy_tree(p, &dst)?;
+                    remove_tree(p)?;
+                }
+            } else {
+                copy_tree(p, &dst)?;
+            }
+            Ok(path(&dst))
+        }
         _ => Err(Exc::attr_error(format!("'PosixPath' object has no attribute '{name}'"))),
     }
+}
+
+/// Path.copy: a file (its content and permissions), or a directory tree (an existing target directory is
+/// an error, as `shutil.copytree(dirs_exist_ok=False)`)
+fn copy_tree(src: &str, dst: &str) -> R<()> {
+    let m = std::fs::metadata(src).map_err(|e| os_err(e, src))?;
+    if m.is_dir() {
+        std::fs::create_dir(dst).map_err(|e| os_err(e, dst))?;
+        for entry in std::fs::read_dir(src).map_err(|e| os_err(e, src))? {
+            let entry = entry.map_err(|e| os_err(e, src))?;
+            let n = entry.file_name().to_string_lossy().to_string();
+            copy_tree(&join(src, &n), &join(dst, &n))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ()).map_err(|e| os_err(e, dst))
+    }
+}
+
+fn remove_tree(p: &str) -> R<()> {
+    let r = if std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false) { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+    r.map_err(|e| os_err(e, p))
 }
 
 // ---------------------------------------------------------------- open()
@@ -421,6 +469,47 @@ pub fn uuid4() -> V {
     V::native(Native::Uuid(u128::from_be_bytes(b)))
 }
 
+/// (last timestamp in ms, last counter) of `uuid7`, shared by the process like CPython's module globals
+static UUID7_LAST: parking_lot::Mutex<Option<(u64, u64)>> = parking_lot::Mutex::new(None);
+
+/// `uuid.uuid7()` (Python 3.14): CPython's algorithm, a 48-bit Unix time in ms, a 42-bit counter (monotonic
+/// within a millisecond) and 32 random bits
+pub fn uuid7() -> V {
+    use rand::RngCore;
+    let fresh = || {
+        let mut b = [0u8; 10];
+        rand::thread_rng().fill_bytes(&mut b);
+        let r = b.iter().fold(0u128, |a, &x| a << 8 | x as u128);
+        (((r >> 32) & 0x1ff_ffff_ffff) as u64, (r & 0xffff_ffff) as u64)
+    };
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut last = UUID7_LAST.lock();
+    let (mut ts, counter, tail) = match *last {
+        Some((lt, _)) if now_ms <= lt => {
+            let ts = if now_ms < lt { lt + 1 } else { now_ms };
+            let counter = last.unwrap().1 + 1;
+            if counter > 0x3ff_ffff_ffff {
+                let (c, t) = fresh();
+                (ts + 1, c, t)
+            } else {
+                (ts, counter, rand::thread_rng().next_u32() as u64)
+            }
+        }
+        _ => {
+            let (c, t) = fresh();
+            (now_ms, c, t)
+        }
+    };
+    *last = Some((ts, counter));
+    ts &= 0xffff_ffff_ffff;
+    let mut u = (ts as u128) << 80;
+    u |= (((counter >> 30) & 0x0fff) as u128) << 64;
+    u |= ((counter & 0x3fff_ffff) as u128) << 32;
+    u |= (tail & 0xffff_ffff) as u128;
+    u |= (7u128 << 76) | (0x8000u128 << 48);
+    V::native(Native::Uuid(u))
+}
+
 pub fn uuid_hex(u: u128) -> String {
     format!("{u:032x}")
 }
@@ -444,7 +533,7 @@ pub fn uuid_attr(u: u128, name: &str) -> R {
 pub fn ctx_enter(v: &V) -> R {
     match v {
         V::Native(n) if matches!(&**n, Native::File(_) | Native::BytesIO(_)) => Ok(v.clone()),
-        other => Err(Exc::type_error(format!("'{}' object does not support the context manager protocol", other.type_name()))),
+        other => Err(super::aio::cm_protocol_error(other, false)),
     }
 }
 

@@ -15,8 +15,11 @@ for port in $REF_PORT $CAND_PORT; do pid=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -n
 lsof -tiTCP:8299 -sTCP:LISTEN >/dev/null || {
 # web push sink (tests/push_sink.py): pywebpush blocks the server that calls it, so its own process
 nohup uvicorn tests.push_sink:app --port 8299 --log-level warning > "$LOG/push-sink.log" 2>&1 & }
-DATABASE_URL="$DB" nohup uvicorn fixtures.dynapp.main:app --port $REF_PORT --log-level warning > "$LOG/dyn-py-$REF_PORT.log" 2>&1 &
-DATABASE_URL="$DB" PORT=$CAND_PORT PY2AXUM_PYTHON_URL=http://127.0.0.1:$REF_PORT nohup env ${RUST_ENV:-} generated/dynapp_axum/target/release/dynapp_axum > "$LOG/dyn-rs-$CAND_PORT.log" 2>&1 &
+# stdout and stderr apart, process ids kept: the log conformance (tests/conformance.py --logs) compares them
+DATABASE_URL="$DB" PYTHONUNBUFFERED=1 nohup uvicorn fixtures.dynapp.main:app --host 127.0.0.1 --port $REF_PORT \
+  > "$LOG/dyn-py-$REF_PORT.out" 2> "$LOG/dyn-py-$REF_PORT.err" & echo $! > "$LOG/dyn-py-$REF_PORT.pid"
+DATABASE_URL="$DB" PY2AXUM_PYTHON_URL=http://127.0.0.1:$REF_PORT nohup env ${RUST_ENV:-} ${BIN:-generated/dynapp_axum/target/release/dynapp_axum} \
+  --host 127.0.0.1 --port $CAND_PORT > "$LOG/dyn-rs-$CAND_PORT.out" 2> "$LOG/dyn-rs-$CAND_PORT.err" & echo $! > "$LOG/dyn-rs-$CAND_PORT.pid"
 for p in $REF_PORT $CAND_PORT 8299; do
   ok=
   for i in $(seq 150); do curl -s -o /dev/null "127.0.0.1:$p/tasks/0" && ok=1 && break; sleep 0.2; done

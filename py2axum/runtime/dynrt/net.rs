@@ -19,6 +19,33 @@ fn int_arg(args: &[V], kwargs: &[(String, V)], i: usize, name: &str) -> R<i32> {
     }
 }
 
+/// The checks of CPython's `idna` codec on an ASCII host, before any lookup: an empty label (but the last) or one
+/// of 64 characters or more. 3.13 made them a UnicodeEncodeError naming the position; 3.12 raised UnicodeError.
+fn idna_check(host: &str) -> R<()> {
+    if host.is_empty() {
+        return Ok(());
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let offset = |i: usize| labels[..i].iter().map(|l| l.len()).sum::<usize>() + i;
+    if super::python() < (3, 13) {
+        if labels[..labels.len() - 1].iter().any(|l| l.is_empty() || l.len() >= 64) {
+            return Err(Exc::msg(&UNICODE_ERROR, "label empty or too long"));
+        }
+        if labels[labels.len() - 1].len() >= 64 {
+            return Err(Exc::msg(&UNICODE_ERROR, "label too long"));
+        }
+        return Ok(());
+    }
+    if let Some(i) = labels[..labels.len() - 1].iter().position(|l| l.is_empty()) {
+        return Err(Exc::msg(&UNICODE_ENCODE_ERROR, format!("'idna' codec can't encode character '\\x2e' in position {}: label empty", offset(i))));
+    }
+    if let Some(i) = labels.iter().position(|l| l.len() >= 64) {
+        let start = offset(i);
+        return Err(Exc::msg(&UNICODE_ENCODE_ERROR, format!("'idna' codec can't encode characters in position {start}-{}: label too long", start + labels[i].len() - 1)));
+    }
+    Ok(())
+}
+
 /// `socket.getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)`: the C library's answer, in its order.
 /// Families and kinds are plain ints (CPython wraps them in `AddressFamily`/`SocketKind` IntEnums).
 pub fn getaddrinfo(args: &[V], kwargs: &[(String, V)]) -> R {
@@ -43,6 +70,9 @@ pub fn getaddrinfo(args: &[V], kwargs: &[(String, V)]) -> R {
     // CPython encodes the host with IDNA; ASCII names are unchanged
     if host.as_deref().is_some_and(|h| !h.is_ascii()) {
         return Err(Exc::type_error("py2axum: socket.getaddrinfo() of a non-ASCII host name is not supported"));
+    }
+    if let Some(h) = &host {
+        idna_check(h)?;
     }
     let chost = host.map(|h| CString::new(h).map_err(|_| Exc::value_error("embedded null character"))).transpose()?;
     let cport = port.map(|p| CString::new(p).map_err(|_| Exc::value_error("embedded null character"))).transpose()?;

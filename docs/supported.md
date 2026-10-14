@@ -24,6 +24,7 @@ its list streaming moved to [Large list responses](advanced/streaming.md)). `--b
 | Topic | Page |
 |---|---|
 | Supported versions | [Versions](reference/versions.md) |
+| Python 3.12 to 3.15: what each version changes, `sys.version_info` | [Python versions](python-versions.md) |
 | Applications, routers, factories, imports, routing, mounts, raw ASGI routes | [Bigger applications](tutorial/bigger-applications.md) |
 | Path, query and header parameters, timestamps | [Parameters](tutorial/parameters.md) |
 | JSON bodies, JSON decoding, `strict_content_type` | [Request body](tutorial/body.md) |
@@ -36,6 +37,7 @@ its list streaming moved to [Large list responses](advanced/streaming.md)). `--b
 | Middleware (`BaseHTTPMiddleware`, raw ASGI, GZip, starlette_context), request attributes, `configure(app)` | [Middleware](tutorial/middleware.md) |
 | `CORSMiddleware` | [CORS](tutorial/cors.md) |
 | Shutdown (SIGTERM, SIGINT) | [Graceful shutdown](advanced/shutdown.md) |
+| `logging`, python-json-logger, uvicorn's own lines (startup, access log, errors), tracebacks, uvicorn's command-line options | [Logging](advanced/logging.md) |
 | WebSockets | [WebSockets](tutorial/websockets.md) |
 | Pydantic v2 | [Models (Pydantic)](tutorial/models.md) |
 | SQLAlchemy 2.0 (async and sync, PostgreSQL) | [SQL databases](tutorial/sql.md) |
@@ -51,11 +53,24 @@ its list streaming moved to [Large list responses](advanced/streaming.md)). `--b
 
 ## Runtime environment
 
-The binary reads its configuration from the environment ([the list](reference/environment.md));
+The binary takes uvicorn's command-line options and prints uvicorn's lines and the application's `logging`
+records as Python does ([Logging](advanced/logging.md); a traceback holds the project's frames only).
+It reads its configuration from the environment ([the list](reference/environment.md));
 it does not read `.env` files (pydantic-settings reads environment variables only, see
 [Models](tutorial/models.md)): export the variables, as an orchestrator does.
 Limits on untrusted input (an optional body cap, the stack size) and the differences they imply are in
 [Security § Request input](advanced/security.md#request-input).
+
+## Deeply nested JSON on Python 3.14+
+
+From Python 3.14, `json.loads` is bounded by the C stack instead of the recursion limit: a document nested
+beyond 10 000 levels decodes in CPython (up to roughly 50 000 levels on an 8 MiB stack, then
+`RecursionError: Stack overflow (used ... kB) while decoding a JSON array from a unicode string`). The binary
+keeps the 10 000-level limit of 3.12 and 3.13 on every Python (`RecursionError: maximum recursion depth exceeded
+while decoding a JSON array from a unicode string`), a bound on untrusted input
+([Security](advanced/security.md)). Such a document usually exceeds the recursion limit later in Python
+(FastAPI's `jsonable_encoder` when it is returned): the response is the same 500, the logged traceback differs
+(where the exception is raised, and its message).
 
 ## Not supported
 

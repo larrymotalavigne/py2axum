@@ -196,12 +196,127 @@ def function_imports(fn: ast.AST, package: str) -> dict[str, tuple]:
     return _import_specs(stmts, package)[0]
 
 
+class _FoldVersion(ast.NodeTransformer):
+    """`sys.version_info` read against the project's Python (dyn.target_python): comparisons with a tuple of
+    ints, `.major`/`.minor`, `[0]`, `[1]` and `[:2]` become constants, and an `if` (or `x if c else y`) whose
+    test folds keeps only the branch taken, so a version-gated import or definition the target Python never
+    runs is never translated (nor needs to resolve). What depends on the patch level (`.micro`, a 3-item
+    tuple of the same minor, `sys.version`) is left as written: refused where it is used."""
+
+    OPS = {ast.Lt: "__lt__", ast.LtE: "__le__", ast.Gt: "__gt__", ast.GtE: "__ge__", ast.Eq: "__eq__", ast.NotEq: "__ne__"}
+
+    def __init__(self, tree: ast.Module, python: tuple[int, int]):
+        self.py = python
+        self.dropped: list[ast.stmt] = []  # the statements of the branches not taken
+        self.mods, self.names = set(), set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                self.mods |= {a.asname or a.name for a in n.names if a.name == "sys"}
+            elif isinstance(n, ast.ImportFrom) and n.module == "sys" and not n.level:
+                self.names |= {a.asname or a.name for a in n.names if a.name == "version_info"}
+
+    def _vi(self, e) -> bool:
+        return ((isinstance(e, ast.Attribute) and e.attr == "version_info" and isinstance(e.value, ast.Name)
+                 and e.value.id in self.mods) or (isinstance(e, ast.Name) and e.id in self.names))
+
+    def _cmp(self, op, t: tuple):
+        """version_info <op> t, or None when it depends on more than (major, minor)."""
+        k = min(len(t), 2)
+        cur, head = self.py[:k], t[:k]
+        if cur != head:
+            return getattr(cur, self.OPS[type(op)])(head)
+        if len(t) > 2:
+            return None
+        # equal prefix, version_info longer: strictly greater
+        return {ast.Lt: False, ast.LtE: False, ast.Gt: True, ast.GtE: True, ast.Eq: False, ast.NotEq: True}[type(op)]
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) != 1 or type(node.ops[0]) not in self.OPS:
+            return node
+        left, right, op = node.left, node.comparators[0], node.ops[0]
+        flip = {ast.Lt: ast.Gt(), ast.LtE: ast.GtE(), ast.Gt: ast.Lt(), ast.GtE: ast.LtE(), ast.Eq: ast.Eq(), ast.NotEq: ast.NotEq()}
+        if self._vi(right) and not self._vi(left):
+            left, right, op = right, left, flip[type(op)]
+        if not self._vi(left) or not isinstance(right, ast.Tuple) or not right.elts or not all(
+                isinstance(x, ast.Constant) and type(x.value) is int for x in right.elts):
+            return node
+        r = self._cmp(op, tuple(x.value for x in right.elts))
+        return node if r is None else self._const(r, node)
+
+    def visit_Attribute(self, node):
+        if self._vi(node.value) and node.attr in ("major", "minor"):
+            return self._const(self.py[node.attr == "minor"], node)
+        return self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        if not self._vi(node.value):
+            return self.generic_visit(node)
+        sl = node.slice
+        if isinstance(sl, ast.Constant) and sl.value in (0, 1):
+            return self._const(self.py[sl.value], node)
+        if (isinstance(sl, ast.Slice) and sl.step is None and (sl.lower is None or (isinstance(sl.lower, ast.Constant) and sl.lower.value == 0))
+                and isinstance(sl.upper, ast.Constant) and sl.upper.value in (1, 2)):
+            return ast.copy_location(ast.Tuple([self._const(v, node) for v in self.py[:sl.upper.value]], ast.Load()), node)
+        return node
+
+    def visit_UnaryOp(self, node):
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Constant) and type(node.operand.value) is bool:
+            return self._const(not node.operand.value, node)
+        return node
+
+    def visit_IfExp(self, node):
+        self.generic_visit(node)
+        if isinstance(node.test, ast.Constant) and type(node.test.value) is bool and self._folded(node.test):
+            return node.body if node.test.value else node.orelse
+        return node
+
+    def _folded(self, c) -> bool:
+        return getattr(c, "_py2axum_folded", False)
+
+    def _const(self, value, like):
+        """A constant marked as made by this pass (a literal `if True:` is left alone)."""
+        c = ast.copy_location(ast.Constant(value), like)
+        c._py2axum_folded = True
+        return c
+
+    def visit_If(self, node):
+        self.generic_visit(node)
+        if isinstance(node.test, ast.Constant) and type(node.test.value) is bool and self._folded(node.test):
+            self.dropped += node.orelse if node.test.value else node.body
+            return (node.body if node.test.value else node.orelse) or []
+        return node
+
+    def generic_visit(self, node):
+        super().generic_visit(node)
+        # a body emptied by a folded `if` keeps a statement (`pass`, at the `if`'s line)
+        for f in ("body", "orelse", "finalbody"):
+            v = getattr(node, f, None)
+            if isinstance(v, list) and not v and f == "body" and not isinstance(node, ast.Module):
+                v.append(ast.copy_location(ast.Pass(), node))
+        return node
+
+
+def fold_version_info(tree: ast.Module, python: tuple[int, int]) -> tuple[ast.Module, list[ast.stmt]]:
+    """`sys.version_info` read against the project's Python (_FoldVersion): the folded tree, and the
+    statements of the branches dropped."""
+    if not any((isinstance(n, ast.Attribute) and n.attr == "version_info")
+               or (isinstance(n, ast.alias) and n.name == "version_info") for n in ast.walk(tree)):
+        return tree, []
+    f = _FoldVersion(tree, python)
+    return ast.fix_missing_locations(f.visit(tree)), f.dropped
+
+
 class ModuleIndex:
     def __init__(self, root: Path, package: Path):
         self.root = root.resolve()
         self.package_dir = package.resolve()
         self.modules: dict[str, Module] = {}
         self.syntax_errors: list[tuple[str, SyntaxError]] = []
+        self.gated: set[str] = set()  # modules imported only in a branch a `sys.version_info` test dropped
+        # `lazy import` (Python 3.15, PEP 810): (module name, statement, the modules it names)
+        self.lazy: list[tuple[str, ast.stmt, list[str]]] = []
         self._missing: set[str] = set()
         for path in sorted(self.package_dir.rglob("*.py")):
             if SKIP_DIRS & set(path.relative_to(self.package_dir).parts):
@@ -226,6 +341,9 @@ class ModuleIndex:
         except SyntaxError as e:
             self.syntax_errors.append((str(path), e))
             return None
+        from .dyn import target_python
+
+        tree, dropped = fold_version_info(tree, target_python(self.root))
         m = Module(name, path, tree, path.name == "__init__.py", in_package)
         for node in tree.body:
             if import_guard(node):
@@ -266,6 +384,14 @@ class ModuleIndex:
                       else stmt_bindings(node)):
                 m.binders.setdefault(n, []).append(node)
         m.imports, m.stars = _import_specs(tree.body, m.package)
+        for node in tree.body:
+            if getattr(node, "is_lazy", 0):
+                specs, _ = _import_specs([node], m.package)
+                self.lazy.append((name, node, sorted({x for spec in specs.values()
+                                                      for x in ((spec[1], f"{spec[1]}.{spec[2]}") if spec[0] == "from" else (spec[1],))})))
+        gone, gone_stars = _import_specs([n for d in dropped for n in ast.walk(d) if isinstance(n, (ast.Import, ast.ImportFrom))], m.package)
+        self.gated |= {x for spec in gone.values() for x in ((spec[1], f"{spec[1]}.{spec[2]}") if spec[0] == "from" else (spec[1],))}
+        self.gated |= set(gone_stars)
         self.modules[name] = m
         return m
 

@@ -11,6 +11,7 @@ project does not mention is not checked.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
-PYTHON: tuple[str, str, str] = ("3.12", "3.14", "3.15")
+PYTHON: tuple[str, str, str] = ("3.12", "3.15", "3.16")
 # libraries checked only when the analysed package imports them (module -> distributions); the framework
 # (fastapi, starlette, pydantic, pydantic-core) is always checked
 _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlalchemy", "psycopg", "asyncpg"),
@@ -216,6 +217,102 @@ def used(package: Path) -> tuple[set[str], list[tuple[str, str, str]]]:
     return out, [(_FEATURES[i][0], _FEATURES[i][2], _FEATURES[i][3]) for i in sorted(feats)]
 
 
+def python_version_file(root: Path) -> tuple[tuple[int, int], str] | None:
+    """The `.python-version` (uv, pyenv) at --root or above, up to the repository's root: (major, minor), file."""
+    d = Path(root).resolve()
+    for cand in (d, *d.parents):
+        f = cand / ".python-version"
+        if f.is_file():
+            for line in f.read_text().splitlines():
+                m = re.match(r"\s*(?:cpython-|python)?(\d+)\.(\d+)", line)
+                if m:
+                    return (int(m.group(1)), int(m.group(2))), str(f)
+            return None
+        if (cand / ".git").exists():
+            break
+    return None
+
+
+def add_python_flag(ap) -> None:
+    """`--python X.Y` on a command line (the project's Python, see target_python)."""
+    ap.add_argument("--python", default=None, metavar="X.Y",
+                    help="the Python the project runs on (default: its .python-version, else this Python if the "
+                         "project's requires-python allows it); messages and sys.version_info follow it")
+
+
+def apply_python_flag(args) -> None:
+    if getattr(args, "python", None):
+        os.environ["PY2AXUM_TARGET_PYTHON"] = args.python
+
+
+def target_python_patch(root: Path) -> int | None:
+    """The patch release of the project's Python (behaviours that changed inside a minor, like `strptime('%e')`
+    in 3.13.6): the one `--python` or `.python-version` names, else the transpiler's own when it runs the
+    project's minor (a Docker build), else None (unknown: the runtime takes the newest)."""
+    tp = target_python(root)
+    forced = os.environ.get("PY2AXUM_TARGET_PYTHON")
+    pv_file = python_version_file(root)
+    text = forced if forced else (Path(pv_file[1]).read_text() if pv_file else None)
+    if text is not None:
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+        if m and (int(m.group(1)), int(m.group(2))) == tp:
+            return int(m.group(3))
+        return None
+    return sys.version_info[2] if tuple(sys.version_info[:2]) == tp else None
+
+
+# behaviours that changed inside a minor (security releases backported by distributions: Debian's 3.13.5 has
+# 3.13.13's base64 padding), probed on the transpiler's own Python when it runs the project's minor
+PROBES = {
+    # binascii's padding rules rewritten in 3.13.13 / 3.14.4: data after the padding is decoded
+    "b64_padding_rfc": "import base64\ntry:\n base64.b64decode('aGk=aGk=')\n r=False\nexcept Exception:\n r=True",
+    # `%e` accepted by strptime from 3.13.6
+    "strptime_e": "import datetime\ntry:\n datetime.datetime.strptime('Oct  9 2026','%b %e %Y')\n r=True\nexcept ValueError:\n r=False",
+    # json: a `\\uXXXX` escape ending the text is an unterminated string (3.13.13 / 3.14.4)
+    "json_u_escape_unterminated": "import json\ntry:\n json.loads('\"\\\\u0041')\nexcept ValueError as e:\n r=str(e).startswith('Unterminated')",
+}
+
+
+def probe_features(root: Path) -> dict[str, bool]:
+    """PROBES answered by the transpiler's Python, when it is the project's (same minor, and no patch release
+    named by --python or .python-version: then the version decides); empty otherwise."""
+    if target_python(root) != tuple(sys.version_info[:2]):
+        return {}
+    forced = os.environ.get("PY2AXUM_TARGET_PYTHON")
+    pv_file = python_version_file(root)
+    text = forced if forced else (Path(pv_file[1]).read_text() if pv_file else "")
+    if re.search(r"\d+\.\d+\.\d+", text):
+        return {}
+    out = {}
+    for name, code in PROBES.items():
+        scope: dict = {}
+        exec(code, scope)  # noqa: S102 — fixed probes of the standard library
+        out[name] = bool(scope["r"])
+    return out
+
+
+def target_python(root: Path) -> tuple[int, int]:
+    """The Python the project runs on, whose messages and behaviours the binary reproduces (and against which
+    `sys.version_info` is folded): `--python` (PY2AXUM_TARGET_PYTHON), else the project's `.python-version`,
+    else the transpiler's own Python when the project's `requires-python` allows it (a Docker build transpiles
+    on the image's Python), else the lowest Python `requires-python` allows."""
+    forced = os.environ.get("PY2AXUM_TARGET_PYTHON")
+    if forced:
+        m = re.fullmatch(r"\s*(\d+)\.(\d+)(?:\.\d+)?\s*", forced)
+        if not m:
+            raise ValueError(f"--python {forced!r}: expected MAJOR.MINOR, e.g. 3.14")
+        return int(m.group(1)), int(m.group(2))
+    pv = python_version_file(root)
+    if pv:
+        return pv[0]
+    mine = tuple(sys.version_info[:2])
+    _, py = project_constraints(root)
+    iv = interval(py[0]) if py else None
+    if iv is None or iv[0] <= parse(".".join(map(str, sys.version_info[:3]))) < iv[1]:
+        return mine
+    return iv[0][0], iv[0][1]
+
+
 def check_project(root: Path, package: Path | None = None) -> list[tuple[str, str, int]]:
     """Errors (message, file, line) for every library or Python constraint of the project outside the
     supported ranges; empty when everything is in range or not constrained. With `package`, only the
@@ -260,6 +357,18 @@ def check_project(root: Path, package: Path | None = None) -> list[tuple[str, st
             errors.append((f"requires-python {py[0]}: run py2axum on a Python at least as recent as the project's "
                            f"(this one is {sys.version_info[0]}.{sys.version_info[1]}; the parser only knows its own syntax)",
                            py[1], py[2]))
+    try:
+        tp = target_python(root)
+    except ValueError as e:
+        return errors + [(str(e), "--python", 0)]
+    pv = python_version_file(root)
+    where = ("--python", 0) if os.environ.get("PY2AXUM_TARGET_PYTHON") else ((pv[1], 1) if pv else None)
+    if where is not None:
+        if not parse(PYTHON[0]) <= parse(f"{tp[0]}.{tp[1]}") < parse(PYTHON[2]):
+            errors.append((f"Python {tp[0]}.{tp[1]} is outside the Pythons py2axum supports (python{spec('python')})", *where))
+        elif tp > tuple(sys.version_info[:2]):
+            errors.append((f"the project runs on Python {tp[0]}.{tp[1]}: run py2axum on a Python at least as recent "
+                           f"(this one is {sys.version_info[0]}.{sys.version_info[1]}; the parser only knows its own syntax)", *where))
     return errors
 
 

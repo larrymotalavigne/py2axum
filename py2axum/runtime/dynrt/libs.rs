@@ -66,11 +66,16 @@ pub fn hash_method(h: &parking_lot::Mutex<Hasher>, name: &str, args: &[V]) -> R 
     }
 }
 
+/// `os.urandom(-1)` (behind `secrets.token_*`): reworded in Python 3.15
+fn negative_size() -> &'static str {
+    if super::python() >= (3, 15) { "size cannot be negative" } else { "negative argument not allowed" }
+}
+
 pub fn token_urlsafe(n: &V) -> R {
     use base64::Engine;
     use rand::RngCore;
     let n = match n {
-        V::Int(i) if *i < 0 => return Err(Exc::value_error("negative argument not allowed")),
+        V::Int(i) if *i < 0 => return Err(Exc::value_error(negative_size())),
         V::Int(i) => *i as usize,
         V::None => 32,
         _ => return Err(Exc::type_error("token_urlsafe() needs an int")),
@@ -85,7 +90,7 @@ pub fn token_urlsafe(n: &V) -> R {
 pub fn token_hex(n: &V) -> R {
     use rand::RngCore;
     let n = match n {
-        V::Int(i) if *i < 0 => return Err(Exc::value_error("negative argument not allowed")),
+        V::Int(i) if *i < 0 => return Err(Exc::value_error(negative_size())),
         V::Int(i) => *i as usize,
         V::None => 32,
         _ => return Err(Exc::type_error("token_hex() needs an int")),
@@ -654,6 +659,7 @@ pub static NAMESPACE: pyd::SchemaDesc = pyd::SchemaDesc {
     ser_bytes: pyd::BytesMode::Utf8,
     computed: &[],
     json_schema: None,
+    x: pyd::SchemaX::NONE,
 };
 
 /// `types.SimpleNamespace(**kwargs)`
@@ -679,11 +685,56 @@ pub fn dict_fromkeys(args: &[V]) -> R {
 // ---------------------------------------------------------------- datetime.strptime / fromtimestamp, secrets.choice
 
 /// `datetime.strptime(s, fmt)`: chrono parsing with Python's defaults (1900-01-01 00:00) and errors
+/// The checks `_strptime` makes on the directives themselves: `%e` (3.13.6+), and `%d` without a year
+/// (`%Y`, `%y`, `%G`), refused from Python 3.15
+fn strptime_directives(f: &str) -> R<()> {
+    let cs: Vec<char> = f.chars().collect();
+    let (mut i, mut year, mut day_d) = (0, false, false);
+    while i < cs.len() {
+        if cs[i] != '%' {
+            i += 1;
+            continue;
+        }
+        // `%[-_0^#]*[0-9]*([OE]?[:\\]?.?)`: flags or a width make the directive another one
+        let mut j = i + 1;
+        while j < cs.len() && (matches!(cs[j], '-' | '_' | '0' | '^' | '#') || cs[j].is_ascii_digit()) {
+            j += 1;
+        }
+        let plain = j == i + 1;
+        if j < cs.len() && matches!(cs[j], 'O' | 'E') {
+            j += 1;
+        }
+        if j < cs.len() && matches!(cs[j], ':' | '\\') {
+            j += 1;
+        }
+        let d: String = cs[i + 1..(j + 1).min(cs.len())].iter().collect();
+        if plain {
+            match d.as_str() {
+                "Y" | "y" | "G" => year = true,
+                "d" => day_d = true,
+                // accepted from 3.13.6
+                "e" if !super::python_feature("strptime_e").unwrap_or_else(|| super::python_at_least(3, 13, 6)) => {
+                    return Err(Exc::value_error(format!("'e' is a bad directive in format {}", ops::str_repr(f))));
+                }
+                _ => {}
+            }
+        }
+        i = j + 1;
+    }
+    if day_d && !year && super::python() >= (3, 15) {
+        return Err(Exc::value_error(
+            "Day of month directive '%d' may not be used without a year directive. Parsing dates involving a day of month without a year is ambiguous and fails to parse leap day. Add a year to the input and format. See https://github.com/python/cpython/issues/70647.",
+        ));
+    }
+    Ok(())
+}
+
 pub fn strptime(s: &V, fmt: &V) -> R {
     let (s, f) = (ops::str_(s)?, ops::str_(fmt)?);
     if f.contains("%f") || f.contains("%Z") || f.contains("%U") || f.contains("%W") || f.contains("%c") || f.contains("%x") || f.contains("%X") {
         return Err(Exc::value_error(format!("py2axum: strptime format {f:?} is not supported")));
     }
+    strptime_directives(&f)?;
     let mut p = chrono::format::Parsed::new();
     let bad = || Exc::value_error(format!("time data {} does not match format {}", ops::str_repr(&s), ops::str_repr(&f)));
     match chrono::format::parse(&mut p, &s, chrono::format::StrftimeItems::new(&f)) {
@@ -725,9 +776,24 @@ pub fn strptime(s: &V, fmt: &V) -> R {
 
 /// `datetime.fromtimestamp(ts, tz=None)`: naive local time without tz (the process's TZ, like CPython)
 pub fn fromtimestamp(ts: &V, tz: Option<&V>) -> R {
+    // the qualified name CPython's messages use
+    let qual = |o: &V| match o {
+        V::Native(n) if matches!(&**n, Native::Fraction(_)) => "fractions.Fraction",
+        o => o.type_name(),
+    };
     let t = match ts {
         V::Int(i) => *i as f64,
+        V::Bool(b) => *b as i64 as f64,
         V::Float(f) => *f,
+        // 3.15: any real number (Decimal, Fraction)
+        V::Decimal(d) if super::python() >= (3, 15) => d.to_f64(),
+        V::Native(n) if super::python() >= (3, 15) && matches!(&**n, Native::Fraction(_)) => {
+            let Native::Fraction(f) = &**n else { unreachable!() };
+            use num_traits::ToPrimitive;
+            f.num.to_f64().unwrap_or(f64::NAN) / f.den.to_f64().unwrap_or(f64::NAN)
+        }
+        o if super::python() >= (3, 15) => return Err(Exc::type_error(format!("must be real number, not {}", qual(o)))),
+        o if super::python() >= (3, 14) => return Err(Exc::type_error(format!("argument must be int or float, not {}", qual(o)))),
         o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
     };
     let whole = t.floor();

@@ -70,7 +70,8 @@ pub enum Native {
     State(Arc<web::ReqCell>),
     Url(Arc<web::ReqCell>),
     Response(Arc<web::RespCell>),
-    Logger(Arc<str>),
+    /// the `logging` module's objects (dynrt/logging.rs)
+    Log(super::logging::LObj),
     Queue(Arc<web::AQueue>),
     Hash(Mutex<super::libs::Hasher>),
     Serializer(super::itsd::Serializer),
@@ -109,6 +110,8 @@ pub enum Native {
     Savepoint(orm::Session, String),
     /// `await session.connection()`: the session's connection (`close()` hands it back to the pool)
     SessConn(orm::Session),
+    /// `obj.collection` of a `WriteOnlyMapped[...]` relationship: (parent, relationship index)
+    WriteOnly(Arc<orm::ObjCell>, usize),
     /// `dateutil.relativedelta.relativedelta(...)`
     RelDelta(super::reldelta::RelDelta),
     /// `urllib.parse.urlparse(...)` / `urlsplit(...)`
@@ -150,6 +153,14 @@ pub enum Native {
     Path(String),
     File(super::pathio::File),
     Uuid(u128),
+    /// `pydantic.SecretStr`: the secret, shown as `**********`
+    Secret(Arc<str>),
+    /// `complex` (a Pydantic field's value): (real, imag)
+    Complex(f64, f64),
+    /// `fractions.Fraction` (a Pydantic field's value)
+    Fraction(Arc<super::fraction::Fraction>),
+    /// a `mode="before"` validator raised `PydanticUseDefault`: the field takes its default (still set)
+    UseDefault,
     Upload(Arc<super::files::Upload>),
     /// a method bound to its receiver (`obj.method` read as a value)
     Bound(super::pyd::MethodFn, V),
@@ -316,6 +327,7 @@ impl V {
             V::Enum(e, _) => e.name,
             V::Col(..) => "InstrumentedAttribute",
             V::Sql(_) => "ClauseElement",
+            V::Session(s) if s.is_sync() => "Session",
             V::Session(_) => "AsyncSession",
             V::Result(_) => "Result",
             V::Exc(e) => e.0.class.name,
@@ -328,7 +340,7 @@ impl V {
                 Native::State(_) => "State",
                 Native::Url(_) => "URL",
                 Native::Response(_) => "Response",
-                Native::Logger(_) => "Logger",
+                Native::Log(o) => super::logging::type_name(o),
                 Native::Queue(_) => "Queue",
                 Native::Hash(_) => "HASH",
                 Native::Serializer(_) => "URLSafeTimedSerializer",
@@ -350,6 +362,7 @@ impl V {
                 Native::HttpBasicAuth(_) => "BasicAuth",
                 Native::HttpUrl(_) => "URL",
                 Native::Savepoint(..) => "AsyncSessionTransaction",
+                Native::WriteOnly(..) => "WriteOnlyCollection",
                 Native::SessConn(_) => "AsyncConnection",
                 Native::RelDelta(_) => "relativedelta",
                 Native::Row(..) => "Row",
@@ -380,6 +393,10 @@ impl V {
                 Native::Path(_) => "PosixPath",
                 Native::File(_) => "TextIOWrapper",
                 Native::Uuid(_) => "UUID",
+                Native::Secret(_) => "SecretStr",
+                Native::UseDefault => "PydanticUseDefault",
+                Native::Fraction(_) => "Fraction",
+                Native::Complex(..) => "complex",
                 Native::Upload(_) => "UploadFile",
                 Native::Bound(..) => "method",
                 Native::Kwargs(_) => "kwargs",
@@ -533,6 +550,7 @@ impl Key {
                 // value semantics (a Path equals a Path, never a str)
                 Native::Path(p) => Key::Str(Arc::from(format!("\u{0}path:{p}"))),
                 Native::Uuid(u) => Key::Str(Arc::from(format!("\u{0}uuid:{u:032x}"))),
+                Native::Secret(s) => Key::Str(Arc::from(format!("\u{0}secret:{s}"))),
                 _ => Key::Ptr(Arc::as_ptr(n) as *const () as usize),
             },
             V::Col(m, i) => Key::Ptr((*m as *const orm::ModelDesc as usize) ^ (*i << 1)),
@@ -692,11 +710,34 @@ pub struct ExcObj {
     pub http_late: Mutex<Option<(u16, V, Vec<(String, String)>)>>,
     /// the traced project frames it has left, innermost first (`sys.settrace`, see `trace`)
     pub tb: Mutex<Vec<(Arc<super::trace::Frame>, u32)>>,
+    /// the project positions it has gone through, innermost first, with their frame's id (tracebacks)
+    pub ptb: Mutex<Vec<(&'static super::trace::Pos, usize)>>,
 }
 
 /// A raised exception. Cheap to clone.
 #[derive(Clone)]
 pub struct Exc(pub Arc<ExcObj>);
+
+impl Exc {
+    /// `add_note`: the note appended to the `__notes__` list (created on the first note)
+    pub fn add_note(&self, note: &str) {
+        let mut attrs = self.0.attrs.lock();
+        match attrs.get("__notes__") {
+            Some(V::List(l)) => l.lock().push(V::str(note)),
+            _ => {
+                attrs.insert("__notes__".to_string(), V::list(vec![V::str(note)]));
+            }
+        }
+    }
+
+    /// The notes `add_note` added, in order (`traceback` prints them after the message)
+    pub fn notes(&self) -> Vec<String> {
+        match self.0.attrs.lock().get("__notes__") {
+            Some(V::List(l)) => l.lock().iter().map(|n| super::ops::str_(n).unwrap_or_default()).collect(),
+            _ => vec![],
+        }
+    }
+}
 
 impl std::fmt::Debug for Exc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -727,6 +768,7 @@ builtin_exc!(GENERATOR_EXIT, "GeneratorExit", [BASE_EXCEPTION]);
 builtin_exc!(CANCELLED_ERROR, "CancelledError", [BASE_EXCEPTION]);
 builtin_exc!(MCP_TOOL_ERROR, "ToolError", [EXCEPTION]);
 builtin_exc!(EXCEPTION, "Exception", [BASE_EXCEPTION]);
+builtin_exc!(EXCEPTION_GROUP, "ExceptionGroup", [EXCEPTION]);
 builtin_exc!(VALUE_ERROR, "ValueError", [EXCEPTION]);
 builtin_exc!(TYPE_ERROR, "TypeError", [EXCEPTION]);
 builtin_exc!(ATTRIBUTE_ERROR, "AttributeError", [EXCEPTION]);
@@ -777,6 +819,7 @@ builtin_exc!(HTTP_EXCEPTION, "HTTPException", [EXCEPTION]);
 // FastAPI: ValidationException(Exception) <- RequestValidationError, WebSocketRequestValidationError
 builtin_exc!(VALIDATION_EXCEPTION, "ValidationException", [EXCEPTION]);
 builtin_exc!(REQUEST_VALIDATION_ERROR, "RequestValidationError", [VALIDATION_EXCEPTION]);
+builtin_exc!(RESPONSE_VALIDATION_ERROR, "ResponseValidationError", [VALIDATION_EXCEPTION]);
 // Starlette / FastAPI WebSockets (dynrt/ws.rs); ClientDisconnected is uvicorn's (an OSError)
 builtin_exc!(WS_DISCONNECT, "WebSocketDisconnect", [EXCEPTION]);
 builtin_exc!(WS_DISCONNECTED, "WebSocketDisconnected", [RUNTIME_ERROR]);
@@ -784,8 +827,10 @@ builtin_exc!(WS_EXCEPTION, "WebSocketException", [EXCEPTION]);
 builtin_exc!(WS_VALIDATION_ERROR, "WebSocketRequestValidationError", [VALIDATION_EXCEPTION]);
 builtin_exc!(CLIENT_DISCONNECTED, "ClientDisconnected", [OS_ERROR]);
 builtin_exc!(VALIDATION_ERROR, "ValidationError", [VALUE_ERROR]);
+builtin_exc!(PYDANTIC_CUSTOM_ERROR, "PydanticCustomError", [VALUE_ERROR]);
+builtin_exc!(PYDANTIC_USE_DEFAULT, "PydanticUseDefault", [EXCEPTION]);
 builtin_exc!(SQLALCHEMY_ERROR, "SQLAlchemyError", [EXCEPTION]);
-builtin_exc!(DBAPI_ERROR, "DBAPIError", [SQLALCHEMY_ERROR]);
+builtin_exc!(DBAPI_ERROR, "DBAPIError", [STATEMENT_ERROR]);
 builtin_exc!(INTEGRITY_ERROR, "IntegrityError", [DBAPI_ERROR]);
 builtin_exc!(STATEMENT_ERROR, "StatementError", [SQLALCHEMY_ERROR]);
 builtin_exc!(COMPILE_ERROR, "CompileError", [SQLALCHEMY_ERROR]);
@@ -799,8 +844,11 @@ builtin_exc!(MULTIPLE_RESULTS_FOUND, "MultipleResultsFound", [SQLALCHEMY_ERROR])
 builtin_exc!(MISSING_GREENLET, "MissingGreenlet", [SQLALCHEMY_ERROR]);
 builtin_exc!(INVALID_REQUEST_ERROR, "InvalidRequestError", [SQLALCHEMY_ERROR]);
 builtin_exc!(OBJECT_DELETED_ERROR, "ObjectDeletedError", [INVALID_REQUEST_ERROR]);
+builtin_exc!(UNMAPPED_INSTANCE_ERROR, "UnmappedInstanceError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(STALE_DATA_ERROR, "StaleDataError", [SQLALCHEMY_ERROR]);
+builtin_exc!(DETACHED_INSTANCE_ERROR, "DetachedInstanceError", [SQLALCHEMY_ERROR]);
 builtin_exc!(ARGUMENT_ERROR, "ArgumentError", [SQLALCHEMY_ERROR]);
+builtin_exc!(NO_FOREIGN_KEYS_ERROR, "NoForeignKeysError", [ARGUMENT_ERROR]);
 builtin_exc!(CIRCULAR_DEPENDENCY_ERROR, "CircularDependencyError", [SQLALCHEMY_ERROR]);
 builtin_exc!(EXPAT_ERROR, "ExpatError", [EXCEPTION]);
 builtin_exc!(RESOURCE_CLOSED_ERROR, "ResourceClosedError", [INVALID_REQUEST_ERROR]);
@@ -892,8 +940,9 @@ builtin_exc!(AIO_SERVER_CONNECTION_ERROR, "ServerConnectionError", [AIO_CONNECTI
 builtin_exc!(AIO_SERVER_TIMEOUT, "ServerTimeoutError", [AIO_SERVER_CONNECTION_ERROR, TIMEOUT_ERROR]);
 builtin_exc!(AIO_CONNECTION_TIMEOUT, "ConnectionTimeoutError", [AIO_SERVER_TIMEOUT]);
 builtin_exc!(AIO_INVALID_URL, "InvalidURL", [AIO_CLIENT_ERROR, VALUE_ERROR]);
-builtin_exc!(UNICODE_DECODE_ERROR, "UnicodeDecodeError", [VALUE_ERROR]);
-builtin_exc!(UNICODE_ENCODE_ERROR, "UnicodeEncodeError", [VALUE_ERROR]);
+builtin_exc!(UNICODE_ERROR, "UnicodeError", [VALUE_ERROR]);
+builtin_exc!(UNICODE_DECODE_ERROR, "UnicodeDecodeError", [UNICODE_ERROR]);
+builtin_exc!(UNICODE_ENCODE_ERROR, "UnicodeEncodeError", [UNICODE_ERROR]);
 builtin_exc!(PYDANTIC_SERIALIZATION_ERROR, "PydanticSerializationError", [VALUE_ERROR]);
 builtin_exc!(FILE_NOT_FOUND_ERROR, "FileNotFoundError", [OS_ERROR]);
 builtin_exc!(FILE_EXISTS_ERROR, "FileExistsError", [OS_ERROR]);
@@ -902,7 +951,7 @@ builtin_exc!(IS_A_DIRECTORY_ERROR, "IsADirectoryError", [OS_ERROR]);
 
 impl Exc {
     pub fn new(class: &'static Class, args: Vec<V>) -> Exc {
-        Exc(Arc::new(ExcObj { class, args, http: None, errors: None, attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default() }))
+        Exc(Arc::new(ExcObj { class, args, http: None, errors: None, attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default(), ptb: Default::default() }))
     }
     pub fn msg(class: &'static Class, msg: impl AsRef<str>) -> Exc {
         Exc::new(class, vec![V::str(msg)])
@@ -929,10 +978,11 @@ impl Exc {
             new_args: Default::default(),
             http_late: Default::default(),
             tb: Default::default(),
+            ptb: Default::default(),
         }))
     }
     pub fn validation(class: &'static Class, errors: Vec<pyd::ErrDetail>) -> Exc {
-        Exc(Arc::new(ExcObj { class, args: vec![], http: None, errors: Some(errors), attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default() }))
+        Exc(Arc::new(ExcObj { class, args: vec![], http: None, errors: Some(errors), attrs: Default::default(), new_args: Default::default(), http_late: Default::default(), tb: Default::default(), ptb: Default::default() }))
     }
     /// a pydantic `ValidationError` raised for a model: `title` is its name (`str(e)` names it too)
     pub fn validation_titled(class: &'static Class, errors: Vec<pyd::ErrDetail>, title: &str) -> Exc {
@@ -955,6 +1005,9 @@ impl Exc {
     /// `str(exc)`: the single argument, or the tuple of arguments, like CPython.
     pub fn message(&self) -> String {
         if let Some(errs) = &self.0.errors {
+            if self.isinstance(&VALIDATION_EXCEPTION) {
+                return super::web::fastapi_validation_str(self, errs);
+            }
             // the model's name, when the raiser knew it (pydantic's `ValidationError.title`)
             if let Some(V::Str(t)) = self.0.attrs.lock().get("title") {
                 return super::pyd::error_str(t, errs);
@@ -999,28 +1052,63 @@ impl From<sqlx::Error> for Exc {
         if let sqlx::Error::Database(db) = &e {
             // psycopg's SQLSTATE class -> DBAPI exception, as SQLAlchemy wraps it
             let code = db.code().map(|c| c.to_string()).unwrap_or_default();
-            if let Some((name, base)) = super::sqlstate::lookup(&code) {
-                let class: &'static Class = match base {
-                    "IntegrityError" => &INTEGRITY_ERROR,
-                    "DataError" => &DATA_ERROR,
-                    "ProgrammingError" => &PROGRAMMING_ERROR,
-                    "NotSupportedError" => &NOT_SUPPORTED_ERROR,
-                    "InternalError" => &INTERNAL_ERROR,
-                    "DatabaseError" => &DBAPI_ERROR, // sqlalchemy.exc.DatabaseError: not a class of its own here
-                    _ => &OPERATIONAL_ERROR,
-                };
-                return Exc::msg(class, format!("(psycopg.errors.{name}) {}", db.message()));
+            // psycopg's message (libpq's, without "ERROR:  "): DETAIL and HINT follow the primary message
+            // (its `LINE n:` excerpt quotes the statement as sent: not reproduced)
+            let mut msg = db.message().to_string();
+            if let Some(pg) = db.try_downcast_ref::<sqlx::postgres::PgDatabaseError>() {
+                if let Some(d) = pg.detail() {
+                    msg += &format!("\nDETAIL:  {d}");
+                }
+                if let Some(h) = pg.hint() {
+                    msg += &format!("\nHINT:  {h}");
+                }
             }
-            let (class, name): (&'static Class, &str) = match code.get(..2).unwrap_or("") {
-                "23" => (&INTEGRITY_ERROR, "IntegrityError"),
-                "22" => (&DATA_ERROR, "DataError"),
-                "42" | "2B" | "2D" | "2F" | "34" | "3D" | "3F" | "44" => (&PROGRAMMING_ERROR, "ProgrammingError"),
-                "0A" => (&NOT_SUPPORTED_ERROR, "NotSupportedError"),
-                "XX" | "2C" | "39" | "3B" => (&INTERNAL_ERROR, "InternalError"),
-                _ => (&OPERATIONAL_ERROR, "OperationalError"),
+            let (class, name): (&'static Class, &str) = match super::sqlstate::lookup(&code) {
+                Some((name, base)) => (
+                    match base {
+                        "IntegrityError" => &INTEGRITY_ERROR,
+                        "DataError" => &DATA_ERROR,
+                        "ProgrammingError" => &PROGRAMMING_ERROR,
+                        "NotSupportedError" => &NOT_SUPPORTED_ERROR,
+                        "InternalError" => &INTERNAL_ERROR,
+                        "DatabaseError" => &DBAPI_ERROR, // sqlalchemy.exc.DatabaseError: not a class of its own here
+                        _ => &OPERATIONAL_ERROR,
+                    },
+                    name,
+                ),
+                None => match code.get(..2).unwrap_or("") {
+                    "23" => (&INTEGRITY_ERROR, "IntegrityError"),
+                    "22" => (&DATA_ERROR, "DataError"),
+                    "42" | "2B" | "2D" | "2F" | "34" | "3D" | "3F" | "44" => (&PROGRAMMING_ERROR, "ProgrammingError"),
+                    "0A" => (&NOT_SUPPORTED_ERROR, "NotSupportedError"),
+                    "XX" | "2C" | "39" | "3B" => (&INTERNAL_ERROR, "InternalError"),
+                    _ => (&OPERATIONAL_ERROR, "OperationalError"),
+                },
             };
-            return Exc::msg(class, format!("(psycopg.errors.{name}) {}", db.message()));
+            let out = Exc::msg(class, format!("(psycopg.errors.{name}) {msg}"));
+            // `raise sqlalchemy_exception from psycopg_error`: the driver's exception is the cause
+            let cause = Exc::msg(psycopg_class(name), msg);
+            out.0.attrs.lock().insert("orig".into(), V::Exc(cause.clone()));
+            out.0.attrs.lock().insert("__cause__".into(), V::Exc(cause));
+            out.0.attrs.lock().insert("__suppress_context__".into(), V::Bool(true));
+            return out;
         }
         Exc::msg(&OPERATIONAL_ERROR, format!("(psycopg.OperationalError) {e}"))
     }
+}
+
+/// `psycopg.errors.<name>`: one class per name (only printed: tracebacks, Sentry)
+fn psycopg_class(name: &str) -> &'static Class {
+    static CLASSES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, &'static Class>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let mut m = CLASSES.lock();
+    if let Some(c) = m.get(name) {
+        return c;
+    }
+    let n: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let q: &'static str = Box::leak(format!("psycopg.errors.{name}").into_boxed_str());
+    static BASES: [&Class; 1] = [&EXCEPTION];
+    let c: &'static Class = Box::leak(Box::new(Class { name: n, qualname: q, bases: &BASES, kind: ClassKind::Exception }));
+    m.insert(name.to_string(), c);
+    c
 }

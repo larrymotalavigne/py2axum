@@ -54,7 +54,18 @@ fn opt_str(v: Option<&V>) -> R<Option<String>> {
 }
 
 /// `MCPServer(name=None, title=None, instructions=None, version=None)`
+/// a record of the SDK's own loggers (INFO, the messages mcp 2.2 logs)
+pub fn log(logger: &str, msg: &str, args: Vec<V>, exc: Option<Exc>) {
+    let level = if exc.is_some() { super::logging::ERROR } else { super::logging::INFO };
+    super::logging::emit_sync(logger, level, msg, args, vec![], exc, &super::logging::NO_LOC);
+}
+
 pub fn server(args: &[V], kwargs: &[(String, V)]) -> R {
+    // MCPServer.__init__: `configure_logging(settings.log_level)`, i.e. basicConfig(level=..., format="%(message)s",
+    // handlers=[StreamHandler()]) (without rich installed): the root gets its handler before the application's
+    let level = opt_str(kwarg(kwargs, "log_level"))?.unwrap_or_else(|| "INFO".into());
+    let h = super::logging::stream_handler_new(&[], &[])?;
+    super::logging::basic_config(&[], &[("level".into(), V::str(&level)), ("format".into(), V::str("%(message)s")), ("handlers".into(), V::list(vec![h]))])?;
     let name = opt_str(args.first().or_else(|| kwarg(kwargs, "name")))?.unwrap_or_else(|| "mcp-server".into());
     let title = opt_str(kwarg(kwargs, "title"))?;
     let instructions = opt_str(args.get(1).or_else(|| kwarg(kwargs, "instructions")))?;
@@ -78,7 +89,8 @@ pub fn decorate(s: &Arc<Server>, spec: &'static ToolSpec, args: &[V]) -> R {
     let mut tools = s.tools.write();
     // FastMCP's ToolManager: a second tool of the same name keeps the first (with a warning)
     if tools.iter().any(|(t, _)| t.name == spec.name) {
-        eprintln!("WARNING:mcp.server.mcpserver.tools.tool_manager:Tool already exists: {}", spec.name);
+        super::logging::emit_sync("mcp.server.mcpserver.tools.tool_manager", super::logging::WARNING, "Tool already exists: %s",
+                                  vec![V::str(spec.name)], vec![], None, &super::logging::NO_LOC);
     } else {
         tools.push((spec, f.clone()));
     }
@@ -181,6 +193,10 @@ pub async fn handle_request(cx: &Cx, s: &Arc<Server>, args: &[V]) -> R {
             }
         }
     }
+    // what reaches the stateless manager's transport (not the body limit, not the modern protocol's handler)
+    let declared = header(&headers, "content-length").and_then(|l| l.trim().parse::<usize>().ok()).unwrap_or(0);
+    let transport = declared <= MAX_BODY && body.len() <= MAX_BODY
+        && header(&headers, "mcp-protocol-version").is_none_or(|v| HANDSHAKE.contains(&v.as_str()));
     let out = respond(cx, s, &method, &headers, &body).await?;
     let hs: Vec<V> = out.headers.iter().map(|(k, v)| V::tuple(vec![V::Bytes(Arc::from(k.as_bytes())), V::Bytes(Arc::from(v.as_bytes()))])).collect();
     let start = V::dict_from(vec![(V::str("type"), V::str("http.response.start")), (V::str("status"), V::Int(out.status as i64)), (V::str("headers"), V::list(hs))])?;
@@ -194,6 +210,10 @@ pub async fn handle_request(cx: &Cx, s: &Arc<Server>, args: &[V]) -> R {
     if out.stream {
         // the standalone SSE stream of a stateless server: nothing is ever sent on it
         std::future::pending::<()>().await;
+    }
+    // the stateless manager's transport, terminated once the request is answered
+    if transport {
+        log("mcp.server.streamable_http", "Terminating session: None", vec![], None);
     }
     Ok(V::None)
 }
@@ -371,7 +391,7 @@ fn ascii(s: &str) -> String {
 // ---------------------------------------------------------------- the JSON-RPC envelope
 
 fn err(kind: &'static str, loc: Vec<V>, msg: &str, input: &V) -> ErrDetail {
-    ErrDetail { kind, loc, msg: msg.to_string(), input: input.clone(), ctx: None }
+    ErrDetail { kind, loc, msg: msg.to_string(), input: input.clone(), ctx: None, custom: false }
 }
 
 fn loc(model: &str, rest: &[&str]) -> Vec<V> {
@@ -382,7 +402,7 @@ fn check_jsonrpc(m: &str, d: &V, errs: &mut Vec<ErrDetail>) {
     match dict_get(d, "jsonrpc") {
         None => errs.push(err("missing", loc(m, &["jsonrpc"]), "Field required", d)),
         Some(V::Str(s)) if &*s == "2.0" => {}
-        Some(v) => errs.push(ErrDetail { kind: "literal_error", loc: loc(m, &["jsonrpc"]), msg: "Input should be '2.0'".into(), input: v, ctx: None }),
+        Some(v) => errs.push(ErrDetail { kind: "literal_error", loc: loc(m, &["jsonrpc"]), msg: "Input should be '2.0'".into(), input: v, ctx: None, custom: false }),
     }
 }
 
@@ -561,6 +581,7 @@ async fn dispatch(cx: &Cx, s: &Arc<Server>, method: &str, params: Option<&V>, he
             let Some(V::Str(uri)) = params.and_then(|p| dict_get(p, "uri")) else {
                 return Ok(invalid_params());
             };
+            log("mcp.server.mcpserver.server", "Resource %r failed: %r", vec![V::Str(uri.clone()), V::str(format!("Unknown resource: {uri}"))], None);
             Err((-32602, format!("Unknown resource: {uri}"), Some(format!("{{\"uri\":{}}}", js(&uri)))))
         }
         "prompts/get" => {
@@ -568,7 +589,12 @@ async fn dispatch(cx: &Cx, s: &Arc<Server>, method: &str, params: Option<&V>, he
                 return Ok(invalid_params());
             }
             let Some(V::Str(name)) = params.and_then(|p| dict_get(p, "name")) else { unreachable!() };
-            Err((0, format!("Unknown prompt: {name}"), None))
+            // the dispatcher logs the handler's exception (a ValueError raised from the prompt manager's)
+            let m = format!("Unknown prompt: {name}");
+            let e = Exc::value_error(&m);
+            e.0.attrs.lock().insert("__cause__".into(), V::Exc(Exc::value_error(&m)));
+            log("mcp.shared.jsonrpc_dispatcher", "handler for %r raised", vec![V::str("prompts/get")], Some(e));
+            Err((0, m, None))
         }
         "tools/call" => {
             if !is_str(params, "name") || !opt_of(params, "arguments", |v| matches!(v, V::Dict(_))) {
@@ -629,7 +655,9 @@ fn pre_parse(spec: &ToolSpec, args: &V) -> R {
 
 async fn call_tool(cx: &Cx, s: &Arc<Server>, name: &str, arguments: Option<V>) -> R<Reply> {
     let found = s.tools.read().iter().find(|(t, _)| t.name == name).map(|(t, f)| (*t, f.clone()));
+    const SRV: &str = "mcp.server.mcpserver.server";
     let Some((spec, f)) = found else {
+        log(SRV, "Tool %r failed: %r", vec![V::str(name), V::str(format!("Unknown tool: {name}"))], None);
         return Ok(Ok(text_result(&format!("Unknown tool: {name}"), true)));
     };
     let args = match arguments {
@@ -641,6 +669,14 @@ async fn call_tool(cx: &Cx, s: &Arc<Server>, name: &str, arguments: Option<V>) -
     let td = super::types::schema_td(spec.args);
     let inst = pyd::validate(cx, &args, td, &[], &mut errs).await?;
     let Some(inst) = inst.filter(|_| errs.is_empty()) else {
+        // the field names only (the rejected values are the caller's data)
+        let mut fields: Vec<String> = errs
+            .iter()
+            .map(|e| e.loc.iter().map(|l| ops::str_(l).unwrap_or_default()).collect::<Vec<_>>().join("."))
+            .collect();
+        fields.sort();
+        fields.dedup();
+        log(SRV, "Tool %r rejected arguments: %r", vec![V::str(name), V::list(fields.into_iter().map(V::str).collect())], None);
         let text = pyd::error_str(spec.args.name, &errs);
         return Ok(Ok(text_result(&format!("Error executing tool {name}: {text}"), true)));
     };
@@ -667,9 +703,13 @@ async fn call_tool(cx: &Cx, s: &Arc<Server>, name: &str, arguments: Option<V>) -
             let structured = pyd::to_json(&jv, &pyd::RESPONSE, false)?;
             Ok(Ok(format!("{{\"content\":[{{\"text\":{},\"type\":\"text\"}}],\"isError\":false,\"structuredContent\":{structured}}}", js(&text))))
         }
-        Err(e) if e.isinstance(&MCP_TOOL_ERROR) => Ok(Ok(text_result(&format!("Error executing tool {name}: {}", e.message()), true))),
+        Err(e) if e.isinstance(&MCP_TOOL_ERROR) => {
+            let text = format!("Error executing tool {name}: {}", e.message());
+            log(SRV, "Tool %r failed: %r", vec![V::str(name), V::str(&text)], None);
+            Ok(Ok(text_result(&text, true)))
+        }
         Err(e) if e.isinstance(&EXCEPTION) => {
-            eprintln!("ERROR:mcp.server.mcpserver.tools.base:Error executing tool {name}: {:?}", e);
+            log(SRV, "Tool %r raised an unexpected exception", vec![V::str(name)], Some(e));
             Ok(Ok(text_result(&format!("Error executing tool {name}"), true)))
         }
         Err(e) => Err(e),

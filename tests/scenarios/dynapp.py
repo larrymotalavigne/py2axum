@@ -321,6 +321,11 @@ STEPS: list = [
     ("GET", "/projects/1", None),
     ("GET", "/projects/9", None),
     ("GET", "/projects/1/lazy", None),
+    ("GET", "/greenlet/read/column", None),
+    ("GET", "/greenlet/read/key", None),
+    ("GET", "/greenlet/read/deferred", None),
+    ("GET", "/greenlet/read/m2o", None),
+    ("GET", "/greenlet/read/o2m", None),
     ("GET", "/owners/1", None),
     ("GET", "/tasks/5/project", None),
     ("GET", "/tasks/5/project?preload=discard", None),
@@ -838,7 +843,12 @@ STEPS: list = [
     ("GET", "/libs/ssrf?host=localhost", None),
     ("GET", "/libs/ssrf?host=127.0.0.1", None),
     ("GET", "/libs/ssrf?host=::1", None),
-    ("GET", "/libs/ssrf?host=nonexistent.invalid", None),
+    # an unresolvable name: one the C library rejects itself (`!`), with no DNS query: a real resolver may answer
+    # NXDOMAIN to one query and NODATA to the next (CI's CoreDNS, 13/10/2026: [Errno -2] then [Errno -5])
+    ("GET", "/libs/ssrf?host=no!such.invalid", None),
+    # CPython's idna codec, before any lookup: a label of 64 characters, an empty label (3.12: UnicodeError)
+    ("GET", "/libs/ssrf?host=" + "a" * 64 + ".invalid", None), ("GET", "/libs/ssrf?host=x..invalid", None),
+    ("GET", "/libs/ssrf?host=x." + "b" * 70, None),
     ("POST", "/libs/sanitize", {"html": "<p onclick=x>Hi <a href=\"javascript:alert(1)\">x</a> <a href=cid:abc target=_blank>y</a>"
                                         "<script>bad()</script><!-- c --><b class=\"k z\" style=\"color:red\">b</b>"
                                         "<img src=x onerror=1><style>p{}</style><table><td colspan=2>t</td></table></p>"}),
@@ -941,6 +951,7 @@ STEPS: list = [
     ("GET", "/enumcols/2/validate", None),
     ("GET", "/enumcols/3/str", None),
     ("POST", "/ddl/fresh", None),
+    ("POST", "/ddl/readings", None),
     ("POST", "/ddl/again", None),
     ("POST", "/ddl/partial", None),
     ("POST", "/ddl/clash", None),
@@ -1252,6 +1263,19 @@ STEPS += [
     LOG,
 ]
 
+# fixtures/dynapp/leaks.py: shapes that made reference cycles (nested function naming itself, objects left linked
+# by a failed flush, a rollback, a DELETE); the same answers as before the cycles were broken
+STEPS += [
+    ("GET", "/leak/selfref", None),
+    ("GET", "/leak/selfref?n=0", None),
+    ("GET", "/leak/selfref_cell", None),
+    ("GET", "/leak/selfref_escape", None),
+    ("POST", "/leak/dup_flush", None),
+    ("POST", "/leak/rolled_back", None),
+    ("POST", "/leak/deleted", None),
+    ("GET", "/leak/stream_dep?n=3&pause=0", None),
+]
+
 # last: they rename task 2
 STEPS += [
     ("POST", "/tasks/2/returning", {"title": "Renamed by RETURNING"}),
@@ -1287,6 +1311,7 @@ def _reset_broker() -> None:
 def reset(db: str) -> None:
     from sqlalchemy import create_engine
 
+    import fixtures.dynapp.inherit  # noqa: F401  (its tables are on the same Base)
     from fixtures.dynapp.models import Base
 
     # FileResponse: a file both servers serve, with a fixed mtime (etag, last-modified)
@@ -1461,6 +1486,109 @@ def _pydmore_cases() -> list:
 
 
 STEPS += _pydmore_cases()
+
+
+def _pydc_cases() -> list:
+    """fixtures/dynapp/pydcorpus.py: aliases, Field options, str config on items, strict mode, discriminated unions."""
+    P = "/pydc"
+    steps = []
+    for b in ({"names": ["Ada", "Lovelace"]}, {"names": ["Ada"], "zip": "75001"}, {"names": "Ada"}, {},
+              {"names": ["Ada", 5], "contact": {"address": {"city": "Paris"}}, "town": "x"},
+              {"names": ["A"], "town": "Lyon", "city": None}, {"names": ["A"], "first": "B"},
+              {"names": ["A"], "contact": {"address": {}}, "postcode": 1}, {"names": [None]}):
+        steps += [("POST", P + "/paths", b), ("POST", P + "/paths/dump", b)]
+    for b in ({"firstName": "Ada"}, {"first_name": "Ada", "lang": "en"}, {"firstName": "Ada", "languageCode": "en"},
+              {"firstName": "Ada", "first_name": "B", "extra": 1}, {"lastName": 1}):
+        steps += [("POST", P + "/gen", b), ("POST", P + "/gen/dump", b)]
+    for b in ({"FIELD_ONE": 1}, {"field_one": 1}, {"FIELD_ONE": 1, "OTHER": "z"}):
+        steps.append(("POST", P + "/gen2", b))
+    for b in ({"my_field": 1, "http_code": 2}, {"myField": 1}, {"h_t_t_p_code": 3}):
+        steps.append(("POST", P + "/snake", b))
+    for b in ({"my_field": "a"}, {"my_alias": "a"}):
+        steps.append(("POST", P + "/byname", b))
+    for b in ({"name": " ab "}, {"name": "abcdefgh"}, {"name": ""}, {"name": "a", "tags": [" x ", "toolongtag", ""],
+              "labels": {" k ": " v ", "toolongkey": "x"}}, {"name": "a", "code": "abcdefg"},
+              {"name": "a", "hidden": 3, "secret": "zz"}, {"name": "a", "step": 15}, {"name": "a", "step": 7},
+              {"name": "a", "step": 110}, {"name": "a", "step": "10"}, {"name": "a", "ratio": 0.3},
+              {"name": "a", "ratio": 0.35}, {"name": "a", "even": 3}, {"name": "a", "even": 4.0}, {"name": "a", "even": -4.5},
+              {"name": "a", "either": "1", "other": "1"}, {"name": "a", "either": 1, "other": 1.5},
+              {"name": "a", "either": None, "other": None}, {"name": "a", "fixed": "given"}):
+        steps += [("POST", P + "/opts", b), ("POST", P + "/opts/model", b)]
+    for b in ({}, {"when": "2020-01-01"}, {"at": "2020-01-01T00:00:00"}, {"n": "1", "f": "1", "s": 1, "b": 1},
+              {"n": 1.0, "f": 1, "s": "x", "b": True}, {"pair": [1, 2]}, {"items": [1, "2"]}, {"items": "x"},
+              {"inner": {"v": "3"}}, {"inner": 1}, {"lax": "4"}, {"n": True}, {"f": True}, {"when": None}):
+        steps.append(("POST", P + "/strict", b))
+    for b in ({"n": "1"}, {"nums": ["1", 2]}, {"nums": "1"}, {"day": "2020-01-01"}, {"day": None}, {"loose": "2"},
+              {"n": 1, "nums": [True]}, {"site": "http:////example.com"}, {"site": "https://ok.org/a"},
+              {"site": "http:\\\\x.org"}, {"site": "HTTP://X.org"}, {"site": "x"}):
+        steps.append(("POST", P + "/fieldstrict", b))
+    steps += [("POST", P + "/strict/python", {"when": "2020-01-02"}), ("POST", P + "/strict/python", {})]
+    for b in ({"pet": {"pet_type": "cat", "meows": "x"}}, {"pet": {"pet_type": "dog", "barks": 1}},
+              {"pet": {"pet_type": "lizard"}}, {"pet": {"pet_type": "reptile", "scales": "yes"}}, {"pet": {}},
+              {"pet": {"pet_type": 1}}, {"pet": {"pet_type": None}}, {"pet": "x"}, {"pet": [1]}, {"pet": None},
+              {"pet": {"pet_type": ["cat"]}}, {}, {"pet": None, "nested": {"pet_type": "kitty", "color": "white", "white_name": "W"}},
+              {"pet": None, "nested": {"pet_type": "kitty", "color": "grey"}}, {"pet": None, "nested": {"pet_type": "kitty"}},
+              {"pet": None, "nested": {"pet_type": "dog", "barks": "loud"}}, {"pet": None, "nested": {"color": "black"}}):
+        steps.append(("POST", P + "/owner", b))
+    steps.append(("POST", P + "/owner/python", None))
+    for b in ({}, {"dessert": {"fruit": "apple", "n": "1"}}, {"dessert": {"filling": "pumpkin", "n": "x"}}, {"dessert": {}},
+              {"dessert": {"fruit": "pear"}}, {"dessert": 5}, {"dessert": {"fruit": 5}}, {"value": "a"}, {"value": 1.5},
+              {"value": [1]}, {"pie": {"filling": "pumpkin"}}, {"pie": {"x": 1}}):
+        steps.append(("POST", P + "/dinner", b))
+    for b in ({}, {"code": "café"}, {"code": "éé"}, {"code": "abcd"}, {"code": "ab1"}, {"code": "ab"}, {"low": "AB"},
+              {"low": "ab"}, {"names": ["foo", 123]}, {"hook": 1}, {"hook": None}, {"dots": 1}, {"plain": {}}, {"plain": "x"},
+              {"ident": "4"}, {"ident": "x"}):
+        steps.append(("POST", P + "/misc", b))
+    for x in ("invalid", [1, 2], "1/3", "3", 0.5, 2, " 2/4 ", "1.25", "-1/0", "1e2", None, True, 0.1, "1_000/3", ".5", "5.",
+              "+3/6", "1E-2", "0x10", "1 /2", "nan", "inf", 1e300, -0.0, "2/-3", "1.5e1/2", "-.25e+1", 123456789012345678):
+        steps += [("POST", P + "/ratio", {"x": x}), ("POST", P + "/ratio/use", {"y": x})]
+    steps.append(("POST", P + "/ratio/use", {}))
+    for x in ("abc", "1+2j", 3, 1.5, [1, 2], "2j", " 1 + 2j ", "(1+2j)", {"real": 1}, "1-2j", "1e3j", "inf", True, "1e20+1e-7j",
+              "-0+2j", "-2j", "nan+infj", "0.1+0.2j", "1e300+1e-300j", "0j", "-1-0j", "1_0j", "j", "-j", "+1.5J", " (1+2j) ",
+              "( 1+2j )", "infj", "-nan+1j", "1e", "1+", "1_+2j", ".5j", "5.j", "INFINITYj", None, ""):
+        steps += [("POST", P + "/cplx", {"n": x}), ("POST", P + "/cplx/use", {"n": x})]
+    steps += [("POST", P + "/pets", b) for b in (["a", "b"], ["a", 1], "x", {"root": ["a"]})]
+    steps += [("POST", P + "/pets/use", ["dog", "cat"])]
+    steps += [("POST", P + "/kennel", b) for b in ({"pets": ["x"]}, {"pets": [1]}, {"pets": [], "counts": {"a": "1"}},
+                                                   {"pets": [], "counts": {"a": "x"}})]
+    steps += [("POST", P + "/shout", b) for b in ({"v": "ab"}, {"v": "AB"}, {})]
+    steps += [("POST", P + "/custom", b) for b in ({"name": None}, {"name": "n", "w": "x"}, {"x": 84}, {"w": None}, {"x": 1, "note": "n"})]
+    for b in ({"password": "abc"}, {"password": "x", "other": "y", "uid": "886313e1-3b8a-4372-9b90-0c9aee199e5d"},
+              {"password": 1}, {"password": None}, {"password": ""}, {"password": "p", "uid": "a6cc5730-2261-11ee-9c43-2eb5a363657c"},
+              {"password": "p", "uid": "nope"}):
+        steps += [("POST", P + "/secrets", b), ("POST", P + "/secrets/use", b)]
+    for b in ({"a": 11}, {"a": 1}, {"a": 11, "b": 3}, {"a": "x", "c": "y"}, {}):
+        steps.append(("POST", P + "/defaults", b))
+    for b in ({}, {"number": 2}, {"number": 3}, {"number": "4"}, {"alias_even": 5}, {"label": 3, "number": 2},
+              {"label": -1}, {"numbers": 5}, {"numbers": ["1", 2]}, {"numbers": "x"}, {"plain": 3}, {"plain": "x"},
+              {"plain": None}, {"stamp": "now"}, {"stamp": 7}, {"stamp": "x"}, {"number": 1, "label": "x"}):
+        steps.append(("POST", P + "/checked", b))
+    for b in ({}, {"short": "abcdefgh"}, {"short": 1}, {"nums": ["1", 2]}, {"nums": ["x", 1, "y"]}, {"nums": "boom"},
+              {"nums": 3}, {"when": "epoch"}, {"when": "2020-01-01T10:00:00.123456"}, {"when": "x"}, {"when": None},
+              {"word": "abc"}, {"word": "abcd"}, {"word": 5}):
+        steps.append(("POST", P + "/wrapped", b))
+    for b in ({}, {"t": [1, "2", True]}, {"t": [1, 2]}, {"t": [1, 2, 3, 4]}, {"t": ["x", 2, 3, 4]}, {"t": ["x"]},
+              {"t": "abc"}, {"one": []}, {"one": [1, 2]}, {"empty": [1]}, {"empty": []}, {"pair": [{"v": "1"}, "a"]},
+              {"pair": [{"v": "x"}]}, {"kind": "Inner"}, {"model": {}}, {"note": "n"}):
+        steps.append(("POST", P + "/shapes", b))
+    for b in ({}, {"number": 4, "when": "2021-05-01T00:00:00", "text": "hi", "tags": ["a", "b"], "ratio": 0.5, "kept": 3},
+              {"ratio": 0}, {"kept": 1, "number": 0}, {"tags": ["x"]}):
+        steps += [("POST", P + "/sered", b), ("POST", P + "/sered/model", b)]
+    for b in ({}, {"flat": {"username": "u", "password": "p"}}, {"listed": [{"username": "a"}, {"username": "b", "inner": {"v": 2}}]},
+              {"flat": {"username": "u"}}):
+        steps += [("POST", P + "/holder", b), ("POST", P + "/holder/dump", b)]
+    for b in ({}, {"dq": [1, "2", 3]}, {"dq": "abc"}, {"dq": {"a": 1}}, {"dq": ["x"]}, {"fs": [1, 2, 2, 3]}, {"fs": "ab"},
+              {"fs": {}}, {"anyfs": [1, 2]}, {"counts": {"a": 2, "b": "3"}}, {"counts": ["a"]}, {"counts": {"a": "x"}},
+              {"ordered": {"b": 1, "a": "2"}}, {"ordered": [1]}, {"seq": ["a", "b"]}, {"seq": "ab"}, {"seq": {"a": 1}},
+              {"seq": [1, "a"]}, {"seq": None}):
+        steps += [("POST", P + "/colls", b), ("POST", P + "/colls/use", b)]
+    for path, bodies in (("/env/int", ({"data": "1"}, {"data": "x"}, {})), ("/env/inner", ({"data": {"v": "2"}}, {"data": 1})),
+                         ("/env/raw", ({"data": {"any": [1]}}, {})), ("/paged", ({"data": ["1", 2], "total": 2}, {"data": "x"})),
+                         ("/holding", ({"item": {"v": 3}}, {"item": 3})), ("/pair", ({"key": 1, "value": "2"}, {"key": "k"}))):
+        steps += [("POST", P + path, b) for b in bodies]
+    return steps
+
+STEPS += _pydc_cases()
 STEPS += [
     ("POST", "/pydmore/notices", {"meta": {"k": [1, 2]}, "hash": "h1", "content": "hello blob"}),
     ("POST", "/pydmore/notices", {"meta": None, "label": "info", "hash": "h1"}),
@@ -1503,7 +1631,8 @@ STEPS += [
     ("POST", "/kw/isinstance", {"vals": [1, 2.5, "s", True, [1], {"a": 1}]}),
     ("GET", "/stdmore/tcp", None),
     ("GET", "/stdmore/tcp?host=localhost", None),
-    ("GET", "/stdmore/tcp?host=nonexistent.invalid&port=25", None),
+    ("GET", "/stdmore/tcp?host=no!such.invalid&port=25", None),  # rejected by the C library, see /libs/ssrf
+    ("GET", "/stdmore/tcp?host=.invalid&port=25", None),
     ("GET", "/stdmore/tcp?port=6379", None),
     ("GET", "/stdmore/tcp?port=6379&send=PING", None),
     ("GET", "/stdmore/tcp?host=10.255.255.1&port=25&timeout=0.2", None),
@@ -1523,7 +1652,8 @@ STEPS += [
 STEPS += [
     ("GET", "/stdmore/sock", None),
     ("GET", "/stdmore/sock?host=localhost", None),
-    ("GET", "/stdmore/sock?host=mailserver.invalid&port=587", None),
+    ("GET", "/stdmore/sock?host=mail!server.invalid&port=587", None),
+    ("GET", "/stdmore/sock?host=" + "m" * 64 + "&port=587", None),
     ("GET", "/stdmore/sock?host=10.255.255.1&port=25&timeout=0.2", None),
     ("GET", "/stdmore/sock?port=6379", None),
 ]
@@ -1734,3 +1864,88 @@ def _realworld_cases() -> list:
 
 
 STEPS += _realworld_cases()
+
+
+def _pyver_cases() -> list:
+    """fixtures/dynapp/pyver.py (every Python), py314.py and py315.py (from those Pythons only: the conformance
+    runs on the reference app's Python)."""
+    import sys
+
+    from fixtures.dynapp.pyver import CASES
+
+    steps = [("GET", f"/pyver/{name}", None) for name in CASES]
+    steps += [("GET", f"/pyver/cm/{k}", None) for k in ("async-lock", "sync-semaphore", "int")]
+    steps += [("GET", f"/pyver/mime/{n}", None) for n in (
+        "a.yaml", "a.yml", "a.md", "a.wav", "a.avi", "a.woff2", "a.ttf", "a.otf", "a.gz", "a.tar.gz", "a.tgz", "a.docx",
+        "a.avif", "a.heic", "a.mjs", "a.js", "a.json", "a.webp", "a.epub", "a.7z", "a.rar", "a.ogg", "a.flac", "a.mkv",
+        "a.m4a", "a.php", "a.glb", "a.stl", "a.ics", "a.PDF", "a.jpeg", "a.svg", "a.csv", "a.xlsx", "a.odt", "a.weba",
+        "a.ai", "a.texi", "a.unknownext", ".bashrc", "noext", "a.tar.bz2", "a.svgz", "a.json.gz")]
+    if sys.version_info >= (3, 14):
+        steps += [("GET", "/py314/except?v=4", None), ("GET", "/py314/except", None), ("GET", "/py314/finally", None),
+                  ("POST", "/py314/forward", {"inner": {"v": "3"}, "items": [{"v": 1}]}),
+                  ("POST", "/py314/forward", {"inner": {"v": "x"}}), ("POST", "/py314/forward", {}),
+                  ("GET", "/py314/lazy-annotation?n=2", None), ("GET", "/py314/uuid7", None)]
+    if sys.version_info >= (3, 15):
+        steps += [("GET", "/py315/unpack", None), *[("GET", f"/py315/unpack-error/{k}", None) for k in ("list", "set", "gen", "dict")],
+                  ("GET", "/py315/prefixmatch", None), ("GET", "/py315/prefixmatch?s=baa", None),
+                  ("GET", "/py315/padded", None), ("GET", "/py315/padded?s=YWJjYQ%3D%3D", None),
+                  *[("GET", f"/py315/match?v={v}", None) for v in (1, -1, 2)]]
+    return steps
+
+
+STEPS += _pyver_cases()
+
+# ---- logging (fixtures/dynapp/logs.py): what each request prints is compared by the log conformance (--logs)
+STEPS += [("GET", "/logs/levels", None), ("GET", "/logs/extra", None), ("GET", "/logs/extra?tenant=9", None),
+          ("GET", "/logs/exc", None), ("GET", "/logs/exc?n=4", None),
+          ("GET", "/logs/bad-format", None), ("GET", "/logs/raise", None), ("GET", "/logs/raise?n=2", None),
+          ("GET", "/logs/sync", None), ("GET", "/logs/objects", None), ("GET", "/logs/config", None),
+          ("GET", "/logs/root", None), ("GET", "/logs/levels", None), ("GET", "/logs/config", None)]
+
+# documented differences of the log conformance (tests/logcmp.py): records left out on both sides
+LOG_IGNORE = [
+    # docs/tutorial/websockets.md: the raw ASGI middlewares do not see WebSocket connections (their frames are
+    # missing from the traceback of a WebSocket endpoint's exception)
+    r'File "[^"]*/fixtures/dynapp/wsock\.py"',
+    # docs/advanced/logging.md: an exception of a Server-Sent Events stream comes out of the stream, not through
+    # the raw ASGI middlewares (Python's ExceptionGroup lists their frames)
+    r"Exception Group Traceback",
+    # docs/tutorial/middleware.md: raised once the response has started (a middleware after the response, a body
+    # that fails while it streams): no frame of the raw ASGI middlewares around it
+    r"RuntimeError: boom after the response", r"AttributeError: 'int' object has no attribute 'encode'",
+    r"'loc': \('response', 'x'\), 'msg': 'Input should be a valid integer, unable to parse string as an integer', 'input': 'nope'",
+    # the WebSocket case above, the binary's side (its traceback has no frame of wsock.py: the HTTPException is
+    # raised before the context chain Python prints)
+    r"Expected ASGI message 'websocket.send' or 'websocket.close', but got 'websocket.http.response.start'",
+]
+if __import__("sys").version_info >= (3, 14):
+    # docs/supported.md "Deeply nested JSON on Python 3.14+" (and docs/python-versions.md): from 3.14, json's
+    # decoder is bounded by the C stack, not by 10 000 levels; the deep
+    # document of /edges/loads passes json.loads, then FastAPI's jsonable_encoder exceeds the recursion limit.
+    # The binary keeps the 10 000 levels (RecursionError in json.loads): the same 500, another traceback
+    LOG_IGNORE.append(r"RecursionError: maximum recursion depth exceeded")
+
+# ---- inheritance in an async session (fixtures/dynapp/inherit.py): what each loader option loads of the subclasses
+STEPS += [
+    ("POST", "/inh/lazy", None),
+    ("POST", "/inh/selectin", None),
+    ("POST", "/inh/selectin/only", None),
+    ("POST", "/inh/withpoly", None),
+    ("POST", "/inh/chained", None),
+    ("POST", "/inh/load", None),
+]
+
+# ---- obj.__dict__ around an INSERT (fixtures/dynapp/idict.py): columns never set, defaults, foreign keys and
+# back-populated relationships, then a later read, SELECT, get, refresh, UPDATE, collection removal
+STEPS += [("POST", f"/idict/insert/{case}/{mode}", None)
+          for case in ("append", "m2o_set", "explicit_none", "m2o_obj", "identity", "eager", "ctor_list", "backref_m2o",
+                       "fk_none", "batch")
+          for mode in ("flush", "commit")]
+STEPS += [("POST", "/idict/later", None), ("POST", "/idict/remove", None)]
+
+# fixtures/dynapp/greenlet.py: an attribute needing IO in an AsyncSession is a StatementError whose .orig is the
+# MissingGreenlet (expired column, expired key, lazy one-to-many and many-to-one); .orig of a database error
+STEPS += [("POST", "/greenlet/run", None), ("POST", "/greenlet/dbapi", None)]
+
+# session.expire(obj) / expire(obj, [names]) (fixtures/dynapp/expire.py); last: its rolled back rows use sequence values
+STEPS += [("POST", "/expire/run", None), ("POST", "/expire/run", None)]

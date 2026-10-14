@@ -34,40 +34,14 @@ pub(super) fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
 
 /// `base64.urlsafe_b64decode` as is (binascii's lenient mode, no padding added)
 pub(super) fn b64_decode_unpadded(s: &[u8]) -> Option<Vec<u8>> {
-    let (mut out, mut quad, mut pads, mut left) = (Vec::new(), 0u32, 0u32, 0u8);
-    for &c in s {
-        if c == b'=' {
-            if quad >= 2 {
-                pads += 1;
-                if quad + pads >= 4 {
-                    return Some(out);
-                }
-            }
-            continue;
-        }
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
-            _ => continue,
-        };
-        match quad {
-            0 => left = v,
-            1 => {
-                out.push((left << 2) | (v >> 4));
-                left = v & 0xf;
-            }
-            2 => {
-                out.push((left << 4) | (v >> 2));
-                left = v & 0x3;
-            }
-            _ => out.push((left << 6) | v),
-        }
-        quad = (quad + 1) % 4;
-    }
-    if quad == 0 { Some(out) } else { None }
+    // binascii's lenient mode, with the padding rules of the project's Python (3.13.13 / 3.14.4 rewrote them,
+    // 3.15's urlsafe_b64decode no longer requires the padding)
+    let swapped: Vec<u8> = s.iter().map(|&c| match c {
+        b'-' => b'+',
+        b'_' => b'/',
+        c => c,
+    }).collect();
+    super::stdlib::b64dec_padded(&swapped, false, super::python() < (3, 15)).ok()
 }
 
 fn exc(class: &'static Class, msg: impl AsRef<str>) -> Exc {

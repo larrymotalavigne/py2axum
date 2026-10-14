@@ -37,6 +37,10 @@ cargo build --release --manifest-path build/api/Cargo.toml
   error.
 - `--allow-untested-versions` translates even if the project locks library versions outside the
   [tested ranges](versions.md), at your own risk.
+- `--python X.Y` names the Python the project runs on (3.12 to 3.15; also `PY2AXUM_TARGET_PYTHON`): the binary
+  reproduces its messages and behaviours, and `sys.version_info` is folded against it. Default: the project's
+  `.python-version`, else this Python when `requires-python` allows it ([Python versions](../python-versions.md)).
+  `check` and `watch` take it too.
 - `--backend` is deprecated and has no effect: there is one backend since 0.4. `--backend auto` and
   `--backend dyn` are still accepted until 1.0; `--backend typed` is an error.
 

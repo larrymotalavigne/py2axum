@@ -232,17 +232,209 @@ pub fn format_exception(cx: &Cx, args: &[V], kwargs: &[(String, V)]) -> R {
 pub fn format_exception_only(value: &V) -> R {
     let line = match value {
         V::None => "NoneType: None\n".to_string(),
-        V::Exc(e) => {
-            let c = e.0.class;
-            // a project exception's qualname already carries its module
-            let ty = match super::sentry::exc_module(c) {
-                Some(m) if m != "builtins" && m != "__main__" && !c.qualname.starts_with(&format!("{m}.")) => format!("{m}.{}", c.qualname),
-                _ => c.qualname.to_string(),
-            };
-            let msg = super::ops::str_(value)?;
-            if msg.is_empty() { format!("{ty}\n") } else { format!("{ty}: {msg}\n") }
-        }
+        V::Exc(e) => exc_line(e),
         o => return Err(Exc::type_error(format!("py2axum: format_exception() of a {} is not supported", o.type_name()))),
     };
-    Ok(V::list(vec![V::str(&line)]))
+    // the notes (`add_note`, 3.14's json/dict notes), one line each after the message
+    let mut out = vec![V::str(&line)];
+    if let V::Exc(e) = value {
+        out.extend(e.notes().iter().map(|n| V::str(format!("{n}\n"))));
+    }
+    Ok(V::list(out))
+}
+
+/// an exception's last traceback line: `module.QualName: message`
+pub fn format_exc_only(e: &Exc) -> String {
+    let mut out = exc_line(e);
+    // its notes (`add_note`, json's from 3.14), a line each
+    for n in e.notes() {
+        out.push_str(&n);
+        out.push('\n');
+    }
+    out
+}
+
+/// `type: message` of an exception, without its notes
+fn exc_line(e: &Exc) -> String {
+    let c = e.0.class;
+    // a project exception's qualname already carries its module
+    let ty = match super::sentry::exc_module(c) {
+        Some(m) if m != "builtins" && m != "__main__" && !c.qualname.starts_with(&format!("{m}.")) => format!("{m}.{}", c.qualname),
+        _ => c.qualname.to_string(),
+    };
+    let msg = super::ops::str_(&V::Exc(e.clone())).unwrap_or_default();
+    if msg.is_empty() { format!("{ty}\n") } else { format!("{ty}: {msg}\n") }
+}
+
+/// `traceback.print_exception(exc)` of a raised exception: its chain (`__cause__`, else `__context__`),
+/// each with "Traceback (most recent call last):", its project frames, and its own line
+pub fn format_exc(e: &Exc) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<*const ExcObj> = vec![];
+    chain(e, &mut out, &mut seen);
+    out
+}
+
+/// anyio's TaskGroup: `ExceptionGroup("unhandled errors in a TaskGroup", [e])`
+pub fn task_group_error(e: &Exc) -> Exc {
+    let g = Exc::msg(&EXCEPTION_GROUP, "unhandled errors in a TaskGroup (1 sub-exception)");
+    g.0.attrs.lock().insert("exceptions".into(), V::tuple(vec![V::Exc(e.clone())]));
+    g
+}
+
+/// an exception group as `traceback` prints it: its own traceback and line behind `  | `, then each
+/// sub-exception boxed under its number
+fn group(g: &Exc, subs: &[Exc], out: &mut String) {
+    out.push_str("  + Exception Group Traceback (most recent call last):\n");
+    for l in format_frames(g).lines() {
+        out.push_str(&format!("  | {l}\n"));
+    }
+    for l in format_exc_only(g).lines() {
+        out.push_str(&format!("  | {l}\n"));
+    }
+    for (i, x) in subs.iter().enumerate() {
+        let head = if i == 0 { "  +-+" } else { "    +" };
+        out.push_str(&format!("{head}---------------- {} ----------------\n", i + 1));
+        for l in format_exc(x).lines() {
+            out.push_str(&format!("    | {l}\n"));
+        }
+    }
+    out.push_str("    +------------------------------------\n");
+}
+
+fn chain(e: &Exc, out: &mut String, seen: &mut Vec<*const ExcObj>) {
+    if e.isinstance(&EXCEPTION_GROUP) {
+        let subs: Vec<Exc> = match e.0.attrs.lock().get("exceptions") {
+            Some(V::Tuple(t)) => t.iter().filter_map(|v| if let V::Exc(x) = v { Some(x.clone()) } else { None }).collect(),
+            _ => vec![],
+        };
+        return group(e, &subs, out);
+    }
+    seen.push(Arc::as_ptr(&e.0));
+    let attrs = e.0.attrs.lock();
+    let cause = attrs.get("__cause__").cloned();
+    let context = attrs.get("__context__").cloned();
+    let suppress = matches!(attrs.get("__suppress_context__"), Some(V::Bool(true)));
+    drop(attrs);
+    match (cause, context) {
+        (Some(V::Exc(c)), _) if !seen.contains(&Arc::as_ptr(&c.0)) => {
+            chain(&c, out, seen);
+            out.push_str("\nThe above exception was the direct cause of the following exception:\n\n");
+        }
+        (_, Some(V::Exc(c))) if !suppress && !seen.contains(&Arc::as_ptr(&c.0)) => {
+            chain(&c, out, seen);
+            out.push_str("\nDuring handling of the above exception, another exception occurred:\n\n");
+        }
+        _ => {}
+    }
+    // an exception never raised (no `__traceback__`: the context `Enum.__new__` sets) has no header
+    if !matches!(e.0.attrs.lock().get("__unraised__"), Some(V::Bool(true))) {
+        out.push_str("Traceback (most recent call last):\n");
+    }
+    out.push_str(&format_frames(e));
+    out.push_str(&format_exc_only(e));
+}
+
+/// A traceback entry: a position in the project's code an exception went through (the file relative to
+/// the source root, the instruction's line, the function, and the source and carets CPython prints under
+/// the `File` line, computed at translation by py2axum/tbfmt.py).
+pub struct Pos {
+    pub file: &'static str,
+    pub line: u32,
+    pub func: &'static str,
+    pub text: &'static str,
+}
+
+/// `r`, its exception recording the position it passes (once per frame invocation: `fid`), and the exception
+/// being handled as its `__context__` when it starts there
+#[inline]
+pub fn at<T>(cx: &Cx, r: R<T>, p: &'static Pos, fid: usize) -> R<T> {
+    if let Err(e) = &r {
+        passed(cx, e, p, fid, false);
+    }
+    r
+}
+
+/// `at` for a method call: a missing attribute (`'X' object has no attribute 'name'`) passes at `obj.name`,
+/// anything else at the call
+#[inline]
+pub fn at_attr<T>(cx: &Cx, r: R<T>, call: &'static Pos, attr: &'static Pos, name: &str, fid: usize) -> R<T> {
+    if let Err(e) = &r {
+        // raised here (no project frame yet) by the lookup of this very name
+        let missing = e.0.ptb.lock().is_empty() && e.isinstance(&ATTRIBUTE_ERROR) && e.message().ends_with(&format!("has no attribute '{name}'"));
+        passed(cx, e, if missing { attr } else { call }, fid, false);
+    }
+    r
+}
+
+#[cold]
+fn passed(cx: &Cx, e: &Exc, p: &'static Pos, fid: usize, force: bool) {
+    let mut tb = e.0.ptb.lock();
+    if tb.is_empty() {
+        drop(tb);
+        set_context(cx, e);
+        tb = e.0.ptb.lock();
+    } else if !force && fid != 0 && tb.last().is_some_and(|(_, f)| *f == fid) {
+        return;
+    }
+    tb.push((p, fid));
+}
+
+/// the exception being handled (`sys.exc_info()`) becomes `__context__` of one raised then, as in CPython
+fn set_context(cx: &Cx, e: &Exc) {
+    let handled = cx.handling.lock().last().cloned();
+    if let Some(h) = handled {
+        if !Arc::ptr_eq(&h.0, &e.0) && !e.0.attrs.lock().contains_key("__context__") {
+            // no cycle: an exception is never in its own context chain
+            let mut c = Some(h.clone());
+            let mut n = 0;
+            while let Some(x) = c {
+                if Arc::ptr_eq(&x.0, &e.0) || n > 100 {
+                    return;
+                }
+                n += 1;
+                c = match x.0.attrs.lock().get("__context__") {
+                    Some(V::Exc(y)) => Some(y.clone()),
+                    _ => None,
+                };
+            }
+            e.0.attrs.lock().insert("__context__".into(), V::Exc(h));
+        }
+    }
+}
+
+/// an exception raised by the runtime while `handled` is being handled: its `__context__`, as in CPython
+pub fn with_context(e: Exc, handled: &Exc) -> Exc {
+    if !Arc::ptr_eq(&e.0, &handled.0) && !e.0.attrs.lock().contains_key("__context__") {
+        e.0.attrs.lock().insert("__context__".into(), V::Exc(handled.clone()));
+    }
+    e
+}
+
+/// `raise X [from Y]`: the raise statement's entry (always: `raise e` again in the same frame adds a line)
+pub fn raised(cx: &Cx, e: Exc, p: &'static Pos, cause: Option<&V>) -> Exc {
+    if let Some(c) = cause {
+        let mut a = e.0.attrs.lock();
+        match c {
+            V::Exc(c) => {
+                a.insert("__cause__".into(), V::Exc(c.clone()));
+            }
+            _ => {
+                a.shift_remove("__cause__");
+            }
+        }
+        a.insert("__suppress_context__".into(), V::Bool(true));
+    }
+    passed(cx, &e, p, 0, true);
+    e
+}
+
+/// the project frames an exception went through, outermost first, as `traceback` prints them
+pub fn format_frames(e: &Exc) -> String {
+    let tb = e.0.ptb.lock();
+    let mut out = String::new();
+    for (p, _) in tb.iter().rev() {
+        out += &format!("  File \"{}\", line {}, in {}\n{}", super::logging::source_path(p.file), p.line, p.func, p.text);
+    }
+    out
 }

@@ -189,3 +189,58 @@ class Notice(Base):
     label: Mapped[str] = mapped_column("lbl", String(20), default="none")
     blob_key: Mapped[str | None] = mapped_column("blob_hash", ForeignKey("notice_blobs.hash"), nullable=True)
     blob: Mapped[NoticeBlob | None] = relationship(lazy="noload")
+
+
+class IdParent(Base):
+    """what an INSERT leaves in the instance dict (fixtures/dynapp/idict.py): every kind of default, a
+    many-to-one without back reference, back_populates and backref collections."""
+    __tablename__ = "idict_parents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(20))
+    plain: Mapped[str | None] = mapped_column(String(20))
+    dnone: Mapped[str | None] = mapped_column(String(20), default=None)
+    dscal: Mapped[str] = mapped_column(String(20), default="d")
+    dcall: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    dsql: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    sdef: Mapped[str] = mapped_column(String(20), server_default="s")
+    ins: Mapped[str] = mapped_column(String(20), insert_default="i")
+    onupd: Mapped[str | None] = mapped_column(String(20), onupdate="u")
+    onupdsql: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("owners.id"))
+    owner: Mapped[Owner | None] = relationship()
+    kids: Mapped[list["IdKid"]] = relationship(back_populates="parent")
+    bkids: Mapped[list["IdBack"]] = relationship(backref="bparent")
+
+
+class IdKid(Base):
+    __tablename__ = "idict_kids"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str | None] = mapped_column(String(20))
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("idict_parents.id"))
+    parent: Mapped[IdParent | None] = relationship(back_populates="kids")
+
+
+class IdBack(Base):
+    __tablename__ = "idict_backs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("idict_parents.id"))
+
+
+class IdIdent(Base):
+    __tablename__ = "idict_idents"
+
+    id: Mapped[int] = mapped_column(Identity(), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(20))
+
+
+class IdEager(Base):
+    __tablename__ = "idict_eager"
+    __mapper_args__ = {"eager_defaults": True}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sdef: Mapped[str] = mapped_column(String(20), server_default="s")
+    dsql: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    plain: Mapped[str | None] = mapped_column(String(20))

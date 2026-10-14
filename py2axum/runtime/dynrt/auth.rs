@@ -118,6 +118,12 @@ pub fn call(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
 pub fn b32decode(s: &str, casefold: bool) -> R<Vec<u8>> {
     let err = |m: &str| Exc::msg(&BINASCII_ERROR, m);
     let mut s: Vec<u8> = s.bytes().collect();
+    if super::python() >= (3, 15) {
+        if casefold {
+            s.make_ascii_uppercase();
+        }
+        return a2b_base32(&s);
+    }
     if s.len() % 8 != 0 {
         return Err(err("Incorrect padding"));
     }
@@ -153,6 +159,73 @@ pub fn b32decode(s: &str, casefold: bool) -> R<Vec<u8>> {
         let n = out.len();
         out.truncate(n - 5);
         out.extend_from_slice(&last[3..3 + leftover]);
+    }
+    Ok(out)
+}
+
+/// Python 3.15's `binascii.a2b_base32(s)` (padded, standard alphabet, no ignorechars), behind
+/// `base64.b32decode`: a port of Modules/binascii.c, messages included
+fn a2b_base32(s: &[u8]) -> R<Vec<u8>> {
+    let err = |m: String| Exc::msg(&BINASCII_ERROR, m);
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'2'..=b'7' => Some(c - b'2' + 26),
+        _ => None,
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(s.len().div_ceil(8) * 5);
+    let (mut left, mut pos, mut pads) = (0u8, 0usize, 0usize);
+    for &c in s {
+        if c == b'=' {
+            pads += 1;
+            if matches!(pos, 2 | 4 | 5 | 7) && pos + pads <= 8 {
+                continue;
+            }
+            if matches!(pos, 1 | 3 | 6) {
+                break;
+            }
+            return Err(err(if pos == 0 && out.is_empty() { "Leading padding not allowed" } else { "Excess padding not allowed" }.into()));
+        }
+        let Some(v) = val(c) else {
+            return Err(err("Only base32 data is allowed".into()));
+        };
+        if pads > 0 {
+            return Err(err(if pos + pads == 8 { "Excess data after padding" } else { "Discontinuous padding not allowed" }.into()));
+        }
+        match pos {
+            0 => left = v,
+            1 => {
+                out.push((left << 3) | (v >> 2));
+                left = v & 0x03;
+            }
+            2 => left = (left << 5) | v,
+            3 => {
+                out.push((left << 1) | (v >> 4));
+                left = v & 0x0f;
+            }
+            4 => {
+                out.push((left << 4) | (v >> 1));
+                left = v & 0x01;
+            }
+            5 => left = (left << 5) | v,
+            6 => {
+                out.push((left << 2) | (v >> 3));
+                left = v & 0x07;
+            }
+            _ => {
+                out.push((left << 5) | v);
+                left = 0;
+            }
+        }
+        pos = (pos + 1) % 8;
+    }
+    if matches!(pos, 1 | 3 | 6) {
+        return Err(err(format!(
+            "Invalid base32-encoded string: number of data characters ({}) cannot be 1, 3, or 6 more than a multiple of 8",
+            out.len() / 5 * 8 + pos
+        )));
+    }
+    if pos != 0 && pos + pads < 8 {
+        return Err(err("Incorrect padding".into()));
     }
     Ok(out)
 }
@@ -412,8 +485,11 @@ pub fn pwd_method(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     }
     let h = str_or_bytes(get(1, "hash"), "hash")?;
     if !argon2_identify(&h) {
-        return Err(Exc::msg(&UNKNOWN_HASH_ERROR, format!("This hash can't be identified. Make sure it's valid and that its \
-corresponding hasher is enabled. {}", String::from_utf8_lossy(&h))));
+        let e = Exc::msg(&UNKNOWN_HASH_ERROR, "This hash can't be identified. Make sure it's valid and that its \
+corresponding hasher is enabled.");
+        // `exc.hash`: what it failed to identify
+        e.0.attrs.lock().insert("hash".into(), get(1, "hash").cloned().unwrap_or(V::None));
+        return Err(e);
     }
     let ok = argon2_verify(&pw, &h);
     if name == "verify" {

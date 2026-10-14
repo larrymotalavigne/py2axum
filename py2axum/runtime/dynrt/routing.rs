@@ -576,8 +576,8 @@ pub fn scope(cx: &Cx) -> R {
     let headers: Vec<V> = r.headers.iter().map(|(k, v)| V::tuple(vec![V::Bytes(Arc::from(k.to_lowercase().as_bytes())), V::Bytes(Arc::from(v.as_bytes()))])).collect();
     let mut items = vec![
         (V::str("type"), V::str("http")),
-        (V::str("http_version"), V::str("1.1")),
-        (V::str("scheme"), V::str("http")),
+        (V::str("http_version"), V::str(r.http_version)),
+        (V::str("scheme"), V::str(&r.scheme)),
         (V::str("method"), V::str(&r.method)),
         (V::str("root_path"), V::str(super::web::root_path())),
         (V::str("path"), V::str(&path)),

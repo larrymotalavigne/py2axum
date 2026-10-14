@@ -62,7 +62,7 @@ pub fn not(v: &V) -> R {
 
 // ---------------------------------------------------------------- numbers
 
-fn num(v: &V) -> Option<f64> {
+pub fn num(v: &V) -> Option<f64> {
     match v {
         V::Bool(b) => Some(*b as i64 as f64),
         V::Int(i) => Some(*i as f64),
@@ -84,12 +84,19 @@ fn is_sql(v: &V) -> bool {
 }
 
 fn binop_err(op: &str, a: &V, b: &V) -> Exc {
-    Exc::type_error(format!(
-        "unsupported operand type(s) for {}: '{}' and '{}'",
-        op,
-        a.type_name(),
-        b.type_name()
-    ))
+    unsupported(op, a, b)
+}
+
+/// The type an operator error names: a Counter or a defaultdict is not a plain dict
+fn op_type_name(v: &V) -> &'static str {
+    match v {
+        V::Dict(d) => match default_factory(d) {
+            Some("Counter") => "Counter",
+            Some(_) => "collections.defaultdict",
+            None => "dict",
+        },
+        _ => v.type_name(),
+    }
 }
 
 fn overflow() -> Exc {
@@ -259,6 +266,29 @@ fn zero_div(msg: &str) -> Exc {
     Exc::msg(&ZERO_DIVISION_ERROR, msg)
 }
 
+/// ZeroDivisionError of `op` ("/", "//", "%", "divmod") on ints (or timedeltas) or floats: Python 3.14 says
+/// "division by zero" for all of them; before, each operator and type had its message (float modulo changed
+/// in 3.13).
+pub fn zero_div_of(op: &str, float: bool) -> Exc {
+    if super::python() >= (3, 14) {
+        return zero_div("division by zero");
+    }
+    zero_div(match (op, float) {
+        ("/", false) => "division by zero",
+        ("/", true) => "float division by zero",
+        ("//" | "divmod", false) => "integer division or modulo by zero",
+        ("%", false) => "integer modulo by zero",
+        ("//", true) => "float floor division by zero",
+        ("%", true) if super::python() >= (3, 13) => "float modulo by zero",
+        ("%", true) => "float modulo",
+        _ => "float divmod()",
+    })
+}
+
+fn is_float(a: &V, b: &V) -> bool {
+    matches!(a, V::Float(_)) || matches!(b, V::Float(_))
+}
+
 pub fn truediv(a: &V, b: &V) -> R {
     if is_sql(a) || is_sql(b) {
         return orm::sql_div(a, b);
@@ -279,14 +309,14 @@ pub fn truediv(a: &V, b: &V) -> R {
         (V::Delta(x), n) if num(n).is_some() => {
             let d = num(n).unwrap();
             if d == 0.0 {
-                return Err(zero_div("division by zero"));
+                return Err(zero_div_of(if matches!(n, V::Float(_)) { "/" } else { "//" }, matches!(n, V::Float(_))));
             }
             V::Delta(Duration::microseconds((dt::micros(x) as f64 / d).round() as i64))
         }
         _ => match (num(a), num(b)) {
             (Some(x), Some(y)) => {
                 if y == 0.0 {
-                    return Err(zero_div("division by zero"));
+                    return Err(zero_div_of("/", is_float(a, b)));
                 }
                 V::Float(x / y)
             }
@@ -302,21 +332,21 @@ pub fn floordiv(a: &V, b: &V) -> R {
     Ok(match (a, b) {
         (V::Delta(x), V::Delta(y)) => {
             if y.is_zero() {
-                return Err(zero_div("integer division or modulo by zero"));
+                return Err(zero_div_of("//", false));
             }
             V::Int(dt::micros(x).div_euclid(dt::micros(y)))
         }
         _ => match (int_of(a), int_of(b)) {
             (Some(x), Some(y)) => {
                 if y == 0 {
-                    return Err(zero_div("integer division or modulo by zero"));
+                    return Err(zero_div_of("//", false));
                 }
                 V::Int(x.div_euclid(y) - if (x.rem_euclid(y) != 0) && (y < 0) { 1 } else { 0 })
             }
             _ => match (num(a), num(b)) {
                 (Some(x), Some(y)) => {
                     if y == 0.0 {
-                        return Err(zero_div("float floor division by zero"));
+                        return Err(zero_div_of("//", true));
                     }
                     V::Float((x / y).floor())
                 }
@@ -339,7 +369,7 @@ pub fn modulo(a: &V, b: &V) -> R {
     match (int_of(a), int_of(b)) {
         (Some(x), Some(y)) => {
             if y == 0 {
-                return Err(zero_div("integer division or modulo by zero"));
+                return Err(zero_div_of("%", false));
             }
             let r = x % y;
             Ok(V::Int(if r != 0 && ((r < 0) != (y < 0)) { r + y } else { r }))
@@ -347,7 +377,7 @@ pub fn modulo(a: &V, b: &V) -> R {
         _ => match (num(a), num(b)) {
             (Some(x), Some(y)) => {
                 if y == 0.0 {
-                    return Err(zero_div("float modulo"));
+                    return Err(zero_div_of("%", true));
                 }
                 let r = x % y;
                 Ok(V::Float(if r != 0.0 && ((r < 0.0) != (y < 0.0)) { r + y } else { r }))
@@ -415,7 +445,7 @@ pub fn bitor(a: &V, b: &V) -> R {
 }
 
 fn unsupported(op: &str, a: &V, b: &V) -> Exc {
-    Exc::type_error(format!("unsupported operand type(s) for {op}: '{}' and '{}'", a.type_name(), b.type_name()))
+    Exc::type_error(format!("unsupported operand type(s) for {op}: '{}' and '{}'", op_type_name(a), op_type_name(b)))
 }
 
 /// `a ** b`: int ** non-negative int is an int (beyond 64 bits: OverflowError, py2axum has no big ints),
@@ -433,7 +463,7 @@ pub fn pow(a: &V, b: &V) -> R {
         _ => return Err(unsupported("** or pow()", a, b)),
     };
     if x == 0.0 && y < 0.0 {
-        return Err(Exc::msg(&ZERO_DIVISION_ERROR, "zero to a negative power"));
+        return Err(Exc::msg(&ZERO_DIVISION_ERROR, if super::python() >= (3, 14) { "zero to a negative power" } else { "0.0 cannot be raised to a negative power" }));
     }
     if x < 0.0 && y.fract() != 0.0 {
         return Err(Exc::type_error("py2axum: a negative number to a fractional power is complex"));
@@ -446,6 +476,26 @@ pub fn pow(a: &V, b: &V) -> R {
 }
 
 pub fn bitxor(a: &V, b: &V) -> R {
+    // Counter ^ Counter (Python 3.15): the absolute differences of the counts, zeros dropped
+    if let (V::Dict(x), V::Dict(y)) = (a, b) {
+        if is_counter(x) && is_counter(y) && super::python() >= (3, 15) {
+            let out = new_counter()?;
+            let (xs, ys) = (x.lock().clone(), y.lock().clone());
+            let absdiff = |p: &V, q: &V| -> R { let d = sub(p, q)?; if cmp(&d, &V::Int(0))? == std::cmp::Ordering::Less { sub(&V::Int(0), &d) } else { Ok(d) } };
+            for (k, (kv, c)) in &xs {
+                let n = absdiff(c, &ys.get(k).map(|(_, v)| v.clone()).unwrap_or(V::Int(0)))?;
+                if truthy(&n)? {
+                    out.lock().insert(k.clone(), (kv.clone(), n));
+                }
+            }
+            for (k, (kv, c)) in &ys {
+                if !xs.contains_key(k) && truthy(c)? {
+                    out.lock().insert(k.clone(), (kv.clone(), absdiff(c, &V::Int(0))?));
+                }
+            }
+            return Ok(V::Dict(out));
+        }
+    }
     match (a, b) {
         (V::Bool(x), V::Bool(y)) => Ok(V::Bool(x ^ y)),
         _ => match (int_of(a), int_of(b)) {
@@ -547,10 +597,11 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
         (V::None, V::None) => true,
         (V::Str(x), V::Str(y)) => x == y,
         (V::Bytes(x), V::Bytes(y)) => x == y,
-        (V::Native(x), V::Native(y)) if matches!((&**x, &**y), (Native::Path(_), Native::Path(_)) | (Native::Uuid(_), Native::Uuid(_))) => {
+        (V::Native(x), V::Native(y)) if matches!((&**x, &**y), (Native::Path(_), Native::Path(_)) | (Native::Uuid(_), Native::Uuid(_)) | (Native::Secret(_), Native::Secret(_))) => {
             match (&**x, &**y) {
                 (Native::Path(p), Native::Path(q)) => p == q,
                 (Native::Uuid(p), Native::Uuid(q)) => p == q,
+                (Native::Secret(p), Native::Secret(q)) => p == q,
                 _ => false,
             }
         }
@@ -699,6 +750,8 @@ pub fn is(a: &V, b: &V) -> bool {
         (V::Dict(x), V::Dict(y)) => Arc::ptr_eq(x, y),
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y),
+        // `e.orig is e.__cause__`, `exc is caught`
+        (V::Exc(x), V::Exc(y)) => Arc::ptr_eq(&x.0, &y.0),
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),
         // enum members are singletons: `shelf is Shelf.done`
         (V::Enum(x, i), V::Enum(y, j)) => std::ptr::eq(*x, *y) && i == j,
@@ -740,6 +793,7 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
         V::Tuple(t) => t.iter().any(|x| eq_bool(x, item)),
         V::Dict(d) => d.lock().contains_key(&Key::dict_key(item)?),
         V::Set(s) => s.lock().contains_key(&Key::set_elem(item)?),
+        V::Session(s) => s.contains(item)?,
         V::Native(n) => match &**n {
             Native::SaColumns(t) => super::satable::contains(t, item)?,
             Native::Deque(d) => super::deque::items(d).iter().any(|x| eq_bool(x, item)),
@@ -858,16 +912,29 @@ pub fn dunder(v: &V, name: &str) -> Option<super::pyd::MethodFn> {
     methods.iter().find(|(n, prop, _)| *n == name && !prop).map(|(_, _, f)| *f)
 }
 
-/// Calls a project dunder method from synchronous code: such methods are `def`s, they never suspend
-/// (a pending future means it awaited something, which CPython could not do either).
+/// Calls a project dunder method from synchronous code: such methods are `def`s; the only I/O one can wait on
+/// is a synchronous session's lazy load (`__repr__` reading a deferred or expired column), which CPython does
+/// blocking: the future is then finished on this thread, tokio told it blocks.
 pub fn call_dunder(f: super::pyd::MethodFn, recv: &V, args: Vec<V>, name: &str) -> R {
-    use std::future::Future;
     let cx = super::root_cx();
-    let mut fut = f(&cx, recv.clone(), args);
+    let fut = f(&cx, recv.clone(), args);
+    block_on_sync(fut, &format!("{name}() of {}", recv.type_name()))
+}
+
+/// Runs a future from synchronous code: polled once (no I/O: done), else finished on this thread, tokio told
+/// it blocks (a synchronous session's lazy load, as CPython does it blocking).
+pub fn block_on_sync<F: std::future::Future<Output = R>>(fut: F, what: &str) -> R {
+    use std::future::Future;
+    let mut fut = Box::pin(fut);
     let waker = std::task::Waker::noop();
     match fut.as_mut().poll(&mut std::task::Context::from_waker(waker)) {
         std::task::Poll::Ready(r) => r,
-        std::task::Poll::Pending => Err(Exc::runtime(format!("py2axum: {name}() of {} suspended (awaited I/O)", recv.type_name()))),
+        std::task::Poll::Pending => match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                super::thread::blocking(|| h.block_on(fut))
+            }
+            _ => Err(Exc::runtime(format!("py2axum: {what} suspended (awaited I/O)"))),
+        },
     }
 }
 
@@ -895,6 +962,11 @@ pub fn eq_r(a: &V, b: &V) -> R<bool> {
 }
 
 pub fn str_(v: &V) -> R<String> {
+    // the text of a type expression depends on the Python (3.14 writes `Union[int, str]` as `int | str`) and
+    // on the modules of its classes: refused rather than approximated
+    if matches!(v, V::Native(n) if matches!(&**n, Native::TypeExpr(..))) {
+        return Err(Exc::type_error("py2axum: the text of a type expression (str(), repr(), f-string) is not supported"));
+    }
     if let Some(t) = row_tuple(v) {
         return str_(&t);
     }
@@ -931,6 +1003,9 @@ pub fn str_(v: &V) -> R<String> {
         if let Native::Prom(p) = &**n {
             return Ok(super::prom::str(p));
         }
+        if let Native::Log(o) = &**n {
+            return Ok(super::logging::repr(o));
+        }
         if let Native::RelDelta(r) = &**n {
             return Ok(super::reldelta::repr(r));
         }
@@ -943,9 +1018,12 @@ pub fn str_(v: &V) -> R<String> {
         V::Delta(d) => dt::delta_str(d),
         V::Exc(e) => e.message(),
         V::Tz(t) => t.name(),
-        V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_)) => match &**n {
+        V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Secret(_) | Native::Fraction(_) | Native::Complex(..)) => match &**n {
             Native::Path(p) => p.clone(),
             Native::Uuid(u) => super::pathio::uuid_str(*u),
+            Native::Secret(s) => if s.is_empty() { String::new() } else { "**********".into() },
+            Native::Fraction(f) => f.text(),
+            Native::Complex(re, im) => super::complex::repr(*re, *im)?,
             _ => unreachable!(),
         },
         V::Sql(_) | V::Col(..) => orm::sql_text(v)?,
@@ -964,6 +1042,11 @@ pub fn ellipsis() -> V {
 }
 
 pub fn repr(v: &V) -> R<String> {
+    // the text of a type expression depends on the Python (3.14 writes `Union[int, str]` as `int | str`) and
+    // on the modules of its classes: refused rather than approximated
+    if matches!(v, V::Native(n) if matches!(&**n, Native::TypeExpr(..))) {
+        return Err(Exc::type_error("py2axum: the text of a type expression (str(), repr(), f-string) is not supported"));
+    }
     super::stack_guard()?;
     if let Some(t) = row_tuple(v) {
         return repr(&t);
@@ -995,6 +1078,9 @@ pub fn repr(v: &V) -> R<String> {
         }
         if let Native::Prom(p) = &**n {
             return Ok(super::prom::repr(p));
+        }
+        if let Native::Log(o) = &**n {
+            return Ok(super::logging::repr(o));
         }
         if let Native::RelDelta(r) = &**n {
             return Ok(super::reldelta::repr(r));
@@ -1055,13 +1141,17 @@ pub fn repr(v: &V) -> R<String> {
         V::Class(c) => format!("<class '{}'>", c.qualname),
         V::Exc(e) => format!("{}({})", e.0.class.name, e.args().iter().map(repr).collect::<R<Vec<_>>>()?.join(", ")),
         V::Inst(i) => i.repr()?,
-        V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Upload(_)) => match &**n {
+        V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Upload(_) | Native::Secret(_) | Native::Fraction(_) | Native::Complex(..)) => match &**n {
             Native::Path(p) => format!("PosixPath({})", str_repr(p)),
+            Native::Secret(s) => format!("SecretStr('{}')", if s.is_empty() { "" } else { "**********" }),
+            Native::Fraction(f) => f.repr(),
+            Native::Complex(re, im) => super::complex::repr(*re, *im)?,
             Native::Uuid(u) => format!("UUID({})", str_repr(&super::pathio::uuid_str(*u))),
             Native::Upload(u) => super::files::repr_upload(u)?,
             _ => unreachable!(),
         },
-        V::Obj(o) => format!("<{} object>", o.desc.class_qualname),
+        // CPython's default repr: the address differs from one process to the other anyway
+        V::Obj(o) => format!("<{} object at {:#x}>", o.desc.class_qualname, Arc::as_ptr(o) as usize),
         V::Enum(e, i) => format!("<{}.{}: {}>", e.name, e.member_name(*i), repr(&e.value(*i))?),
         other => format!("<{}>", other.type_name()),
     })
@@ -1137,6 +1227,8 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
     match v {
         V::DateTime(d) => return Ok(super::libs::strftime(&d.wall, d.offset(), d.tz.map(|t| t.name()), spec)),
         V::Date(d) => return Ok(super::libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, spec)),
+        // time.__format__: strftime on 1900-01-01
+        V::Time(t) => return Ok(super::libs::strftime(&chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_time(*t), None, None, spec)),
         _ => {}
     }
     if let V::Enum(e, i) = v {
@@ -1178,12 +1270,14 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         width = width * 10 + chars[i].to_digit(10).unwrap() as usize;
         i += 1;
     }
-    let mut thousands = false;
+    let mut thousands: Option<char> = None;
     if i < chars.len() && (chars[i] == ',' || chars[i] == '_') {
-        thousands = true;
+        thousands = Some(chars[i]);
         i += 1;
     }
     let mut prec: Option<usize> = None;
+    // Python 3.14: a separator for the fractional part, after the precision (`.6_f`)
+    let mut frac_sep: Option<char> = None;
     if i < chars.len() && chars[i] == '.' {
         i += 1;
         let mut p = 0;
@@ -1192,8 +1286,25 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
             i += 1;
         }
         prec = Some(p);
+        if i < chars.len() && (chars[i] == ',' || chars[i] == '_') && super::python() >= (3, 14) {
+            frac_sep = Some(chars[i]);
+            i += 1;
+        }
+    }
+    let invalid = || Exc::value_error(format!("Invalid format specifier '{spec}' for object of type '{}'", v.type_name()));
+    if i + 1 < chars.len() {
+        return Err(invalid());
     }
     let ty = chars.get(i).copied();
+    if !matches!(v, V::Int(_) | V::Float(_) | V::Bool(_) | V::Str(_)) {
+        return Err(Exc::type_error(format!("unsupported format string passed to {}.__format__", v.type_name())));
+    }
+    if let (Some(','), Some(c @ ('x' | 'X' | 'o' | 'b' | 's' | 'c' | 'n'))) = (thousands, ty) {
+        return Err(Exc::value_error(format!("Cannot specify ',' with '{c}'.")));
+    }
+    if frac_sep.is_some() && !(matches!(v, V::Float(_) | V::Int(_) | V::Bool(_)) && matches!(ty, None | Some('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%'))) {
+        return Err(invalid());
+    }
     let numeric = matches!(v, V::Int(_) | V::Float(_) | V::Bool(_));
     let mut body = match (ty, v) {
         // CPython: "nan"/"inf" (upper case for F, E, G), the sign handled below; no '%' suffix scaling
@@ -1222,21 +1333,39 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
             s.trim_start_matches('-').to_string()
         }
         (None, V::DateTime(_) | V::Date(_)) => str_(v)?,
-        _ => return Err(Exc::value_error(format!("Unknown format code for object of type '{}'", v.type_name()))),
+        (Some(c), _) => return Err(Exc::value_error(format!("Unknown format code '{c}' for object of type '{}'", v.type_name()))),
+        (None, _) => return Err(invalid()),
     };
-    if thousands {
-        let (int_part, rest) = match body.find('.') {
-            Some(p) => (body[..p].to_string(), body[p..].to_string()),
-            None => (body.clone(), String::new()),
-        };
+    if let Some(sep) = frac_sep {
+        // the digits right after the point, grouped by 3 from the point (`1.500,0`)
+        if let Some(p) = body.find('.') {
+            let digits: String = body[p + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let tail = body[p + 1 + digits.len()..].to_string();
+            let mut grouped = String::new();
+            for (k, c) in digits.chars().enumerate() {
+                if k > 0 && k % 3 == 0 {
+                    grouped.push(sep);
+                }
+                grouped.push(c);
+            }
+            body = format!("{}.{grouped}{tail}", &body[..p]);
+        }
+    }
+    if let Some(sep) = thousands {
+        // `_` groups hexadecimal, octal and binary digits by 4
+        let n = if sep == '_' && matches!(ty, Some('x' | 'X' | 'o' | 'b')) { 4 } else { 3 };
+        let skip = if alt && matches!(ty, Some('x' | 'X' | 'o' | 'b')) { 2 } else { 0 };
+        let (prefix, body_) = body.split_at(skip);
+        let end = body_.find(|c: char| if n == 4 { !c.is_ascii_hexdigit() } else { !c.is_ascii_digit() }).unwrap_or(body_.len());
+        let (int_part, rest) = body_.split_at(end);
         let mut grouped = String::new();
         for (k, c) in int_part.chars().enumerate() {
-            if k > 0 && (int_part.len() - k) % 3 == 0 {
-                grouped.push(',');
+            if k > 0 && (int_part.len() - k) % n == 0 {
+                grouped.push(sep);
             }
             grouped.push(c);
         }
-        body = grouped + &rest;
+        body = format!("{prefix}{grouped}{rest}");
     }
     // a float's sign bit: format(-0.0, ".2f") == "-0.00" (NaN has no sign in CPython's formatting)
     let negative = match v {
@@ -1276,10 +1405,18 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
 
 /// `"fmt" % args` (printf-style, as used by logging).
 pub fn percent_format(fmt: &str, args: &V) -> R<String> {
+    // Python 3.15 reworded every error: the argument's number (or key), the `%`'s position, the counts
+    let py315 = super::python() >= (3, 15);
+    let tuple = matches!(args, V::Tuple(_));
     let items: Vec<V> = match args {
         V::Tuple(t) => t.to_vec(),
         other => vec![other.clone()],
     };
+    let given = items.len();
+    // a mapping on the right: `%(key)s` reads it, and unused values are no error (CPython's PyMapping_Check)
+    let mapping = matches!(args, V::Dict(_));
+    let mut used_key = false;
+    let mut consumed = 0usize;
     let mut it = items.into_iter();
     let mut out = String::new();
     let chars: Vec<char> = fmt.chars().collect();
@@ -1291,20 +1428,88 @@ pub fn percent_format(fmt: &str, args: &V) -> R<String> {
             i += 1;
             continue;
         }
+        let pct = i;
         i += 1;
         if i < chars.len() && chars[i] == '%' {
             out.push('%');
             i += 1;
             continue;
         }
+        let mut key: Option<String> = None;
+        if i < chars.len() && chars[i] == '(' {
+            // `%(name)`: nested parentheses count, as in CPython
+            let mut depth = 1;
+            let start = i + 1;
+            i += 1;
+            while i < chars.len() && depth > 0 {
+                match chars[i] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth > 0 {
+                return Err(Exc::value_error(if py315 { format!("stray % or incomplete format key at position {pct}") } else { "incomplete format key".into() }));
+            }
+            key = Some(chars[start..i - 1].iter().collect());
+        }
         let mut spec = String::new();
         while i < chars.len() && "-+ #0123456789.".contains(chars[i]) {
             spec.push(chars[i]);
             i += 1;
         }
-        let conv = chars.get(i).copied().unwrap_or('s');
+        let Some(&conv) = chars.get(i) else {
+            return Err(Exc::value_error(if py315 { format!("stray % at position {pct}") } else { "incomplete format".into() }));
+        };
+        if conv == '*' {
+            return Err(Exc::type_error("py2axum: a `*` width or precision in %-formatting is not supported"));
+        }
+        if !"srdiuaxXoeEfFgGc".contains(conv) {
+            return Err(Exc::value_error(if py315 {
+                format!("unsupported format %{conv} at position {pct}")
+            } else {
+                format!("unsupported format character '{conv}' (0x{:x}) at index {i}", conv as u32)
+            }));
+        }
+        let shown = conv;
+        let conv = match conv {
+            'u' => 'd',
+            'F' => 'f',
+            c => c,
+        };
         i += 1;
-        let arg = it.next().ok_or_else(|| Exc::type_error("not enough arguments for format string"))?;
+        let arg = match &key {
+            Some(k) => {
+                if !mapping {
+                    return Err(Exc::type_error(if py315 { format!("format requires a mapping, not {}", args.type_name()) } else { "format requires a mapping".into() }));
+                }
+                used_key = true;
+                getitem(args, &V::str(k))?
+            }
+            None if mapping && used_key => {
+                return Err(if py315 {
+                    Exc::value_error(format!("format requires a parenthesised mapping key at position {pct}"))
+                } else {
+                    Exc::type_error("not enough arguments for format string")
+                });
+            }
+            None => {
+                consumed += 1;
+                it.next().ok_or_else(|| {
+                    Exc::type_error(if py315 { format!("not enough arguments for format string (got {given})") } else { "not enough arguments for format string".into() })
+                })?
+            }
+        };
+        // `format argument 2: ` (3.15) before the conversion's complaint
+        let which = match &key {
+            Some(k) => format!("format argument {}: ", repr(&V::str(k))?),
+            None if tuple => format!("format argument {consumed}: "),
+            None => "format argument: ".to_string(),
+        };
+        let needs = |what: &str, old: String| -> Exc {
+            Exc::type_error(if py315 { format!("{which}%{shown} requires {what}, not {}", arg.type_name()) } else { old })
+        };
         let left = spec.starts_with('-');
         let zero = spec.trim_start_matches('-').starts_with('0');
         let (w, p) = match spec.trim_start_matches(['-', '+', ' ', '#', '0']).split_once('.') {
@@ -1317,17 +1522,40 @@ pub fn percent_format(fmt: &str, args: &V) -> R<String> {
             'd' | 'i' => match (int_of(&arg), num(&arg)) {
                 (Some(x), _) => x.to_string(),
                 (None, Some(f)) => (f.trunc() as i64).to_string(),
-                _ => return Err(Exc::type_error(format!("%d format: a real number is required, not {}", arg.type_name()))),
+                _ => return Err(needs("a real number", format!("%{shown} format: a real number is required, not {}", arg.type_name()))),
             },
-            'f' => format!("{:.*}", p.unwrap_or(6), num(&arg).ok_or_else(|| Exc::type_error("must be real number"))?),
-            'x' => format!("{:x}", int_of(&arg).unwrap_or(0)),
-            'e' | 'E' | 'g' | 'G' | 'X' | 'o' => {
+            'f' => format!("{:.*}", p.unwrap_or(6), num(&arg).ok_or_else(|| needs("a real number", format!("must be real number, not {}", arg.type_name())))?),
+            'x' | 'X' | 'o' => {
+                let n = int_of(&arg).ok_or_else(|| needs("an integer", format!("%{shown} format: an integer is required, not {}", arg.type_name())))?;
+                let body = format_spec(&V::Int(n), &shown.to_string())?;
+                if n < 0 && !body.starts_with('-') { format!("-{body}") } else { body }
+            }
+            'e' | 'E' | 'g' | 'G' => {
                 // same presentation as format(): flags and width applied below
-                let n = num(&arg).ok_or_else(|| Exc::type_error(format!("must be real number, not {}", arg.type_name())))?;
-                let v = if matches!(conv, 'X' | 'o') { V::Int(n as i64) } else { V::Float(n) };
-                let body = format_spec(&v, &match p { Some(p) => format!(".{p}{conv}"), None => conv.to_string() })?;
+                let n = num(&arg).ok_or_else(|| needs("a real number", format!("must be real number, not {}", arg.type_name())))?;
+                let body = format_spec(&V::Float(n), &match p { Some(p) => format!(".{p}{conv}"), None => conv.to_string() })?;
                 if n < 0.0 && !body.starts_with('-') { format!("-{body}") } else { body }
             }
+            'c' => match &arg {
+                V::Str(s) if s.chars().count() == 1 => s.to_string(),
+                V::Int(n) => char::from_u32(*n as u32).filter(|_| (0..=0x10FFFF).contains(n)).map(String::from)
+                    .ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, "%c arg not in range(0x110000)"))?,
+                V::Str(s) => {
+                    let n = s.chars().count();
+                    return Err(Exc::type_error(if py315 {
+                        format!("{which}%c requires an integer or a unicode character, not a string of length {n}")
+                    } else if super::python() >= (3, 14) {
+                        format!("%c requires an int or a unicode character, not a string of length {n}")
+                    } else {
+                        "%c requires int or char".to_string()
+                    }));
+                }
+                o => return Err(needs("an integer or a unicode character", if super::python() >= (3, 14) {
+                    format!("%c requires an int or a unicode character, not {}", o.type_name())
+                } else {
+                    "%c requires int or char".to_string()
+                })),
+            },
             _ => str_(&arg)?,
         };
         let body = if conv == 's' { match p { Some(p) => body.chars().take(p).collect(), None => body } } else { body };
@@ -1353,6 +1581,13 @@ pub fn percent_format(fmt: &str, args: &V) -> R<String> {
         } else {
             out.push_str(&body);
         }
+    }
+    if it.next().is_some() && !mapping && !used_key {
+        return Err(Exc::type_error(if py315 {
+            format!("not all arguments converted during string formatting (required {consumed}, got {given})")
+        } else {
+            "not all arguments converted during string formatting".into()
+        }));
     }
     Ok(out)
 }
@@ -1861,11 +2096,37 @@ pub fn len(v: &V) -> R<usize> {
     })
 }
 
+/// `*it` in a list display or comprehension (`list_msg`: "Value after * must be an iterable"), or in a set
+/// comprehension or generator (iter()'s message)
+pub fn iter_star(v: &V, list_msg: bool) -> R<Vec<V>> {
+    iter(v).map_err(|e| {
+        if list_msg && e.isinstance(&TYPE_ERROR) {
+            Exc::type_error(format!("Value after * must be an iterable, not {}", v.type_name()))
+        } else {
+            e
+        }
+    })
+}
+
+/// `**m` in a dict display or comprehension: a dict's pairs; any other value is refused (CPython would call
+/// `keys()` and `__getitem__` of a mapping-like object)
+pub fn mapping_pairs(v: &V) -> R<Vec<(V, V)>> {
+    match v {
+        V::Dict(d) => Ok(d.lock().values().cloned().collect()),
+        V::Obj(_) | V::Inst(_) | V::Native(_) => Err(Exc::type_error(format!("py2axum: ** of a '{}' (not a dict) is not supported", v.type_name()))),
+        _ => Err(Exc::type_error(format!("'{}' object is not a mapping", v.type_name()))),
+    }
+}
+
 /// Unpack `a, b = value` into exactly `n` items.
 pub fn unpack(v: &V, n: usize) -> R<Vec<V>> {
     let items = iter(v)?;
     if items.len() != n {
         if items.len() > n {
+            // 3.14 counts the items of a list, tuple or dict (an iterator, a str: still unknown)
+            if super::python() >= (3, 14) && matches!(v, V::List(_) | V::Tuple(_) | V::Dict(_)) {
+                return Err(Exc::value_error(format!("too many values to unpack (expected {n}, got {})", items.len())));
+            }
             return Err(Exc::value_error(format!("too many values to unpack (expected {n})")));
         }
         return Err(Exc::value_error(format!("not enough values to unpack (expected {n}, got {})", items.len())));
@@ -1924,7 +2185,7 @@ pub fn dt_value(d: DateTime) -> V {
 
 /// `scheme://host` of a request as Starlette builds it from the scope (plain HTTP: the binary terminates no TLS)
 pub fn request_origin(r: &super::web::ReqCell) -> String {
-    format!("http://{}", r.header("host").unwrap_or_else(|| "127.0.0.1".into()))
+    format!("{}://{}", r.scheme, r.header("host").unwrap_or_else(|| "127.0.0.1".into()))
 }
 
 

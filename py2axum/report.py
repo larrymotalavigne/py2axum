@@ -47,6 +47,18 @@ def _where(e: TranspileError) -> str:
     return e.file or "?"
 
 
+def syntax_errors(ix) -> list:
+    """The files that do not parse, except those only imported in a branch a `sys.version_info` test dropped
+    (e.g. 3.15 syntax read by a 3.14 transpiler, for a 3.14 project): the project's Python never imports them."""
+    wanted = set()
+    for m in list(ix.modules.values()):
+        for spec in m.imports.values():
+            wanted |= {spec[1], f"{spec[1]}.{spec[2]}"} if spec[0] == "from" else {spec[1]}
+        wanted.update(m.stars)
+    return [(path, e) for path, e in ix.syntax_errors
+            if ix._modname(Path(path)) in wanted or ix._modname(Path(path)) not in ix.gated]
+
+
 def collect_dyn(package: Path, root: Path | None, python_side, auto: bool = False) -> tuple[Frontend, list]:
     """Dyn pass that never stops: the frontend (global errors) and, per route, its info and errors (its own and
     those of the functions it reaches). auto: raw `add_route` with a literal path go to `fe.auto_side`."""
@@ -57,7 +69,7 @@ def collect_dyn(package: Path, root: Path | None, python_side, auto: bool = Fals
     fe = Frontend(package, root, collect=True)
     if auto:
         fe.auto_side = {}
-    for path, e in fe.index.syntax_errors:
+    for path, e in syntax_errors(fe.index):
         fe.global_errors.append(TranspileError(f"syntax error: {e.msg}", None, f"{path}:{e.lineno}"))
     dyn.prepare(fe, set(python_side))
     with tempfile.TemporaryDirectory() as tmp:

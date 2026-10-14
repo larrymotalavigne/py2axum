@@ -4,7 +4,10 @@
 pub mod agen;
 pub mod aio;
 pub mod asgi;
+pub mod complex;
+pub mod mimetab;
 pub mod ctxmw;
+pub mod fraction;
 pub mod auth;
 pub mod crypto;
 pub mod decimal;
@@ -29,6 +32,7 @@ pub mod rds;
 pub mod rmq;
 pub mod satable;
 pub mod tenacity;
+pub mod uvicorn;
 pub mod reldelta;
 pub mod xmld;
 pub mod prom;
@@ -41,6 +45,7 @@ pub mod itsd;
 pub mod jose;
 pub mod pyjwt;
 pub mod libs;
+pub mod logging;
 pub mod mcp;
 pub mod methods;
 pub mod ops;
@@ -105,6 +110,14 @@ pub struct CxInner {
     pub handling: parking_lot::Mutex<Vec<Exc>>,
     /// the endpoint whose `return (await s.execute(q)).scalars().all()` may stream, with its response_model
     pub stream_list: parking_lot::Mutex<Option<(&'static str, &'static pyd::TD)>>,
+    /// a `def` endpoint is running (uvicorn would run it in AnyIO's worker thread: `threadName`)
+    pub worker: std::sync::atomic::AtomicBool,
+    /// the context of the import and the lifespan (no asyncio task: `taskName` None)
+    pub root: std::sync::atomic::AtomicBool,
+    /// the request's task number (`taskName` "Task-N"), given on first use
+    pub task_no: std::sync::OnceLock<u64>,
+    /// the route the router chose (FastAPI's endpoint context of a validation error)
+    pub route_def: std::sync::OnceLock<&'static web::RouteDef>,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -127,7 +140,24 @@ impl CxInner {
             sentry: std::sync::OnceLock::new(),
             handling: parking_lot::Mutex::new(Vec::new()),
             stream_list: parking_lot::Mutex::new(None),
+            worker: std::sync::atomic::AtomicBool::new(false),
+            root: std::sync::atomic::AtomicBool::new(false),
+            task_no: std::sync::OnceLock::new(),
+            route_def: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn in_worker_thread(&self) -> bool {
+        self.worker.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.root.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn task_number(&self) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        *self.task_no.get_or_init(|| NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -256,6 +286,24 @@ pub fn status_phrase(code: u16) -> Option<&'static str> {
 
 pub fn func(f: FnVal) -> V {
     V::native(Native::Func(f))
+}
+
+/// What a nested function reads when it names itself (`def walk(k): ... walk(k - 1)`): a weak reference.
+/// A strong one (its cell holding the function, the function's closure holding the cell) is a cycle that
+/// CPython's cyclic GC frees and `Arc` never does: everything the closure captured leaked with each call.
+/// The function is alive whenever it runs (its caller holds it). Only for a name bound once, by this `def`.
+#[derive(Default)]
+pub struct SelfRef(std::sync::OnceLock<std::sync::Weak<Native>>);
+
+impl SelfRef {
+    pub fn set(&self, f: &V) {
+        if let V::Native(n) = f {
+            let _ = self.0.set(Arc::downgrade(n));
+        }
+    }
+    pub fn get(&self) -> V {
+        self.0.get().and_then(|w| w.upgrade()).map(V::Native).unwrap_or(V::Unbound)
+    }
 }
 
 /// A project function as a value (`def` of the project, decorated or nested): CPython's function
@@ -445,6 +493,7 @@ pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, cas
             pyd::Dflt::Required => {}
             pyd::Dflt::Value(g) | pyd::Dflt::Factory(g) => items.push((V::str(f.name), g())),
             pyd::Dflt::Dyn(g) => items.push((V::str(f.name), g(cx, V::None, vec![]).await?)),
+            pyd::Dflt::Data(_) => return Err(Exc::type_error("py2axum: a default_factory taking data in settings is not supported")),
         }
     }
     pyd::construct(cx, desc, V::dict_from(items)?).await
@@ -532,6 +581,51 @@ pub fn python() -> (u32, u32) {
     PYTHON.get().copied().unwrap_or((3, 12))
 }
 
+static PYTHON_PATCH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The patch release of the project's Python, where a behaviour changed inside a minor (`u32::MAX`: not
+/// known, the newest): `PY2AXUM_PYTHON_VERSION` (e.g. `3.13.5`) when it names the project's minor, else the
+/// one the generator recorded (`--python 3.13.5`, `.python-version`, or the transpiler's own patch when it
+/// runs the project's minor).
+pub fn set_python_patch(patch: u32) {
+    let _ = PYTHON_PATCH.set(patch);
+}
+
+pub fn python_patch() -> u32 {
+    static RESOLVED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        if let Ok(v) = std::env::var("PY2AXUM_PYTHON_VERSION") {
+            let n: Vec<u32> = v.trim().split('.').map(|x| x.parse().unwrap_or(0)).collect();
+            if n.len() >= 2 && (n[0], n[1]) == python() {
+                return n.get(2).copied().unwrap_or(u32::MAX);
+            }
+        }
+        PYTHON_PATCH.get().copied().unwrap_or(u32::MAX)
+    })
+}
+
+static PYTHON_FEATURES: std::sync::OnceLock<&'static [(&'static str, bool)]> = std::sync::OnceLock::new();
+
+/// Behaviours the generator probed on the project's Python (versions.PROBES): a distribution's 3.13.5 may carry
+/// 3.13.13's fixes, which its version number does not tell
+pub fn set_python_features(features: &'static [(&'static str, bool)]) {
+    let _ = PYTHON_FEATURES.set(features);
+}
+
+/// A probed behaviour, unless `PY2AXUM_PYTHON_VERSION` names a patch release (then the version decides)
+pub fn python_feature(name: &str) -> Option<bool> {
+    if std::env::var("PY2AXUM_PYTHON_VERSION").is_ok() {
+        return None;
+    }
+    PYTHON_FEATURES.get().and_then(|f| f.iter().find(|(n, _)| *n == name)).map(|(_, b)| *b)
+}
+
+/// The project's Python is at least `major.minor.patch`
+pub fn python_at_least(major: u32, minor: u32, patch: u32) -> bool {
+    let v = python();
+    v > (major, minor) || (v == (major, minor) && python_patch() >= patch)
+}
+
 static PYDANTIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The project's locked pydantic version, "major.minor" (the documentation URL of each error).
@@ -553,6 +647,7 @@ pub fn root_cx() -> Cx {
     let app = ROOT.get().expect("py2axum runtime not initialised").clone();
     let cx = Arc::new(CxInner::new(app, web::ReqCell::empty()));
     let _ = cx.sentry.set(sentry::main_iso());
+    cx.root.store(true, std::sync::atomic::Ordering::Relaxed);
     cx
 }
 

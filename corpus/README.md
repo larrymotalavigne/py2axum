@@ -106,12 +106,12 @@ units SQLAlchemy runs). The bench:
    its route (or, in a definition, all of them) out; the apps are compiled in shared crates (`corpus_sqla*`, same
    target directory as the other corpora).
 6. **Replays** each route in order, on a worker slot's database (`py2axum_sqla_s<slot>`): before every request
-   the database is put back to the seed (tables truncated, seed rows copied back, sequences restored, tables an
-   example created dropped); the request goes twice to the Python reference (unstable output, or an object
+   the database is put back to the seed (a transaction an example left open ended, tables truncated, seed rows
+   copied back, sequences restored, tables an example created dropped); the request goes twice to the Python reference (unstable output, or an object
    repr with its address: `nondeterministic`) and once to the binary, compared with tests/conformance.py's logic.
 
 `python corpus/sqlalchemy_docs.py [--only UNIT] [--jobs N]` runs it alone (`<work>/sqla/results.json`, about 4
-minutes from scratch); `python corpus/coverage.py corpus/out/sqla/results.json --only-sqlalchemy -o
+minutes from scratch; `PY2AXUM_SQLA_PORT_BASE` and `PY2AXUM_SQLA_DB_SUFFIX` isolate a second run on the same machine); `python corpus/coverage.py corpus/out/sqla/results.json --only-sqlalchemy -o
 docs/coverage.md` rewrites only the SQLAlchemy section. Ports 10300-10399, databases `py2axum_sqla_prep` and
 `py2axum_sqla_s<slot>` on the server of `DATABASE_URL`, which must allow `session_replication_role` (a
 superuser: the seed is copied back with foreign keys unchecked).

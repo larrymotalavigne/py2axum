@@ -16,6 +16,11 @@ Generated instants (`created_at`, ...) cannot match between two runs: every ISO-
 client did not send is replaced by its *shape* (digits -> 9), so the format (Z vs offset, fraction
 length) is still compared, only the value is not.
 
+--logs REF_PREFIX CAND_PREFIX: also compare what the servers printed (REF_PREFIX.out / .err, see
+tests/logcmp.py) from their start to the end of the scenario, line for line once instants, ids and ports
+are masked; with --logs-stop, both are then stopped (SIGTERM to the pid in PREFIX.pid) and their shutdown
+lines are compared too.
+
 --ignore-encoding: forced-streaming pass. A streamed response has no content-length, so axum
 compresses it even under GZipMiddleware's minimum_size; everything else must still match.
 """
@@ -33,6 +38,8 @@ from pathlib import Path
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import logcmp  # noqa: E402
 
 DB = os.environ.get("DATABASE_URL", "postgresql://postgres@127.0.0.1/poc")
 J = {"content-type": "application/json"}
@@ -296,10 +303,28 @@ def main() -> int:
     if name is None and "--scenario" in sys.argv:
         name = sys.argv[sys.argv.index("--scenario") + 1]
         args.remove(name)
+    logs = None
+    if "--logs" in sys.argv:
+        # the servers' output files (tests/logcmp.py): from their start to the end of the scenario
+        i = sys.argv.index("--logs")
+        logs = tuple(logcmp.Logs(p) for p in sys.argv[i + 1:i + 3])
+        for p in sys.argv[i + 1:i + 3]:
+            args.remove(p)
     scenario = load_scenario(name or "app")
     ignore_encoding = "--ignore-encoding" in flags
     ref_url, cand_url = args[0], args[1]
-    ref, cand = run(ref_url, scenario), run(cand_url, scenario)
+    ref = run(ref_url, scenario)
+    if logs:
+        logcmp.settle(logs[0])
+        logs[0].take()
+    cand = run(cand_url, scenario)
+    if logs:
+        logcmp.settle(logs[1])
+        logs[1].take()
+        if "--logs-stop" in flags:
+            # SIGTERM to both: the shutdown lines are compared too
+            logs[0].stop()
+            logs[1].stop()
     failures = 0
     for a, b in zip(ref, cand):
         same = identical(a, b, ignore_encoding)
@@ -310,6 +335,9 @@ def main() -> int:
             print(f"     ref:  {json.dumps(a, ensure_ascii=False)}")
             print(f"     cand: {json.dumps(b, ensure_ascii=False)}")
     print(f"\n{len(ref) - failures}/{len(ref)} identical responses")
+    if logs:
+        failures += bool(logcmp.compare(*logs, ignore=getattr(scenario, "LOG_IGNORE", []),
+                                       masks=getattr(scenario, "LOG_MASKS", [])))
     return 1 if failures else 0
 
 

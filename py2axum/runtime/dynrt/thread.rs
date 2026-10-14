@@ -271,7 +271,7 @@ fn spawn_os(cx: &Cx, f: V, args: Vec<V>, kwargs: Vec<(String, V)>, alive: Arc<At
             IDENT.with(|c| c.set(ident));
             let r = handle.block_on(super::methods::call_value(&cx2, &f, args, kwargs));
             if let Err(e) = r {
-                eprintln!("Exception in thread: {:?}", e);
+                eprint!("Exception in thread:\n{}", super::trace::format_exc(&e));
             }
             alive.store(false, Ordering::SeqCst);
         })
@@ -382,7 +382,7 @@ pub async fn loop_method(cx: &Cx, recv: &V, l: &Arc<ELoop>, name: &str, args: Ve
             let pending = std::mem::take(&mut *l.pending.lock());
             for (cb, a) in pending {
                 if let Err(e) = Box::pin(super::methods::call_value(cx, &cb, a, vec![])).await {
-                    eprintln!("ERROR:asyncio:Exception in callback: {:?}", e);
+                    super::logging::emit_sync("asyncio", super::logging::ERROR, "Exception in callback", vec![], vec![], Some(e.clone()), &super::logging::NO_LOC);
                 }
             }
             // the loop "runs" the coroutines submitted to it (as tasks of the process) until stopped
@@ -460,7 +460,7 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         if s.is_sync() {
             return super::aio::aenter(cx, v).await;
         }
-        return Err(Exc::type_error("'AsyncConnection' object does not support the context manager protocol"));
+        return Err(super::aio::cm_error("AsyncConnection", false, true));
     }
     if let V::Native(n) = v {
         if let Native::TLock(l) = &**n {
@@ -475,6 +475,13 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         }
         if let Native::Suppress(_) = &**n {
             return Ok(V::None);
+        }
+        // `with var.set(x):` (Python 3.14): the token, reset when the block ends
+        if let Native::CtxToken(..) = &**n {
+            if super::python() < (3, 14) {
+                return Err(Exc::type_error("'_contextvars.Token' object does not support the context manager protocol"));
+            }
+            return Ok(v.clone());
         }
         if let Native::Socket(_) | Native::ZipW(_) = &**n {
             return Ok(v.clone());
@@ -510,6 +517,10 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         }
         if let Native::ZipW(z) = &**n {
             super::zipw::method(z, "close", &[], &[])?;
+            return Ok(V::Bool(false));
+        }
+        if let Native::CtxToken(var, _) = &**n {
+            super::agen::ctxvar_method(cx, var, "reset", &[v.clone()])?;
             return Ok(V::Bool(false));
         }
         if let Native::Suppress(classes) = &**n {

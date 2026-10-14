@@ -26,7 +26,7 @@ pub fn from_response(r: Response) -> V {
         .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().iter().map(|&b| b as char).collect::<String>()))
         .collect();
     V::native(Native::RespObj(Arc::new(RespObj {
-        status: Mutex::new(parts.status.as_u16()),
+        status: Mutex::new(parts.status.as_u16() as i64),
         headers: Mutex::new(headers),
         body: RespBody::Raw(Mutex::new(Some(body))),
         media: None,
@@ -34,7 +34,7 @@ pub fn from_response(r: Response) -> V {
 }
 
 pub struct RespObj {
-    pub status: Mutex<u16>,
+    pub status: Mutex<i64>,
     /// user headers then the ones Starlette adds (content-length, content-type...), in order
     pub headers: Mutex<Vec<(String, String)>>,
     pub body: RespBody,
@@ -89,10 +89,10 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     if let Some((k, _)) = kwargs.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
         return Err(Exc::type_error(format!("py2axum: {kind}({k}=) is not supported")));
     }
-    let status = |i: usize, d: u16| -> R<u16> {
+    let status = |i: usize, d: i64| -> R<i64> {
         match arg(args, kwargs, i, "status_code") {
             None => Ok(d),
-            Some(V::Int(s)) => Ok(status_u16(*s)),
+            Some(V::Int(s)) => Ok(*s),
             Some(o) => Err(Exc::type_error(format!("status_code must be an int, not {}", o.type_name()))),
         }
     };
@@ -110,7 +110,10 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             let disposition = arg(args, kwargs, 8, "content_disposition_type").map(ops::str_).transpose()?.unwrap_or_else(|| "attachment".into());
             let media = match arg(args, kwargs, 3, "media_type") {
                 Some(m) => ops::str_(m)?,
-                None => guess_type(filename.as_deref().unwrap_or(&path)).unwrap_or("text/plain").to_string(),
+                // an unknown type: application/octet-stream from Starlette 1.1, text/plain before
+                None => guess_type(filename.as_deref().unwrap_or(&path))
+                    .unwrap_or(if super::web::starlette() >= (1, 1) { "application/octet-stream" } else { "text/plain" })
+                    .to_string(),
             };
             RespObj { status: Mutex::new(status(1, 200)?), headers: Mutex::new(headers), body: RespBody::File { path, filename, disposition }, media: Some(media) }
         }
@@ -128,7 +131,8 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
                 (c, true) => super::pyd::to_json(c.as_ref().unwrap_or(&V::None), &super::pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false }, false)?.into_bytes(),
                 (Some(V::Bytes(b)), _) => b.to_vec(),
                 (Some(V::Str(s)), _) => s.as_bytes().to_vec(),
-                (Some(o), _) => return Err(Exc::type_error(format!("py2axum: {kind} content must be str or bytes, not {}", o.type_name()))),
+                // Starlette's `render`: `content.encode(self.charset)`
+                (Some(o), _) => return Err(Exc::attr_error(format!("'{}' object has no attribute 'encode'", o.type_name()))),
             };
             let media = arg(args, kwargs, 3, "media_type").map(ops::str_).transpose()?.or(default_media.map(str::to_string));
             let st = status(1, 200)?;
@@ -146,30 +150,71 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     Ok(V::native(Native::RespObj(Arc::new(obj))))
 }
 
-/// `mimetypes.guess_type` for the usual extensions
-pub fn guess_type(name: &str) -> Option<&'static str> {
-    let ext = name.rsplit('/').next()?.rsplit_once('.')?.1.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "txt" => "text/plain",
-        "csv" => "text/csv",
-        "html" | "htm" => "text/html",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "zip" => "application/zip",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "ics" => "text/calendar",
-        "mp4" => "video/mp4",
-        _ => return None,
+/// `mimetypes.knownfiles`: read at the first guess, in this order, over the built-in table (`mimetypes.init`)
+const KNOWN_FILES: [&str; 9] = ["/etc/mime.types", "/etc/httpd/mime.types", "/etc/httpd/conf/mime.types", "/etc/apache/mime.types",
+    "/etc/apache2/mime.types", "/usr/local/etc/httpd/conf/mime.types", "/usr/local/lib/netscape/mime.types",
+    "/usr/local/etc/httpd/conf/mime.types", "/usr/local/etc/mime.types"];
+
+static MIME_TYPES: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+
+/// `types_map[True]` after `mimetypes.init()`: CPython's built-in table of the project's Python (mimetab.rs; it
+/// changed in 3.13, 3.14 and 3.15), then each existing known file (`type ext ext...` lines, `#` comments), a
+/// later entry replacing an earlier one, like `MimeTypes.readfp`
+fn mime_types() -> &'static std::collections::HashMap<String, String> {
+    MIME_TYPES.get_or_init(|| {
+        let mut m: std::collections::HashMap<String, String> =
+            super::mimetab::tables(super::python()).0.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        for f in KNOWN_FILES {
+            let Ok(text) = std::fs::read_to_string(f) else { continue };
+            for line in text.lines() {
+                let words: Vec<&str> = line.split_whitespace().take_while(|w| !w.starts_with('#')).collect();
+                if let [ty, suffixes @ ..] = &words[..] {
+                    for suf in suffixes {
+                        m.insert(format!(".{suf}"), ty.to_string());
+                    }
+                }
+            }
+        }
+        m
     })
+}
+
+/// `mimetypes.guess_type(path)[0]` (Starlette's FileResponse): a file path, or a URL with a scheme (its path);
+/// `data:` URLs are not expected here
+pub fn guess_type(name: &str) -> Option<&'static str> {
+    let (_, suffixes, encodings) = super::mimetab::tables(super::python());
+    let find = |t: &'static [(&'static str, &'static str)], k: &str| t.binary_search_by(|(x, _)| (*x).cmp(k)).ok().map(|i| t[i].1);
+    // urlparse: a scheme of two characters or more is a URL (its path is used); a file path otherwise
+    let path = match name.split_once(':') {
+        Some((scheme, rest)) if scheme.len() > 1 && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) => {
+            let rest = rest.strip_prefix("//").map(|r| r.find('/').map(|i| &r[i..]).unwrap_or("")).unwrap_or(rest);
+            rest.split(['?', '#']).next().unwrap_or("").to_string()
+        }
+        _ => name.to_string(),
+    };
+    let (mut base, mut ext) = splitext(&path);
+    while let Some(to) = find(suffixes, &ext.to_lowercase()) {
+        (base, ext) = splitext(&format!("{base}{to}"));
+    }
+    if find(encodings, &ext).is_some() {
+        (_, ext) = splitext(&base);
+    }
+    mime_types().get(&ext.to_lowercase()).map(|t| t.as_str())
+}
+
+/// `posixpath.splitext`: the extension starts at the last dot of the last component, after its leading dots
+fn splitext(p: &str) -> (String, String) {
+    let name_start = p.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let name = &p[name_start..];
+    let lead = name.len() - name.trim_start_matches('.').len();
+    match name[lead..].rfind('.') {
+        Some(i) => {
+            let at = name_start + lead + i;
+            (p[..at].to_string(), p[at..].to_string())
+        }
+        None => (p.to_string(), String::new()),
+    }
 }
 
 // ---------------------------------------------------------------- cookies
@@ -275,7 +320,7 @@ pub fn method(r: &RespObj, name: &str, args: &[V], kwargs: &[(String, V)]) -> R 
 
 pub fn attr(r: &Arc<RespObj>, name: &str) -> R {
     match name {
-        "status_code" => Ok(V::Int(*r.status.lock() as i64)),
+        "status_code" => Ok(V::Int(*r.status.lock())),
         "headers" => Ok(V::native(Native::RespHeaders(r.clone()))),
         "body" => match &r.body {
             RespBody::Bytes(b) => Ok(V::Bytes(Arc::from(&b[..]))),
@@ -290,7 +335,7 @@ pub fn attr(r: &Arc<RespObj>, name: &str) -> R {
 pub fn set_status(r: &RespObj, v: &V) -> R<()> {
     match v {
         V::Int(i) => {
-            *r.status.lock() = status_u16(*i);
+            *r.status.lock() = *i;
             Ok(())
         }
         _ => Err(Exc::type_error("status_code must be an int")),
@@ -300,8 +345,8 @@ pub fn set_status(r: &RespObj, v: &V) -> R<()> {
 /// uvicorn (httptools) has a status line for 100..599 only: any other status is a KeyError raised by the
 /// server's `send` and the connection is dropped without an answer. The KeyError goes up through the
 /// middlewares (their `finally` blocks run), then the server drops the connection (`is_drop`).
-pub fn status_drop(status: u16) -> Exc {
-    let e = Exc::new(&KEY_ERROR, vec![V::Int(status as i64)]);
+pub fn status_drop(status: i64) -> Exc {
+    let e = Exc::new(&KEY_ERROR, vec![V::Int(status)]);
     e.0.attrs.lock().insert("__py2axum_drop__".into(), V::Bool(true));
     e
 }
@@ -310,18 +355,14 @@ pub fn is_drop(e: &Exc) -> bool {
     e.0.attrs.lock().contains_key("__py2axum_drop__")
 }
 
-/// The returned response object, sent as Starlette would.
-/// A status kept as given while it fits (0 stands for any other value: never a valid status, never a
-/// truncated one that would look valid).
-fn status_u16(s: i64) -> u16 {
-    u16::try_from(s).ok().filter(|s| *s <= 999).unwrap_or(0)
-}
-
+/// The returned response object, sent as Starlette would (a status as the application gave it: uvicorn has
+/// a status line for 100..599 only).
 pub fn into_response(r: &RespObj) -> R<Response> {
     let status = *r.status.lock();
     if !(100..=599).contains(&status) {
         return Err(status_drop(status));
     }
+    let status = status as u16;
     let mut headers = r.headers.lock().clone();
     let body = match &r.body {
         RespBody::Raw(b) => {
@@ -396,7 +437,7 @@ pub async fn run_background(cx: Cx) {
     let tasks = std::mem::take(&mut *t.0.lock());
     for (f, args, kwargs) in tasks {
         if let Err(e) = super::methods::call_value(&cx, &f, args, kwargs).await {
-            eprintln!("ERROR:py2axum:Exception in ASGI application: {:?}", e);
+            super::uvicorn::exception(&e);
             break;
         }
     }

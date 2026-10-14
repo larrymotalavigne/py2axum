@@ -55,4 +55,8 @@ closed with code 1012 ([Graceful shutdown](../advanced/shutdown.md)).
   `Sec-WebSocket-Extensions`; messages are the same); no server keepalive pings (uvicorn pings every 20 s
   and closes with 1011 after 20 s without pong); messages are limited to 16 MiB like uvicorn, but the
   error past it may differ; an invalid handshake request (missing key, version ≠ 13) is answered by axum
-  (400/426, other text); uvicorn's access log lines are not printed.
+  (400/426, other text). uvicorn's lines are printed (`"WebSocket /path" [accepted]`, `connection open`,
+  `connection rejected (...)`, see [Logging](../advanced/logging.md)).
+- Raw ASGI middlewares (`app.add_middleware(SomeASGIClass)`) do not see WebSocket connections: in Python
+  their `__call__` runs with the `websocket` scope (and its frames appear in a traceback); in the binary the
+  connection goes to the route directly.
