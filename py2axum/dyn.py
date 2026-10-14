@@ -2041,7 +2041,6 @@ class Project:
     def secondary_table(self, node: ast.AST, module: str, where: str) -> ModelInfo:
         """`relationship(secondary=...)`: the association table, a module-level `Table(name, metadata, Column(...),
         ...)` named by its variable or its table name, described like a mapped table (no class)."""
-        secs = self.__dict__.setdefault("secondaries", {})
         sym, stmt = None, None
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             for m in self.ix.package_modules():
@@ -5073,16 +5072,16 @@ class FnCompiler:
                 if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     continue
                 inner = isinstance(st, (ast.For, ast.AsyncFor, ast.While))
-                for field in ("body", "orelse", "finalbody", "handlers", "cases"):
-                    sub = getattr(st, field, None)
+                for attr in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    sub = getattr(st, attr, None)
                     if isinstance(sub, list) and sub:
-                        if field in ("handlers", "cases"):
+                        if attr in ("handlers", "cases"):
                             for h in sub:
                                 r = in_loop(h.body, loop or inner)
                                 if r is not None:
                                     return r
                         else:
-                            r = in_loop(sub, loop or (inner and field == "body"))
+                            r = in_loop(sub, loop or (inner and attr == "body"))
                             if r is not None:
                                 return r
             return None
