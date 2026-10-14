@@ -437,7 +437,7 @@ pub fn uuid_new(args: &[V], kwargs: &[(String, V)]) -> R {
         if k == "int" {
             let n: u128 = match n {
                 V::Int(i) if *i >= 0 => *i as u128,
-                V::Decimal(d) if d.is_integral() => d.to_int().to_string().parse().map_err(|_| Exc::value_error("int is out of range (need a 128-bit value)"))?,
+                V::Decimal(d) if d.is_integral() && d.adjusted() < 40 => d.to_int().to_string().parse().map_err(|_| Exc::value_error("int is out of range (need a 128-bit value)"))?,
                 V::Int(_) | V::Decimal(_) => return Err(Exc::value_error("int is out of range (need a 128-bit value)")),
                 o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
             };

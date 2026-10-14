@@ -541,7 +541,7 @@ impl Key {
                 _ => unreachable!(),
             },
             // hash(Decimal(2)) == hash(2)
-            V::Decimal(d) if d.is_integral() => match num_traits::ToPrimitive::to_i64(&d.to_int()) {
+            V::Decimal(d) if d.is_integral() => match d.to_i64() {
                 Some(i) => Key::Int(i),
                 None => Key::Str(Arc::from(format!("\u{0}dec:{}", d))),
             },
@@ -902,6 +902,10 @@ builtin_exc!(DECIMAL_INVALID_OPERATION, "InvalidOperation", [DECIMAL_EXCEPTION])
 builtin_exc!(DECIMAL_CONVERSION_SYNTAX, "ConversionSyntax", [DECIMAL_INVALID_OPERATION]);
 builtin_exc!(DECIMAL_DIVISION_BY_ZERO, "DivisionByZero", [DECIMAL_EXCEPTION, ZERO_DIVISION_ERROR]);
 builtin_exc!(DECIMAL_DIVISION_UNDEFINED, "DivisionUndefined", [DECIMAL_INVALID_OPERATION, ZERO_DIVISION_ERROR]);
+builtin_exc!(DECIMAL_DIVISION_IMPOSSIBLE, "DivisionImpossible", [DECIMAL_INVALID_OPERATION]);
+builtin_exc!(DECIMAL_INEXACT, "Inexact", [DECIMAL_EXCEPTION]);
+builtin_exc!(DECIMAL_ROUNDED, "Rounded", [DECIMAL_EXCEPTION]);
+builtin_exc!(DECIMAL_OVERFLOW, "Overflow", [DECIMAL_INEXACT, DECIMAL_ROUNDED]);
 // httpx
 builtin_exc!(HTTPX_HTTP_ERROR, "HTTPError", [EXCEPTION]);
 builtin_exc!(HTTPX_REQUEST_ERROR, "RequestError", [HTTPX_HTTP_ERROR]);

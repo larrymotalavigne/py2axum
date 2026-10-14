@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-14
+
+Security release. Upgrading is strongly recommended.
+
+### Security
+
+- **Denial of service fixed (all earlier versions):** a request reaching a `Decimal` field with constraints, or
+  `Decimal` arithmetic in the application, could make a generated binary spend minutes of CPU and then exhaust its
+  memory until the process was killed, without authentication. `Decimal` now follows CPython's default context
+  and its limits. Upgrading is strongly recommended.
+- MCP (`mcp` SDK, stateless server): a `GET` event stream now ends when the client leaves. Before, each disconnect
+  kept a pooled database connection open in a transaction until the pool was exhausted (all earlier versions serving MCP natively).
+
 ## [0.7.0] — 2026-10-14
 
 Pydantic documentation corpus at 90.8 % and SQLAlchemy ORM documentation corpus at 93.8 % (both past the 1.0

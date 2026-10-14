@@ -61,6 +61,7 @@ same requests. The ones Starlette applies are applied the same way.
 | Body size | no limit | no limit by default; `PY2AXUM_MAX_BODY` (bytes) answers **413** past it, checked on `Content-Length` and while reading a chunked body |
 | JSON nesting | CPython's decoder (~10 000 levels on 3.12/3.13, ~50 000 on 3.14), then RecursionError → 400 | iterative decoder, 400 past 10 000 levels; see below |
 | Numbers | int → str limited to 4 300 digits | integers beyond 64 bits are an OverflowError (documented in [Python semantics](../reference/python.md)); decoding is linear |
+| `Decimal` | libmpdec: exponents up to ±10¹⁸, default context (28 digits, Emax 999 999) | same limits and context: comparisons and bounds decided on the exponents, `Overflow`, `DivisionImpossible` and subnormal rounding as CPython; long coefficients parsed and counted in quasi-linear time |
 | Invalid UTF-8, lone surrogates | 400 / kept | 400 / U+FFFD (documented) |
 | Multipart | `max_files` 1 000, `max_fields` 1 000, 1 MiB per non-file part | same limits, same 400 messages |
 | URL-encoded forms | 1 000 fields, 1 MiB per field (Starlette ≥ 1.4) | same |
@@ -96,6 +97,11 @@ Difference: uvicorn refuses such a header at send time and closes the connection
 
 **Panics.** The generated crates do not set `panic = "abort"`: a bug that panics loses its own connection only,
 and the runtime's locks do not poison.
+
+## Streams
+
+- MCP (`mcp` SDK, stateless): the `GET` event stream ends when the client leaves, as `EventSourceResponse` does,
+  so the endpoint's dependencies (a database session) are released.
 
 ## Files and paths
 
@@ -232,10 +238,14 @@ The generated application code contains no `unsafe`.
   `resolve()`; CR/LF in a response header; the body of a 500 (an exception message with a password, an
   IntegrityError); `token_urlsafe(-1)`; `str * n` past memory; Starlette's multipart limits and Windows file
   names.
+- `Decimal` bounds, arithmetic, `quantize`, `//` and `%` at the limits of the context (exponents near ±10⁹ and
+  ±10¹⁸) and `max_digits` on a 200 000-digit value, in the same scenario; `tests/sse_check.py` checks that MCP
+  `GET` streams the client leaves keep no database connection.
 - `tests/security_check.py` (against the binary alone, in CI after the conformance): JSON nested up to 50 000
   levels on model, `dict` and `Any` bodies with the process still serving; 30 000 cookies in one header; 5 000
   multipart files; eight concurrent bcrypt hashes at cost 12 while other requests stay under 0.5 s; the relay
-  dropping `Connection`-named headers; `PY2AXUM_MAX_BODY` with `Content-Length` and chunked bodies.
+  dropping `Connection`-named headers; `PY2AXUM_MAX_BODY` with `Content-Length` and chunked bodies; million-digit
+  and huge-exponent `Decimal` values answered within seconds.
 - The existing PyJWT, python-jose, itsdangerous and Fernet cases of the dynapp scenario (wrong algorithms,
   `none`, PEM keys used as HMAC secrets, tampered and expired tokens).
 - The `audit` CI job (`cargo audit`).

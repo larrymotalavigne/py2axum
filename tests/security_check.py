@@ -145,6 +145,15 @@ def main():
         st, _, _ = req(base, "POST", "/sec/echo", b"[1]", js)
         check("under max body", st == 200, str(st))
 
+    # 10. 0.7.1: Decimal work chosen by the request is bounded in time, never an aborted process
+    for path, body in (("/sec/decimal", {"price": "1e999999999999999999"}), ("/sec/decimal", {"price": "-1e-999999999999999999"}),
+                       ("/sec/decimal/digits", {"amount": "1" + "0" * 1_000_000}), ("/sec/decimal/digits", {"amount": "7" * 1_000_000})):
+        st, _, dt = req(base, "POST", path, json.dumps(body).encode(), js)
+        check(f"{path} {str(body)[:30]}", st in (200, 422) and dt < 5 and alive(base), f"{st} {dt:.2f}s")
+    for q in ("a=1e999999999999999999&b=-1e-999999999999999999", "a=1e-999999999999999999&b=1e999999999999999999"):
+        st, _, dt = req(base, "GET", f"/sec/decimal/ops?{q}")
+        check(f"decimal ops {q[:24]}", st == 200 and dt < 5, f"{st} {dt:.2f}s")
+
     check("still serving", alive(base))
     print(f"{len(FAILS)} failure(s)")
     sys.exit(1 if FAILS else 0)

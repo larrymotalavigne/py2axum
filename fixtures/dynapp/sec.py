@@ -3,13 +3,14 @@ FastAPI where it matters for safety. Request values that reach SQL as names (lab
 `index_elements`) are quoted as SQLAlchemy quotes them, values are bound; `Path.resolve()` follows symlinks
 below a missing tail; unhandled errors leak nothing; sizes chosen by the request raise, never abort."""
 import secrets
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import bcrypt
 
 from fastapi import APIRouter, Body, File, Request, Response, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -131,6 +132,56 @@ async def repeat(n: int):
         return {"len": len("ab" * n)}
     except (MemoryError, OverflowError) as e:
         return {"err": type(e).__name__}
+
+
+# ---- 0.7.1: exponents and digit counts chosen by the request
+class Price(BaseModel):
+    price: Decimal = Field(ge=0)
+
+
+class Amount(BaseModel):
+    amount: Decimal = Field(max_digits=12, decimal_places=2)
+
+
+@router.post("/decimal")
+async def decimal_bound(body: Price):
+    """`Decimal` with a bound: compared on the adjusted exponents, never by building 10**exponent."""
+    return {"price": str(body.price)}
+
+
+@router.post("/decimal/digits")
+async def decimal_digits(body: Amount):
+    """`max_digits`/`decimal_places` on a long coefficient: linear, not one division per trailing zero."""
+    return {"amount": str(body.amount)}
+
+
+def _arith(f):
+    try:
+        return f()
+    except ArithmeticError as e:
+        return type(e).__name__
+
+
+@router.get("/decimal/ops")
+async def decimal_ops(a: str, b: str):
+    """Arithmetic of the default context (Emax 999999, Etiny -1000026): Overflow, DivisionImpossible,
+    subnormal rounding, as CPython, in bounded time whatever the exponents."""
+    x, y = Decimal(a), Decimal(b)
+    return {
+        "lt": _arith(lambda: x < y),
+        "eq": _arith(lambda: x == y),
+        "add": _arith(lambda: str(x + y)),
+        "sub": _arith(lambda: str(x - y)),
+        "mul": _arith(lambda: str(x * y)),
+        "div": _arith(lambda: str(x / y)),
+        "floordiv": _arith(lambda: str(x // y)),
+        "mod": _arith(lambda: str(x % y)),
+        "quantize": _arith(lambda: str(x.quantize(y))),
+        "round": _arith(lambda: str(round(x, 2))),
+        "integral": _arith(lambda: str(x.to_integral_value())),
+        "normalize": _arith(lambda: str(x.normalize())),
+        "pos": _arith(lambda: str(+x)),
+    }
 
 
 @router.post("/upload")

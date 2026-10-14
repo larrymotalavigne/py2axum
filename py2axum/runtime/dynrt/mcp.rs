@@ -208,8 +208,15 @@ pub async fn handle_request(cx: &Cx, s: &Arc<Server>, args: &[V]) -> R {
     ])?;
     super::aio::await_value(super::methods::call_value_boxed(cx, send, vec![msg]).await?).await?;
     if out.stream {
-        // the standalone SSE stream of a stateless server: nothing is ever sent on it
-        std::future::pending::<()>().await;
+        // the standalone SSE stream of a stateless server: nothing is ever sent on it; it ends when the client
+        // leaves (EventSourceResponse listens for `http.disconnect`), so the endpoint's `finally` (a session
+        // dependency's close) runs. Never-ending before: one stuck task and one pooled connection per disconnect
+        loop {
+            let msg = super::aio::await_value(super::methods::call_value_boxed(cx, receive, vec![]).await?).await?;
+            if matches!(dict_get(&msg, "type"), Some(V::Str(t)) if &*t == "http.disconnect") {
+                break;
+            }
+        }
     }
     // the stateless manager's transport, terminated once the request is answered
     if transport {

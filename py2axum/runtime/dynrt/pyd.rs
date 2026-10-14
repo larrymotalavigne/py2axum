@@ -1515,7 +1515,7 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 e.push("bool_parsing", loc, "Input should be a valid boolean, unable to interpret input", input, None);
                 None
             }
-            V::Decimal(d) if d.is_integral() => match num_traits::ToPrimitive::to_i64(&d.to_int()) {
+            V::Decimal(d) if d.is_integral() => match d.to_i64() {
                 Some(i @ (0 | 1)) => {
                     e.floor(LAX);
                     Some(V::Bool(i == 1))
@@ -1579,7 +1579,7 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 }
                 V::Decimal(d) => {
                     if d.is_integral() {
-                        match num_traits::ToPrimitive::to_i64(&d.to_int()) {
+                        match d.to_i64() {
                             Some(i) => Some(i),
                             None => return beyond_i64(&d.to_string()),
                         }
@@ -2544,32 +2544,33 @@ fn decimal_val(input: &V, c: &DecC, loc: &[V], e: &mut Errs) -> Option<V> {
     };
     if c.max_digits.is_some() || c.decimal_places.is_some() {
         // digits of the normalized value (trailing zeros dropped)
+        // digits counted without printing the number, trailing zeros stripped by doubling steps (one division
+        // per zero, or printing, is quadratic: a megabyte of digits took seconds)
+        use super::decimal::{digits as ndigits, strip_zeros};
         let (mut coeff, mut exp) = (d.coeff.clone(), d.exp);
-        let ten = num_bigint::BigUint::from(10u32);
         if num_traits::Zero::is_zero(&coeff) {
             exp = 0;
         } else {
-            // pydantic-core < 2.50 (pydantic 2.13) normalized with `Decimal.normalize()`, which also rounds to
-            // the context's 28 digits (ROUND_HALF_EVEN): a longer value can pass
-            let text = coeff.to_str_radix(10);
-            if super::pydantic_before(2, 14) && text.len() > 28 {
-                let drop = (text.len() - 28) as u32;
-                let unit = ten.pow(drop);
-                let (q, r) = (&coeff / &unit, &coeff % &unit);
-                let half = &unit / 2u32;
-                let odd = (&q % 2u32) == num_bigint::BigUint::from(1u32);
-                coeff = if r > half || (r == half && odd) { q + 1u32 } else { q };
-                exp += drop as i64;
+            // pydantic-core < 2.50 (pydantic 2.13) normalized with `Decimal.normalize()` in the default context:
+            // rounded to 28 digits (ROUND_HALF_EVEN) and below Etiny to zero, so a longer or tinier value can pass
+            // (an Overflow there leaves the value as written)
+            if super::pydantic_before(2, 14) {
+                if let Ok(f) = d.clone().fix() {
+                    (coeff, exp) = (f.coeff, f.exp);
+                }
             }
-            while num_traits::Zero::is_zero(&(&coeff % &ten)) {
-                coeff /= &ten;
-                exp += 1;
+            if num_traits::Zero::is_zero(&coeff) {
+                exp = 0;
+            } else {
+                let (c, k) = strip_zeros(&coeff);
+                coeff = c;
+                exp += k;
             }
         }
-        let count = |nd: i64, exp: i64| if exp >= 0 { (nd + exp, 0) } else { (nd.max(-exp), -exp) };
-        let (digits, decimals) = count(coeff.to_str_radix(10).len() as i64, exp);
+        let count = |nd: i64, exp: i64| if exp >= 0 { (nd.saturating_add(exp), 0) } else { (nd.max(-exp), -exp) };
+        let (digits, decimals) = count(ndigits(&coeff) as i64, exp);
         // a bound is exceeded when both the value as written and the normalized one exceed it
-        let (raw_digits, raw_decimals) = count(d.coeff.to_str_radix(10).len() as i64, d.exp);
+        let (raw_digits, raw_decimals) = count(ndigits(&d.coeff) as i64, d.exp);
         let (digits, decimals, whole_digits) = (digits.min(raw_digits), decimals.min(raw_decimals), (digits - decimals).min(raw_digits - raw_decimals));
         let pl = |n: u64| if n == 1 { "" } else { "s" };
         if let Some(m) = c.max_digits {

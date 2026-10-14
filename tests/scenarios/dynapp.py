@@ -1697,6 +1697,18 @@ STEPS += [
     ("GET", "/sec/repeat?n=-2", None),
     ("GET", f"/sec/repeat?n={2**62}", None),
     ("GET", f"/sec/repeat?n={10**15}", None),
+]
+# fixtures/dynapp/sec.py (0.7.1): exponents and digit counts chosen by the request
+_DEC_PAIRS = [("1e999999999", "1"), ("1", "1e-999999999"), ("1e-999999999", "1"), ("-1", "3"), ("-3", "3"),
+              ("0", "0E-999999999"), ("0E-5", "1.5"), ("1E+999999", "10"), ("1.5", "1e-1000020"), ("123.456", "0.01"),
+              ("5", "1e999999999"), ("1e999999999999999999", "-1e999999999999999999"),
+              ("12345678901234567890123456789", "1"), ("-0", "0"), ("9.99E+999999", "1E+999999"), ("1E-1000020", "3")]
+STEPS += [("GET", f"/sec/decimal/ops?a={quote(a)}&b={quote(b)}", None) for a, b in _DEC_PAIRS]
+STEPS += [("POST", "/sec/decimal", {"price": v}) for v in ("1e999999999", "-1e999999999", "1e-999999999",
+                                                            "1e999999999999999999", "1e9999999999999999999", 5)]
+STEPS += [("POST", "/sec/decimal/digits", {"amount": v}) for v in ("1" + "0" * 200000, "12.345", "1" + "0" * 10 + ".00",
+                                                                  "1e-999999999", "1e-1000026", "1e-1000027")]
+STEPS += [
     # Cookie() parameters (fixtures/dynapp/docsx.py, the FastAPI docs' cookie examples)
     ("GET", "/docsx/cookies", None),
     ("GET", "/docsx/cookies", None, {"cookie": "ads_id=abc; n=7; session-id=s1"}),

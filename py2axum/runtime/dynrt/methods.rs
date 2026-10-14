@@ -2407,7 +2407,7 @@ pub fn b_repr(v: &V) -> R {
 pub fn b_int(args: &[V]) -> R {
     match args.first() {
         None => Ok(V::Int(0)),
-        Some(V::Decimal(d)) => num_traits::ToPrimitive::to_i64(&d.to_int()).map(V::Int).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, "py2axum: integer beyond 64 bits")),
+        Some(V::Decimal(d)) => d.to_i64().map(V::Int).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, "py2axum: integer beyond 64 bits")),
         Some(V::Int(i)) => Ok(V::Int(*i)),
         Some(V::Bool(b)) => Ok(V::Int(*b as i64)),
         Some(V::Float(f)) => {
@@ -2657,7 +2657,7 @@ pub fn b_round(args: &[V]) -> R {
         // round(Decimal) -> int, round(Decimal, n) -> Decimal quantized (half even)
         (V::Decimal(d), None) => {
             let q = d.quantize(0, super::decimal::Rounding::HalfEven)?;
-            num_traits::ToPrimitive::to_i64(&q.to_int()).map(V::Int).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, "py2axum: integer beyond 64 bits"))
+            q.to_i64().map(V::Int).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, "py2axum: integer beyond 64 bits"))
         }
         (V::Decimal(d), Some(n)) => Ok(super::decimal::v(d.quantize(-n, super::decimal::Rounding::HalfEven)?)),
         (V::Int(i), _) => Ok(V::Int(*i)),
@@ -2685,7 +2685,7 @@ pub fn b_abs(v: &V) -> R {
         V::Int(i) => V::Int(i.abs()),
         V::Bool(b) => V::Int(*b as i64),
         V::Float(f) => V::Float(f.abs()),
-        V::Decimal(d) => super::decimal::v(super::decimal::Dec { neg: false, ..(**d).clone() }.fix()),
+        V::Decimal(d) => super::decimal::v(super::decimal::Dec { neg: false, ..(**d).clone() }.fix()?),
         V::Delta(d) => V::Delta(d.abs()),
         _ => return Err(Exc::type_error(format!("bad operand type for abs(): '{}'", v.type_name()))),
     })

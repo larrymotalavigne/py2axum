@@ -120,9 +120,9 @@ fn dec_op(a: &V, b: &V, op: &str) -> Option<R> {
         return Some(Err(binop_err(op, a, b)));
     };
     Some(match op {
-        "+" => Ok(d::v(x.add(&y))),
-        "-" => Ok(d::v(x.sub(&y))),
-        "*" => Ok(d::v(x.mul(&y))),
+        "+" => x.add(&y).map(d::v),
+        "-" => x.sub(&y).map(d::v),
+        "*" => x.mul(&y).map(d::v),
         "/" => x.div(&y).map(d::v),
         "//" => x.divmod(&y).map(|(q, _)| d::v(q)),
         "%" => x.divmod(&y).map(|(_, r)| d::v(r)),
@@ -213,7 +213,7 @@ pub fn sub(a: &V, b: &V) -> R {
 
 /// `seq * n` with a size from the request: OverflowError / MemoryError as CPython, never an allocation
 /// failure (which aborts the process)
-fn repeat_room(unit: usize, k: usize, overflow_msg: &str) -> R<()> {
+pub(crate) fn repeat_room(unit: usize, k: usize, overflow_msg: &str) -> R<()> {
     let total = unit.checked_mul(k).filter(|t| *t <= isize::MAX as usize).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, overflow_msg))?;
     if total > 1 << 20 {
         let mut probe: Vec<u8> = Vec::new();
@@ -389,7 +389,7 @@ pub fn modulo(a: &V, b: &V) -> R {
 
 pub fn neg(a: &V) -> R {
     Ok(match a {
-        V::Decimal(d) => super::decimal::v(d.negate()),
+        V::Decimal(d) => super::decimal::v(d.negate().fix()?),
         V::Bool(b) => V::Int(-(*b as i64)),
         V::Int(i) => V::Int(i.checked_neg().ok_or_else(overflow)?),
         V::Float(f) => V::Float(-f),
@@ -406,7 +406,8 @@ pub fn pos(a: &V) -> R {
     Ok(match a {
         V::Bool(b) => V::Int(*b as i64),
         V::Int(_) | V::Float(_) | V::Delta(_) => a.clone(),
-        V::Decimal(d) => super::decimal::v((**d).clone().fix()),
+        // `__pos__`: a zero loses its sign (default rounding), then `_fix`
+        V::Decimal(d) => super::decimal::v(super::decimal::Dec { neg: d.neg && !d.is_zero(), ..(**d).clone() }.fix()?),
         _ => return Err(Exc::type_error(format!("bad operand type for unary +: '{}'", a.type_name()))),
     })
 }
