@@ -26,32 +26,15 @@ def main(argv: list[str] | None = None) -> int:
         from .watch import main as watch
 
         return watch(argv[1:])
-    ap = argparse.ArgumentParser(prog="py2axum", description=__doc__.splitlines()[0])
-    ap.add_argument("package", type=Path, help="directory of the FastAPI application package")
-    ap.add_argument("-o", "--out", type=Path, help="output directory for the Rust project")
-    ap.add_argument("--root", type=Path, default=None,
-                    help="import root, like sys.path (default: parent of the package)")
-    ap.add_argument("--backend", choices=["auto", "typed", "dyn"], default="auto",
-                    help="deprecated, no effect: there is one backend (auto and dyn are accepted until 1.0; "
-                         "typed was removed in 0.4)")
-    ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
-                    help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
-                         "mount: the app's last app.mount(), which gets every request no translated route fully matches); "
-                         "auto: every route that does not translate, and such mounts")
-    ap.add_argument("--report", type=Path, default=None,
-                    help="coverage report (Markdown + JSON) instead of generating: never stops at the first error")
-    ap.add_argument("--name", default=None, help="crate name (default: <package>_axum)")
-    ap.add_argument("--no-stream", action="store_true", help="buffer list responses instead of streaming them")
-    ap.add_argument("--allow-untested-versions", action="store_true",
-                    help="translate even if the project locks library versions outside the tested ranges")
-    from .versions import add_python_flag, apply_python_flag
+    from .versions import apply_python_flag
 
-    add_python_flag(ap)
+    ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
     if args.backend == "typed":
         print("error: --backend typed was removed in 0.4: use the default backend (drop --backend)", file=sys.stderr)
         return 2
+    deprecated_backend(argv)
     from .versions import check_project
 
     bad = [] if args.allow_untested_versions else check_project(args.root or args.package.resolve().parent, args.package)
@@ -64,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  = help: {c.fix}\n  = see: {c.anchor()}", file=sys.stderr)
         return 1
     if args.report:
+        print("warning[deprecated]: --report is an internal tool, outside the stable interface from 1.0: use "
+              "`py2axum check --format json` (or markdown)", file=sys.stderr)
         from .report import aggregate, build, write
 
         result = build(args.package, args.root, stream=not args.no_stream,
@@ -104,6 +89,40 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    """The generation command line (frozen by tests/test_contract.py: see docs/reference/versioning.md)."""
+    ap = argparse.ArgumentParser(prog="py2axum", description=__doc__.splitlines()[0])
+    ap.add_argument("package", type=Path, help="directory of the FastAPI application package")
+    ap.add_argument("-o", "--out", type=Path, help="output directory for the Rust project")
+    ap.add_argument("--root", type=Path, default=None,
+                    help="import root, like sys.path (default: parent of the package)")
+    ap.add_argument("--backend", choices=["auto", "typed", "dyn"], default="auto",
+                    help="deprecated, no effect: there is one backend (auto and dyn are accepted until 1.0; "
+                         "typed was removed in 0.4)")
+    ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
+                    help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
+                         "mount: the app's last app.mount(), which gets every request no translated route fully matches); "
+                         "auto: every route that does not translate, and such mounts")
+    ap.add_argument("--report", type=Path, default=None,
+                    help="deprecated (internal tool, use `py2axum check --format json|markdown`): coverage report "
+                         "(Markdown + JSON) instead of generating")
+    ap.add_argument("--name", default=None, help="crate name (default: <package>_axum)")
+    ap.add_argument("--no-stream", action="store_true", help="buffer list responses instead of streaming them")
+    ap.add_argument("--allow-untested-versions", action="store_true",
+                    help="translate even if the project locks library versions outside the tested ranges")
+    from .versions import add_python_flag
+
+    add_python_flag(ap)
+    return ap
+
+
+def deprecated_backend(argv: list[str]) -> None:
+    """`--backend auto|dyn` still works and has no effect: say it (docs/reference/versioning.md)."""
+    if any(a == "--backend" or a.startswith("--backend=") for a in argv):
+        print("warning[deprecated]: --backend has no effect since 0.4 and will be removed in 1.0: drop it",
+              file=sys.stderr)
 
 
 def auto_python_side(package: Path, root: Path | None, python_side: set[str]) -> set[str] | None:

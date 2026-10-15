@@ -128,8 +128,11 @@ enum Out {
     End,
 }
 
+/// messages an application may have sent ahead of the client
+const OUT_QUEUE: usize = 16;
+
 enum Handshake {
-    Accept { subprotocol: Option<String>, headers: Vec<(Vec<u8>, Vec<u8>)>, out: mpsc::UnboundedReceiver<Out> },
+    Accept { subprotocol: Option<String>, headers: Vec<(Vec<u8>, Vec<u8>)>, out: mpsc::Receiver<Out> },
     Reject(Response),
 }
 
@@ -153,7 +156,7 @@ pub struct Session {
     peer_closed: AtomicBool,
     disconnected: AtomicBool,
     initial_response: Mutex<Option<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)>>,
-    out: Mutex<Option<mpsc::UnboundedSender<Out>>>,
+    out: Mutex<Option<mpsc::Sender<Out>>>,
 }
 
 impl Session {
@@ -220,7 +223,9 @@ impl Session {
                     }
                     super::uvicorn::ws_handshake(&self.req, None);
                     self.uv_handshake.store(true, Ordering::SeqCst);
-                    let (tx, rx) = mpsc::unbounded_channel();
+                    // bounded: `websocket.send` waits while a client that does not read holds the queue (websockets'
+                    // drain); unbounded, a pushing app grew the memory of a slow connection without limit
+                    let (tx, rx) = mpsc::channel(OUT_QUEUE);
                     *self.out.lock() = Some(tx);
                     self.handshake_complete.store(true, Ordering::SeqCst);
                     if !self.decide(Handshake::Accept { subprotocol, headers, out: rx }) {
@@ -296,7 +301,11 @@ impl Session {
             };
             if let Some(o) = out {
                 let tx = self.out.lock().clone();
-                if tx.map(|t| t.send(o).is_err()).unwrap_or(true) {
+                let sent = match tx {
+                    Some(t) => t.send(o).await.is_ok(),
+                    None => false,
+                };
+                if !sent {
                     return Err(Self::client_disconnected());
                 }
             }
@@ -350,7 +359,8 @@ impl Session {
         // a handshake never decided (the denial response unfinished): the connection is dropped
         self.hs.lock().take();
         if let Some(tx) = self.out.lock().take() {
-            let _ = tx.send(Out::End);
+            // a full queue: dropping the sender ends it all the same (the reader sees None after the rest)
+            let _ = tx.try_send(Out::End);
         }
     }
 }
@@ -410,7 +420,7 @@ fn denial(status: u16, headers: &[(Vec<u8>, Vec<u8>)], body: Vec<u8>) -> Respons
 }
 
 /// the I/O of an accepted connection: reads while the queue is empty, writes in order
-async fn io(socket: WebSocket, s: Arc<Session>, mut out: mpsc::UnboundedReceiver<Out>) {
+async fn io(socket: WebSocket, s: Arc<Session>, mut out: mpsc::Receiver<Out>) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
     let mut deadline: Option<tokio::time::Instant> = None;

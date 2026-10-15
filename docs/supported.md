@@ -72,6 +72,55 @@ while decoding a JSON array from a unicode string`), a bound on untrusted input
 (FastAPI's `jsonable_encoder` when it is returned): the response is the same 500, the logged traceback differs
 (where the exception is raised, and its message).
 
+## PyYAML
+
+`yaml.safe_load` and the dump functions follow PyYAML 6.0's pure-Python implementation (its `SafeLoader`, which
+`safe_load` always uses, even when libyaml is installed). Where the binary cannot follow it:
+
+- An integer beyond 64 bits (`9223372036854775808`, `!!int` of a long digit string) raises
+  `OverflowError: py2axum: the YAML integer ... does not fit in 64 bits`, as `json.loads` does; CPython returns a
+  Python int. A digit string past 4 300 digits raises CPython's own `ValueError` (the int-conversion limit).
+- A `\uD800`-`\uDFFF` escape in a double-quoted scalar (a lone surrogate) becomes U+FFFD: a Rust string cannot
+  hold it (CPython keeps it in the str, which FastAPI then fails to encode as JSON: a 500).
+- The nesting depth at which the recursive steps raise `RecursionError: maximum recursion depth exceeded` is fixed:
+  a collection nested 471 levels deep loads, one 472 deep does not; a list nested 316 deep dumps, one 317 deep
+  does not. CPython's limit depends on the stack of the caller (those are its depths from an async endpoint under
+  uvicorn with Python 3.12; a sync endpoint, another Python or a deeper call chain moves them).
+- `yaml.dump` (the full `Representer`) writes the builtin types as PyYAML does (`!!python/tuple`,
+  `!!python/complex`, `!!set`, `!!binary`...); a value it would write as `!!python/object...`,
+  `!!python/name:...` or `!!python/object/apply:...` (a project class, a Pydantic model, an ORM object, an Enum
+  member, `Decimal`, `UUID`, `time`, `timedelta`...) raises `TypeError: py2axum: yaml.dump() of a ... object is not
+  supported`. `yaml.safe_dump` raises PyYAML's own `RepresenterError('cannot represent an object', data)` for them.
+- Anchors follow object identity: a list, dict, set or tuple met twice is written once with an anchor, as in
+  CPython; a `date` or `datetime` object met twice is not (the binary's dates are values, without identity), and
+  an equal tuple written twice in the source is two objects in the binary where CPython may fold the constants
+  into one.
+- The order of a `set` (`!!set`, `sort_keys=False`) is its insertion order, not CPython's hash order (which varies
+  from one process to the other for strings).
+- `encoding=` accepts UTF-8, UTF-16, UTF-32 (with or without `-le`/`-be`), ASCII and Latin-1 (`TypeError` for
+  another codec); a text file read by `safe_load` is decoded as UTF-8 with universal newlines.
+## croniter
+
+croniter 6.2 is ported line by line ([Libraries](reference/libraries.md)); what the binary does not reproduce:
+
+- `R` (random) fields: Python draws a random number. A literal expression containing one is refused at compile
+  time; one built at run time raises `NotImplementedError` (py2axum) where Python would draw the number (after
+  the errors croniter raises before it), `is_valid` included.
+- `for x in croniter(...)` and `for x in cron.all_next()` / `all_prev()` (or `list()` of them) raise a py2axum
+  `TypeError`: these iterators are endless and iteration is materialised; read them with `next()`.
+  `croniter_range()` is a lazy generator (`next()`, `for`, `list()`), but a `for` loop computes every value of the
+  range before its first iteration.
+- `croniter.expand()` of an expression holding an integer of more than 4300 digits: Python's
+  `CroniterBadCronError` carries the formatted traceback of the `ValueError`, the binary its message only.
+- The `CroniterUnsupportedSyntaxError` message prints each nth set with its numbers first, then `'l'`; Python's
+  order of a set mixing both depends on the string hash seed (`PYTHONHASHSEED`).
+- Time zones: `datetime.timezone` and `zoneinfo.ZoneInfo` (pytz and dateutil zones are not translated); the
+  zone rules are the runtime's tz database, Python's those of the system or of the `tzdata` package.
+- A start time that `gmtime` cannot represent raises the platform's `OSError` (`[Errno 75]` on Linux).
+- `croniter_range(_croniter=)`, `croniter.expand(from_timestamp=)` and `is_valid(encoding=)` other than UTF-8
+  are refused at compile time; a start time other than a `datetime`, an `int` or a `float`, and `croniter_range`
+  bounds other than datetimes and numbers raise a py2axum `TypeError`.
+
 ## Not supported
 
 An application wrapped in a project ASGI class at module level (`app = Wrapper(api)`, refused: the

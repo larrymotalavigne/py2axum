@@ -468,9 +468,7 @@ pub async fn create_connection(args: &[V], kwargs: &[(String, V)]) -> R {
     };
     let timeout = match opt(1, "timeout") {
         V::None => None,
-        V::Int(n) => Some(n as f64),
-        V::Float(f) => Some(f),
-        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer or float", o.type_name()))),
+        o => Some(super::libs::c_seconds(&o)?),
     };
     if timeout.is_some_and(|t| t < 0.0) {
         return Err(Exc::value_error("Timeout value out of range"));

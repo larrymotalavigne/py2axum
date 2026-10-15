@@ -380,6 +380,7 @@ pub fn type_name(o: &LObj) -> &'static str {
             FKind::UvDefault(_) => "DefaultFormatter",
             FKind::UvAccess(_) => "AccessFormatter",
             FKind::Json(_) => "JsonFormatter",
+            FKind::Ecs(_) => "StdlibFormatter",
         },
         LObj::Record(_) => "LogRecord",
         LObj::Filter(_) => "Filter",
@@ -625,6 +626,15 @@ pub enum FKind {
     UvAccess(bool),
     /// pythonjsonlogger's JsonFormatter
     Json(Box<JsonOpts>),
+    /// ecs_logging's StdlibFormatter
+    Ecs(Box<EcsOpts>),
+}
+
+pub struct EcsOpts {
+    extra: Option<V>,
+    exclude: Vec<String>,
+    stack_trace_limit: Option<i64>,
+    ensure_ascii: bool,
 }
 
 pub struct JsonOpts {
@@ -839,6 +849,7 @@ impl Formatter {
     pub fn format(&self, rec: &Record) -> R<String> {
         match &self.kind {
             FKind::Json(o) => return self.format_json(o, rec),
+            FKind::Ecs(o) => return self.format_ecs(o, rec),
             FKind::UvDefault(_) | FKind::UvAccess(_) | FKind::Std => {}
         }
         let msg = rec.get_message()?;
@@ -1041,6 +1052,283 @@ impl Formatter {
         let s = ops::str_(&super::libs::json_dumps(&d, &kw)?)?;
         Ok(format!("{}{s}", o.prefix))
     }
+}
+
+impl Formatter {
+    /// ecs_logging 2.x `StdlibFormatter.format`: `format_to_ecs` then its `json_dumps`
+    fn format_ecs(&self, o: &EcsOpts, rec: &Record) -> R<String> {
+        let excluded = |field: &str| -> bool {
+            let mut path = String::new();
+            for (i, part) in field.split('.').enumerate() {
+                if i > 0 {
+                    path.push('.');
+                }
+                path.push_str(part);
+                if o.exclude.contains(&path) {
+                    return true;
+                }
+            }
+            false
+        };
+        let result = V::empty_dict();
+        // the extractors (their order does not matter: they never collide)
+        let exc = rec.exc.clone().or_else(|| match rec.get("exc_info") {
+            Some(V::Tuple(t)) if t.len() == 3 => match &t[1] {
+                V::Exc(e) => Some(e.clone()),
+                _ => None,
+            },
+            Some(V::Exc(e)) => Some(e),
+            _ => None,
+        });
+        let has_exc = rec.get("exc_info").map(|v| ops::truthy(&v)).transpose()?.unwrap_or(false);
+        let created = match rec.get("created") {
+            Some(V::Float(f)) => f,
+            Some(V::Int(i)) => i as f64,
+            _ => now(),
+        };
+        let msecs = match rec.get("msecs") {
+            Some(V::Float(f)) => f,
+            Some(V::Int(i)) => i as f64,
+            _ => 0.0,
+        };
+        let secs = created.floor() as i64;
+        let utc = chrono::DateTime::from_timestamp(secs, 0).map(|d| d.naive_utc()).unwrap_or_default();
+        let stamp = format!("{}.{:03}Z", super::libs::strftime(&utc, Some(0), Some("UTC".into()), "%Y-%m-%dT%H:%M:%S"), msecs.trunc() as i64);
+        let level = rec.get("levelname").map(|v| ops::truthy(&v).map(|t| (t, v))).transpose()?
+            .and_then(|(t, v)| t.then(|| ops::str_(&v).map(|s| V::str(s.to_lowercase())))).transpose()?;
+        let stack = if has_exc && exc.is_some() && o.stack_trace_limit.is_none_or(|l| l > 0) {
+            let t = super::trace::format_frames_limit(exc.as_ref().unwrap(), o.stack_trace_limit.map(|l| l as usize));
+            if t.is_empty() { None } else { Some(V::str(t)) }
+        } else {
+            match rec.get("stack_info") {
+                Some(si) if ops::truthy(&si)? => Some(V::str(ops::str_(&si)?)),
+                _ => None,
+            }
+        };
+        let extractors: Vec<(&str, Option<V>)> = vec![
+            ("@timestamp", Some(V::str(stamp))),
+            ("ecs.version", Some(V::str("1.6.0"))),
+            ("log.level", level),
+            ("log.origin.function", rec.get("funcName")),
+            ("log.origin.file.line", rec.get("lineno")),
+            ("log.origin.file.name", rec.get("filename")),
+            ("log.original", Some(V::str(rec.get_message()?))),
+            ("log.logger", rec.get("name")),
+            ("process.pid", rec.get("process")),
+            ("process.name", rec.get("processName")),
+            ("process.thread.id", rec.get("thread")),
+            ("process.thread.name", rec.get("threadName")),
+            ("error.type", if has_exc { exc.as_ref().map(|e| V::str(e.0.class.name)) } else { None }),
+            ("error.message", if has_exc { exc.as_ref().map(|e| V::str(e.message())) } else { None }),
+            ("error.stack_trace", stack),
+        ];
+        for (field, value) in extractors {
+            if excluded(field) {
+                continue;
+            }
+            let Some(value) = value.filter(|v| !v.is_none()) else { continue };
+            let d = if field == "ecs.version" { V::dict_from(vec![(V::str(field), value)])? } else { ecs_de_dot(field, value)? };
+            ecs_merge(&d, &result)?;
+        }
+        let message = rec.get_message()?;
+        rec.set("message", V::str(&message));
+        // the attributes LogRecord does not define: `extra=`, attributes set by filters
+        let known = |k: &str| ECS_RECORD_ATTRS.contains(&k) || (k.starts_with("__") && k.ends_with("__")) || (k == "taskName" && super::python().1 >= 12);
+        let extra_items: Vec<(V, V)> = rec.dict_items().into_iter().filter(|(k, _)| !known(k)).map(|(k, v)| (V::str(k), v)).collect();
+        let extras = ecs_flatten(&V::dict_from(extra_items)?)?;
+        if let Some(e) = &o.extra {
+            for (field, value) in mapping_items(e)? {
+                ecs_merge(&ecs_de_dot(&ops::str_(&field)?, value)?, &extras)?;
+            }
+        }
+        {
+            let V::Dict(m) = &extras else { unreachable!() };
+            let mut m = m.lock();
+            for (to, from) in [("span.id", "elasticapm_span_id"), ("transaction.id", "elasticapm_transaction_id"),
+                               ("trace.id", "elasticapm_trace_id"), ("service.name", "elasticapm_service_name"),
+                               ("service.environment", "elasticapm_service_environment")] {
+                let popped = m.shift_remove(&Key::Str(from.into())).map(|(_, v)| v).unwrap_or(V::None);
+                m.entry(Key::Str(to.into())).or_insert((V::str(to), popped));
+            }
+        }
+        let entries: Vec<(V, V)> = match &extras {
+            V::Dict(m) => m.lock().values().cloned().collect(),
+            _ => vec![],
+        };
+        for (field, value) in entries {
+            let f = ops::str_(&field)?;
+            if f.starts_with("elasticapm_labels.") || value.is_none() || excluded(&f) {
+                continue;
+            }
+            ecs_merge(&ecs_de_dot(&f, value)?, &result)?;
+        }
+        if !excluded("message") {
+            let V::Dict(m) = &result else { unreachable!() };
+            m.lock().entry(Key::Str("message".into())).or_insert((V::str("message"), V::str(&message)));
+        }
+        ecs_json_dumps(&result, o.ensure_ascii)
+    }
+}
+
+/// `LogRecord`'s own names (`StdlibFormatter._LOGRECORD_DICT`, without the dunders)
+const ECS_RECORD_ATTRS: &[&str] = &[
+    "name", "msg", "args", "asctime", "levelname", "levelno", "pathname", "filename", "module", "exc_info", "exc_text", "stack_info",
+    "lineno", "funcName", "created", "msecs", "relativeCreated", "thread", "threadName", "processName", "process", "message", "getMessage",
+];
+
+/// `de_dot("a.b", v)` = `{"a": {"b": v}}`
+fn ecs_de_dot(field: &str, value: V) -> R {
+    let mut out = value;
+    for part in field.rsplit('.') {
+        out = V::dict_from(vec![(V::str(part), out)])?;
+    }
+    Ok(out)
+}
+
+/// ecs_logging's `merge_dicts(from_, into)`
+fn ecs_merge(from: &V, into: &V) -> R<()> {
+    let (V::Dict(f), V::Dict(i)) = (from, into) else { return Ok(()) };
+    let pairs: Vec<(V, V)> = f.lock().values().cloned().collect();
+    for (k, value) in pairs {
+        let key = Key::dict_key(&k)?;
+        let cur = {
+            let mut m = i.lock();
+            m.entry(key.clone()).or_insert_with(|| (k.clone(), V::empty_dict())).1.clone()
+        };
+        match (&value, &cur) {
+            (V::Dict(_), V::Dict(_)) => ecs_merge(&value, &cur)?,
+            (_, V::Dict(c)) if c.lock().is_empty() => {
+                if let Some(slot) = i.lock().get_mut(&key) {
+                    slot.1 = value;
+                }
+            }
+            _ => {
+                return Err(Exc::type_error(format!(
+                    "Type mismatch at key `{}`: merging dicts would replace value `{}` with `{}`. This is likely due to dotted keys in the \
+                     event dict being turned into nested dictionaries, causing a conflict.",
+                    ops::str_(&k)?, ops::str_(&cur)?, ops::str_(&value)?)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ecs_logging's `flatten_dict`: nested mappings as dotted keys
+fn ecs_flatten(value: &V) -> R {
+    let top = V::empty_dict();
+    let V::Dict(t) = &top else { unreachable!() };
+    for (key, val) in mapping_items(value)? {
+        let k = ops::str_(&key)?;
+        if !matches!(val, V::Dict(_)) {
+            if t.lock().contains_key(&Key::dict_key(&key)?) {
+                return Err(Exc::value_error(format!("Duplicate entry for '{k}' with different nesting")));
+            }
+            t.lock().insert(Key::dict_key(&key)?, (key, val));
+        } else {
+            for (vk, vv) in mapping_items(&ecs_flatten(&val)?)? {
+                let name = format!("{k}.{}", ops::str_(&vk)?);
+                let nk = Key::Str(name.as_str().into());
+                if t.lock().contains_key(&nk) {
+                    return Err(Exc::value_error(format!("Duplicate entry for '{name}' with different nesting")));
+                }
+                t.lock().insert(nk, (V::str(&name), vv));
+            }
+        }
+    }
+    Ok(top)
+}
+
+/// json.dumps's `default=_json_dumps_fallback` (`repr()`), applied ahead (what the encoder cannot write)
+fn ecs_default(v: &V) -> R {
+    Ok(match v {
+        V::None | V::Bool(_) | V::Int(_) | V::Float(_) | V::Str(_) => v.clone(),
+        V::List(l) => V::list(l.lock().iter().map(ecs_default).collect::<R<_>>()?),
+        V::Tuple(t) => V::list(t.iter().map(ecs_default).collect::<R<_>>()?),
+        V::Dict(m) => V::dict_from(m.lock().values().map(|(k, x)| Ok((k.clone(), ecs_default(x)?))).collect::<R<_>>()?)?,
+        V::Enum(d, i) if matches!(d.kind, EnumKind::Str | EnumKind::StrEnum | EnumKind::Int | EnumKind::IntEnum) => d.value(*i),
+        o => V::str(ops::repr(o)?),
+    })
+}
+
+/// ecs_logging's `json_dumps`: `@timestamp`, `log.level` and `message` first, the rest sorted, compact
+fn ecs_json_dumps(value: &V, ensure_ascii: bool) -> R<String> {
+    let V::Dict(m) = value else { return Ok(String::new()) };
+    let dump = |v: &V| -> R<String> {
+        let kw = vec![("sort_keys".to_string(), V::Bool(true)),
+                      ("separators".to_string(), V::tuple(vec![V::str(","), V::str(":")])),
+                      ("ensure_ascii".to_string(), V::Bool(ensure_ascii))];
+        ops::str_(&super::libs::json_dumps(&ecs_default(v)?, &kw)?)
+    };
+    let mut ordered: Vec<(&str, V)> = vec![];
+    {
+        let mut d = m.lock();
+        if let Some((_, v)) = d.shift_remove(&Key::Str("@timestamp".into())) {
+            ordered.push(("@timestamp", v));
+        }
+        let log_level = match d.get(&Key::Str("log".into())) {
+            Some((_, V::Dict(l))) => {
+                let lv = l.lock().shift_remove(&Key::Str("level".into())).map(|(_, v)| v);
+                if lv.is_some() && l.lock().is_empty() {
+                    d.shift_remove(&Key::Str("log".into()));
+                }
+                lv
+            }
+            _ => d.shift_remove(&Key::Str("log.level".into())).map(|(_, v)| v),
+        };
+        if let Some(v) = log_level {
+            ordered.push(("log.level", v));
+        }
+        if let Some((_, v)) = d.shift_remove(&Key::Str("message".into())) {
+            ordered.push(("message", v));
+        }
+    }
+    if ordered.is_empty() {
+        return dump(value);
+    }
+    let head = ordered.iter().map(|(k, v)| Ok(format!("\"{k}\":{}", dump(v)?))).collect::<R<Vec<_>>>()?.join(",");
+    if m.lock().is_empty() {
+        Ok(format!("{{{head}}}"))
+    } else {
+        Ok(format!("{{{head},{}", &dump(value)?[1..]))
+    }
+}
+
+/// `ecs_logging.StdlibFormatter(fmt=None, datefmt=None, style='%', validate=None, stack_trace_limit=None,
+/// extra=None, exclude_fields=(), ensure_ascii=True)` (2.x)
+pub fn ecs_formatter_new(args: &[V], kwargs: &[(String, V)]) -> R {
+    let a = bind("StdlibFormatter.__init__", args, kwargs,
+                 &["fmt", "datefmt", "style", "validate", "stack_trace_limit", "extra", "exclude_fields", "ensure_ascii"], &[])?;
+    let style = parse_style(a[2])?;
+    let validate = match a[3] {
+        Some(v) if !v.is_none() => ops::truthy(v)?,
+        _ => true,
+    };
+    let base = Formatter::new(FKind::Std, opt_str(a[0])?, opt_str(a[1])?, style, validate, None)?;
+    let stack_trace_limit = match a[4] {
+        None | Some(V::None) => None,
+        Some(V::Int(i)) if *i < 0 => return Err(Exc::value_error("'stack_trace_limit' must be None, or a non-negative integer")),
+        Some(V::Int(i)) => Some(*i),
+        Some(V::Bool(b)) => Some(*b as i64),
+        Some(_) => return Err(Exc::type_error("'stack_trace_limit' must be None, or a non-negative integer")),
+    };
+    let exclude = match a[6] {
+        None => vec![],
+        Some(v @ (V::List(_) | V::Tuple(_))) => {
+            let xs = items(v);
+            if xs.iter().any(|x| !matches!(x, V::Str(_))) {
+                return Err(Exc::type_error("'exclude_fields' must be a sequence of strings"));
+            }
+            xs.iter().map(ops::str_).collect::<R<_>>()?
+        }
+        Some(_) => return Err(Exc::type_error("'exclude_fields' must be a sequence of strings")),
+    };
+    let opts = EcsOpts {
+        extra: a[5].filter(|v| !v.is_none()).cloned(),
+        exclude,
+        stack_trace_limit,
+        ensure_ascii: a[7].map(ops::truthy).transpose()?.unwrap_or(true),
+    };
+    Ok(formatter_value(Formatter { kind: FKind::Ecs(Box::new(opts)), ..base }))
 }
 
 /// python-json-logger's `JsonEncoder.default`, applied ahead of `json.dumps` (recursively)
@@ -2002,6 +2290,15 @@ pub fn dict_config(cfg: &V) -> R {
                         }
                     }
                     json_formatter_new(&[], &kw)
+                }
+                Some("ecs_logging.StdlibFormatter") => {
+                    kw.retain(|(k, _)| k != "defaults");
+                    for k in ["stack_trace_limit", "extra", "exclude_fields", "ensure_ascii"] {
+                        if let Some(v) = get_str(&c, k)? {
+                            kw.push((k.into(), v));
+                        }
+                    }
+                    ecs_formatter_new(&[], &kw)
                 }
                 Some(o) => Err(Exc::value_error(format!("py2axum: formatter class {} is not supported", ops::str_repr(o)))),
             }

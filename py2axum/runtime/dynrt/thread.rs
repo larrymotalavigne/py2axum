@@ -399,6 +399,7 @@ pub async fn loop_method(cx: &Cx, recv: &V, l: &Arc<ELoop>, name: &str, args: Ve
             l.closed.store(true, Ordering::SeqCst);
             Ok(V::None)
         }
+        "create_future" if args.is_empty() => Ok(super::aio::future_new(cx)),
         "create_task" => match args.first() {
             Some(c) => super::aio::spawn_coro(cx, c.clone()),
             None => Err(Exc::type_error("create_task() missing 1 required positional argument: 'coro'")),

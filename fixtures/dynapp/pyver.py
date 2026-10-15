@@ -7,9 +7,11 @@ import contextvars
 import threading
 from collections import Counter, defaultdict
 from decimal import Decimal
+from fractions import Fraction
 import json
 import re
 import secrets
+import socket
 import sys
 import traceback
 from datetime import UTC, date, datetime
@@ -21,6 +23,20 @@ from fastapi.responses import FileResponse
 router = APIRouter()
 
 CV = contextvars.ContextVar("pyver_cv", default=0)
+
+
+def re_error_name():
+    # re.error is named PatternError from 3.13 (re.error stays an alias of it)
+    try:
+        re.compile("\\z")
+    except re.error as e:
+        return [type(e).__name__, type(e).__qualname__, isinstance(e, re.error), str(e)]
+
+
+def connect(timeout):
+    # a C timeout (socket.settimeout): any real number from 3.15, its messages by version; port 9 is closed
+    with socket.create_connection(("127.0.0.1", 9), timeout=timeout) as s:
+        return s.getpeername()
 
 
 def unpack_list():
@@ -149,6 +165,16 @@ CASES = {
     "counter_xor": lambda n, x: dict(Counter(a=1, b=2) ^ Counter(a=3, c=1)),
     "counter_add_int": lambda n, x: Counter(a=1) + 1,
     "defaultdict_add_int": lambda n, x: defaultdict(int) + 1,
+    "re_error_name": lambda n, x: re_error_name(),
+    "timeout_decimal": lambda n, x: connect(Decimal("1.5")),
+    "timeout_fraction": lambda n, x: connect(Fraction(3, 2)),
+    "timeout_bool": lambda n, x: connect(True),
+    "timeout_str": lambda n, x: connect("1"),
+    "timeout_decimal_negative": lambda n, x: connect(Decimal("-1")),
+    "timeout_decimal_huge": lambda n, x: connect(Decimal("1e30")),
+    "timeout_nan": lambda n, x: connect(float("nan")),
+    "timeout_huge": lambda n, x: connect(1e20),
+    "timeout_int_huge": lambda n, x: connect(10**15),
     # datetime.fromtimestamp: 3.14 rewords the error, 3.15 accepts any real number
     "fromtimestamp_decimal": lambda n, x: datetime.fromtimestamp(Decimal("1.5"), UTC).isoformat(),
     "fromtimestamp_str": lambda n, x: datetime.fromtimestamp("1"),
@@ -212,3 +238,28 @@ async def context_managers(kind: str):
     except TypeError as e:
         return {"t": type(e).__name__, "e": str(e)}
 
+
+
+async def marked(seen: list):
+    seen.append(1)
+    return "ran"
+
+
+AIO_DELAYS = {"decimal": Decimal("0.01"), "fraction": Fraction(1, 100), "bool": False, "str": "1", "none": None,
+              "negative": -1, "zero": 0, "decimal_zero": Decimal(0), "float": 0.01}
+
+
+@router.get("/pyver/aio/{fn}/{kind}")
+async def aio_delay(fn: str, kind: str):
+    # asyncio's delays: `delay <= 0`, then the loop's float time + delay (uvloop rounds delay * 1000)
+    seen = []
+    try:
+        if fn == "sleep":
+            r = await asyncio.sleep(AIO_DELAYS[kind], "res")
+        elif fn == "sleep_kw":
+            r = await asyncio.sleep(delay=AIO_DELAYS[kind], result=[kind])
+        else:
+            r = await asyncio.wait_for(marked(seen), AIO_DELAYS[kind])
+        return {"r": r, "seen": seen}
+    except Exception as e:
+        return {"t": type(e).__name__, "e": str(e), "seen": seen}

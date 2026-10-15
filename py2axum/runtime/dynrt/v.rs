@@ -198,8 +198,13 @@ pub enum Native {
     SaColumns(&'static super::satable::TableInfo),
     SaColumn(&'static super::satable::ColInfo),
     SaType(&'static super::satable::ColInfo),
+    /// `yaml.error.Mark` (see `pyyaml`)
+    YamlMark(Arc<super::pyyaml::Mark>),
     /// `icalendar.Calendar()` / `Event()` / `Alarm()` (see `ical`)
     ICal(Arc<super::ical::Comp>),
+    /// `croniter.croniter(...)`, its all_next()/all_prev() generators and croniter_range() (see `croniter`)
+    Cron(Arc<super::croniter::Cron>),
+    CronGen(Arc<super::croniter::Gen>),
     /// Bound builtin type used as a value (`dict`, `str`) e.g. in isinstance.
     Type(&'static str),
     FieldInfo,
@@ -218,6 +223,10 @@ pub enum Native {
     TEvent(Arc<super::thread::TEvent>),
     TThread(Arc<super::thread::TThread>),
     ELoop(Arc<super::thread::ELoop>),
+    /// `asyncio.Future` (`loop.create_future()`)
+    AFuture(Arc<super::aio::AFut>),
+    /// `asyncio.Event`
+    AEvent(Arc<super::aio::AEvt>),
     /// `async_sessionmaker(...)`/`sessionmaker(...)` built at run time: (expire_on_commit, autoflush, sync: `sessionmaker` rather than `async_sessionmaker`)
     Maker(bool, bool, bool),
     /// `session.query(...)`: the session and the `select()` it runs
@@ -232,8 +241,14 @@ pub enum Native {
     /// aio_pika objects (see `rmq`)
     AmqpConn(Arc<super::rmq::AConn>),
     AmqpChan(Arc<super::rmq::AChan>),
-    AmqpQueue(Arc<super::rmq::AChan>, String),
-    AmqpExchange(Arc<super::rmq::AChan>, String),
+    AmqpQueue(Arc<super::rmq::AQueue>),
+    AmqpExchange(Arc<super::rmq::AExch>),
+    /// `queue.iterator()`
+    AmqpIter(Arc<super::rmq::AIter>),
+    /// `message.process(requeue, reject_on_redelivered, ignore_processed)`
+    AmqpProcess(Arc<super::rmq::AIncoming>, bool, bool, bool),
+    /// a pamqp frame returned by a method (`Queue.BindOk`...): its name, its fields
+    AmqpFrame(&'static str, Vec<(&'static str, V)>),
     AmqpMsg(Arc<super::rmq::AMsg>),
     AmqpIncoming(Arc<super::rmq::AIncoming>),
     /// a project module returned by `importlib.import_module("literal")`
@@ -290,7 +305,7 @@ impl V {
     pub fn dict_from(items: Vec<(V, V)>) -> R {
         let mut m = IndexMap::new();
         for (k, v) in items {
-            m.insert(Key::dict_key(&k)?, (k, v));
+            dict_put(&mut m, Key::dict_key(&k)?, k, v);
         }
         Ok(V::Dict(Arc::new(Mutex::new(m))))
     }
@@ -320,6 +335,7 @@ impl V {
             V::Date(_) => "date",
             V::Time(_) => "time",
             V::Delta(_) => "timedelta",
+            V::Tz(super::dt::Tz::Zone(_)) => "ZoneInfo",
             V::Tz(_) => "timezone",
             V::Class(c) => c.name,
             V::Inst(i) => i.desc.name,
@@ -417,15 +433,21 @@ impl V {
                 Native::Namespace(_) => "module",
                 Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => super::satable::type_name(n),
                 Native::ICal(c) => super::ical::type_name(c),
+                Native::YamlMark(_) => "Mark",
+                Native::Cron(_) => super::croniter::type_name(),
+                Native::CronGen(_) => "generator",
                 Native::Type(_) => "type",
                 Native::FieldInfo => "FieldInfo",
                 Native::Func(_) | Native::PyFn(_) => "function",
                 Native::Coro(_) => "coroutine",
                 Native::YarlUrl(_) => "URL",
-                Native::AmqpConn(_) => "RobustConnection",
-                Native::AmqpChan(_) => "RobustChannel",
-                Native::AmqpQueue(..) => "RobustQueue",
-                Native::AmqpExchange(..) => "Exchange",
+                Native::AmqpConn(c) => if c.robust { "RobustConnection" } else { "Connection" },
+                Native::AmqpChan(c) => if c.robust { "RobustChannel" } else { "Channel" },
+                Native::AmqpQueue(q) => if q.ch.robust { "RobustQueue" } else { "Queue" },
+                Native::AmqpExchange(x) => if x.ch.robust { "RobustExchange" } else { "Exchange" },
+                Native::AmqpIter(_) => "QueueIterator",
+                Native::AmqpProcess(..) => "ProcessContext",
+                Native::AmqpFrame(name, _) => name.rsplit('.').next().unwrap_or(name),
                 Native::AmqpMsg(_) => "Message",
                 Native::AmqpIncoming(_) => "IncomingMessage",
                 Native::Module(_) => "module",
@@ -444,7 +466,8 @@ impl V {
                 Native::Maker(_, _, true) => "sessionmaker",
                 Native::Query(..) => "Query",
                 Native::TLock(l) => if l.reentrant { "RLock" } else { "lock" },
-                Native::TEvent(_) => "Event",
+                Native::TEvent(_) | Native::AEvent(_) => "Event",
+                Native::AFuture(_) => "Future",
                 Native::TThread(_) => "Thread",
                 Native::ELoop(_) => "_UnixSelectorEventLoop",
                 Native::Adapter(..) => "TypeAdapter",
@@ -468,6 +491,16 @@ impl V {
 }
 
 // ---------------------------------------------------------------- hashable keys
+
+/// `d[k] = v`: a key already there keeps its first object (`{1: "a", True: "b"}` is `{1: "b"}`), as in CPython
+pub fn dict_put(m: &mut IndexMap<Key, (V, V)>, key: Key, k: V, v: V) {
+    match m.get_mut(&key) {
+        Some(slot) => slot.1 = v,
+        None => {
+            m.insert(key, (k, v));
+        }
+    }
+}
 
 /// The hashable projection of a value (dict keys, set members).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -524,6 +557,9 @@ impl Key {
             V::Bytes(b) => Key::Str(Arc::from(format!("\u{0}bytes:{}", hex::encode(&b[..])))),
             V::Tuple(t) => Key::Tuple(t.iter().map(Key::of).collect::<R<Vec<_>>>()?),
             V::Date(d) => Key::Date(*d),
+            // value semantics (a naive time, a timedelta)
+            V::Time(t) => Key::Str(Arc::from(format!("\u{0}time:{t}"))),
+            V::Delta(d) => Key::Str(Arc::from(format!("\u{0}delta:{}", d.num_microseconds().unwrap_or(i64::MAX)))),
             V::DateTime(d) => Key::DateTime(d.key_micros(), d.tz.is_some()),
             V::Obj(o) => Key::Ptr(Arc::as_ptr(o) as *const () as usize),
             V::Enum(e, i) => match e.kind {
@@ -779,6 +815,15 @@ builtin_exc!(TENACITY_RETRY_ERROR, "RetryError", [EXCEPTION]);
 builtin_exc!(DUPLICATE_TIMESERIES, "DuplicateTimeseries", [VALUE_ERROR]);
 builtin_exc!(AMQP_CONNECTION_ERROR, "AMQPConnectionError", [AMQP_ERROR]);
 builtin_exc!(AMQP_QUEUE_EMPTY, "QueueEmpty", [AMQP_ERROR]);
+// aiormq's channel errors (EXCEPTION_MAPPING) and aio-pika's MessageProcessError
+builtin_exc!(AMQP_CHANNEL_ERROR, "AMQPChannelError", [AMQP_ERROR]);
+builtin_exc!(AMQP_CHANNEL_CLOSED, "ChannelClosed", [AMQP_CHANNEL_ERROR]);
+builtin_exc!(AMQP_CHANNEL_ACCESS_REFUSED, "ChannelAccessRefused", [AMQP_CHANNEL_CLOSED]);
+builtin_exc!(AMQP_CHANNEL_NOT_FOUND, "ChannelNotFoundEntity", [AMQP_CHANNEL_CLOSED]);
+builtin_exc!(AMQP_CHANNEL_LOCKED, "ChannelLockedResource", [AMQP_CHANNEL_CLOSED]);
+builtin_exc!(AMQP_CHANNEL_PRECONDITION, "ChannelPreconditionFailed", [AMQP_CHANNEL_CLOSED]);
+builtin_exc!(AMQP_CONNECTION_CLOSED, "ConnectionClosed", [AMQP_CONNECTION_ERROR]);
+builtin_exc!(AMQP_MESSAGE_PROCESS_ERROR, "MessageProcessError", [AMQP_ERROR]);
 builtin_exc!(REDIS_CONNECTION_ERROR, "ConnectionError", [REDIS_ERROR]);
 builtin_exc!(REDIS_TIMEOUT_ERROR, "TimeoutError", [REDIS_ERROR]);
 builtin_exc!(REDIS_DATA_ERROR, "DataError", [REDIS_ERROR]);
@@ -860,6 +905,13 @@ builtin_exc!(EXPIRED_SIGNATURE_ERROR, "ExpiredSignatureError", [JWT_ERROR]);
 builtin_exc!(JWK_ERROR, "JWKError", [JOSE_ERROR]);
 // PyJWT (jwt.exceptions)
 builtin_exc!(PYJWT_ERROR, "PyJWTError", [EXCEPTION]);
+// croniter 6.2 (dynrt/croniter.rs)
+builtin_exc!(CRONITER_ERROR, "CroniterError", [VALUE_ERROR]);
+builtin_exc!(CRONITER_BAD_TYPE_RANGE_ERROR, "CroniterBadTypeRangeError", [TYPE_ERROR]);
+builtin_exc!(CRONITER_BAD_CRON_ERROR, "CroniterBadCronError", [CRONITER_ERROR]);
+builtin_exc!(CRONITER_UNSUPPORTED_SYNTAX_ERROR, "CroniterUnsupportedSyntaxError", [CRONITER_BAD_CRON_ERROR]);
+builtin_exc!(CRONITER_BAD_DATE_ERROR, "CroniterBadDateError", [CRONITER_ERROR]);
+builtin_exc!(CRONITER_NOT_ALPHA_ERROR, "CroniterNotAlphaError", [CRONITER_BAD_CRON_ERROR]);
 builtin_exc!(PYJWT_INVALID_TOKEN, "InvalidTokenError", [PYJWT_ERROR]);
 builtin_exc!(PYJWT_DECODE_ERROR, "DecodeError", [PYJWT_INVALID_TOKEN]);
 builtin_exc!(PYJWT_INVALID_SIGNATURE, "InvalidSignatureError", [PYJWT_DECODE_ERROR]);
@@ -888,6 +940,13 @@ builtin_exc!(INVALID_TOKEN, "InvalidToken", [EXCEPTION]);
 builtin_exc!(TEMPLATE_NOT_FOUND, "TemplateNotFound", [OS_ERROR, LOOKUP_ERROR]);
 builtin_exc!(SMTP_EXCEPTION, "SMTPException", [EXCEPTION]);
 builtin_exc!(RE_ERROR, "error", [EXCEPTION]);
+// `re.error` is named PatternError from 3.13 (`re.error` stays an alias): one class or the other, by the project's Python
+builtin_exc!(RE_PATTERN_ERROR, "PatternError", [EXCEPTION]);
+
+/// The class of `re`'s errors on the project's Python
+pub fn re_error() -> &'static Class {
+    if super::python() >= (3, 13) { &RE_PATTERN_ERROR } else { &RE_ERROR }
+}
 builtin_exc!(IMPORT_ERROR, "ImportError", [EXCEPTION]);
 builtin_exc!(MODULE_NOT_FOUND_ERROR, "ModuleNotFoundError", [IMPORT_ERROR]);
 // importlib.metadata.PackageNotFoundError (args = the name, `str()` = its message)
@@ -896,6 +955,21 @@ builtin_exc!(FROZEN_INSTANCE_ERROR, "FrozenInstanceError", [ATTRIBUTE_ERROR]);
 builtin_exc!(CSV_ERROR, "Error", [EXCEPTION]);
 builtin_exc!(BINASCII_ERROR, "Error", [VALUE_ERROR]);
 builtin_exc!(JSON_DECODE_ERROR, "JSONDecodeError", [VALUE_ERROR]);
+// orjson.JSONDecodeError (a json.JSONDecodeError; orjson.JSONEncodeError is TypeError itself)
+builtin_exc!(ORJSON_DECODE_ERROR, "JSONDecodeError", [JSON_DECODE_ERROR]);
+builtin_exc!(UNIDECODE_ERROR, "UnidecodeError", [VALUE_ERROR]);
+builtin_exc!(INVALID_STATE_ERROR, "InvalidStateError", [EXCEPTION]);
+// PyYAML (yaml.error, yaml.reader, yaml.scanner...: see pyyaml, yamlemit)
+builtin_exc!(YAML_ERROR, "YAMLError", [EXCEPTION]);
+builtin_exc!(YAML_MARKED_ERROR, "MarkedYAMLError", [YAML_ERROR]);
+builtin_exc!(YAML_READER_ERROR, "ReaderError", [YAML_ERROR]);
+builtin_exc!(YAML_SCANNER_ERROR, "ScannerError", [YAML_MARKED_ERROR]);
+builtin_exc!(YAML_PARSER_ERROR, "ParserError", [YAML_MARKED_ERROR]);
+builtin_exc!(YAML_COMPOSER_ERROR, "ComposerError", [YAML_MARKED_ERROR]);
+builtin_exc!(YAML_CONSTRUCTOR_ERROR, "ConstructorError", [YAML_MARKED_ERROR]);
+builtin_exc!(YAML_REPRESENTER_ERROR, "RepresenterError", [YAML_ERROR]);
+builtin_exc!(YAML_EMITTER_ERROR, "EmitterError", [YAML_ERROR]);
+builtin_exc!(YAML_SERIALIZER_ERROR, "SerializerError", [YAML_ERROR]);
 // decimal
 builtin_exc!(DECIMAL_EXCEPTION, "DecimalException", [ARITHMETIC_ERROR]);
 builtin_exc!(DECIMAL_INVALID_OPERATION, "InvalidOperation", [DECIMAL_EXCEPTION]);
@@ -1020,6 +1094,9 @@ impl Exc {
         }
         if let Some((code, detail, _)) = &self.http_info() {
             return format!("{}: {}", code, super::ops::str_(detail).unwrap_or_default());
+        }
+        if let Some(s) = super::pyyaml::exc_str(self) {
+            return s;
         }
         let args = self.args();
         if std::ptr::eq(self.0.class, &WEBPUSH_EXCEPTION) {

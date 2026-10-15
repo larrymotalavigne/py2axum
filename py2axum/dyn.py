@@ -2873,7 +2873,16 @@ class Project:
                 abstract = set(parent.__dict__.get("abstract", ()))
                 if parent.__dict__.get("init") is not None:
                     info.__dict__["init"] = parent.__dict__["init"]
+                if parent.__dict__.get("new") is not None:
+                    info.__dict__["new"] = parent.__dict__["new"]
             for st in node.body:
+                if isinstance(st, ast.FunctionDef) and st.name == "__new__":
+                    # `__new__(cls, ...)`: called with the class; `__init__` follows only on an instance of it
+                    if st.decorator_list:
+                        raise self.err(f"class {sym.name}: a decorated __new__ is not supported", st.decorator_list[0], module)
+                    info.__dict__["new"] = Sym(module, f"{node.name}.__new__")
+                    self.function(info.__dict__["new"])  # compiled even when the class is only called as a value
+                    continue
                 if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if is_dunder(st.name) and st.name != "__init__" and st.name not in DISPATCHED_DUNDERS:
                         raise self.err(f"class {sym.name}: method {st.name} is not supported", st, module)
@@ -2925,8 +2934,12 @@ class Project:
                 f"static G_{g}: {RT}::Global = {RT}::Global::new();\n"
                 f"pub async fn {g}(cx: &Cx) -> R {{\n"
                 f"    G_{g}.get(cx, |cx| Box::pin(async move {{\n{body}\n        Ok({code})\n    }})).await\n}}\n"
-                f"fn {g}_prop<'a>(cx: &'a Cx, _slf: V, _args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin({g}(cx)) }}"
+                f"fn {g}_prop<'a>(cx: &'a Cx, _slf: V, _args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin({g}(cx)) }}\n"
+                # `cls.X = v` on the class held as a value (its own attribute only)
+                f"fn {g}_setp<'a>(cx: &'a Cx, _slf: V, args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{ "
+                f"{g}(cx).await?; G_{g}.set(args.into_iter().next().unwrap_or(V::None)); Ok(V::None) }}) }}"
             )
+        info.__dict__["own_class_attrs"] = list(attrs)
         self.schemas[sym] = info
         return info
 
@@ -4750,6 +4763,8 @@ class FnCompiler:
             return self.p.class_static(ref)
         if isinstance(ref, Ext) and ref.dotted in libmap.EXCEPTIONS:
             return f"{RT}::v::{libmap.EXCEPTIONS[ref.dotted]}"
+        if isinstance(ref, Ext) and libmap.too_new(ref.dotted):
+            raise self.err(libmap.too_new(ref.dotted), t)
         raise self.err(f"unsupported exception class `{ast.unparse(t)}`", t)
 
     def with_stmt(self, node: ast.With) -> None:
@@ -4966,6 +4981,8 @@ class FnCompiler:
         """A nested `def`: a function object closing over the enclosing locals (by value), bound like
         CPython at each call; decorators evaluated, then defaults, then applied bottom-up."""
         free = self.free_vars(node)
+        if isinstance(node, ast.FunctionDef) and has_yield(node):
+            self.__dict__.setdefault("sync_gens", {})[node.name] = node
         name = f"{self.name}__{ident(node.name)}_{self.p.uid()}"
         caps = {v: f"c_{ident(v)}" for v in free}
         sub = FnCompiler(self.p, self.module, node, name, captures=caps, parent=self)
@@ -5368,6 +5385,9 @@ class FnCompiler:
         if isinstance(ref, Ext):
             if ref.dotted in libmap.VALUES:
                 return libmap.VALUES[ref.dotted]
+            if ref.dotted == "datetime.datetime":
+                # the class itself (callable like datetime(...)): `ret_type=datetime`, `type(x) is datetime`
+                return f'V::native({RT}::Native::Type("datetime"))'
             code = libmap.status_constant(ref.dotted)
             if code is not None:
                 return f"V::Int({code})"
@@ -5803,7 +5823,11 @@ class FnCompiler:
                 sub.comp_cells, sub.nonlocals = self.comp_cells, self.nonlocals
                 sub.node = self.node  # name resolution in the function's scope (its local imports)
                 sub.factory = self.__dict__.get("factory")
-                code = sub.call(inner, awaited=True)
+                if isinstance(inner, ast.Call):
+                    code = sub.call(inner, awaited=True)
+                else:
+                    # a future, a task or a coroutine held in a variable (`await asyncio.wait_for(fut, 5)`)
+                    code = f"{RT}::aio::await_value({sub.expr(inner)}.clone()).await?"
                 pre = " ".join(sub.lines)
                 return self.q(f"{RT}::web::wait_for(&{timeout}, async {{ {pre} Ok({code}) }}).await")
             if isinstance(ref, Ext) and ref.dotted == "asyncio.to_thread":
@@ -5903,6 +5927,12 @@ class FnCompiler:
         args, kwargs = self.dyn_args(node)
         return self.q(f"{RT}::methods::call_method(cx, &{me}, {rs(f.attr)}, {args}, {kwargs}).await")
 
+    def object_new(self, node: ast.Call) -> str:
+        """`object.__new__(cls)` / `super().__new__(cls)` in a `__new__`: a bare instance (no `__init__`)."""
+        if len(node.args) != 1 or node.keywords:
+            raise self.err("only `object.__new__(cls)` / `super().__new__(cls)` (the class alone) is supported", node)
+        return self.q(f"{RT}::pyd::object_new_of(&{self.expr(node.args[0])})")
+
     def super_init(self, node: ast.Call) -> str | None:
         """`super().__init__(...)` in the `__init__` of a project class."""
         f = node.func
@@ -5914,6 +5944,8 @@ class FnCompiler:
             for a in node.args:
                 self.expr(a)
             return "V::None"
+        if f.attr == "__new__" and not f.value.args:
+            return self.object_new(node)
         cm = self.super_classmethod(node)
         if cm is not None:
             return cm
@@ -6096,7 +6128,28 @@ class FnCompiler:
             return kinds.pop() if len(kinds) == 1 else None
         return None
 
+    STREAM_RESPONSES = {"StreamingResponse", "EventSourceResponse"}
+
+    def check_sync_gen_call(self, node: ast.Call, fn: ast.AST) -> None:
+        """A synchronous generator function called: the runtime runs it as an async generator, which only a
+        streamed response consumes like Starlette (`StreamingResponse(gen())`, iterated in a threadpool); a
+        synchronous consumer (`list()`, `for`, `next()`, a comprehension...) cannot drive it lazily."""
+        if isinstance(fn, ast.FunctionDef) and has_yield(fn) and id(node) not in self.p.__dict__.get("stream_args", set()):
+            raise self.err(f"`{ast.unparse(node.func)}()` calls a synchronous generator function: only "
+                           "`StreamingResponse(gen())` is supported; build a list (`return [..]`), or make it an "
+                           "`async def` generator iterated with `async for`", node)
+
     def call(self, node: ast.Call, awaited: bool) -> str:
+        ref = self.static_ref(node.func)
+        if isinstance(ref, Ext) and ref.dotted.split(".")[-1] in self.STREAM_RESPONSES:
+            content = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "content"), None)
+            if isinstance(content, ast.Call):
+                self.p.__dict__.setdefault("stream_args", set()).add(id(content))
+        if isinstance(node.func, ast.Name) and node.func.id in self.__dict__.get("sync_gens", ()):
+            self.check_sync_gen_call(node, self.sync_gens[node.func.id])
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "__new__" and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "object" and "object" not in self.locals):
+            return self.object_new(node)
         if isinstance(node.func, ast.Attribute):
             self.check_model_table(node.func)
         self.check_joined_construct(node)
@@ -6171,6 +6224,8 @@ class FnCompiler:
                 recv = self.expr(node.func.value)
                 if kind == "asgi":
                     self.p.__dict__.setdefault("stack_classes", []).append(self.p.resolve(self.module, node.args[0]))
+                    fe_ = self.p.fe
+                    fe_.raw_mws = [*fe_.__dict__.get("raw_mws", []), (self.p.resolve(self.module, node.args[0]), node, self.p.src(self.module))]
                     slot = self.tmp("slot")
                     self.emit(f"let {slot} = {RT}::asgi::Slot::new();")
                     obj = asgi_instance(self, node, slot)
@@ -6361,6 +6416,7 @@ class FnCompiler:
             return self.q(f"{rust}(cx).await")
         rust = self.p.function(sym)
         if has_yield(d):
+            self.check_sync_gen_call(node, d)
             caps = [self.tmp("g") for _ in args]
             binds = " ".join(f"let {c} = {a};" for c, a in zip(caps, args))
             return (f"{{ {binds} let cx2 = cx.clone(); {RT}::web::spawn_gen(move |y| Box::pin(async move {{ "
@@ -6436,6 +6492,9 @@ class FnCompiler:
                     self.expr(a)
                 return self.q(f"Err::<V, Exc>(Exc::type_error({rs(msg)}))")
             init = info.__dict__.get("init")
+            if info.__dict__.get("new") is not None:
+                args, kwargs = self.dyn_args(node)
+                return self.q(f"{RT}::methods::plain_new(cx, &{info.rust}, {args}, {kwargs}).await")
             if init is None and self.p.is_http_middleware(sym):
                 # BaseHTTPMiddleware.__init__(app, dispatch=None) inherited: the stack calls `dispatch` itself
                 if len(node.args) + len(node.keywords) != 1 or any(k.arg != "app" for k in node.keywords):
@@ -6571,6 +6630,11 @@ class FnCompiler:
         if name.startswith("jwt."):
             try:
                 libmap.pyjwt_static(name, node)
+            except ValueError as e:
+                raise self.err(f"{name}(): {e}", node) from None
+        if name.startswith("croniter."):
+            try:
+                libmap.croniter_static(name, node)
             except ValueError as e:
                 raise self.err(f"{name}(): {e}", node) from None
         for k in node.keywords:
@@ -7549,7 +7613,7 @@ class RouteBuilder:
                 t = self.p.resolve(module, kw.value, fn)
                 last = t.dotted.split(".")[-1] if isinstance(t, Ext) and t.dotted.split(".")[0] in {"fastapi", "starlette"} else None
                 if last not in {"StreamingResponse", "FileResponse", "RedirectResponse", "JSONResponse", "Response",
-                                "HTMLResponse", "PlainTextResponse", "EventSourceResponse"}:
+                                "HTMLResponse", "PlainTextResponse", "EventSourceResponse", "ORJSONResponse"}:
                     raise TranspileError(f"response_class={ast.unparse(kw.value)} is not supported "
                                          "(only the fastapi/starlette response classes)", kw, src)
                 resp_cls = last
@@ -7919,6 +7983,9 @@ def emit_descriptors(p: Project) -> list[str]:
         cattrs = info.__dict__.get("class_attrs", {})
         if cattrs:
             methods = ", ".join(x for x in [methods, *(f"({rs(n)}, true, {g}_prop as {RT}::pyd::MethodFn)" for n, g in cattrs.items())] if x)
+            own = info.__dict__.get("own_class_attrs", [])
+            methods = ", ".join(x for x in [methods, *(f"({rs('=' + n)}, false, {cattrs[n]}_setp as {RT}::pyd::MethodFn)"
+                                                       for n in own if n in cattrs)] if x)
         out.append(
             f"pub static {info.cls}: {RT}::v::Class = {RT}::v::Class {{ name: {rs(info.sym.name)}, qualname: {rs(info.sym.qual)}, "
             f"bases: &[{('&' + info.__dict__['base_cls']) if info.__dict__.get('base_cls') else ''}], kind: {RT}::v::ClassKind::Schema(&{info.rust}) }};\n"
@@ -8143,7 +8210,8 @@ def schema_x(p, info) -> str:
             f"exclude: &[{names('exclude', True)}], norepr: &[{names('repr', False)}], frozen: &[{names('frozen', True)}], "
             f"exclude_if: &[{', '.join(excl)}], field_ser: &[{', '.join(ser(n, e, d) for n, (e, d) in sers.items())}], "
             f"model_ser: {('Some(' + ser('', ms, True) + ')') if ms else 'None'}, "
-            f"root: {str(bool(info.__dict__.get('root'))).lower()} }}")
+            f"root: {str(bool(info.__dict__.get('root'))).lower()}, "
+            f"new_: {('Some(' + method_wrapper(p, info.__dict__['new']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('new') else 'None'} }}")
 
 
 def settings_desc(info) -> str:
@@ -8364,6 +8432,7 @@ unicode-normalization = "0.1"
 redis = {{ version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "aio"] }}
 lapin = "4"
 ammonia = "4.1"
+zmij = "1"
 
 {extra}
 [profile.release]
@@ -8391,13 +8460,29 @@ fn main() {{
     // overflow it and abort the whole process. PY2AXUM_STACK_SIZE (bytes) overrides it.
     let stack = std::env::var("PY2AXUM_STACK_SIZE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(dynrt::STACK_SIZE);
     dynrt::set_stack_size(stack);
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(stack)
         .on_thread_start(dynrt::stack_thread_start)
         .build()
-        .expect("tokio runtime")
-        .block_on(serve());
+        .expect("tokio runtime");
+    // `<binary> migrate ...`: the project's alembic migrations (dynrt/migrate.rs), not the server
+    if std::env::args().nth(1).as_deref() == Some("migrate") {{
+        dynrt::set_python({pymajor}, {pyminor});
+        dynrt::logging::init_clock();
+        // the runtime's state (the logging module reads it); the pool is never used: `migrate` has its own connection
+        let _guard = rt.enter();
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1)
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        dynrt::set_root(Arc::new(dynrt::AppState {{ pool, expire_on_commit: {expire}, autoflush: {autoflush}, commit_after: {commit}, sync_session: {sync} }}));
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if gen::MIGRATIONS.is_none() {{
+            eprintln!("py2axum migrate: {{}}", gen::MIGRATIONS_WHY);
+            std::process::exit(1);
+        }}
+        std::process::exit(rt.block_on(dynrt::migrate::run(gen::MIGRATIONS, args)));
+    }}
+    rt.block_on(serve());
 }}
 
 async fn serve() {{
@@ -8667,9 +8752,10 @@ def prepare(fe: Frontend, python_side: set[str]):
                     elif kw.arg == "default_response_class":
                         t = fe.index.resolve_expr(m.name, kw.value)
                         last = t.dotted.split(".")[-1] if isinstance(t, Ext) and t.dotted.split(".")[0] in {"fastapi", "starlette"} else None
-                        if last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse"}:
+                        if last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse", "ORJSONResponse"}:
                             kept.append(TranspileError(f"FastAPI(default_response_class={ast.unparse(kw.value)}) is not "
-                                                       "supported (JSONResponse, HTMLResponse or PlainTextResponse)", kw, str(m.path)))
+                                                       "supported (JSONResponse, ORJSONResponse, HTMLResponse or "
+                                                       "PlainTextResponse)", kw, str(m.path)))
                         elif last != "JSONResponse":
                             fe.default_resp_cls = last
                     elif kw.arg == "strict_content_type":
@@ -9567,6 +9653,36 @@ def check_libpq_options(p: "Project", module: str, call: ast.Call) -> None:
                                      f"(found {bad[0]!r})", v, p.src(module))
 
 
+def passes_websockets(cls: ast.AST | None) -> bool:
+    """A raw ASGI middleware whose `__call__` starts by handing every non-HTTP scope to the app unchanged:
+    `if scope["type"] != "http" [or ...]: return await self.app(scope, receive, send)` (or the call, then
+    `return`). Skipping it for a WebSocket connection is then what Starlette does."""
+    if not isinstance(cls, ast.ClassDef):
+        return False
+    call = next((f for f in cls.body if isinstance(f, ast.AsyncFunctionDef) and f.name == "__call__"), None)
+    if call is None or len(call.args.args) != 4 or call.args.vararg or call.args.kwarg:
+        return False
+    sc, rcv, snd = (a.arg for a in call.args.args[1:])
+    body = [st for st in call.body if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))]
+    if not body or not isinstance(body[0], ast.If) or body[0].orelse:
+        return False
+    test = body[0].test
+    first = test.values[0] if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or) else test
+    if not (isinstance(first, ast.Compare) and len(first.ops) == 1 and isinstance(first.ops[0], ast.NotEq)
+            and ast.dump(first.left) == ast.dump(ast.Subscript(value=ast.Name(id=sc, ctx=ast.Load()), slice=ast.Constant(value="type"), ctx=ast.Load()))
+            and isinstance(first.comparators[0], ast.Constant) and first.comparators[0].value == "http"):
+        return False
+
+    def forwards(e):
+        return (isinstance(e, ast.Await) and isinstance(e.value, ast.Call) and not e.value.keywords
+                and ast.unparse(e.value.func) == f"{call.args.args[0].arg}.app"
+                and [ast.unparse(a) for a in e.value.args] == [sc, rcv, snd])
+    then = body[0].body
+    return ((len(then) == 1 and isinstance(then[0], ast.Return) and forwards(then[0].value))
+            or (len(then) == 2 and isinstance(then[0], ast.Expr) and forwards(then[0].value)
+                and isinstance(then[1], ast.Return) and then[1].value is None))
+
+
 def root_path_checked(fe: Frontend, ws_routes: list) -> str:
     """`FastAPI(root_path="/api/v1")`: the scope's root_path, stripped from the path before routing (Starlette's
     get_route_path), part of `base_url`. Refused with mounts, Python-side routes and WebSocket routes (their
@@ -9575,6 +9691,13 @@ def root_path_checked(fe: Frontend, ws_routes: list) -> str:
         call, src = fe.host_mws[0]
         raise TranspileError("HTTPSRedirectMiddleware/TrustedHostMiddleware with WebSocket routes is not supported (the "
                              "binary checks HTTP requests only)", call, src)
+    # a WebSocket connection goes to its route without crossing raw ASGI middlewares: allowed only for those
+    # that hand non-HTTP scopes straight on (an auth, IP or rate-limit check on websockets would be skipped)
+    for sym, call, src in fe.__dict__.get("raw_mws", []) if ws_routes else ():
+        if not passes_websockets(fe.index.definition(sym) if isinstance(sym, Sym) else None):
+            raise TranspileError(f"raw ASGI middleware {ast.unparse(call.args[0])} with WebSocket routes: its __call__ must "
+                                 "start with `if scope[\"type\"] != \"http\": return await self.app(scope, receive, send)` (the "
+                                 "binary does not run raw middlewares for WebSocket connections)", call, src)
     rp = fe.__dict__.get("root_path")
     if rp is None:
         return ""
@@ -9879,6 +10002,7 @@ def build_stack(p: "Project", fe: Frontend) -> str:
             # Starlette: cls(app, *args, **kwargs) once the stack is built; `app` = the rest of the stack
             t = fe.index.resolve_expr(module, call.args[0])
             p.stack_classes.append(t)
+            fe.raw_mws = [*fe.__dict__.get("raw_mws", []), (t, call, p.src(module))]
             slot = fc.tmp("slot")
             fc.emit(f"let {slot} = {RT}::asgi::Slot::new();")
             obj = asgi_instance(fc, call, slot)
@@ -10077,7 +10201,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         v = locked_version(fe.index.root, lib)
         if v:
             libmap.LIB_VERSIONS[lib] = v
-    libmap.PYTHON = target_python(fe.index.root)
+    libmap.set_python(target_python(fe.index.root))
     rb = RouteBuilder(proj)
     routes = []
     idx = 0
@@ -10206,12 +10330,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
                                  if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
                                         for c in proj.__dict__.get("stack_classes", []))}
-        seen = set()
-        for k in keys:
-            for e in closure_errors(proj, k):
-                if id(e) not in seen:
-                    seen.add(id(e))
-                    fe.global_errors.append(e)
+        fe.global_errors += closure_errors_of(proj, keys)
         return proj
     for info, err in proj.__dict__.get("route_infos", []):
         for e in ([err] if err else []) + closure_errors(proj, info["id"]):
@@ -10219,9 +10338,8 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     stack_keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
                                    if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
                                           for c in proj.__dict__.get("stack_classes", []))}
-    for k in stack_keys:
-        for e in closure_errors(proj, k):
-            raise e
+    for e in closure_errors_of(proj, stack_keys):
+        raise e
     proj.items.append(stack)
     proj.items.append(lifespan)
     # module globals (and the app factory's locals) evaluated at startup, as importing the app does
@@ -10262,8 +10380,9 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                for pattern, handler, fn, m in ws_routes]
     if any(isinstance(n, (ast.Import, ast.ImportFrom)) and "unicodedata" in ast.unparse(n)
            for m in list(proj.ix.modules.values()) for n in ast.walk(m.tree)):
-        proj.items.append(ucd_unassigned())
-    proj.items.append(str_classes())
+        proj.items.append(ucd_unassigned(libmap.PYTHON))
+    proj.items.append(str_classes(libmap.PYTHON))
+    proj.items.append(migrations_item(source, fe.index.root))
     gen = [
         "// Generated by py2axum (dyn backend) from the FastAPI project. Do not edit.",
         "#![allow(unused_mut, unused_variables, unused_imports, unreachable_code, dead_code, non_snake_case, unused_parens, unused_braces, unused_labels, unused_assignments, non_upper_case_globals, clippy::all)]",
@@ -10382,14 +10501,16 @@ _RUNTIME_ATTRS: set[str] | None = None
 
 def runtime_attr_names() -> set[str]:
     """The names the runtime dispatches on (`runtime_names`), compares to (`name == "x"`), keeps in a table
-    (`("x", value)`, `&["x", "y"]`) or declares as a field (`name: "x"`): over-approximates the attributes
-    some runtime value provides, so a name outside it is certainly missing."""
+    (`("x", value)`, `&["x", "y"]`), declares as a field (`name: "x"`) or sets on an instance
+    (`attrs.insert("x".into(), ..)`: an exception's `colno`, `index`...): over-approximates the attributes some
+    runtime value provides, so a name outside it is certainly missing."""
     global _RUNTIME_ATTRS
     if _RUNTIME_ATTRS is None:
         names, ident = set(runtime_names()), r'"([A-Za-z_][A-Za-z0-9_]*)"'
         for f in (Path(__file__).parent / "runtime" / "dynrt").glob("*.rs"):
             src = f.read_text()
-            for pat in (rf"==\s*{ident}", rf"{ident}\s*==", rf"\(\s*{ident}\s*,", rf"\bname:\s*{ident}"):
+            for pat in (rf"==\s*{ident}", rf"{ident}\s*==", rf"\(\s*{ident}\s*,", rf"\bname:\s*{ident}",
+                        rf"\binsert\(\s*{ident}\s*\.(?:into|to_string|to_owned)\(\)"):
                 names |= set(re.findall(pat, src))
             for table in re.findall(r'&\[((?:\s*"[A-Za-z_][A-Za-z0-9_]*"\s*,?)+)\s*\]', src):
                 names |= set(re.findall(ident, table))
@@ -10398,44 +10519,98 @@ def runtime_attr_names() -> set[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def str_classes() -> str:
-    """`str.isdigit/isdecimal/isnumeric/isalpha/isspace/islower/isupper` (and the titlecase letters) of the
-    translating Python, as code point ranges: Rust's
+def migrations_item(source: str, root) -> str:
+    """`gen::MIGRATIONS`: the project's alembic revisions rendered for `<binary> migrate` (py2axum/migrations.py);
+    without one, why (a migration that cannot be translated never blocks the routes)."""
+    from . import migrations
+    try:
+        plan = migrations.collect(Path(source), Path(root))
+        why = "this binary has no migrations (no alembic.ini at the package or above when it was generated)"
+    except TranspileError as e:
+        plan, why = None, f"the migrations were not translated: {e}"
+    if plan is None:
+        return (f"pub static MIGRATIONS: Option<&'static {RT}::migrate::Plan> = None;\n"
+                f"pub static MIGRATIONS_WHY: &str = {rs(why)};")
+    steps = ", ".join(
+        f"{RT}::migrate::Step {{ revision: {rs(st.revision)}, log: {rs(st.log)}, "
+        f"heads_after: &[{', '.join(rs(h) for h in st.heads_after)}], stmts: &[{', '.join(rs(x) for x in st.stmts)}], "
+        f"refused: {('Some(' + rs(st.refused) + ')') if st.refused else 'None'} }}" for st in plan.steps)
+    log = ("Some(" + rs(json.dumps(plan.logging)) + ")") if plan.logging else "None"
+    return (f"/// the alembic revisions of {Path(plan.ini).name}, rendered by alembic's offline mode\n"
+            f"pub static MIGRATIONS: Option<&'static {RT}::migrate::Plan> = Some(&{RT}::migrate::Plan {{ "
+            f"ini: {rs(plan.ini)}, version_table: {rs(plan.version_table)}, "
+            f"version_schema: {('Some(' + rs(plan.version_schema) + ')') if plan.version_schema else 'None'}, "
+            f"per_migration: {str(plan.per_migration).lower()}, create_version: {rs(plan.create_version)}, "
+            f"steps: &[{steps}], sql: {rs(plan.sql)}, logging: {log} }});\n"
+            f"pub static MIGRATIONS_WHY: &str = \"\";")
+
+
+@functools.lru_cache(maxsize=4)
+def unassigned_later(python: tuple[int, int]) -> frozenset[int]:
+    """The code points the translating Python's Unicode assigned after the project's Python's (`ucdages.py`):
+    unassigned (Cn) for the project, whatever the translating Python's `unicodedata` says"""
+    import sys
+
+    from . import ucdages
+
+    mine = sys.version_info[:2]
+    return frozenset(cp for v, rs in ucdages.ADDED.items() if python < v <= mine for lo, hi in rs
+                     for cp in range(lo, hi + 1))
+
+
+@functools.lru_cache(maxsize=4)
+def str_classes(python: tuple[int, int]) -> str:
+    """`str.isdigit/isdecimal/isnumeric/isalpha/isspace/islower/isupper/isprintable` (and the titlecase letters) of the
+    project's Python (the translating Python's tables, less the characters assigned after the project's
+    Unicode), as code point ranges: Rust's
     char predicates follow other Unicode properties ('¾' is numeric there, not a digit in Python; U+001C is
     a Python space)."""
     import unicodedata
 
+    later = unassigned_later(python)
+
     def ranges(pred) -> str:
         out, start = [], None
         for cp in range(0x110001):
-            ok = cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF and pred(chr(cp))
+            ok = cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF and cp not in later and pred(chr(cp))
             if ok and start is None:
                 start = cp
             elif not ok and start is not None:
                 out.append(f"({start:#x}, {cp - 1:#x})")
                 start = None
         return "&[" + ", ".join(out) + "]"
-    fields = ", ".join(f"{k}: {ranges(getattr(str, 'is' + k))}" for k in ("digit", "decimal", "numeric", "alpha", "space", "lower", "upper"))
+    fields = ", ".join(f"{k}: {ranges(getattr(str, 'is' + k))}" for k in ("digit", "decimal", "numeric", "alpha", "space", "lower", "upper",
+                                                                                     "printable"))
     fields += f", title: {ranges(lambda c: unicodedata.category(c) == 'Lt')}"
-    return (f"/// Unicode {unicodedata.unidata_version} (the translating Python): the str.is*() classes\n"
+    return (f"/// Unicode {unicode_of(python)} (the project's Python): the str.is*() classes\n"
             f"pub static STR_CLASSES: {RT}::methods::StrClasses = {RT}::methods::StrClasses {{ {fields} }};")
 
 
-def ucd_unassigned() -> str:
-    """The code points unassigned in this Python's `unicodedata` (category Cn): it leaves them alone, while the
+def unicode_of(python: tuple[int, int]) -> str:
+    import unicodedata
+
+    from . import ucdages
+
+    return ucdages.UNICODE.get(python, unicodedata.unidata_version)
+
+
+def ucd_unassigned(python: tuple[int, int]) -> str:
+    """The code points unassigned in the project's Python's `unicodedata` (category Cn: the translating
+    Python's, plus what a later Unicode assigned, `unassigned_later`): it leaves them alone, while the
     runtime's tables (a newer Unicode) may decompose or class them. Assigned characters never change their
     decomposition or combining class (Unicode stability policy), so these ranges are the whole difference."""
     import unicodedata
 
+    later = unassigned_later(python)
     ranges, start = [], None
     for cp in range(0x110001):
-        cn = cp <= 0x10FFFF and unicodedata.category(chr(cp)) == "Cn"
+        cn = cp <= 0x10FFFF and (unicodedata.category(chr(cp)) == "Cn" or cp in later)
         if cn and start is None:
             start = cp
         elif not cn and start is not None:
             ranges.append(f"({start:#x}, {cp - 1:#x})")
             start = None
-    return (f"/// Unicode {unicodedata.unidata_version} (the translating Python): unassigned ranges\n"
+    return (f"/// Unicode {unicode_of(python)} (the project's Python): unassigned ranges\n"
             f"pub static UCD_UNASSIGNED: &[(u32, u32)] = &[{', '.join(ranges)}];")
 
 
@@ -10500,17 +10675,41 @@ def class_level_methods(p: Project, methods) -> list[str]:
     return out
 
 
+def _source_order(e: TranspileError):
+    return (e.file or "", getattr(e.node, "lineno", 0) or 0, getattr(e.node, "col_offset", 0) or 0, e.msg)
+
+
+def closure_errors_of(p: Project, starts) -> list[TranspileError]:
+    """The errors reachable from a set of nodes (the middleware stack, the lifespan...), once each, in source
+    order: the set is iterated in hash order."""
+    seen, out = set(), []
+    for k in starts:
+        for e in closure_errors(p, k):
+            if id(e) not in seen:
+                seen.add(id(e))
+                out.append(e)
+    return sorted(out, key=_source_order)
+
+
 def closure_errors(p: Project, start) -> list[TranspileError]:
-    """Errors of every function reachable from a route (endpoint, dependencies, callees)."""
-    seen, todo, out = set(), [start], []
-    while todo:
-        n = todo.pop()
-        if n in seen:
-            continue
-        seen.add(n)
-        if n in p.fn_errors:
-            out.append(p.fn_errors[n])
-        if isinstance(n, tuple) and n[0] == "class" and n[1] in p.class_errors:
-            out.append(p.class_errors[n[1]])
-        todo.extend(p.edges.get(n, ()))
+    """Errors of every function reachable from a route (endpoint, dependencies, callees), in a fixed order: the
+    closest to the route first (breadth first), then source order (file, line, message) at the same distance.
+    The edges are sets, iterated in hash order: walking them as they come changed the first reason of `check`
+    from one run to the next (PYTHONHASHSEED)."""
+    seen, level, out = {start}, [start], []
+    while level:
+        errs = []
+        for n in level:
+            if n in p.fn_errors:
+                errs.append(p.fn_errors[n])
+            if isinstance(n, tuple) and n[0] == "class" and n[1] in p.class_errors:
+                errs.append(p.class_errors[n[1]])
+        out += sorted(errs, key=_source_order)
+        nxt = []
+        for n in level:
+            for m in p.edges.get(n, ()):
+                if m not in seen:
+                    seen.add(m)
+                    nxt.append(m)
+        level = nxt
     return out

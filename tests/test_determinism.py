@@ -25,3 +25,58 @@ def test_same_output_whatever_the_hash_seed(tmp_path, args):
     b = generate(tmp_path / "b", "1", *args)
     assert a.keys() == b.keys()
     assert [f for f in a if a[f] != b[f]] == []
+
+
+HELPERS = '''import boto3
+import openpyxl
+import reportlab.pdfgen.canvas
+
+
+def use_boto():
+    return boto3.client("s3")
+
+
+def use_reportlab():
+    return reportlab.pdfgen.canvas.Canvas("x")
+
+
+def use_openpyxl():
+    return openpyxl.Workbook()
+'''
+MAIN = '''from fastapi import FastAPI
+
+from proj.helpers import use_boto, use_openpyxl, use_reportlab
+
+app = FastAPI()
+
+
+@app.get("/many")
+async def many():
+    use_reportlab()
+    use_openpyxl()
+    use_boto()
+    return {}
+'''
+
+
+def test_check_json_whatever_the_hash_seed(tmp_path):
+    """A route refused for several reasons: the call graph's edges are sets, and walking them as they came made
+    the first reason (and the order of the blockers) of `check --json` change from run to run. Now: closest to the
+    route first, then source order."""
+    import json
+
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "helpers.py").write_text(HELPERS)
+    (pkg / "main.py").write_text(MAIN)
+    outs = set()
+    for seed in ("0", "1", "2", "3", "4"):
+        r = subprocess.run([sys.executable, "-m", "py2axum", "check", str(pkg), "--root", str(tmp_path), "--json",
+                            "--allow-untested-versions"], cwd=ROOT, env={**os.environ, "PYTHONHASHSEED": seed},
+                           capture_output=True, text=True)
+        outs.add(r.stdout)
+    assert len(outs) == 1
+    [route] = json.loads(outs.pop())["routes"]
+    assert "boto3.client()" in route["reason"]  # helpers.py:7, the first in source order
+    assert list(route["blockers"]) == ["library boto3", "library reportlab", "library openpyxl"]

@@ -431,9 +431,14 @@ pub fn raised(cx: &Cx, e: Exc, p: &'static Pos, cause: Option<&V>) -> Exc {
 
 /// the project frames an exception went through, outermost first, as `traceback` prints them
 pub fn format_frames(e: &Exc) -> String {
+    format_frames_limit(e, None)
+}
+
+/// `traceback.format_tb(tb, limit)` joined: the first `limit` frames (outermost first)
+pub fn format_frames_limit(e: &Exc, limit: Option<usize>) -> String {
     let tb = e.0.ptb.lock();
     let mut out = String::new();
-    for (p, _) in tb.iter().rev() {
+    for (p, _) in tb.iter().rev().take(limit.unwrap_or(usize::MAX)) {
         out += &format!("  File \"{}\", line {}, in {}\n{}", super::logging::source_path(p.file), p.line, p.func, p.text);
     }
     out

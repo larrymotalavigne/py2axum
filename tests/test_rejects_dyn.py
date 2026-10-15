@@ -393,6 +393,23 @@ def test_python_semantics_rejected(tmp_path, capsys, body, message):
     assert "main.py:" in err
 
 
+@pytest.mark.parametrize("body", [
+    "    import orjson\n    try:\n        orjson.loads('[')\n    except orjson.JSONDecodeError as e:\n"
+    "        return {'a': [e.pos, e.lineno, e.colno, e.msg]}\n    return {}",
+    "    from unidecode import UnidecodeError, unidecode\n    try:\n        unidecode('\\ue000', errors='strict')\n"
+    "    except UnidecodeError as e:\n        return {'a': e.index}\n    return {}",
+])
+def test_exception_attributes_set_by_the_runtime_accepted(tmp_path, body):
+    """attributes the runtime sets on an exception instance (`attrs.insert("colno".into(), ..)`) are known to the
+    attribute check: libapp alone was refused on `.colno` (another fixture of dynapp used to mask it)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n" + body + "\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+
+
 @pytest.mark.parametrize(
     "call, message",
     [
@@ -1567,11 +1584,11 @@ def test_custom_response_class_rejected(tmp_path, capsys):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(
-        "from fastapi import FastAPI\nfrom fastapi.responses import ORJSONResponse\n\napp = FastAPI()\n\n\n"
-        "@app.get('/x', response_class=ORJSONResponse)\nasync def x():\n    return {}\n")
+        "from fastapi import FastAPI\nfrom fastapi.responses import UJSONResponse\n\napp = FastAPI()\n\n\n"
+        "@app.get('/x', response_class=UJSONResponse)\nasync def x():\n    return {}\n")
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "response_class=ORJSONResponse is not supported" in err and "main.py:7" in err
+    assert "response_class=UJSONResponse is not supported" in err and "main.py:7" in err
 
 
 def test_uuid_as_str_column_rejected(tmp_path, capsys):
@@ -1776,6 +1793,78 @@ def test_library_ports_rejected(tmp_path, capsys, body, msg, line):
     assert f"main.py:{line}" in err
 
 
+CRON_MAIN = """
+from datetime import datetime
+
+from croniter import croniter, croniter_range
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/x")
+async def x():
+    return {body}
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ('croniter("R * * * *", 0).get_next()', "croniter.croniter(): R (random) fields in 'R * * * *' are not supported"),
+    ('croniter.is_valid("0 r(0-5)/2 * * *")', "croniter.croniter.is_valid(): R (random) fields"),
+    ('croniter.match("H R * * *", datetime(2026, 1, 1))', "croniter.croniter.match(): R (random) fields"),
+    ('list(croniter_range(0, 60, "* * * * *", _croniter=croniter))', "croniter.croniter_range(): _croniter= is not supported"),
+    ('croniter.expand("* * * * *", from_timestamp=0)', "croniter.croniter.expand(): from_timestamp= is not supported"),
+    ('croniter.is_valid("* * * * *", encoding="latin-1")', "encoding= other than a literal UTF-8 is not supported"),
+    ('croniter("* * * * *", 0, zone="UTC")', "croniter.croniter(): unexpected keyword argument 'zone'"),
+    ('croniter("* * * * *", 0, float, True, 50, False, None, False, False, False, 1)', "takes at most 10 positional arguments"),
+])
+def test_croniter_outside_subset_rejected(tmp_path, capsys, body, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(CRON_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:12" in err
+
+
+
+POPULAR_MAIN = """
+import ecs_logging
+import orjson
+from fastapi import FastAPI
+from unidecode import unidecode
+
+app = FastAPI()
+
+
+{body}
+
+
+@app.get("/x")
+async def x():
+    return use()
+"""
+
+
+@pytest.mark.parametrize("body, msg, line", [
+    ("def use():\n    return orjson.dumps(orjson.Fragment(b'1'))", "library call `orjson.Fragment()` is not supported", 11),
+    ("def use():\n    return orjson.loads(b'1', 2)", "orjson.loads() takes exactly one positional argument", 11),
+    ("def use():\n    return orjson.dumps(1, opts=1)", "orjson.dumps(opts=) is not supported", 11),
+    ("def use():\n    return unidecode('é', errors='ignore', strict=True)", "unidecode.unidecode(strict=) is not supported", 11),
+    ("def use():\n    return str(ecs_logging.StdlibFormatter(validate=False, colors=1))",
+     "ecs_logging.StdlibFormatter(colors=) is not supported", 11),
+])
+def test_popular_libraries_rejected(tmp_path, capsys, body, msg, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(POPULAR_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert f"main.py:{line}" in err
 
 MOUNT_APP = '''
 from fastapi import FastAPI
@@ -2466,6 +2555,11 @@ def test_request_validation_error_body(tmp_path):
      "FastAPI(root_path=...) together with WebSocket routes"),
     ("def __getattr__(n):\n    return n\n@app.get('/x')\nasync def x(q: Annotated[str, Query(min_length=2)] = None, u=Query(max_length=3)):\n"
      "    return 1\n", "constraints without a type annotation are not supported"),
+    # a raw ASGI middleware that also looks at WebSocket connections: the binary would skip it for them
+    ("class Guard:\n    def __init__(self, app):\n        self.app = app\n    async def __call__(self, scope, receive, send):\n"
+     "        if scope['type'] == 'websocket' and scope['path'] != '/ok':\n            return\n        await self.app(scope, receive, send)\n"
+     "app.add_middleware(Guard)\n@app.websocket('/ws')\nasync def ws(w: WebSocket):\n    await w.accept()\n",
+     "raw ASGI middleware Guard with WebSocket routes"),
 ])
 def test_corpus06_rejected(tmp_path, capsys, src, message):
     pkg = tmp_path / "proj"
@@ -2759,6 +2853,43 @@ def test_python_version_dependent_rejected(tmp_path, capsys, monkeypatch, stmt, 
     assert "main.py:14" in err
 
 
+PYVER_EXC_APP = """
+import asyncio
+import re
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/x")
+async def x(t: str):
+    try:
+        {stmt}
+    except {exc}:
+        return None
+"""
+
+
+@pytest.mark.parametrize("stmt, exc, msg", [
+    # re.error is named PatternError from 3.13 only
+    ("return re.compile(t).pattern", "re.PatternError", "re.PatternError needs Python 3.13 (the project runs on 3.12"),
+    ("return await asyncio.sleep()", "ValueError", "asyncio.sleep() missing required argument 'delay'"),
+    ("return await asyncio.sleep(1, t, 2)", "ValueError", "asyncio.sleep() takes at most 2 positional arguments"),
+    ("return await asyncio.sleep(1, loop=t)", "ValueError", "asyncio.sleep(loop=) is not supported"),
+])
+def test_python_version_dependent_names_rejected(tmp_path, capsys, monkeypatch, stmt, exc, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PYVER_EXC_APP.format(stmt=stmt, exc=exc))
+    monkeypatch.setenv("PY2AXUM_TARGET_PYTHON", "3.12")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert ("main.py:14" if "PatternError" in msg else "main.py:13") in err, err
+
+
 @pytest.mark.skipif(sys.version_info < (3, 14), reason="t-strings need the 3.14 parser")
 def test_t_string_rejected(tmp_path, capsys):
     pkg = tmp_path / "proj"
@@ -2805,3 +2936,107 @@ def test_logging_rejected(tmp_path, capsys, head, body, message):
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
+
+
+def test_raw_middleware_passing_websockets_accepted(tmp_path):
+    """the usual guard (non-HTTP scopes handed on unchanged) keeps a raw middleware next to WebSocket routes"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI, WebSocket\napp = FastAPI()\n"
+        "class Stamp:\n    def __init__(self, app):\n        self.app = app\n    async def __call__(self, scope, receive, send):\n"
+        "        if scope['type'] != 'http' or scope['path'] == '/x':\n            await self.app(scope, receive, send)\n            return\n"
+        "        await self.app(scope, receive, send)\n"
+        "app.add_middleware(Stamp)\n@app.websocket('/ws')\nasync def ws(w: WebSocket):\n    await w.accept()\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+
+
+SYNC_GEN_APP = """
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+
+def top(n):
+    for i in range(n):
+        yield str(i)
+
+
+@app.get("/stream")
+async def stream():
+    return StreamingResponse(top(3), media_type="text/plain")
+
+
+@app.get("/x")
+async def x():
+{body}
+"""
+
+
+@pytest.mark.parametrize("body, line", [
+    ("    return list(top(3))", 20),
+    ("    return [v for v in top(3)]", 20),
+    ("    def inner(n):\n        yield n\n    out = []\n    for v in inner(2):\n        out.append(v)\n    return out", 23),
+])
+def test_sync_generator_consumed_synchronously_rejected(tmp_path, capsys, body, line):
+    # the runtime runs a generator function as an async generator: only a streamed response consumes it
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(SYNC_GEN_APP.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "calls a synchronous generator function: only `StreamingResponse(gen())` is supported" in err, err
+    assert f"main.py:{line}" in err, err
+    assert "main.py:15" not in err, err
+
+
+YAML_MAIN = """
+import yaml
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+def use(s):
+    return {body}
+
+
+@app.post("/x")
+async def x(s: str):
+    return use(s)
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("yaml.load(s)", "yaml.load() is supported with Loader=yaml.SafeLoader only"),
+    ("yaml.load(s, Loader=yaml.Loader)", "yaml.Loader"),
+    ("yaml.load(s, Loader=yaml.FullLoader)", "yaml.FullLoader"),
+    ("yaml.load(s, yaml.CSafeLoader)", "yaml.CSafeLoader"),
+    ("yaml.full_load(s)", "yaml.full_load()"),
+    ("yaml.unsafe_load(s)", "yaml.unsafe_load()"),
+    ("yaml.safe_load_all(s)", "yaml.safe_load_all()"),
+    ("yaml.load_all(s, Loader=yaml.SafeLoader)", "yaml.load_all()"),
+    ("yaml.safe_load(stream=s, Loader=yaml.SafeLoader)", "yaml.safe_load(Loader=) is not supported"),
+    ("yaml.safe_dump(s, None, True)", "yaml.safe_dump() takes at most 2 positional arguments"),
+    ("yaml.safe_dump(s, indnt=2)", "yaml.safe_dump(indnt=) is not supported"),
+    ("yaml.dump(s, Dumper=yaml.CDumper)", "yaml.CDumper"),
+    ("yaml.dump(s, Dumper=yaml.BaseDumper)", "yaml.BaseDumper"),
+    ("yaml.add_constructor('!x', None)", "yaml.add_constructor()"),
+    ("yaml.compose(s)", "yaml.compose()"),
+    ("yaml.ScannerError", "yaml.ScannerError"),
+])
+def test_pyyaml_outside_subset_rejected(tmp_path, capsys, body, msg):
+    """PyYAML: only the pure-Python SafeLoader and the dump functions are native; the other loaders (Python
+    objects, libyaml's own messages) and the extension API are refused with their line."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(YAML_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:10" in err

@@ -53,7 +53,7 @@ fn translate(p: &str, flags: i64) -> R<String> {
                 // `\z` is 3.14's synonym of `\Z`; before, an unknown escape
                 out += "\\z";
             } else if n == 'z' {
-                return Err(Exc::msg(&RE_ERROR, format!("bad escape \\z at position {i}")));
+                return Err(Exc::msg(re_error(), format!("bad escape \\z at position {i}")));
             } else if !in_class && n == 'B' && !py314 {
                 // before 3.14, `\B` never matched an empty string
                 out += "(?:(?!\\A\\z)\\B)";
@@ -122,7 +122,7 @@ pub fn compile(pattern: &V, flags: Option<&V>) -> R {
         Some(V::Int(f)) => *f,
         Some(o) => return Err(Exc::type_error(format!("flags must be int, not {}", o.type_name()))),
     };
-    let re = fancy_regex::Regex::new(&translate(&src, flags)?).map_err(|e| Exc::msg(&RE_ERROR, format!("{e}")))?;
+    let re = fancy_regex::Regex::new(&translate(&src, flags)?).map_err(|e| Exc::msg(re_error(), format!("{e}")))?;
     let names = re.capture_names().map(|n| n.map(str::to_string)).collect();
     Ok(V::native(Native::Pattern(Arc::new(Pattern { src, flags, re, names }))))
 }
@@ -236,7 +236,7 @@ fn parse_repl(p: &Pattern, repl: &str) -> R<Vec<Piece>> {
     let mut lit = String::new();
     let chars: Vec<char> = repl.chars().collect();
     let mut i = 0;
-    let bad = |m: String| Exc::msg(&RE_ERROR, m);
+    let bad = |m: String| Exc::msg(re_error(), m);
     while i < chars.len() {
         let c = chars[i];
         if c != '\\' || i + 1 >= chars.len() {
@@ -426,7 +426,7 @@ fn search_like(p: &Pattern, s: &V, mode: &str) -> R {
         translate(&p.src, p.flags)?,
         if mode == "fullmatch" { "\\z" } else { "" }
     ))
-    .map_err(|e| Exc::msg(&RE_ERROR, format!("{e}")))?;
+    .map_err(|e| Exc::msg(re_error(), format!("{e}")))?;
     let _ = (m, ok);
     let c = anchored.captures(&s).map_err(|e| Exc::runtime(format!("re: {e}")))?;
     Ok(match c {

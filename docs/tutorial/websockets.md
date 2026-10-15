@@ -59,4 +59,7 @@ closed with code 1012 ([Graceful shutdown](../advanced/shutdown.md)).
   `connection rejected (...)`, see [Logging](../advanced/logging.md)).
 - Raw ASGI middlewares (`app.add_middleware(SomeASGIClass)`) do not see WebSocket connections: in Python
   their `__call__` runs with the `websocket` scope (and its frames appear in a traceback); in the binary the
-  connection goes to the route directly.
+  connection goes to the route directly. Next to WebSocket routes, a raw middleware is therefore accepted only
+  when its `__call__` starts with `if scope["type"] != "http": return await self.app(scope, receive, send)`;
+  any other is refused at translation (a check it makes on websockets would be skipped, see
+  [Security](../advanced/security.md#slow-clients-and-streams)).

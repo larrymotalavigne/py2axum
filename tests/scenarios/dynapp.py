@@ -549,6 +549,8 @@ STEPS: list = [
     ("GET", "/mail/filters", None),
     ("GET", "/mail/filters?name=x&amount=0.5", None),
     ("GET", "/mail/build", None),
+    ("GET", "/mail/build?to=j%C3%B6hn%40ex%C3%A4mple.com", None),
+    ("GET", "/mail/build?to=J%C3%B6hn%20%3Cjohn%40example.com%3E", None),
     ("POST", "/mail/send?to=nobody@example.com", None),
     ("POST", "/mail/send?to=nobody@example.com&envelope=true", None),  # no SMTP server in the scenario: the error path
     ("POST", "/stdlib", {"text": "<LOC> https://a.fr/x </loc><loc>b</loc> le 05/10/2026 et 31/12/1999"}),
@@ -1273,6 +1275,10 @@ STEPS += [
     ("POST", "/leak/dup_flush", None),
     ("POST", "/leak/rolled_back", None),
     ("POST", "/leak/deleted", None),
+    ("GET", "/leak/task_state", None),
+    ("POST", "/leak/rolled_back/state", None),
+    ("POST", "/leak/rolled_back/state?delete=true", None),
+    ("POST", "/leak/dup_flush/state", None),
     ("GET", "/leak/stream_dep?n=3&pause=0", None),
 ]
 
@@ -1698,7 +1704,7 @@ STEPS += [
     ("GET", f"/sec/repeat?n={2**62}", None),
     ("GET", f"/sec/repeat?n={10**15}", None),
 ]
-# fixtures/dynapp/sec.py (0.7.1): exponents and digit counts chosen by the request
+# fixtures/dynapp/sec.py, second review: exponents, digit counts, widths and precisions chosen by the request
 _DEC_PAIRS = [("1e999999999", "1"), ("1", "1e-999999999"), ("1e-999999999", "1"), ("-1", "3"), ("-3", "3"),
               ("0", "0E-999999999"), ("0E-5", "1.5"), ("1E+999999", "10"), ("1.5", "1e-1000020"), ("123.456", "0.01"),
               ("5", "1e999999999"), ("1e999999999999999999", "-1e999999999999999999"),
@@ -1708,6 +1714,17 @@ STEPS += [("POST", "/sec/decimal", {"price": v}) for v in ("1e999999999", "-1e99
                                                             "1e999999999999999999", "1e9999999999999999999", 5)]
 STEPS += [("POST", "/sec/decimal/digits", {"amount": v}) for v in ("1" + "0" * 200000, "12.345", "1" + "0" * 10 + ".00",
                                                                   "1e-999999999", "1e-1000026", "1e-1000027")]
+STEPS += [("POST", "/sec/fraction", {"r": v}) for v in ("1" * 5000, "1/3", "1." + "1" * 4301)]
+STEPS += [("GET", f"/sec/pad?how={how}&{k}={v}", None) for how, k, v in (
+    ("zfill", "n", 5), ("zfill", "n", -3), ("zfill", "n", 10**15), ("ljust", "n", 2**62), ("center", "n", 7),
+    ("ljust", "n", -1), ("format", "w", "99999999999999999999"), ("format", "w", "9223372036854775807"),
+    ("format", "w", "10"), ("precision", "w", "2147483648"), ("precision", "w", "99999999999999999999"),
+    ("precision", "w", "3"), ("percent", "w", "99999999999999999999"), ("percent", "w", "10000000000000000000"),
+    ("percent", "w", "9223372036854775807"), ("percent", "w", "5"), ("pprec", "w", "9999999999"),
+    ("pprec", "w", "99999999999999999999"), ("pprec", "w", "2"))]
+STEPS += [("GET", f"/sec/range?start={a}&stop={b}&step={c}", None) for a, b, c in (
+    (0, 2**63 - 1, 2**62), (2**63 - 2, -2**63, -2**63 + 1), (-5, 5, 3))]
+STEPS += [("GET", f"/sec/regexp?flags={quote(v)}", None) for v in ("i", "c", "x'y", "\\'||(SELECT 1)||'", "'); DROP TABLE owners; --")]
 STEPS += [
     # Cookie() parameters (fixtures/dynapp/docsx.py, the FastAPI docs' cookie examples)
     ("GET", "/docsx/cookies", None),
@@ -1775,6 +1792,7 @@ STEPS += [
     *[step for m in ("ok", "http", "value", "key", "ok?n=x") for step in
       (("GET", f"/corpusx/any/{m}", None), ("GET", "/corpusx/log", None))],
     ("GET", "/corpusx/scope/function", None),
+    ("GET", "/corpusx/scope/late", None),
     # (the request-scoped exit code runs once the response is sent: a following /log races with it in Python)
     ("GET", "/corpusx/scope/request", None),
     ("GET", "/corpusx/scope/raises", None),
@@ -1887,6 +1905,10 @@ def _pyver_cases() -> list:
 
     steps = [("GET", f"/pyver/{name}", None) for name in CASES]
     steps += [("GET", f"/pyver/cm/{k}", None) for k in ("async-lock", "sync-semaphore", "int")]
+    from fixtures.dynapp.pyver import AIO_DELAYS
+    steps += [("GET", f"/pyver/aio/{fn}/{k}", None) for fn in ("sleep", "sleep_kw", "wait_for") for k in AIO_DELAYS
+              # a delay wait_for refuses leaves its coroutine never awaited: a RuntimeWarning on stderr in Python
+              if fn != "wait_for" or k not in ("decimal", "str")]
     steps += [("GET", f"/pyver/mime/{n}", None) for n in (
         "a.yaml", "a.yml", "a.md", "a.wav", "a.avi", "a.woff2", "a.ttf", "a.otf", "a.gz", "a.tar.gz", "a.tgz", "a.docx",
         "a.avif", "a.heic", "a.mjs", "a.js", "a.json", "a.webp", "a.epub", "a.7z", "a.rar", "a.ogg", "a.flac", "a.mkv",
@@ -1896,7 +1918,8 @@ def _pyver_cases() -> list:
         steps += [("GET", "/py314/except?v=4", None), ("GET", "/py314/except", None), ("GET", "/py314/finally", None),
                   ("POST", "/py314/forward", {"inner": {"v": "3"}, "items": [{"v": 1}]}),
                   ("POST", "/py314/forward", {"inner": {"v": "x"}}), ("POST", "/py314/forward", {}),
-                  ("GET", "/py314/lazy-annotation?n=2", None), ("GET", "/py314/uuid7", None)]
+                  ("GET", "/py314/lazy-annotation?n=2", None), ("GET", "/py314/uuid7", None),
+                  ("GET", "/py314/pattern-error", None), ("GET", "/py314/pattern-error?p=a%2B", None)]
     if sys.version_info >= (3, 15):
         steps += [("GET", "/py315/unpack", None), *[("GET", f"/py315/unpack-error/{k}", None) for k in ("list", "set", "gen", "dict")],
                   ("GET", "/py315/prefixmatch", None), ("GET", "/py315/prefixmatch?s=baa", None),
@@ -1961,3 +1984,5 @@ STEPS += [("POST", "/greenlet/run", None), ("POST", "/greenlet/dbapi", None)]
 
 # session.expire(obj) / expire(obj, [names]) (fixtures/dynapp/expire.py); last: its rolled back rows use sequence values
 STEPS += [("POST", "/expire/run", None), ("POST", "/expire/run", None)]
+
+

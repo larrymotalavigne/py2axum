@@ -281,14 +281,15 @@ def _relative(text: str) -> str:
     return text.replace(str(Path.cwd()) + "/", "")
 
 
-def main(argv: list[str]) -> int:
+def parser():
+    """The command line of `check` (frozen by tests/test_contract.py)."""
     import argparse
 
     ap = argparse.ArgumentParser(prog="py2axum check", description=__doc__.splitlines()[0])
     ap.add_argument("package", type=Path, nargs="?", help="directory of the FastAPI application package")
     ap.add_argument("--root", type=Path, default=None, help="import root, like sys.path (default: parent of the package)")
     ap.add_argument("--backend", choices=["auto", "dyn"], default="auto", help="deprecated, no effect (one backend since 0.4)")
-    ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|auto",
+    ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="as for generation: routes or the lifespan left to Python; auto: every route that does not translate")
     ap.add_argument("--format", choices=["text", "json", "markdown"], default=None,
                     help="text (default), json (machine-readable, on stdout) or markdown (for a pull request or a CI summary)")
@@ -299,11 +300,21 @@ def main(argv: list[str]) -> int:
                     help="also exit 1 when fewer than PCT %% of the routes are native")
     ap.add_argument("--allow-untested-versions", action="store_true",
                     help="do not refuse library versions outside the tested ranges")
-    from .versions import add_python_flag, apply_python_flag
+    from .versions import add_python_flag
 
     add_python_flag(ap)
+    return ap
+
+
+def main(argv: list[str]) -> int:
+    from .versions import apply_python_flag
+
+    ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
+    from .__main__ import deprecated_backend
+
+    deprecated_backend(argv)
     if args.explain is not None:
         text = errors.explain(args.explain)
         if text is None:

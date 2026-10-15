@@ -761,7 +761,7 @@ impl Cors {
                 "allow_credentials" => allow_credentials = ops::truthy(v)?,
                 "allow_origin_regex" if !v.is_none() => {
                     let pat = ops::str_(v)?;
-                    regex = Some(fancy_regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| Exc::msg(&RE_ERROR, e.to_string()))?);
+                    regex = Some(fancy_regex::Regex::new(&format!("^(?:{pat})$")).map_err(|e| Exc::msg(re_error(), e.to_string()))?);
                 }
                 "allow_origin_regex" => {}
                 "allow_private_network" => allow_private_network = ops::truthy(v)?,

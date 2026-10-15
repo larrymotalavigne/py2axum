@@ -35,7 +35,14 @@ pub fn exc(text: &[char], f: Fail) -> Exc {
     match f {
         Fail::Decode(msg, pos) => Exc::msg(&JSON_DECODE_ERROR, message(text, msg, pos)),
         Fail::Recursion(what) => Exc::msg(&RECURSION_ERROR, format!("maximum recursion depth exceeded while decoding a JSON {what} from a unicode string")),
-        Fail::Overflow(text) => overflow(&text),
+        Fail::Overflow(text) => {
+            let n = text.trim_start_matches('-').len();
+            if n > 4300 {
+                // CPython's `int(text)` inside the decoder
+                return Exc::value_error(format!("Exceeds the limit (4300 digits) for integer string conversion: value has {n} digits; use sys.set_int_max_str_digits() to increase the limit"));
+            }
+            overflow(&text)
+        }
     }
 }
 
@@ -288,7 +295,9 @@ fn number(s: &[char], idx: &mut usize) -> Result<V, Fail> {
 }
 
 pub fn overflow(text: &str) -> Exc {
-    Exc::msg(&OVERFLOW_ERROR, format!("py2axum: the JSON integer {text} does not fit in 64 bits"))
+    // the number itself only when short: the message reaches the logs (a megabyte of digits would too)
+    let shown = if text.len() > 40 { format!("{}... ({} digits)", &text[..20], text.trim_start_matches('-').len()) } else { text.to_string() };
+    Exc::msg(&OVERFLOW_ERROR, format!("py2axum: the JSON integer {shown} does not fit in 64 bits"))
 }
 
 /// `scanstring_unicode(s, end, strict=True)`: the string whose opening quote is at `end - 1`, and the

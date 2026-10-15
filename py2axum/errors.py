@@ -160,7 +160,7 @@ CLASSES: list[ErrorClass] = [
        r"^CORSMiddleware", r"TrustedHostMiddleware", r"HTTPSRedirectMiddleware", r"^GZipMiddleware",
        r"minimum_size must be", r"^RawContextMiddleware", r"^plugin", r"BaseHTTPMiddleware",
        r"wrapped in an ASGI class", r"^option \w+= is not supported \(only plugins=\)", r"pass plugins=",
-       r"plugins= must be"),
+       r"plugins= must be", r"^raw ASGI middleware \S+ with WebSocket routes"),
       "Middlewares are compiled one by one: GZip, CORS, TrustedHost, HTTPSRedirect, project "
       "`BaseHTTPMiddleware` subclasses and raw ASGI middlewares of the project, with literal options.",
       "Use one of the supported middlewares with literal keyword options. A middleware of a library must stay "
@@ -227,6 +227,13 @@ CLASSES: list[ErrorClass] = [
       "A `TypeDecorator` is compiled when it wraps a string type with `process_bind_param`/`process_result_value`.",
       "Keep `impl` a string type and only these two methods (plus `cache_ok`).",
       "tutorial/sql.md#what-is-native", "TypeDecorator", "TypeDecorator"),
+    E("P2A0510", "Alembic migrations",
+      (r"^env\.py: context\.configure", r"^alembic\.ini: ", r"translating the migrations"),
+      "`<binary> migrate` replays the SQL alembic's offline mode renders at translation time, with the options "
+      "env.py and alembic.ini set; an option or a layout it cannot reproduce is refused.",
+      "Keep env.py's `context.configure(...)` options literal and identical online and offline, keep the revisions "
+      "under `script_location/versions`, or keep running `alembic upgrade head` instead of `<binary> migrate`.",
+      "advanced/migrations.md", "migrations alembic", "alembic migrations"),
     E("P2A0507", "create_all and DDL",
       (r"^create_all", r"not reproduced", r"\bDDL\b", r"is in a module only imported inside a function",
        r"Sequence \(CREATE SEQUENCE\)", r"SQLAlchemy raised", r"does not exist in the installed SQLAlchemy",
@@ -384,7 +391,7 @@ CLASSES: list[ErrorClass] = [
       (r"only exception classes are supported", r"^exception class", r"super\(", r"__slots__", r"is not a class",
        r"^no method", r"object\.__(init|setattr)__", r"BaseException\.__init__", r"^base class `",
        r"class variables", r"method \w+ is not supported",
-       r"unsupported statement in class"),
+       r"unsupported statement in class", r"a decorated __new__"),
       "Project classes are compiled when they are models, schemas, exceptions, dataclasses, enums or plain "
       "classes with plain methods; this member or form is not reproduced.",
       "Keep the class to `__init__`, plain methods and properties, or turn it into a dataclass or a model.",
@@ -420,6 +427,12 @@ CLASSES: list[ErrorClass] = [
       "in the runtime yet, or would change when the module's top-level code runs.",
       "Use the construct the message suggests (an f-string, a plain import).",
       "python-versions.md", "construction Python 3.14/3.15", "Python 3.14/3.15 construct"),
+    E("P2A0118", "Synchronous generator consumed synchronously",
+      r"calls a synchronous generator function",
+      "The runtime runs a generator function as an async generator: a streamed response consumes it like "
+      "Starlette, a synchronous consumer (`list()`, `for`, `next()`, a comprehension) cannot drive it lazily.",
+      "Build the list in the function and return it, or write an `async def` generator iterated with `async for`.",
+      "reference/python.md", "générateur synchrone", "synchronous generator"),
     E("P2A0107", "Loop with else", r"with/else|for/else|while/else",
       "`else` clauses of loops are not compiled.",
       "Use a flag variable or a helper function that returns.",

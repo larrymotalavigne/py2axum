@@ -388,11 +388,16 @@ struct Trust {
 
 impl Trust {
     fn parse(hosts: &[String]) -> Trust {
-        let mut t = Trust { all: hosts.iter().any(|h| h == "*"), ..Default::default() };
+        // uvicorn: trust everyone only for exactly "*" (in "*,10.0.0.1" the star is a literal, trusting nobody)
+        let mut t = Trust { all: hosts.len() == 1 && hosts[0] == "*", ..Default::default() };
+        if t.all {
+            return t;
+        }
         for h in hosts {
             if let Some((net, len)) = h.split_once('/') {
-                match (net.parse(), len.parse::<u8>()) {
-                    (Ok(n), Ok(l)) => t.nets.push((n, l)),
+                // `ipaddress.ip_network` is strict: host bits set ("10.0.0.1/8") is a ValueError, so a literal
+                match (net.parse::<std::net::IpAddr>(), len.parse::<u8>()) {
+                    (Ok(n), Ok(l)) if l <= (if n.is_ipv4() { 32 } else { 128 }) && strict(n, l) => t.nets.push((n, l)),
                     _ => t.literals.push(h.clone()),
                 }
             } else {
@@ -423,6 +428,14 @@ fn trusted(host: &str) -> bool {
     opts().trust.contains(host)
 }
 
+/// no host bit set below the prefix
+fn strict(net: std::net::IpAddr, len: u8) -> bool {
+    match net {
+        std::net::IpAddr::V4(a) => len >= 32 || u32::from(a) & (u32::MAX >> len) == 0,
+        std::net::IpAddr::V6(a) => len >= 128 || u128::from(a) & (u128::MAX >> len) == 0,
+    }
+}
+
 fn in_net(ip: std::net::IpAddr, net: std::net::IpAddr, len: u8) -> bool {
     match (ip, net) {
         (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) if len <= 32 => {
@@ -451,7 +464,8 @@ pub fn proxy_headers(headers: &axum::http::HeaderMap, client: &mut Option<(Strin
     if !trusted(host) {
         return;
     }
-    if let Some(p) = headers.get("x-forwarded-proto") {
+    // uvicorn keeps the last X-Forwarded-Proto (a proxy that appends its own after the client's is trusted)
+    if let Some(p) = headers.get_all("x-forwarded-proto").iter().last() {
         let p: String = p.as_bytes().iter().map(|b| *b as char).collect::<String>().trim().to_string();
         if ["http", "https", "ws", "wss"].contains(&p.as_str()) {
             *scheme = p;

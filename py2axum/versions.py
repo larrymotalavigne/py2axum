@@ -33,6 +33,11 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "mcp": ("2.2.0", "2.2.0", "2.3"),  # MCP servers: tested through a real MCP server's lock (internal conformance)
     "asyncpg": ("0.31.0", "0.32.0", "0.33"),
     "icalendar": ("7.0.0", "7.0.0", "7.1"),  # calendar files: tested through a real application's lock (internal conformance)  # the asyncpg driver: transcript-service's production driver (internal conformance)
+    "orjson": ("3.13.0", "3.13.0", "3.14"),  # yyjson's messages and the allocation limit of this release
+    "unidecode": ("1.4.0", "1.4.0", "1.5"),  # its transliteration tables (tools/gen_unidecode.py)
+    "ecs-logging": ("2.3.0", "2.3.0", "2.4"),
+    "pyyaml": ("6.0.2", "6.0.3", "6.1"),  # yaml.safe_load / safe_dump / dump: a port of its pure-Python loader and dumper
+    "croniter": ("6.2.4", "6.2.4", "6.3"),  # dynrt/croniter.rs ports 6.2.4's croniter.py (6.0 differs: no W, no strict)
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
@@ -40,7 +45,9 @@ PYTHON: tuple[str, str, str] = ("3.12", "3.15", "3.16")
 # libraries checked only when the analysed package imports them (module -> distributions); the framework
 # (fastapi, starlette, pydantic, pydantic-core) is always checked
 _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlalchemy", "psycopg", "asyncpg"),
-              "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",), "icalendar": ("icalendar",)}
+              "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",), "icalendar": ("icalendar",),
+              "orjson": ("orjson",), "unidecode": ("unidecode",), "ecs_logging": ("ecs-logging",),
+              "yaml": ("pyyaml",), "croniter": ("croniter",)}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
 _FEATURES = [("WebSocket routes (Starlette 1.7's WebSocketDisconnected semantics)", r"\.websocket\(", "starlette", "1.7.0")]
@@ -270,6 +277,8 @@ PROBES = {
     "strptime_e": "import datetime\ntry:\n datetime.datetime.strptime('Oct  9 2026','%b %e %Y')\n r=True\nexcept ValueError:\n r=False",
     # json: a `\\uXXXX` escape ending the text is an unterminated string (3.13.13 / 3.14.4)
     "json_u_escape_unterminated": "import json\ntry:\n json.loads('\"\\\\u0041')\nexcept ValueError as e:\n r=str(e).startswith('Unterminated')",
+    # a C timeout or timestamp out of range: one message for float and int from 3.13.15 / 3.14.7
+    "pytime_range": "import socket\ntry:\n socket.socket().settimeout(1e20)\n r=False\nexcept OverflowError as e:\n r='C PyTime_t' in str(e)",
 }
 
 

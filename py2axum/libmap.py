@@ -116,6 +116,34 @@ def _raiseload(name, kw):
     return kw.get("raiseload", "V::Bool(false)")
 
 
+def _one_pos(name, tmpl):
+    """a function of exactly one positional-only argument"""
+    def f(a, kw):
+        if len(a) != 1 or kw:
+            raise ValueError(f"{name}() takes exactly one positional argument")
+        return tmpl(a[0])
+    return f
+
+
+def _orjson_dumps(a, kw):
+    """`orjson.dumps(obj, default=None, option=None)`"""
+    _bind("orjson.dumps", a, kw, ["obj", "default", "option"], {"obj", "default", "option"})
+    return f"{RT}::orj::dumps(cx, {_argv(a)}, {_kwvec(kw)}).await"
+
+
+_ECS_PARAMS = ["fmt", "datefmt", "style", "validate", "stack_trace_limit", "extra", "exclude_fields", "ensure_ascii"]
+
+
+def _ecs_formatter(a, kw):
+    _bind("ecs_logging.StdlibFormatter", a, kw, _ECS_PARAMS, set(_ECS_PARAMS))
+    return f"{RT}::logging::ecs_formatter_new(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _unidecode(name, a, kw):
+    _bind(f"unidecode.{name}", a, kw, ["string", "errors", "replace_str"], {"string", "errors", "replace_str"})
+    return f"{RT}::unidec::unidecode(&{_argv(a)}, &{_kwvec(kw)}, {'false' if name.endswith('nonascii') else 'true'})"
+
+
 def _one(name):
     def f(a, kw):
         if len(a) != 1 or kw:
@@ -131,7 +159,15 @@ VALUES: dict[str, str] = {
     "sqlalchemy.null": "V::None",
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean")},
     "os.environ": f"{RT}::libs::environ()",
+    **{f"orjson.{k}": f"V::Int({v})" for k, v in (
+        ("OPT_APPEND_NEWLINE", 1024), ("OPT_INDENT_2", 1), ("OPT_NAIVE_UTC", 2), ("OPT_NON_STR_KEYS", 4),
+        ("OPT_OMIT_MICROSECONDS", 8), ("OPT_PASSTHROUGH_DATACLASS", 2048), ("OPT_PASSTHROUGH_DATETIME", 512),
+        ("OPT_PASSTHROUGH_SUBCLASS", 256), ("OPT_SERIALIZE_DATACLASS", 0), ("OPT_SERIALIZE_NUMPY", 16),
+        ("OPT_SERIALIZE_UUID", 0), ("OPT_SORT_KEYS", 32), ("OPT_STRICT_INTEGER", 64), ("OPT_UTC_Z", 128))},
     "aio_pika.DeliveryMode.PERSISTENT": "V::Int(2)",
+    # aio_pika.ExchangeType members are their values (like DeliveryMode's: documented)
+    **{f"aio_pika.{p}ExchangeType.{m}": f'V::str("{m.lower().replace("_", "-")}")' for p in ("", "exchange.")
+       for m in ("DIRECT", "FANOUT", "TOPIC", "HEADERS", "X_DELAYED_MESSAGE", "X_CONSISTENT_HASH", "X_MODULUS_HASH")},
     "zipfile.ZIP_STORED": "V::Int(0)",
     "zipfile.ZIP_DEFLATED": "V::Int(8)",
     # cryptography's serialization constants (dynrt/crypto.rs)
@@ -194,6 +230,9 @@ VALUES: dict[str, str] = {
                                              ("DOTALL", 16), ("X", 64), ("VERBOSE", 64), ("UNICODE", 32), ("U", 32))},
     **{f"csv.QUOTE_{n}": f"V::Int({v})" for n, v in (("MINIMAL", 0), ("ALL", 1), ("NONNUMERIC", 2), ("NONE", 3))},
     "csv.excel": 'V::str("excel")',
+    # PyYAML: the loader/dumper classes a load()/dump() call may name (dynrt/pyyaml.rs, yamlemit.rs)
+    **{f"yaml{m}.{n}": f'V::native({RT}::Native::ExtType("yaml.{n}"))'
+       for m in ("", ".loader", ".dumper") for n in ("SafeLoader", "SafeDumper", "Dumper")},
     "math.pi": "V::Float(std::f64::consts::PI)",
     **{f"decimal.{r}": f'V::str("{r}")' for r in ("ROUND_HALF_EVEN", "ROUND_HALF_UP", "ROUND_HALF_DOWN", "ROUND_DOWN",
                                                    "ROUND_UP", "ROUND_FLOOR", "ROUND_CEILING", "ROUND_05UP")},
@@ -258,6 +297,9 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.GeneratorExit": "GENERATOR_EXIT",
     "binascii.Error": "BINASCII_ERROR",
     "json.JSONDecodeError": "JSON_DECODE_ERROR",
+    "orjson.JSONDecodeError": "ORJSON_DECODE_ERROR",
+    "orjson.JSONEncodeError": "TYPE_ERROR",
+    "unidecode.UnidecodeError": "UNIDECODE_ERROR",
     "gzip.BadGzipFile": "BAD_GZIP_FILE",
     "zlib.error": "ZLIB_ERROR",
     "sqlalchemy.exc.CompileError": "COMPILE_ERROR",
@@ -288,6 +330,7 @@ EXCEPTIONS: dict[str, str] = {
         ("ServerTimeoutError", "SERVER_TIMEOUT"), ("ConnectionTimeoutError", "CONNECTION_TIMEOUT"), ("InvalidURL", "INVALID_URL"))},
     "asyncio.TimeoutError": "TIMEOUT_ERROR",
     "asyncio.CancelledError": "CANCELLED_ERROR",
+    "asyncio.InvalidStateError": "INVALID_STATE_ERROR",
     "mcp.server.mcpserver.exceptions.ToolError": "MCP_TOOL_ERROR",
     "asyncio.QueueFull": "QUEUE_FULL",
     "asyncio.QueueEmpty": "QUEUE_EMPTY",
@@ -331,6 +374,28 @@ EXCEPTIONS: dict[str, str] = {
     "prometheus_client.registry.DuplicateTimeseries": "DUPLICATE_TIMESERIES",
     "aio_pika.exceptions.AMQPConnectionError": "AMQP_CONNECTION_ERROR",
     "aio_pika.exceptions.QueueEmpty": "AMQP_QUEUE_EMPTY",
+    "aio_pika.exceptions.AMQPChannelError": "AMQP_CHANNEL_ERROR",
+    "aio_pika.exceptions.ChannelClosed": "AMQP_CHANNEL_CLOSED",
+    "aio_pika.exceptions.ChannelAccessRefused": "AMQP_CHANNEL_ACCESS_REFUSED",
+    "aio_pika.exceptions.ChannelNotFoundEntity": "AMQP_CHANNEL_NOT_FOUND",
+    "aio_pika.exceptions.ChannelLockedResource": "AMQP_CHANNEL_LOCKED",
+    "aio_pika.exceptions.ChannelPreconditionFailed": "AMQP_CHANNEL_PRECONDITION",
+    "aio_pika.exceptions.ConnectionClosed": "AMQP_CONNECTION_CLOSED",
+    "aiormq.exceptions.AMQPChannelError": "AMQP_CHANNEL_ERROR",
+    "aiormq.exceptions.ChannelClosed": "AMQP_CHANNEL_CLOSED",
+    "aiormq.exceptions.ChannelAccessRefused": "AMQP_CHANNEL_ACCESS_REFUSED",
+    "aiormq.exceptions.ChannelNotFoundEntity": "AMQP_CHANNEL_NOT_FOUND",
+    "aiormq.exceptions.ChannelLockedResource": "AMQP_CHANNEL_LOCKED",
+    "aiormq.exceptions.ChannelPreconditionFailed": "AMQP_CHANNEL_PRECONDITION",
+    "aiormq.exceptions.ConnectionClosed": "AMQP_CONNECTION_CLOSED",
+    "aiormq.AMQPChannelError": "AMQP_CHANNEL_ERROR",
+    "aiormq.ChannelClosed": "AMQP_CHANNEL_CLOSED",
+    "aiormq.ChannelAccessRefused": "AMQP_CHANNEL_ACCESS_REFUSED",
+    "aiormq.ChannelNotFoundEntity": "AMQP_CHANNEL_NOT_FOUND",
+    "aiormq.ChannelLockedResource": "AMQP_CHANNEL_LOCKED",
+    "aiormq.ChannelPreconditionFailed": "AMQP_CHANNEL_PRECONDITION",
+    "aiormq.ConnectionClosed": "AMQP_CONNECTION_CLOSED",
+    "aio_pika.exceptions.MessageProcessError": "AMQP_MESSAGE_PROCESS_ERROR",
     **{f"redis.exceptions.{n}": c for n, c in (("RedisError", "REDIS_ERROR"), ("ConnectionError", "REDIS_CONNECTION_ERROR"),
                                                 ("TimeoutError", "REDIS_TIMEOUT_ERROR"), ("DataError", "REDIS_DATA_ERROR"),
                                                 ("ResponseError", "REDIS_RESPONSE_ERROR"))},
@@ -360,6 +425,16 @@ EXCEPTIONS: dict[str, str] = {
     **{f"jwt.exceptions.{n}": c for n, c in (("PyJWTError", "PYJWT_ERROR"), ("InvalidTokenError", "PYJWT_INVALID_TOKEN"), ("DecodeError", "PYJWT_DECODE_ERROR"), ("InvalidSignatureError", "PYJWT_INVALID_SIGNATURE"), ("ExpiredSignatureError", "PYJWT_EXPIRED_SIGNATURE"), ("InvalidAudienceError", "PYJWT_INVALID_AUDIENCE"), ("InvalidIssuerError", "PYJWT_INVALID_ISSUER"), ("InvalidIssuedAtError", "PYJWT_INVALID_ISSUED_AT"), ("ImmatureSignatureError", "PYJWT_IMMATURE_SIGNATURE"), ("InvalidKeyError", "PYJWT_INVALID_KEY"), ("InvalidAlgorithmError", "PYJWT_INVALID_ALGORITHM"), ("MissingRequiredClaimError", "PYJWT_MISSING_REQUIRED_CLAIM"), ("PyJWKError", "PYJWK_ERROR"), ("MissingCryptographyError", "PYJWT_MISSING_CRYPTOGRAPHY"), ("PyJWKSetError", "PYJWK_SET_ERROR"), ("PyJWKClientError", "PYJWK_CLIENT_ERROR"), ("PyJWKClientConnectionError", "PYJWK_CLIENT_CONNECTION_ERROR"), ("InvalidSubjectError", "PYJWT_INVALID_SUBJECT"), ("InvalidJTIError", "PYJWT_INVALID_JTI"))},
     **{f"jwt.{n}": c for n, c in (("PyJWTError", "PYJWT_ERROR"), ("InvalidTokenError", "PYJWT_INVALID_TOKEN"), ("DecodeError", "PYJWT_DECODE_ERROR"), ("InvalidSignatureError", "PYJWT_INVALID_SIGNATURE"), ("ExpiredSignatureError", "PYJWT_EXPIRED_SIGNATURE"), ("InvalidAudienceError", "PYJWT_INVALID_AUDIENCE"), ("InvalidIssuerError", "PYJWT_INVALID_ISSUER"), ("InvalidIssuedAtError", "PYJWT_INVALID_ISSUED_AT"), ("ImmatureSignatureError", "PYJWT_IMMATURE_SIGNATURE"), ("InvalidKeyError", "PYJWT_INVALID_KEY"), ("InvalidAlgorithmError", "PYJWT_INVALID_ALGORITHM"), ("MissingRequiredClaimError", "PYJWT_MISSING_REQUIRED_CLAIM"), ("PyJWKError", "PYJWK_ERROR"), ("PyJWKSetError", "PYJWK_SET_ERROR"), ("PyJWKClientError", "PYJWK_CLIENT_ERROR"), ("PyJWKClientConnectionError", "PYJWK_CLIENT_CONNECTION_ERROR"))},
     "cryptography.fernet.InvalidToken": "INVALID_TOKEN",
+    # PyYAML: yaml re-exports YAMLError and MarkedYAMLError only, each module its own class
+    **{f"yaml{m}.{n}": c for m, names in (
+        ("", (("YAMLError", "YAML_ERROR"), ("MarkedYAMLError", "YAML_MARKED_ERROR"))),
+        (".error", (("YAMLError", "YAML_ERROR"), ("MarkedYAMLError", "YAML_MARKED_ERROR"))),
+        (".reader", (("ReaderError", "YAML_READER_ERROR"),)), (".scanner", (("ScannerError", "YAML_SCANNER_ERROR"),)),
+        (".parser", (("ParserError", "YAML_PARSER_ERROR"),)), (".composer", (("ComposerError", "YAML_COMPOSER_ERROR"),)),
+        (".constructor", (("ConstructorError", "YAML_CONSTRUCTOR_ERROR"),)),
+        (".representer", (("RepresenterError", "YAML_REPRESENTER_ERROR"),)),
+        (".emitter", (("EmitterError", "YAML_EMITTER_ERROR"),)), (".serializer", (("SerializerError", "YAML_SERIALIZER_ERROR"),)))
+       for n, c in names},
     "jinja2.TemplateNotFound": "TEMPLATE_NOT_FOUND",
     "re.error": "RE_ERROR",
     "csv.Error": "CSV_ERROR",
@@ -378,6 +453,11 @@ EXCEPTIONS: dict[str, str] = {
     "itsdangerous.exc.BadHeader": "BAD_HEADER",
     "itsdangerous.BadPayload": "BAD_PAYLOAD",
     "itsdangerous.exc.BadPayload": "BAD_PAYLOAD",
+    **{f"{m}.{n}": c for m in ("croniter", "croniter.croniter") for n, c in (
+        ("CroniterError", "CRONITER_ERROR"), ("CroniterBadCronError", "CRONITER_BAD_CRON_ERROR"),
+        ("CroniterBadDateError", "CRONITER_BAD_DATE_ERROR"), ("CroniterBadTypeRangeError", "CRONITER_BAD_TYPE_RANGE_ERROR"),
+        ("CroniterNotAlphaError", "CRONITER_NOT_ALPHA_ERROR"),
+        ("CroniterUnsupportedSyntaxError", "CRONITER_UNSUPPORTED_SYNTAX_ERROR"))},
 }
 
 # keyword arguments refused at transpile time (the call is otherwise supported)
@@ -439,6 +519,31 @@ LIB_VERSIONS: dict[str, str] = {}
 PYTHON: tuple[int, int] = (3, 12)
 
 
+# library names that exist from a Python on (refused for an older project: AttributeError there)
+SINCE = {"re.PatternError": (3, 13)}
+
+
+def too_new(dotted: str) -> str | None:
+    """The refusal of a library name newer than the project's Python, None if it exists there."""
+    v = SINCE.get(dotted)
+    if v is None or PYTHON >= v:
+        return None
+    return (f"{dotted} needs Python {v[0]}.{v[1]} (the project runs on {PYTHON[0]}.{PYTHON[1]}, "
+            "where it raises AttributeError)")
+
+
+def set_python(version: tuple[int, int]) -> None:
+    """The project's Python: names that exist from a version on (`re.PatternError`, 3.13, `re.error` its alias)"""
+    global PYTHON
+    PYTHON = version
+    re_cls = "RE_PATTERN_ERROR" if version >= (3, 13) else "RE_ERROR"
+    EXCEPTIONS["re.error"] = re_cls
+    if version >= (3, 13):
+        EXCEPTIONS["re.PatternError"] = re_cls
+    else:
+        EXCEPTIONS.pop("re.PatternError", None)
+
+
 def _no_kw(name: str, kw, refused) -> str:
     """Refuses keyword arguments the runtime does not implement (Python 3.15's `missing_as_none=`...)."""
     for k in kw:
@@ -455,6 +560,14 @@ def _since(version: tuple[int, int], what: str) -> str:
     return ""
 
 
+def _need(vals, name, *required):
+    """`vals` (from _bind) with its required parameters given (CPython's TypeError otherwise, at transpile time)"""
+    for r in required:
+        if r not in vals:
+            raise ValueError(f"{name}() missing required argument '{r}'")
+    return vals
+
+
 def _bind(name, a, kw, params, allowed):
     """Positional + keyword arguments of a library call, by parameter name; anything else is refused."""
     if len(a) > len(params):
@@ -465,6 +578,46 @@ def _bind(name, a, kw, params, allowed):
             raise ValueError(f"{name}({k}=) is not supported")
         vals[k] = v
     return vals
+
+
+_YAML_SAFE_LOADER = {f'V::native({RT}::Native::ExtType("yaml.SafeLoader"))'}
+_YAML_DUMPERS = {f'V::native({RT}::Native::ExtType("yaml.{n}"))': n for n in ("SafeDumper", "Dumper")}
+_YAML_DUMP_KW = ["default_style", "default_flow_style", "canonical", "indent", "width", "allow_unicode", "line_break",
+                 "encoding", "explicit_start", "explicit_end", "version", "tags", "sort_keys"]
+
+
+def _yaml_load(name, a, kw, loader):
+    """`yaml.safe_load(stream)` / `yaml.load(stream, Loader=yaml.SafeLoader)`: PyYAML's pure-Python SafeLoader
+    (dynrt/pyyaml.rs); the other loaders construct Python objects (and the C ones word their errors otherwise)."""
+    params = ["stream", "Loader"] if loader else ["stream"]
+    v = _bind(name, a, kw, params, set(params))
+    if "stream" not in v:
+        raise ValueError(f"{name}() needs the stream")
+    if loader and v.get("Loader") not in _YAML_SAFE_LOADER:
+        raise ValueError("yaml.load() is supported with Loader=yaml.SafeLoader only (Loader, FullLoader, UnsafeLoader "
+                         "and the libyaml CLoader/CSafeLoader are not: use yaml.safe_load())")
+    return f"{RT}::pyyaml::safe_load(&{v['stream']})"
+
+
+def _yaml_dump(name, a, kw, full, all_):
+    """`yaml.safe_dump(data, stream=None, **kw)`, `yaml.dump(..., Dumper=yaml.Dumper|yaml.SafeDumper)` and their
+    `_all` forms (dynrt/yamlemit.rs); yaml.dump's Representer is ported for the builtin types only."""
+    first = "documents" if all_ else "data"
+    params = [first, "stream"] + (["Dumper"] if full else [])
+    if all_ and full:
+        params += _YAML_DUMP_KW
+    v = _bind(name, a, kw, params, set(params) | set(_YAML_DUMP_KW))
+    if first not in v:
+        raise ValueError(f"{name}() needs the {first}")
+    if full and "Dumper" in v:
+        d = _YAML_DUMPERS.get(v["Dumper"])
+        if d is None:
+            raise ValueError(f"{name}() is supported with Dumper=yaml.Dumper or yaml.SafeDumper only")
+        full = d == "Dumper"
+    opts = {k: x for k, x in v.items() if k in _YAML_DUMP_KW}
+    stream = v.get("stream", "V::None")
+    return (f"{RT}::yamlemit::dump({'true' if full else 'false'}, {'true' if all_ else 'false'}, &{v[first]}, "
+            f"&{stream}, &{_kwvec(opts)})")
 
 
 # Starlette's signatures (1.x): arguments bound by name, so the runtime never reads a positional at a wrong index;
@@ -604,7 +757,75 @@ def _relativedelta(a, kw):
     return f"{RT}::reldelta::new(&{_argv(a)}, &{_kwvec(kw)})"
 
 
+# croniter 6.2 (dynrt/croniter.rs): the class (`from croniter import croniter`, or its module path), its
+# classmethods, croniter_range; parameters as in croniter.py (checked statically by croniter_static)
+_CRON_CLASSES = ("croniter.croniter", "croniter.croniter.croniter")
+_CRON_MODULES = ("croniter", "croniter.croniter")
+_CRON_SIGS = {
+    "": ("expr_format", "start_time", "ret_type", "day_or", "max_years_between_matches", "is_prev", "hash_id",
+         "implement_cron_bug", "second_at_beginning", "expand_from_start_time"),
+    "is_valid": ("expression", "hash_id", "encoding", "second_at_beginning", "strict", "strict_year"),
+    "match": ("cron_expression", "testdate", "day_or", "second_at_beginning", "precision_in_seconds"),
+    "match_range": ("cron_expression", "from_datetime", "to_datetime", "day_or", "second_at_beginning", "precision_in_seconds"),
+    "expand": ("expr_format", "hash_id", "second_at_beginning", "from_timestamp", "strict", "strict_year"),
+    "croniter_range": ("start", "stop", "expr_format", "ret_type", "day_or", "exclude_ends", "_croniter",
+                       "second_at_beginning", "expand_from_start_time"),
+    "datetime_to_timestamp": ("d",),
+}
+_CRON_FN = {"": "new", "is_valid": "is_valid", "match": "match_fn", "match_range": "match_range", "expand": "expand_fn",
+            "croniter_range": "croniter_range", "datetime_to_timestamp": "datetime_to_timestamp"}
+_CRON_RANDOM = re.compile(r"^r(\(\d+-\d+\))?(/\d+)?$")
+
+
+def _cron_kind(name: str) -> str | None:
+    for c in _CRON_CLASSES:
+        if name == c:
+            return ""
+        if name.startswith(c + ".") and name[len(c) + 1:] in ("is_valid", "match", "match_range", "expand", "datetime_to_timestamp"):
+            return name[len(c) + 1:]
+    for m in _CRON_MODULES:
+        if name in (f"{m}.croniter_range", f"{m}.datetime_to_timestamp"):
+            return name[len(m) + 1:]
+    return None
+
+
+def croniter_static(name, node):
+    """What croniter's runtime cannot reproduce, refused at transpile time: an `R` (random) field in a literal
+    expression, `croniter_range(_croniter=)`, `expand(from_timestamp=)`, an `is_valid(encoding=)` other than
+    UTF-8; arguments croniter does not take."""
+    import ast
+
+    kind = _cron_kind(name)
+    if kind is None:
+        return
+    sig = _CRON_SIGS[kind]
+    if len(node.args) > len(sig):
+        raise ValueError(f"takes at most {len(sig)} positional arguments")
+    given = {sig[i]: a for i, a in enumerate(node.args)}
+    for k in node.keywords:
+        if k.arg is None or k.arg not in sig:
+            raise ValueError(f"unexpected keyword argument {k.arg!r}")
+        given[k.arg] = k.value
+    expr = given.get({"is_valid": "expression", "match": "cron_expression", "match_range": "cron_expression"}.get(kind, "expr_format"))
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        if any(_CRON_RANDOM.match(f) for f in expr.value.lower().split()):
+            raise ValueError(f"R (random) fields in {expr.value!r} are not supported: Python draws a random "
+                             "number, its output cannot be reproduced")
+    for k, why in (("_croniter", "a croniter subclass"), ("from_timestamp", "from_timestamp")):
+        v = given.get(k)
+        if v is not None and not (isinstance(v, ast.Constant) and v.value is None):
+            raise ValueError(f"{k}= is not supported ({why})")
+    enc = given.get("encoding")
+    if enc is not None and not (isinstance(enc, ast.Constant) and isinstance(enc.value, str)
+                                and enc.value.lower().replace("-", "").replace("_", "") == "utf8"):
+        raise ValueError("encoding= other than a literal UTF-8 is not supported")
+
+
 CALLS = {
+    **{c + ("." + k if k else ""): (lambda f: lambda a, kw: f"{RT}::croniter::{f}(&{_argv(a)}, &{_kwvec(kw)})")(_CRON_FN[k])
+       for c in _CRON_CLASSES for k in ("", "is_valid", "match", "match_range", "expand", "datetime_to_timestamp")},
+    **{f"{m}.{k}": (lambda f: lambda a, kw: f"{RT}::croniter::{f}(&{_argv(a)}, &{_kwvec(kw)})")(_CRON_FN[k])
+       for m in _CRON_MODULES for k in ("croniter_range", "datetime_to_timestamp")},
     # python-dateutil 2.9 (dynrt/reldelta.rs)
     "dateutil.relativedelta.relativedelta": _relativedelta,
     # xmltodict 1.0 (dynrt/xmld.rs): default options, namespaces; dict_constructor= has no effect (dicts)
@@ -650,7 +871,8 @@ CALLS = {
     "prometheus_client.disable_created_metrics": lambda a, kw: f"{RT}::prom::set_created(false)",
     "prometheus_client.enable_created_metrics": lambda a, kw: f"{RT}::prom::set_created(true)",
     # aio_pika 10 (dynrt/rmq.rs)
-    **{n: (lambda a, kw: f"{RT}::rmq::connect(&{_argv(a)}, &{_kwvec(kw)}).await") for n in ("aio_pika.connect_robust", "aio_pika.connect")},
+    **{n: (lambda robust: lambda a, kw: f"{RT}::rmq::connect(&{_argv(a)}, &{_kwvec(kw)}, {robust}).await")(
+        "true" if n.endswith("robust") else "false") for n in ("aio_pika.connect_robust", "aio_pika.connect")},
     "aio_pika.Message": lambda a, kw: f"{RT}::rmq::message(&{_argv(a)}, &{_kwvec(kw)})",
     # redis.asyncio (dynrt/rds.rs)
     **{n: (lambda a, kw: f"{RT}::rds::from_url(&{_argv(a)}, &{_kwvec(kw)})") for n in ("redis.asyncio.from_url", "redis.asyncio.client.from_url")},
@@ -737,6 +959,12 @@ CALLS = {
     # FastAPI's encoder: what a response without response_model goes through (`pyd::jsonable`)
     "fastapi.encoders.jsonable_encoder": _jsonable_encoder,
     "json.loads": lambda a, kw: f"{RT}::libs::json_loads(&{a[0]})",
+    # orjson 3.11-3.13 (dynrt/orj.rs); orjson.Fragment is refused (not listed)
+    "orjson.loads": _one_pos("orjson.loads", lambda x: f"{RT}::orj::loads(&{x})"),
+    "orjson.dumps": lambda a, kw: _orjson_dumps(a, kw),
+    # Unidecode 1.3-1.4 (dynrt/unidec.rs, tables of tools/gen_unidecode.py)
+    **{f"unidecode.{f}": (lambda f: lambda a, kw: _unidecode(f, a, kw))(f)
+       for f in ("unidecode", "unidecode_expect_ascii", "unidecode_expect_nonascii")},
     # python-jose (HMAC only; other options refused)
     "jose.jwt.encode": _jwt_encode,
     "jose.jwt.decode": _jwt_decode,
@@ -786,6 +1014,12 @@ CALLS = {
     "nh3.is_html": lambda a, kw: f"{RT}::nh3::is_html(&{_argv(a)})",
     "string.Template": lambda a, kw: f"{RT}::stdlib::template_new(&{_argv(a)}, &{_kwvec(kw)})",
     "html.escape": lambda a, kw: f"{RT}::stdlib::html_escape(&{_argv(a)}, &{_kwvec(kw)})",
+    "yaml.safe_load": lambda a, kw: _yaml_load("yaml.safe_load", a, kw, False),
+    "yaml.load": lambda a, kw: _yaml_load("yaml.load", a, kw, True),
+    "yaml.safe_dump": lambda a, kw: _yaml_dump("yaml.safe_dump", a, kw, False, False),
+    "yaml.dump": lambda a, kw: _yaml_dump("yaml.dump", a, kw, True, False),
+    "yaml.safe_dump_all": lambda a, kw: _yaml_dump("yaml.safe_dump_all", a, kw, False, True),
+    "yaml.dump_all": lambda a, kw: _yaml_dump("yaml.dump_all", a, kw, True, True),
     "html.unescape": lambda a, kw: f"{RT}::stdlib::html_unescape(&{_argv(a)}, &{_kwvec(kw)})",
     # icalendar 7.0: components built empty, then add()/add_component()/to_ical() (dynrt/ical.rs)
     **{f"icalendar.{k}": (lambda k: lambda a, kw: f'{RT}::ical::new("{k}")'
@@ -799,6 +1033,7 @@ CALLS = {
     "fastapi.responses.Response": _resp("Response"),
     "starlette.responses.Response": _resp("Response"),
     "fastapi.responses.JSONResponse": _resp("JSONResponse"),
+    "fastapi.responses.ORJSONResponse": _resp("ORJSONResponse"),
     "starlette.responses.JSONResponse": _resp("JSONResponse"),
     "fastapi.responses.PlainTextResponse": _resp("PlainTextResponse"),
     "starlette.responses.PlainTextResponse": _resp("PlainTextResponse"),
@@ -880,11 +1115,19 @@ CALLS = {
     "logging.shutdown": lambda a, kw: f"{RT}::logging::shutdown()",
     **{f"pythonjsonlogger.{m}.JsonFormatter": lambda a, kw: f"{RT}::logging::json_formatter_new(&{_argv(a)}, &{_kwvec(kw)})"
        for m in ("json", "jsonlogger")},
+    # ecs-logging 2.x (dynrt/logging.rs); its structlog processor is not translated
+    "ecs_logging.StdlibFormatter": lambda a, kw: _ecs_formatter(a, kw),
     **{f"uvicorn.logging.{c}Formatter": (lambda acc: lambda a, kw: f"{RT}::logging::uv_formatter_new({acc}, &{_argv(a)}, &{_kwvec(kw)})")(c == "Access")
        for c in ("Default", "Access")},
+    "asyncio.Event": lambda a, kw: f"{RT}::aio::event_new(&{_argv(a)}, &{_kwvec(kw)})",
+    "asyncio.Future": _noargs("asyncio.Future", f"Ok::<V, Exc>({RT}::aio::future_new(cx))"),
     "asyncio.Queue": lambda a, kw: f"Ok::<V, Exc>({RT}::web::AQueue::new(match &{a[0] if a else kw.get('maxsize', 'V::Int(0)')} {{ V::Int(i) => *i as usize, _ => 0 }}))",
-    "asyncio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0]}).await",
-    "anyio.sleep": lambda a, kw: f"{RT}::web::sleep(&{a[0] if a else kw.get('delay', 'V::Int(0)')}).await",
+    "asyncio.sleep": lambda a, kw: (lambda b: f"{RT}::web::sleep(&{b['delay']}, {b.get('result', 'V::None')}, "
+                                    f"{str('uvloop' in LIB_VERSIONS).lower()}).await")(
+        _need(_bind("asyncio.sleep", a, kw, ["delay", "result"], {"delay", "result"}), "asyncio.sleep", "delay")),
+    "anyio.sleep": lambda a, kw: (lambda b: f"{RT}::web::sleep(&{b['delay']}, V::None, "
+                                  f"{str('uvloop' in LIB_VERSIONS).lower()}).await")(
+        _need(_bind("anyio.sleep", a, kw, ["delay"], {"delay"}), "anyio.sleep", "delay")),
     # FastAPI's default exception handlers, awaited by an application's own handler
     "fastapi.exception_handlers.http_exception_handler": _default_handler("http"),
     "fastapi.exception_handlers.request_validation_exception_handler": _default_handler("validation"),

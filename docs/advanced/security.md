@@ -3,13 +3,13 @@
 This page describes what the binary py2axum generates guarantees when it faces untrusted clients. It covers
 the threat model, the protections the runtime (`py2axum/runtime/dynrt/`, copied into every generated crate)
 puts in place, how they compare with uvicorn + Starlette + FastAPI, and the knobs you can turn. It is the
-result of the security review done before 1.0. Each guarantee is pinned by a test, named in **Tests** at the
+result of two security reviews done before 1.0 (0.5 and 0.8). Each guarantee is pinned by a test, named in **Tests** at the
 end.
 
 To report a vulnerability, see [SECURITY.md](https://github.com/larrymotalavigne/py2axum/blob/main/SECURITY.md).
 
 **Contents:** [Threat model](#threat-model) · [SQL](#sql) · [Request input](#request-input) · [Files and paths](#files-and-paths)
-· [Errors and logs](#errors-and-logs) · [Cryptography](#cryptography) · [Hybrid deployments](#hybrid-deployments-the-python-side-relay)
+· [Slow clients](#slow-clients-and-streams) · [Errors and logs](#errors-and-logs) · [Cryptography](#cryptography) · [Hybrid deployments](#hybrid-deployments-the-python-side-relay)
 · [Per-request state](#per-request-state) · [Rust dependencies](#rust-dependencies) · [`unsafe` code](#unsafe-code)
 · [Settings](#settings) · [Tests](#tests)
 
@@ -32,7 +32,7 @@ To report a vulnerability, see [SECURITY.md](https://github.com/larrymotalavigne
 ## SQL
 
 - **Values are always bound.** Every value that reaches a statement (comparisons, `in_()`, `like`/`ilike`/
-  `contains`/`startswith`/`endswith`, `regexp_match`, JSONB and ARRAY operators, `limit`/`offset`,
+  `contains`/`startswith`/`endswith`, `regexp_match` and its `flags=`, JSONB and ARRAY operators, `limit`/`offset`,
   `insert().values()`, `update().values()`, the unit of work, `text()` with parameters or `.bindparams()`) is
   sent as a `$n` parameter. A value is never re-parsed for placeholders.
 - **Names given as strings are quoted like SQLAlchemy quotes them.** A label (`.label(name)`), a subquery or
@@ -41,7 +41,9 @@ To report a vulnerability, see [SECURITY.md](https://github.com/larrymotalavigne
   that are not reserved words; anything else is put between double quotes with `"` doubled (SQLAlchemy's
   `IdentifierPreparer`).
 - **Equivalent by design:** `text("…")` built from a request string, `.op(string)` and `literal_column`-style
-  constructs are raw SQL in SQLAlchemy too; the binary sends exactly what the application wrote.
+  constructs are raw SQL in SQLAlchemy too; the binary sends exactly what the application wrote. Each
+  distinct `.op()` operator string is kept for the life of the process: taking operators from the request
+  (beyond a fixed set) grows memory.
   `order_by("string")` only accepts a label or column of the statement, else it raises SQLAlchemy's
   CompileError. `cast()` accepts a closed list of types, `extract()` a field made of letters.
 - **Connection settings** (`connect_args` options, the session time zone) are applied with
@@ -60,8 +62,9 @@ same requests. The ones Starlette applies are applied the same way.
 | --- | --- | --- |
 | Body size | no limit | no limit by default; `PY2AXUM_MAX_BODY` (bytes) answers **413** past it, checked on `Content-Length` and while reading a chunked body |
 | JSON nesting | CPython's decoder (~10 000 levels on 3.12/3.13, ~50 000 on 3.14), then RecursionError → 400 | iterative decoder, 400 past 10 000 levels; see below |
-| Numbers | int → str limited to 4 300 digits | integers beyond 64 bits are an OverflowError (documented in [Python semantics](../reference/python.md)); decoding is linear |
+| Numbers | int → str limited to 4 300 digits | integers beyond 64 bits are an OverflowError (documented in [Python semantics](../reference/python.md)), past 4 300 digits a 400 as in FastAPI; decoding is linear |
 | `Decimal` | libmpdec: exponents up to ±10¹⁸, default context (28 digits, Emax 999 999) | same limits and context: comparisons and bounds decided on the exponents, `Overflow`, `DivisionImpossible` and subnormal rounding as CPython; long coefficients parsed and counted in quasi-linear time |
+| `Fraction` | `int()`'s 4 300-digit limit | same (`fraction_parsing` in a model); exponents past 100 000 are refused (a RuntimeError, 500) |
 | Invalid UTF-8, lone surrogates | 400 / kept | 400 / U+FFFD (documented) |
 | Multipart | `max_files` 1 000, `max_fields` 1 000, 1 MiB per non-file part | same limits, same 400 messages |
 | URL-encoded forms | 1 000 fields, 1 MiB per field (Starlette ≥ 1.4) | same |
@@ -86,10 +89,22 @@ Difference: between ~1 000 and 10 000 levels, FastAPI often answers 500 (its rec
 Pydantic hits Python's recursion limit while echoing the input or the result); the binary usually answers
 normally. Neither process goes down.
 
-**Sizes chosen by the request.** `str * n`, `bytes * n`, `list * n`, `secrets.token_*(n)` raise OverflowError or
-MemoryError (and ValueError for a negative token size) like CPython, instead of a failed allocation that would
-abort. A request body is buffered whole before routing (uvicorn reads it lazily, when the endpoint asks); behind
-a reverse proxy, cap bodies there (ingress-nginx `proxy-body-size`) or set `PY2AXUM_MAX_BODY`.
+**Sizes chosen by the request.** `str * n`, `bytes * n`, `list * n`, `secrets.token_*(n)`, `str.zfill`/`ljust`/
+`rjust`/`center`, the width and precision of format specs and of `%`-formatting raise OverflowError, MemoryError
+or ValueError ("Too many decimal digits in format string", "width too big", "precision too big") like CPython,
+instead of a failed allocation that would abort. `range()` is a list in the binary (CPython's is lazy): its length
+is computed first, and a range too large to hold is a MemoryError even where Python would only have iterated a
+few items of it (`for i in range(n): ... break` with `n` from the request).
+
+**Request bodies.** A request body is buffered whole before routing, also for a 404 or a route that takes no body
+(uvicorn reads it lazily, when the endpoint asks, and pauses the client past 64 KiB). Behind a reverse proxy, cap
+bodies there (ingress-nginx `proxy-body-size`) or set `PY2AXUM_MAX_BODY`.
+
+**Proxy headers.** As uvicorn (`--proxy-headers`, on by default): `X-Forwarded-For` and `X-Forwarded-Proto` are
+read only from a peer in `FORWARDED_ALLOW_IPS` (default `127.0.0.1,::1`), the client being the right-most
+untrusted hop and the scheme the last `X-Forwarded-Proto`. `*` trusts every peer only when it is the whole list;
+an entry that is not a valid address or network (`10.0.0.1/8`, host bits set) is a literal, as uvicorn's strict
+parsing makes it.
 
 **Response headers.** A header value the application builds from request data with CR, LF or NUL in it never
 reaches the client: the response becomes a plain 500. Header injection (response splitting) is not possible.
@@ -98,10 +113,23 @@ Difference: uvicorn refuses such a header at send time and closes the connection
 **Panics.** The generated crates do not set `panic = "abort"`: a bug that panics loses its own connection only,
 and the runtime's locks do not poison.
 
-## Streams
+## Slow clients and streams
 
+- Streamed responses (`StreamingResponse`, lists streamed from the session, SSE) are produced as the client reads:
+  a client that stops reading holds its own request, not the server's memory.
+- Raw ASGI apps and middlewares: `await send(...)` waits once 16 messages are queued ahead of the client, as
+  uvicorn's `send` waits for the transport to drain. A stream the application leaves unfinished (it returns or
+  raises without `more_body=False`) closes the connection, as uvicorn does (without uvicorn's "ASGI callable
+  returned without completing response" line).
+- WebSocket: `websocket.send` waits once 16 messages are queued ahead of the client (websockets' drain). Incoming
+  frames are read only when the application has taken the previous message (websockets queues up to 32).
 - MCP (`mcp` SDK, stateless): the `GET` event stream ends when the client leaves, as `EventSourceResponse` does,
   so the endpoint's dependencies (a database session) are released.
+- Raw ASGI middlewares do not run for WebSocket connections. A raw middleware next to WebSocket routes is
+  therefore accepted only when its `__call__` starts by handing non-HTTP scopes straight on
+  (`if scope["type"] != "http": return await self.app(scope, receive, send)`); one that checks websockets
+  (authentication, IP filter, rate limit) is refused at translation rather than skipped. `TrustedHostMiddleware`
+  and `HTTPSRedirectMiddleware` with WebSocket routes are refused for the same reason.
 
 ## Files and paths
 
@@ -238,14 +266,18 @@ The generated application code contains no `unsafe`.
   `resolve()`; CR/LF in a response header; the body of a 500 (an exception message with a password, an
   IntegrityError); `token_urlsafe(-1)`; `str * n` past memory; Starlette's multipart limits and Windows file
   names.
-- `Decimal` bounds, arithmetic, `quantize`, `//` and `%` at the limits of the context (exponents near ±10⁹ and
-  ±10¹⁸) and `max_digits` on a 200 000-digit value, in the same scenario; `tests/sse_check.py` checks that MCP
-  `GET` streams the client leaves keep no database connection.
+- The second review's cases in the same scenario: `Decimal` bounds, arithmetic, `quantize`, `//` and `%` at the
+  limits of the context (exponents near ±10⁹ and ±10¹⁸), `max_digits` on a 200 000-digit value, `Fraction` past
+  4 300 digits, widths and precisions of `zfill`/`ljust`/`center`/`format()`/`%`, `range()` at the 64-bit edge,
+  hostile `regexp_match` flags with the table checked intact. `tests/sse_check.py` checks that MCP `GET` streams
+  the client leaves keep no database connection.
 - `tests/security_check.py` (against the binary alone, in CI after the conformance): JSON nested up to 50 000
   levels on model, `dict` and `Any` bodies with the process still serving; 30 000 cookies in one header; 5 000
   multipart files; eight concurrent bcrypt hashes at cost 12 while other requests stay under 0.5 s; the relay
   dropping `Connection`-named headers; `PY2AXUM_MAX_BODY` with `Content-Length` and chunked bodies; million-digit
-  and huge-exponent `Decimal` values answered within seconds.
+  `Decimal`, `Fraction` and JSON integers answered within seconds; `range(10**15)`; an unfinished raw ASGI stream
+  closed; a client that does not read a 256 MiB raw ASGI stream without the server's memory following it.
+- `tests/test_rejects_dyn.py`: a raw ASGI middleware that looks at websockets, next to a WebSocket route.
 - The existing PyJWT, python-jose, itsdangerous and Fernet cases of the dynapp scenario (wrong algorithms,
   `none`, PEM keys used as HMAC secrets, tampered and expired tokens).
 - The `audit` CI job (`cargo audit`).

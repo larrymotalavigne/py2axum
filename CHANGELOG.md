@@ -5,6 +5,118 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-15
+
+The public contract is frozen ahead of 1.0 (versioning and deprecation policy, tests that pin the command lines,
+the binary's options and variables, the error codes and the JSON of `check`), after a second security review of
+the runtime. The behaviour follows the project's Python from 3.12 to 3.15. Popular libraries are translated
+natively (orjson, PyYAML, croniter, Unidecode, ecs-logging, aio-pika) and the binary applies the project's alembic
+migrations itself (`<binary> migrate`). Upgrading is recommended: several fixes below close denials of service
+that, depending on the application, need no authentication.
+
+### Added
+
+- [Versioning and deprecation](https://larrymotalavigne.github.io/py2axum/reference/versioning/): the public
+  contract semver covers from 1.0 (command lines, the binary's options and environment variables, the supported
+  subset, the JSON of `check`, the error codes) and how a deprecation works. The JSON output of `check` is
+  published as a JSON Schema (`reference/check-schema.json`); tests freeze the contract.
+- orjson 3.13: `loads` (the decoder's messages and positions, its depth and memory limits) and `dumps` with every
+  `OPT_*`, `default=` and the types orjson serializes natively; FastAPI's `ORJSONResponse` (returned,
+  `response_class=`, `default_response_class=`).
+- Unidecode 1.4: `unidecode`, `unidecode_expect_ascii`, `unidecode_expect_nonascii`, `errors=`, `UnidecodeError`
+  (tables generated from Unidecode by `tools/gen_unidecode.py`).
+- ecs-logging 2.3: `StdlibFormatter`, called or from `dictConfig`.
+- PyYAML 6.0 native (`import yaml`): `safe_load` / `load(Loader=yaml.SafeLoader)` of a str, bytes or file object
+  and `safe_dump` / `dump` / `safe_dump_all` / `dump_all` with all their options, ported from PyYAML's pure-Python
+  loader and dumper: same values, same text byte for byte, same exceptions (`str()`, `problem`, `context`, marks
+  and snippets). The other loaders, libyaml's classes and the extension API are refused at translation; the
+  differences (integers beyond 64 bits, recursion depth, `yaml.dump` of `!!python/object` values) are documented.
+- aio-pika 10: exchanges of every type (`declare_exchange`, `get_exchange`, `bind`/`unbind`), `queue.consume`/`cancel`,
+  `queue.iterator()`, `message.process()`, `ack`/`nack`/`reject`, `purge`, `delete`, `set_qos`, the broker's channel
+  errors as aiormq's classes; a published message gets aiormq's defaults (delivery mode 1, priority 0, a `message_id`).
+- croniter 6.2 native (`dynrt/croniter.rs`, a port of croniter.py): `croniter(...)` and its `get_next`/`get_prev`/
+  `get_current`/`set_current`/`next()`/`all_next()`/`all_prev()`, `is_valid`, `match`, `match_range`, `expand`,
+  `croniter_range`, its exceptions; 5, 6 and 7 fields, `L`, `W`, `#`, names, aliases, `H` hashing, time zones
+  and DST transitions (`timezone`, `ZoneInfo`). `R` (random) fields are refused (see the known differences).
+- `datetime` (the class) as a value: `ret_type=datetime`, `type(x) is datetime`, called later.
+- `datetime.replace(fold=)`; `replace()` keeps the fold of the datetime, as CPython does.
+- `asyncio.Future` (`loop.create_future()`), `asyncio.Event`, `asyncio.wait_for` of a future or task held in a variable.
+- A plain class's `__new__` (a factory returning something else, a singleton through `super().__new__(cls)` /
+  `object.__new__(cls)`), and `cls.X` read or assigned on a class held as a value.
+- `<binary> migrate`: the project's alembic migrations applied by the binary, rendered at translation time by
+  alembic's offline mode (docs/advanced/migrations.md); revisions that read the database are refused with file:line.
+  New error code `P2A0510` (an alembic option or layout `migrate` cannot reproduce); the binary's subcommands
+  (`migrate [upgrade [head|<revision>]]`, `migrate current`, `migrate --sql`) join the frozen public contract.
+- `str.isprintable()`.
+
+### Changed
+
+- `unicodedata.normalize`/`combining` and `str.isalpha()`... follow the Unicode version of the project's Python
+  (15.0 to 17.0), even when the translating Python is newer.
+- `re.error` is named `PatternError` from Python 3.13 (`type(e).__name__`, tracebacks); `re.PatternError` is
+  refused for a 3.12 project.
+- `socket.create_connection(timeout=)` reads its timeout like CPython's `settimeout`: `Decimal`/`Fraction` from
+  3.15, each version's messages (down to the patch release for an out-of-range delay, probed like the other
+  backported fixes, so a distribution's Python is matched), `ValueError`/`OverflowError` for NaN and huge values
+  (they made the request panic).
+- A synchronous generator consumed synchronously (`list()`, `for`, `next()`, a comprehension) is refused at
+  translation (P2A0118); it answered 500. `StreamingResponse(gen())` is unchanged.
+
+### Deprecated
+
+- `--backend` now prints a deprecation warning (it has no effect since 0.4); it is removed in 1.0, with the key
+  `backend` of the JSON of `check`.
+- `--report`: an internal coverage report, outside the stable interface; use `py2axum check --format json` or
+  `--format markdown`. It prints a deprecation warning.
+
+### Fixed
+
+- `check --help` lists `mount` among the values of `--python-side` (it was accepted, not shown).
+- `check`: the first reason of a route refused for several reasons, the order of its blockers and of the
+  whole-application errors no longer change from run to run (hash order of the call graph): closest to the
+  route first, then source order.
+- `StreamingResponse(content)` started iterating its content as soon as the response object was built: the
+  generator could read state before the endpoint finished or before a `Depends(scope="function")` dependency
+  ran its exit code (seen as an intermittent conformance difference). It now starts when the body is sent,
+  as Starlette does.
+- `asyncio.sleep(delay, result)` returns `result`; `asyncio.sleep`/`wait_for` read their delay like asyncio
+  (`TypeError` for a `str`, or a `Decimal` outside uvloop; a timeout <= 0 raises `TimeoutError` without running
+  the awaitable, which used to run once).
+- SQLAlchemy: objects INSERTed then rolled back are transient again, with their attributes and loaded
+  relationships; pending objects a failed flush did not reach are transient too.
+- `email.utils.formataddr` raises `UnicodeEncodeError` for a non-ASCII address, as CPython.
+- Memory: a finished task stored in the request's state no longer keeps the request alive; anonymous subqueries
+  are numbered per statement (`anon_1`...), so a query is the same SQL at every request.
+- `repr()` of a string escapes non-printable characters as CPython does (`'\xa0'`, `'\u200b'`, `'\U000e0001'`);
+  only ASCII control characters were escaped.
+- `str()` of a Pydantic model is its fields separated by spaces (`BaseModel.__str__`), not its repr.
+- `exc.__cause__` / `exc.__context__` of an exception without a chain is `None` (was an `AttributeError`).
+- A dict keeps the first object of a key set again under an equal key (`{1: "a", True: "b"}` is `{1: "b"}`).
+- `int(b"42")`.
+- `repr(int)` / `str(int)` of a builtin type is `<class 'int'>`; `type(zoneinfo.ZoneInfo(...)).__name__` is
+  `ZoneInfo`.
+
+
+
+
+
+### Security
+
+- `rustls` 0.23.46 in the shipped lock file (was 0.23.45): RUSTSEC-2026-0346 to RUSTSEC-2026-0349.
+- Second review of the runtime, see [Security](https://larrymotalavigne.github.io/py2axum/advanced/security/):
+  - `str.zfill`/`ljust`/`rjust`/`center`, format specs and `%`-formatting with a width or precision from the
+    request raise `MemoryError`/`ValueError` like CPython (a negative width panicked, a huge one aborted);
+    `range()` near the 64-bit edge no longer loops for ever, and a range too large to hold is `MemoryError`;
+    `Fraction(text)` applies `int()`'s 4300-digit limit; a JSON integer past 4300 digits is a 400.
+  - Raw ASGI apps and middlewares: `send` waits for a client that does not read (it buffered the whole response);
+    a stream the application leaves unfinished closes the connection instead of holding it. WebSocket
+    `send` waits likewise (the outgoing queue was unbounded).
+  - A raw ASGI middleware next to WebSocket routes is refused at translation unless it hands non-HTTP scopes
+    straight on (the binary does not run raw middlewares for WebSocket connections: an auth or rate-limit check
+    written for websockets would have been skipped).
+  - uvicorn's proxy headers: the last `X-Forwarded-Proto` is used, `*` trusts everyone only alone, networks with
+    host bits set are literals (as uvicorn); `regexp_match(flags=)` binds its flags.
+
 ## [0.7.1] — 2026-10-14
 
 Security release. Upgrading is strongly recommended.

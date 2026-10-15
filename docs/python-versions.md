@@ -123,7 +123,7 @@ release then (`--python 3.13.5` or `.python-version`).
 | `asyncio`: `create_task(**kwargs)`, call graphs, `get_event_loop()` raising without a loop | N/A | A route always runs inside the loop; the call-graph functions are not translated |
 | `logging.handlers.QueueListener` as a context manager | N/A | Not translated (the logging work of 0.8) |
 | `inspect.signature(annotation_format=)`, `io.Reader`/`Writer`, `ast` additions | N/A | Not translated |
-| `unicodedata` 16.0 | To do | `unicodedata.normalize` follows the runtime crate's Unicode tables, not checked against each Python's |
+| `unicodedata` 16.0 | Supported | `unicodedata.normalize`/`combining` and `str.isalpha()`... follow the project's Python: the runtime's tables (Unicode 17.0) less what that Python's Unicode does not assign (`py2axum/ucdages.py`, from `tools/gen_ucdages.py`), even when the translating Python is newer; `/libs/unicodedata` |
 | `hmac`, `ssl`, `http.server`, `tarfile`, `zipfile`, `configparser`, `argparse`, `sqlite3`, `unittest`, `getpass`, `faulthandler`... | N/A | Not used by a request handler, or not translated |
 
 ### Deprecations, removals, runtime
@@ -156,7 +156,7 @@ release then (`--python 3.13.5` or `.python-version`).
 | `sentinel` (PEP 661) | Refused (P2A0105) | |
 | `bytes.replace(..., count=)` as a keyword | Supported | `/pyver/bytes_replace_kw` (a `TypeError` before 3.15, as in CPython); `bytes.replace` itself was missing from the runtime and is now supported on every Python |
 | `bytearray.take_bytes()`, `slice[...]`, `memoryview` complex formats, `__slots__` changes | N/A | Not translated |
-| Timestamps and timeouts accept any real number (`Decimal`, `Fraction`) | Supported for `datetime.fromtimestamp` | `/pyver/fromtimestamp_decimal`, with 3.14's reworded error before (`argument must be int or float, not decimal.Decimal`); other functions taking a timestamp or a timeout: To do |
+| Timestamps and timeouts accept any real number (`Decimal`, `Fraction`) | Supported | `datetime.fromtimestamp` (`/pyver/fromtimestamp_decimal`, with 3.14's reworded error before: `argument must be int or float, not decimal.Decimal`) and `socket.create_connection(timeout=)` (`/pyver/timeout_*`: `must be real number, not str`). The other C functions taking a timestamp or a timeout (`time.sleep`, `time.localtime`, `date.fromtimestamp`, `threading`, `select`...) are not translated (P2A0201). asyncio's delays are Python code, unchanged: `asyncio.sleep`/`wait_for` add the delay to the loop's float time (a `Decimal` fails, except `asyncio.sleep` on uvloop), `/pyver/aio/*` |
 | `AttributeError` hints from other languages (`Did you mean '.append'?`) | Difference | `str(exc)` is unchanged; `traceback.format_exception_only` adds the hint in Python (on every Python for a close name, from 3.15 for these), not in the binary. Reading an attribute no runtime type has is refused anyway (P2A0204) |
 
 ### Standard library
@@ -177,8 +177,8 @@ release then (`--python 3.13.5` or `.python-version`).
 | `collections.Counter` `^` (symmetric difference) | Supported | `/pyver/counter_xor`; before 3.15 the `TypeError` names `Counter` (the runtime said `dict` on every Python) |
 | `functools.singledispatchmethod`, `threading` iterator helpers, `pprint(expand=)` | Refused | |
 | `typing`: `TypeForm`, `TypedDict(closed=, extra_items=)` (PEP 728), `@disjoint_base` | Refused | A `TypedDict` as a request or response type is refused (P2A0410); elsewhere it is a `dict`, unchanged |
-| `email` refuses to flatten a non-ASCII address it cannot encode | To do | Not checked against the runtime's `EmailMessage`/MIME generation |
-| `unicodedata` 17.0 and its new functions | Refused (P2A0201) for the new functions; To do for `normalize` | See 3.14 |
+| `email` refuses to flatten a non-ASCII address it cannot encode (`HeaderWriteError`) | N/A | Only under a policy with header objects (`EmailMessage`, `policy.default`), not translated (P2A0201). The compat32 messages the runtime builds (`MIMEText`, `MIMEMultipart`...) encode such an address whole on every Python, unchanged (`/mail/build?to=...`) |
+| `unicodedata` 17.0 and its new functions | Refused (P2A0201) for the new functions; Supported for `normalize`, `combining` | See 3.14 |
 | `importlib.metadata`, `hashlib`, `http.client`, `http.cookies`, `ssl`, `sqlite3`, `tomllib` 1.1, `xml`, `zlib`, `os.statx`, `Path.mkdir(parent_mode=)`... | N/A | Not used by a request handler, or not translated |
 
 ### Deprecations, removals, runtime
@@ -208,7 +208,8 @@ Found by running the same code on 3.12, 3.13, 3.14 and 3.15 (`/pyver/{name}` rep
 | `base64.b64decode`: data after the padding is decoded, excess `=` skipped (non-strict) | 3.13.13, 3.14.4 | Supported (`/pyver/b64_after_padding`) |
 | `%`-formatting errors name the argument and the position (`format argument 2: %d requires a real number, not str`, `not enough arguments for format string (got 1)`, `stray % at position 3`) | 3.15 | Supported (`/pyver/pct_*`) |
 | `socket.getaddrinfo` (and `create_connection`, `asyncio.open_connection`): the `idna` codec's check of the host raises `UnicodeEncodeError` naming the position (`label too long`, `label empty`), where 3.12 raises `UnicodeError: label empty or too long` | 3.13 | Supported (`/libs/ssrf`, `/stdmore/sock`); before, the binary passed such a host to the C library |
-| `re.error` is named `re.PatternError` | 3.13 | Difference: `type(e).__name__` is `error` in the binary; `except re.error` is unaffected |
+| `re.error` is named `re.PatternError` (`re.error` an alias) | 3.13 | Supported: `type(e).__name__` and tracebacks follow the project's Python (`/pyver/re_error_name`, `/py314/pattern-error`); `re.PatternError` is refused for a 3.12 project (P2A0603) |
+| `socket.create_connection(timeout=)` (C `settimeout`): `'Fraction' object cannot be interpreted as an integer` (3.13: `integer`, 3.14: `integer or float` and `fractions.Fraction`); out of range: `timestamp out of range for platform time_t` for a float, `too large to convert to C _PyTime_t` for an int (`PyTime_t` from 3.13), then `timestamp out of range for C PyTime_t` for both from the security releases 3.13.15 and 3.14.7 (probed on a distribution's Python: `pytime_range`) | 3.13, 3.14 | Supported (`/pyver/timeout_*`); before, a NaN or out-of-range timeout aborted the request |
 
 ## Differences found and fixed on every Python
 

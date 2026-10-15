@@ -809,6 +809,52 @@ pub fn fromtimestamp(ts: &V, tz: Option<&V>) -> R {
     }
 }
 
+/// A timeout given to a C function of CPython (`socket.settimeout`, `create_connection(timeout=)`):
+/// `_PyTime_FromSecondsObject`, its messages by version; any real number from 3.15 (Decimal, Fraction)
+pub fn c_seconds(v: &V) -> R<f64> {
+    let qual = |o: &V| match o {
+        V::Native(n) if matches!(&**n, Native::Fraction(_)) && super::python() >= (3, 14) => "fractions.Fraction",
+        o => o.type_name(),
+    };
+    // one message for float and int since the security releases 3.13.15 / 3.14.7 (then 3.15); before, the
+    // float's names `time_t`, the int's `_PyTime_t` (3.12) or `PyTime_t` (3.13, 3.14)
+    let unified = super::python_feature("pytime_range").unwrap_or_else(|| match super::python() {
+        (3, 13) => super::python_at_least(3, 13, 15),
+        (3, 14) => super::python_at_least(3, 14, 7),
+        v => v >= (3, 15),
+    });
+    let range = |old: &str| {
+        Exc::msg(&OVERFLOW_ERROR, if unified { "timestamp out of range for C PyTime_t".to_string() } else { old.to_string() })
+    };
+    let int_type = if super::python() >= (3, 13) { "PyTime_t" } else { "_PyTime_t" };
+    let t = match v {
+        V::Bool(b) => return Ok(*b as i64 as f64),
+        V::Int(i) if i.unsigned_abs() > 9_223_372_036 => {
+            return Err(range(&format!("timestamp too large to convert to C {int_type}")))
+        }
+        V::Int(i) => return Ok(*i as f64),
+        V::Float(f) => *f,
+        V::Decimal(d) if super::python() >= (3, 15) => d.to_f64(),
+        V::Native(n) if super::python() >= (3, 15) && matches!(&**n, Native::Fraction(_)) => {
+            let Native::Fraction(f) = &**n else { unreachable!() };
+            use num_traits::ToPrimitive;
+            f.num.to_f64().unwrap_or(f64::NAN) / f.den.to_f64().unwrap_or(f64::NAN)
+        }
+        o if super::python() >= (3, 15) => return Err(Exc::type_error(format!("must be real number, not {}", qual(o)))),
+        o if super::python() >= (3, 14) => {
+            return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer or float", qual(o))))
+        }
+        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", qual(o)))),
+    };
+    if t.is_nan() {
+        return Err(Exc::value_error("Invalid value NaN (not a number)"));
+    }
+    if t.abs() * 1e9 >= 9.223372036854775807e18 {
+        return Err(range("timestamp out of range for platform time_t"));
+    }
+    Ok(t)
+}
+
 /// `secrets.choice(seq)`
 /// `random.random/uniform/randint/sample/shuffle` (an OS-seeded generator: CPython's Mersenne Twister is
 /// seeded from os.urandom too, so no sequence is reproducible on either side)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py2axum"
-version = "0.7.1"
+version = "0.8.0"
 description = "Ahead-of-time compiler from FastAPI + SQLAlchemy + Pydantic applications to Rust (axum), with response-level conformance testing"
 readme = "README.md"
 license = "Apache-2.0"
@@ -45,6 +45,11 @@ conformance = [
     "mcp>=2.2.0,<2.3",
     "asyncpg>=0.31.0,<0.33",
     "icalendar>=7.0.0,<7.1",
+    "orjson>=3.13.0,<3.14",
+    "unidecode>=1.4.0,<1.5",
+    "ecs-logging>=2.3.0,<2.4",
+    "pyyaml>=6.0.2,<6.1",
+    "croniter>=6.2.4,<6.3",
     "uvicorn[standard]>=0.30",
 ]
 difftest = ["httpx>=0.27", "psycopg[binary]>=3.2", "schemathesis>=4.29", "hypothesis>=6.140"]

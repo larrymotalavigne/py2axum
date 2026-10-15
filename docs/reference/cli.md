@@ -33,8 +33,8 @@ cargo build --release --manifest-path build/api/Cargo.toml
   the first refused route.
 - `--no-stream` buffers list responses instead of streaming them
   ([Large list responses](../advanced/streaming.md)).
-- `--report FILE` writes a coverage report (Markdown + JSON) instead of generating; it never stops at the first
-  error.
+- `--report FILE` is deprecated: an internal coverage report (Markdown + JSON), outside the
+  [stable interface](versioning.md); use `py2axum check --format json` or `--format markdown` instead.
 - `--allow-untested-versions` translates even if the project locks library versions outside the
   [tested ranges](versions.md), at your own risk.
 - `--python X.Y` names the Python the project runs on (3.12 to 3.15; also `PY2AXUM_TARGET_PYTHON`): the binary
@@ -42,7 +42,10 @@ cargo build --release --manifest-path build/api/Cargo.toml
   `.python-version`, else this Python when `requires-python` allows it ([Python versions](../python-versions.md)).
   `check` and `watch` take it too.
 - `--backend` is deprecated and has no effect: there is one backend since 0.4. `--backend auto` and
-  `--backend dyn` are still accepted until 1.0; `--backend typed` is an error.
+  `--backend dyn` are still accepted until 1.0, with a warning; `--backend typed` is an error.
+
+The options, their defaults and the exit statuses are a stable interface: see
+[Versioning and deprecation](versioning.md).
 
 <!-- py2axum:cli-help -->
 
@@ -53,11 +56,12 @@ py2axum check api --root .
 py2axum check api --root . --python-side auto --fail-under 80     # in CI: exit 1 below 80 % native
 ```
 
-`check` takes the same `package`, `--root`, `--python-side` (`PATH`, `lifespan` or `auto`) and
+`check` takes the same `package`, `--root`, `--python-side` (`PATH`, `lifespan`, `mount` or `auto`) and
 `--allow-untested-versions` as generation, and:
 
 - `--format text|json|markdown`: the terminal report (default); machine-readable output on stdout, with the
-  same verdicts, each refused route's `code` and `suggestion`, and the `unblock` list (`--json` is a synonym);
+  same verdicts, each refused route's `code` and `suggestion`, and the `unblock` list (`--json` is a synonym;
+  its format is published as a JSON Schema, [`check-schema.json`](check-schema.json));
   or Markdown tables for a pull request comment or a CI job summary (`>> "$GITHUB_STEP_SUMMARY"`);
 - `--fail-under PCT`: also exit 1 when fewer than `PCT` % of the routes are native;
 - `--explain CODE`: print why a class of construct is refused and what to do ([Error codes](errors.md)), then
@@ -82,3 +86,15 @@ A failed cycle prints the error and keeps the previous binary running. Ctrl-C st
 [Watch mode](../getting-started/watch.md).
 
 <!-- py2axum:watch-help -->
+
+## The binary's `migrate`
+
+The generated binary applies the project's alembic migrations without Python when an `alembic.ini` was found at
+generation ([Database migrations](../advanced/migrations.md)), on `DATABASE_URL`:
+
+- `migrate [upgrade [head|<revision>]]` applies the revisions from where the database is, like `alembic upgrade`;
+- `migrate current` prints the database's revision, like `alembic current`;
+- `migrate --sql` prints the SQL `alembic upgrade head --sql` prints.
+
+A revision refused at generation (`P2A0510`, or one reading the database) stops `migrate` before anything is
+applied: apply it with alembic.

@@ -387,6 +387,20 @@ pub fn open(args: &[V], kwargs: &[(String, V)]) -> R {
     Ok(V::native(Native::File(File { path: p, binary, f: Mutex::new(Some(f)) })))
 }
 
+/// The whole content of an open file from its position (`yaml.safe_load(f)` reads it by chunks: see `pyyaml`),
+/// whether it is binary, and its `name`
+pub fn read_all(f: &File) -> R<(Vec<u8>, bool, String)> {
+    let mut g = f.f.lock();
+    let file = g.as_mut().ok_or_else(|| Exc::value_error("I/O operation on closed file."))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| os_err(e, &f.path))?;
+    Ok((buf, f.binary, f.path.clone()))
+}
+
+pub fn is_binary(f: &File) -> bool {
+    f.binary
+}
+
 pub fn file_method(f: &File, name: &str, args: &[V]) -> R {
     let closed = || Exc::value_error("I/O operation on closed file.");
     match name {

@@ -1,0 +1,104 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://larrymotalavigne.github.io/py2axum/reference/check-schema.json",
+ "title": "py2axum check --format json",
+ "description": "Output of `py2axum check --format json` (stable from 1.0: see Versioning and deprecation). Paths are absolute, as resolved by the translation.",
+ "type": "object",
+ "required": ["package", "backend", "python_side_auto", "routes", "global", "notes", "python", "summary", "blockers", "unblock"],
+ "additionalProperties": false,
+ "properties": {
+  "package": {"type": "string", "description": "the package directory, as given"},
+  "backend": {"const": "dyn", "description": "deprecated: always \"dyn\" (one backend since 0.4), removed in 1.0"},
+  "python_side_auto": {"type": "boolean", "description": "--python-side auto was given"},
+  "python": {
+   "type": "object",
+   "description": "the Python the binary follows; empty when it cannot be determined",
+   "additionalProperties": false,
+   "properties": {
+    "version": {"type": "string", "pattern": "^3\\.\\d+(\\.\\d+)?$"},
+    "probed": {"type": "object", "additionalProperties": {"type": "boolean"}}
+   }
+  },
+  "routes": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": ["method", "path", "handler", "where", "status", "reason", "code", "suggestion", "blockers"],
+    "additionalProperties": false,
+    "properties": {
+     "method": {"type": "string", "description": "GET, POST... ; RAW for a raw ASGI route"},
+     "path": {"type": "string"},
+     "handler": {"type": "string", "description": "the endpoint's name, ? when unknown"},
+     "where": {"type": "string", "description": "file:line of the route"},
+     "status": {"enum": ["native", "python-side", "refused"]},
+     "reason": {"type": ["string", "null"], "description": "the first refusal, file:line first"},
+     "code": {"type": ["string", "null"], "pattern": "^P2A\\d{4}$"},
+     "suggestion": {"type": ["string", "null"]},
+     "blockers": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                  "description": "construct label -> file:line of each occurrence"}
+    }
+   }
+  },
+  "global": {
+   "type": "array",
+   "description": "errors that refuse the whole application",
+   "items": {
+    "type": "object",
+    "required": ["construction", "error", "where", "code", "suggestion"],
+    "additionalProperties": false,
+    "properties": {
+     "construction": {"type": "string"},
+     "error": {"type": "string"},
+     "where": {"type": "string"},
+     "code": {"type": "string", "pattern": "^P2A\\d{4}$"},
+     "suggestion": {"type": "string"}
+    }
+   }
+  },
+  "notes": {"type": "array", "items": {"type": "string"}},
+  "summary": {
+   "type": "object",
+   "required": ["total", "native", "python-side", "refused", "native_pct", "generates"],
+   "additionalProperties": false,
+   "properties": {
+    "total": {"type": "integer"},
+    "native": {"type": "integer"},
+    "python-side": {"type": "integer"},
+    "refused": {"type": "integer"},
+    "native_pct": {"type": "number"},
+    "generates": {"type": "boolean", "description": "generation would succeed"}
+   }
+  },
+  "blockers": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": ["construction", "routes", "only_blocker", "code", "where"],
+    "additionalProperties": false,
+    "properties": {
+     "construction": {"type": "string"},
+     "routes": {"type": "integer", "description": "routes it touches"},
+     "only_blocker": {"type": "integer", "description": "routes for which it is the only blocker"},
+     "code": {"type": ["string", "null"], "pattern": "^P2A\\d{4}$"},
+     "where": {"type": "array", "items": {"type": "string"}}
+    }
+   }
+  },
+  "unblock": {
+   "type": "array",
+   "description": "greedy order: supporting (or rewriting) these constructs in turn makes the most routes native",
+   "items": {
+    "type": "object",
+    "required": ["construction", "code", "new_native", "native_after", "suggestion"],
+    "additionalProperties": false,
+    "properties": {
+     "construction": {"type": "string"},
+     "code": {"type": ["string", "null"], "pattern": "^P2A\\d{4}$"},
+     "new_native": {"type": "integer"},
+     "native_after": {"type": "integer"},
+     "suggestion": {"type": "string"}
+    }
+   }
+  }
+ }
+}

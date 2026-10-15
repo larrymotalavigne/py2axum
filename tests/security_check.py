@@ -145,14 +145,52 @@ def main():
         st, _, _ = req(base, "POST", "/sec/echo", b"[1]", js)
         check("under max body", st == 200, str(st))
 
-    # 10. 0.7.1: Decimal work chosen by the request is bounded in time, never an aborted process
+    # 10. second review (0.8): work chosen by the request is bounded in time, never an aborted process
     for path, body in (("/sec/decimal", {"price": "1e999999999999999999"}), ("/sec/decimal", {"price": "-1e-999999999999999999"}),
-                       ("/sec/decimal/digits", {"amount": "1" + "0" * 1_000_000}), ("/sec/decimal/digits", {"amount": "7" * 1_000_000})):
+                       ("/sec/decimal/digits", {"amount": "1" + "0" * 1_000_000}), ("/sec/decimal/digits", {"amount": "7" * 1_000_000}),
+                       ("/sec/fraction", {"r": "1" * 1_000_000})):
         st, _, dt = req(base, "POST", path, json.dumps(body).encode(), js)
         check(f"{path} {str(body)[:30]}", st in (200, 422) and dt < 5 and alive(base), f"{st} {dt:.2f}s")
+    st, _, dt = req(base, "POST", "/sec/echo", b"1" * 1_000_000, js)
+    check("json integer of a million digits", st == 400 and dt < 5 and alive(base), f"{st} {dt:.2f}s")
     for q in ("a=1e999999999999999999&b=-1e-999999999999999999", "a=1e-999999999999999999&b=1e999999999999999999"):
         st, _, dt = req(base, "GET", f"/sec/decimal/ops?{q}")
         check(f"decimal ops {q[:24]}", st == 200 and dt < 5, f"{st} {dt:.2f}s")
+    for q in ("how=zfill&n=-1", f"how=ljust&n={2**62}", "how=format&w=99999999999999999999", "how=precision&w=2147483648",
+              "how=percent&w=99999999999999999999", "how=pprec&w=99999999999999999999"):
+        st, b, _ = req(base, "GET", f"/sec/pad?{q}")
+        check(f"pad {q}", st == 200 and alive(base), b[:60].decode(errors="replace"))
+    st, _, dt = req(base, "GET", f"/sec/range?start=0&stop={10**15}")
+    check("range(10**15)", st == 500 and dt < 5 and alive(base), f"{st} {dt:.2f}s")
+    st, _, dt = req(base, "GET", f"/sec/range?start=0&stop={2**63 - 1}&step={2**62}")
+    check("range near the 64-bit edge", st == 200 and dt < 5, f"{st} {dt:.2f}s")
+
+    # 11. a raw ASGI stream the app leaves unfinished: the connection is closed, not held open
+    host, port = base.split("//", 1)[1].split(":")
+    with socket.create_connection((host, int(port)), timeout=10) as s:
+        s.sendall(b"GET /mw/x HTTP/1.1\r\nhost: x\r\nx-block: halt\r\n\r\n")
+        t0, closed = time.monotonic(), False
+        try:
+            while time.monotonic() - t0 < 8:
+                if not s.recv(65536):
+                    closed = True
+                    break
+        except OSError:
+            closed = True
+    check("unfinished raw stream closed", closed, f"{time.monotonic() - t0:.2f}s")
+
+    # 12. a client that does not read a large raw ASGI stream: the server waits, its memory does not follow
+    import subprocess
+    pid = subprocess.run(["lsof", "-tiTCP:" + port, "-sTCP:LISTEN"], capture_output=True, text=True).stdout.split()
+    if pid:
+        rss = lambda: int(subprocess.run(["ps", "-o", "rss=", "-p", pid[0]], capture_output=True, text=True).stdout.strip() or 0)
+        before = rss()
+        with socket.create_connection((host, int(port)), timeout=10) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            s.sendall(b"GET /mw/x HTTP/1.1\r\nhost: x\r\nx-block: flood\r\n\r\n")
+            time.sleep(3)
+            grown = (rss() - before) // 1024
+        check("slow reader of a raw stream", grown < 64 and alive(base), f"+{grown} MiB")
 
     check("still serving", alive(base))
     print(f"{len(FAILS)} failure(s)")

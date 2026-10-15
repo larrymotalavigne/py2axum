@@ -3,7 +3,7 @@ function naming itself, objects a failed flush, a rollback or a DELETE left link
 while a `yield` dependency is open. Measured by bench/leak_isolate.py (kind `leak_*` of bench/soak.py)."""
 import asyncio
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -100,6 +100,54 @@ async def deleted(db: DbDep):
     tasks = len(p.tasks)
     await db.rollback()
     return {"gone": gone is None, "tasks": tasks}
+
+
+@router.get("/task_state")
+async def task_state(request: Request, n: int = 3):
+    """A task kept in the request's own state (request -> task -> its coroutine's context -> request)."""
+    payload = "z" * 100000
+
+    async def work():
+        return len(payload) + n
+
+    request.state.task = asyncio.create_task(work())
+    return {"v": await request.state.task, "done": request.state.task.done()}
+
+
+@router.post("/rolled_back/state")
+async def rolled_back_state(db: DbDep, delete: bool = False):
+    """After the rollback, objects INSERTed in the transaction are transient again: out of the session, keeping
+    their attributes (key included) and their loaded relationships; added again, they INSERT with that key."""
+    p = Project(name="rb", tasks=[Task(title="c"), Task(title="d")])
+    db.add(p)
+    await db.flush()
+    pid, tid = p.id, p.tasks[0].id
+    if delete:
+        await db.delete(p)
+        await db.flush()
+    await db.rollback()
+    out = {"in": p in db, "task_in": p.tasks[0] in db, "id": p.id == pid, "name": p.name, "tasks": len(p.tasks),
+           "tid": p.tasks[0].id == tid, "back": p.tasks[0].project is p, "rev": p.tasks[0].revision,
+           "keys": sorted(k for k in vars(p) if not k.startswith("_"))}
+    db.add(p)
+    await db.flush()
+    out["again"] = [p.id == pid, p in db, len(p.tasks), p.tasks[1].id is not None]
+    await db.rollback()
+    return out
+
+
+@router.post("/dup_flush/state")
+async def dup_flush_state(db: DbDep):
+    """A failed flush, then the rollback: the parent and its children transient, still linked both ways."""
+    pid = await _seed(db)
+    p = Project(id=pid, name="dup", tasks=[Task(title="a"), Task(title="b")])
+    db.add(p)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+    return {"in": p in db, "id": p.id == pid, "tasks": len(p.tasks), "back": p.tasks[0].project is p,
+            "tid": p.tasks[0].id, "task_in": p.tasks[0] in db}
 
 
 @router.get("/stream_dep")

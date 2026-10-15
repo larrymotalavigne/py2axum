@@ -32,6 +32,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0115](#p2a0115) | Syntax error |
 | [P2A0116](#p2a0116) | Decorator |
 | [P2A0117](#p2a0117) | Python 3.14 or 3.15 construct not supported |
+| [P2A0118](#p2a0118) | Synchronous generator consumed synchronously |
 | [P2A0201](#p2a0201) | Library call not supported |
 | [P2A0202](#p2a0202) | Library value not supported |
 | [P2A0203](#p2a0203) | Method not implemented by the runtime |
@@ -73,6 +74,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0507](#p2a0507) | create_all and DDL |
 | [P2A0508](#p2a0508) | TypeDecorator |
 | [P2A0509](#p2a0509) | Table introspection |
+| [P2A0510](#p2a0510) | Alembic migrations |
 | [P2A0601](#p2a0601) | Library version outside the tested ranges |
 | [P2A0602](#p2a0602) | Cannot be left to Python |
 | [P2A0603](#p2a0603) | Not available on the project's Python |
@@ -250,6 +252,16 @@ A construct of a recent Python (template strings, lazy imports of project module
 **What to do:** Use the construct the message suggests (an f-string, a plain import).
 
 See [python-versions.md](../python-versions.md).
+
+### P2A0118
+
+**Synchronous generator consumed synchronously**
+
+The runtime runs a generator function as an async generator: a streamed response consumes it like Starlette, a synchronous consumer (`list()`, `for`, `next()`, a comprehension) cannot drive it lazily.
+
+**What to do:** Build the list in the function and return it, or write an `async def` generator iterated with `async for`.
+
+See [Python semantics](../reference/python.md).
 
 ## Libraries
 
@@ -668,6 +680,16 @@ See [SQL databases](../tutorial/sql.md#what-is-native).
 **What to do:** Install SQLAlchemy 2.x next to py2axum, and read `__table__` from a mapped class of a declarative base.
 
 See [SQL databases](../tutorial/sql.md).
+
+### P2A0510
+
+**Alembic migrations**
+
+`<binary> migrate` replays the SQL alembic's offline mode renders at translation time, with the options env.py and alembic.ini set; an option or a layout it cannot reproduce is refused.
+
+**What to do:** Keep env.py's `context.configure(...)` options literal and identical online and offline, keep the revisions under `script_location/versions`, or keep running `alembic upgrade head` instead of `<binary> migrate`.
+
+See [advanced/migrations.md](../advanced/migrations.md).
 
 ## Project and versions
 

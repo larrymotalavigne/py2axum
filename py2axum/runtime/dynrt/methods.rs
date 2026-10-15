@@ -99,9 +99,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::Tenacity(t) => return super::tenacity::attr(t, name),
             Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => return super::satable::attr(n, name),
             Native::RelDelta(r) => return super::reldelta::attr(r, name).ok_or_else(|| no_attr(v, name)),
+            Native::Cron(c) => return super::croniter::attr(c, name),
             Native::Prom(p) => return super::prom::attr(p, name),
             Native::Routing(o) => return super::routing::attr(o, name),
             Native::TraceFrame(f) => return super::trace::frame_attr(f, name),
+            Native::YamlMark(m) => return super::pyyaml::mark_attr(m, name),
             Native::TraceCode(f) => return super::trace::code_attr(f, name),
             Native::Traceback(c, i) => return super::trace::tb_attr(c, *i, name),
             Native::FrameSummary(f, l) => return super::trace::summary_attr(f, *l, name),
@@ -192,6 +194,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 None => unreachable!("class method {name} not in the method table"),
             },
             (ClassKind::Schema(s), "model_fields") => schema_fields(s),
+            // a class attribute of a plain class read on the class held as a value (`cls.X` in `__new__` or a classmethod)
+            (ClassKind::Schema(s), _) if s.open && matches!(find_method(s.methods, name), Some((true, _))) => {
+                let (_, f) = find_method(s.methods, name).unwrap();
+                f(cx, v.clone(), vec![]).await
+            }
             (ClassKind::Enum(e), _) if e.by_name(name).is_some() => Ok(e.by_name(name).unwrap()),
             (ClassKind::Enum(e), _) if find_method(e.methods, name).is_some() => Ok(bound(find_method(e.methods, name).unwrap().1, v.clone())),
             (_, "__name__") => Ok(V::str(c.name)),
@@ -210,6 +217,9 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
         V::Exc(e) if e.0.attrs.lock().contains_key(name) => Ok(e.0.attrs.lock()[name].clone()),
         V::Exc(e) => match name {
             "args" => Ok(V::tuple(e.args())),
+            // the chain (set when raised `from`, or while another was handled: read above), else none
+            "__cause__" | "__context__" => Ok(V::None),
+            "__suppress_context__" => Ok(V::Bool(false)),
             // set by add_note (an instance attribute, read above): absent before the first note
             "__notes__" => Err(no_attr(v, name)),
             // SQLAlchemy's StatementError/DBAPIError: the exception met (read above), absent elsewhere
@@ -225,6 +235,8 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 let h = e.http_info().unwrap().2;
                 if h.is_empty() { Ok(V::None) } else { V::dict_from(h.into_iter().map(|(k, v)| (V::str(k), V::str(v))).collect()) }
             }
+            // the attributes PyYAML's exceptions set in their `__init__`
+            _ if super::pyyaml::exc_attr(e, name).is_some() => Ok(super::pyyaml::exc_attr(e, name).unwrap()),
             _ => match e.0.class.exc_lookup(name) {
                 Some(ExcMember::Attr(f)) => f(cx).await,
                 Some(ExcMember::Method(true, f)) => f(cx, v.clone(), vec![]).await,
@@ -342,7 +354,9 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::AmqpConn(c) => super::rmq::conn_attr(c, name),
             Native::AmqpChan(c) => super::rmq::chan_attr(c, name),
             Native::AmqpIncoming(m) => super::rmq::incoming_attr(m, name),
-            Native::AmqpQueue(_, q) if name == "name" => Ok(V::str(q)),
+            Native::AmqpQueue(q) => super::rmq::queue_attr(q, name),
+            Native::AmqpExchange(x) => super::rmq::exchange_attr(x, name),
+            Native::AmqpFrame(_, fields) => fields.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()).ok_or_else(|| no_attr(v, name)),
             Native::ExtType(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t.rsplit('.').next().unwrap_or(t))),
             Native::ExtType(t) if name == "__module__" => Ok(V::str(t.rsplit_once('.').map(|x| x.0).unwrap_or("builtins"))),
             Native::PyFn(f) => f.attrs.lock().iter().find(|(k, _)| k == name).map(|(_, x)| x.clone()).ok_or_else(|| no_attr(v, name)),
@@ -691,6 +705,18 @@ pub async fn setattr_cx(cx: &Cx, v: &V, name: &str, val: V) -> R<()> {
             return pyd::assign_validated(cx, i, name, val).await;
         }
     }
+    if let V::Class(c) = v {
+        if let ClassKind::Schema(s) = c.kind {
+            if s.open {
+                // `cls.X = v` (a plain class's own class attribute, `=X` in its method table)
+                return match find_method(s.methods, &format!("={name}")) {
+                    Some((_, f)) => f(cx, v.clone(), vec![val]).await.map(|_| ()),
+                    None => Err(Exc::type_error(format!(
+                        "py2axum: setting {name} on class {} at run time is not supported (only its own class attributes)", c.name))),
+                };
+            }
+        }
+    }
     setattr(v, name, val)
 }
 
@@ -775,6 +801,14 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let f = getattr(cx, recv, name).await?;
             call_value(cx, &f, args, kwargs).await
         }
+        V::Native(n) if matches!(&**n, Native::YamlMark(_)) => {
+            let Native::YamlMark(m) = &**n else { unreachable!() };
+            super::pyyaml::mark_method(m, name, &args, &kwargs)
+        }
+        V::Native(n) if matches!(&**n, Native::Cron(_)) => {
+            let Native::Cron(c) = &**n else { unreachable!() };
+            super::croniter::method(c, name, args, kwargs)
+        }
         V::Native(n) if matches!(&**n, Native::ICal(_)) => {
             let Native::ICal(c) = &**n else { unreachable!() };
             super::ical::method(c, name, args, kwargs)
@@ -817,13 +851,20 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let Native::Adapter(td, _) = &**n else { unreachable!() };
             pyd::adapter_method(cx, td, name, args, kwargs).await
         }
-        V::Native(n) if matches!(&**n, Native::AmqpConn(_) | Native::AmqpChan(_) | Native::AmqpQueue(..) | Native::AmqpExchange(..) | Native::AmqpIncoming(_)) => match &**n {
+        V::Native(n) if matches!(&**n, Native::AmqpConn(_) | Native::AmqpChan(_) | Native::AmqpQueue(..) | Native::AmqpExchange(..)
+                                       | Native::AmqpIncoming(_) | Native::AmqpIter(_)) => match &**n {
             Native::AmqpConn(c) => super::rmq::conn_method(c, name, &args).await,
             Native::AmqpChan(c) => super::rmq::chan_method(c, name, &args, &kwargs).await,
-            Native::AmqpQueue(c, q) if name == "get" => super::rmq::queue_get(c, q, &kwargs).await,
-            Native::AmqpExchange(c, x) if name == "publish" => super::rmq::publish(c, x, &args, &kwargs).await,
-            Native::AmqpIncoming(m) => super::rmq::incoming_method(m, name).await,
+            Native::AmqpQueue(q) => super::rmq::queue_method(cx, q, name, &args, &kwargs).await,
+            Native::AmqpExchange(x) => super::rmq::exchange_method(x, name, &args, &kwargs).await,
+            Native::AmqpIncoming(m) => super::rmq::incoming_method(m, name, &args, &kwargs).await,
+            Native::AmqpIter(it) if name == "close" && args.is_empty() => super::rmq::iter_close(it).await.map(|_| V::None),
             _ => Err(no_attr(recv, name)),
+        },
+        V::Native(n) if matches!(&**n, Native::AFuture(_) | Native::AEvent(_)) => match &**n {
+            Native::AFuture(f) => super::aio::future_method(recv, f, name, &args),
+            Native::AEvent(e) => super::aio::event_method(e, name, &args).await,
+            _ => unreachable!(),
         },
         V::Native(n) if matches!(&**n, Native::Redis(_)) => {
             let Native::Redis(c) = &**n else { unreachable!() };
@@ -1352,7 +1393,7 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
         // a builtin type used as a function value (`map(str, xs)`, `defaultdict(list)`)
         if let Native::Type(t) = &**n {
-            if *t != "dict" && !kwargs.is_empty() {
+            if *t != "dict" && *t != "datetime" && !kwargs.is_empty() {
                 return Err(Exc::type_error(format!("{t}() takes no keyword arguments")));
             }
             return match *t {
@@ -1364,6 +1405,7 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
                 "tuple" => b_tuple(&args),
                 "set" | "frozenset" => b_set(&args),
                 "dict" => b_dict(&args, &kwargs),
+                "datetime" => super::libs::datetime_new(&args, &kwargs),
                 other => Err(Exc::type_error(format!("py2axum: calling the type {other} as a value is not supported"))),
             };
         }
@@ -1451,6 +1493,9 @@ async fn schema_new(cx: &Cx, s: &'static pyd::SchemaDesc, args: Vec<V>, kwargs: 
     if s.dataclass {
         return pyd::dataclass_new(cx, s, args, kwargs).await;
     }
+    if s.open && s.x.new_.is_some() {
+        return Box::pin(plain_new(cx, s, args, kwargs)).await;
+    }
     if s.open {
         let o = pyd::object_new(s);
         return match s.init {
@@ -1476,6 +1521,19 @@ async fn schema_new(cx: &Cx, s: &'static pyd::SchemaDesc, args: Vec<V>, kwargs: 
         return init(cx, o.clone(), super::pack(vec![], kwargs)).await.map(|_| o);
     }
     pyd::construct(cx, s, super::kwargs_dict(kwargs)?).await
+}
+
+/// `Cls(...)` of a plain class with a `__new__`: `__new__(cls, ...)`, then `__init__` when it returned an instance
+/// of the class (CPython's `type.__call__`)
+pub async fn plain_new(cx: &Cx, s: &'static pyd::SchemaDesc, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    let Some(new_) = s.x.new_ else { return Box::pin(schema_new(cx, s, args, kwargs)).await };
+    let r = new_(cx, V::Class(s.class), super::pack(args.clone(), kwargs.clone())).await?;
+    if let (V::Inst(i), Some(init)) = (&r, s.init) {
+        if i.desc.class.is_subclass(s.class) {
+            init(cx, r.clone(), super::pack(args, kwargs)).await?;
+        }
+    }
+    Ok(r)
 }
 
 // ---------------------------------------------------------------- str
@@ -1713,6 +1771,7 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
         // Python: isalpha or isdecimal or isdigit or isnumeric (numeric includes the other two)
         "isalnum" => V::Bool(!s.is_empty() && s.chars().all(|c| str_class(c, |t| t.alpha, char::is_alphabetic) || str_class(c, |t| t.numeric, char::is_numeric))),
         "isspace" => V::Bool(!s.is_empty() && s.chars().all(py_space)),
+        "isprintable" => V::Bool(s.chars().all(printable)),
         // CPython's unicode_islower_impl / unicode_isupper_impl: no cased character of the other kind (nor a
         // titlecase one), at least one of this kind
         "islower" | "isupper" => {
@@ -1732,11 +1791,15 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
             V::Bool(ok && cased)
         }
         "zfill" => {
+            // a negative width pads nothing (it was 2^64 here: capacity overflow), a huge one is MemoryError
             let w = match &args[0] {
-                V::Int(i) => *i as usize,
+                V::Int(i) => (*i).max(0) as usize,
                 _ => 0,
             };
             let n = s.chars().count();
+            if n < w {
+                super::ops::repeat_room(1, w - n, "padded string is too long")?;
+            }
             if n >= w {
                 V::Str(s.clone())
             } else if let Some(rest) = s.strip_prefix(['-', '+']) {
@@ -1758,11 +1821,14 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
         }
         "ljust" | "rjust" | "center" => {
             let w = match &args[0] {
-                V::Int(i) => *i as usize,
+                V::Int(i) => (*i).max(0) as usize,
                 _ => 0,
             };
             let fill = args.get(1).and_then(|f| f.as_str()).and_then(|f| f.chars().next()).unwrap_or(' ');
             let n = s.chars().count();
+            if n < w {
+                super::ops::repeat_room(fill.len_utf8(), w - n, "padded string is too long")?;
+            }
             if n >= w {
                 V::Str(s.clone())
             } else {
@@ -1771,7 +1837,8 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
                 V::str(match name {
                     "ljust" => format!("{s}{}", rep(pad)),
                     "rjust" => format!("{}{s}", rep(pad)),
-                    _ => format!("{}{s}{}", rep(pad / 2 + (pad % 2 & n % 2)), rep(pad - (pad / 2 + (pad % 2 & n % 2)))),
+                    // CPython's `pad()`: the odd margin goes left when the width is odd
+                    _ => format!("{}{s}{}", rep(pad / 2 + (pad & w & 1)), rep(pad - (pad / 2 + (pad & w & 1)))),
                 })
             }
         }
@@ -1926,7 +1993,7 @@ fn dict_method(d: &Arc<Mutex<IndexMap<Key, (V, V)>>>, name: &str, args: &[V], kw
             }
             let mut g = d.lock();
             for (k, v) in items {
-                g.insert(Key::dict_key(&k)?, (k, v));
+                dict_put(&mut g, Key::dict_key(&k)?, k, v);
             }
             Ok(V::None)
         }
@@ -2062,12 +2129,22 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
         "replace" => {
             let w = d.wall;
             let mut tz = d.tz;
+            let mut fold = d.fold;
             let mut f = [w.year() as i64, w.month() as i64, w.day() as i64, w.hour() as i64, w.minute() as i64, w.second() as i64, (w.nanosecond() / 1000) as i64];
             for (k, v) in kwargs {
                 let slot = match k.as_str() {
                     "year" => 0, "month" => 1, "day" => 2, "hour" => 3, "minute" => 4, "second" => 5, "microsecond" => 6,
                     "tzinfo" => {
                         tz = libs::tz_of(v)?;
+                        continue;
+                    }
+                    "fold" => {
+                        fold = match v {
+                            V::Int(i @ (0 | 1)) => *i as u8,
+                            V::Bool(b) => *b as u8,
+                            V::Int(_) => return Err(Exc::value_error("fold must be either 0 or 1")),
+                            o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+                        };
                         continue;
                     }
                     _ => return Err(Exc::type_error(format!("'{k}' is an invalid keyword argument for replace()"))),
@@ -2080,7 +2157,7 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
                 time_field(v, hi, what)?;
             }
             let wall = date.and_hms_micro_opt(h as u32, mi as u32, sec as u32, us as u32).ok_or_else(|| Exc::value_error("replace(): value out of range"))?;
-            V::DateTime(DateTime { wall, tz, fold: 0 })
+            V::DateTime(DateTime { wall, tz, fold })
         }
         "utcoffset" => d.offset().map(|o| V::Delta(Duration::seconds(o as i64))).unwrap_or(V::None),
         "weekday" => V::Int(d.wall.weekday().num_days_from_monday() as i64),
@@ -2424,6 +2501,19 @@ pub fn b_int(args: &[V]) -> R {
             let t = s.trim().replace('_', "");
             i64::from_str_radix(&t, base).map(V::Int).map_err(|_| Exc::value_error(format!("invalid literal for int() with base {base}: {}", ops::str_repr(s))))
         }
+        // bytes: parsed as their ASCII text, the error showing the bytes' repr
+        Some(V::Bytes(b)) => {
+            let base = match args.get(1) {
+                Some(V::Int(b)) => *b as u32,
+                _ => 10,
+            };
+            let bad = || Exc::value_error(format!("invalid literal for int() with base {base}: {}", ops::repr(&V::Bytes(b.clone())).unwrap_or_default()));
+            let t = std::str::from_utf8(b).ok().filter(|t| t.is_ascii()).ok_or_else(bad)?;
+            match b_int(&[V::str(t), V::Int(base as i64)]) {
+                Ok(v) => Ok(v),
+                Err(_) => Err(bad()),
+            }
+        }
         Some(other) => Err(Exc::type_error(format!("int() argument must be a string, a bytes-like object or a real number, not '{}'", other.type_name()))),
     }
 }
@@ -2633,6 +2723,11 @@ pub fn b_next_iter(args: &[V]) -> R {
                 Some(v) => Ok(v),
                 None => args.get(1).cloned().ok_or_else(|| Exc::new(&STOP_ITERATION, vec![])),
             },
+            Native::Cron(c) => super::croniter::next(c),
+            Native::CronGen(g) => match super::croniter::gen_next(g)? {
+                Some(v) => Ok(v),
+                None => args.get(1).cloned().ok_or_else(|| Exc::new(&STOP_ITERATION, vec![])),
+            },
             _ => Err(Exc::type_error(format!("'{}' object is not an iterator", args[0].type_name()))),
         },
         other => Err(Exc::type_error(format!("'{}' object is not an iterator", other.type_name()))),
@@ -2732,12 +2827,14 @@ pub fn b_range(args: &[V]) -> R {
     if step == 0 {
         return Err(Exc::value_error("range() arg 3 must not be zero"));
     }
+    // the range is a list here (not lazy): its length computed first, without overflow (`i += step` wrapped
+    // past i64::MAX and never ended), and reserved up front, MemoryError rather than an aborted process
+    let (lo, hi, st) = (start as i128, stop as i128, step as i128);
+    let len = if st > 0 && lo < hi { (hi - lo - 1) / st + 1 } else if st < 0 && lo > hi { (lo - hi - 1) / -st + 1 } else { 0 };
+    let len = usize::try_from(len).map_err(|_| Exc::msg(&MEMORY_ERROR, ""))?;
     let mut out = Vec::new();
-    let mut i = start;
-    while (step > 0 && i < stop) || (step < 0 && i > stop) {
-        out.push(V::Int(i));
-        i += step;
-    }
+    out.try_reserve_exact(len).map_err(|_| Exc::msg(&MEMORY_ERROR, ""))?;
+    out.extend((0..len as i128).map(|k| V::Int((lo + k * st) as i64)));
     Ok(V::list(out))
 }
 
@@ -3014,6 +3111,13 @@ pub struct StrClasses {
     pub lower: &'static [(u32, u32)],
     pub upper: &'static [(u32, u32)],
     pub title: &'static [(u32, u32)],
+    /// `str.isprintable()`: what `repr()` leaves unescaped
+    pub printable: &'static [(u32, u32)],
+}
+
+/// a character `repr()` writes as is (CPython's `Py_UNICODE_ISPRINTABLE`)
+pub fn printable(c: char) -> bool {
+    str_class(c, |t| t.printable, |c| !c.is_control())
 }
 
 static STR_CLASSES: std::sync::OnceLock<&'static StrClasses> = std::sync::OnceLock::new();

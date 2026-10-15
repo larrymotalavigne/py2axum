@@ -1261,10 +1261,12 @@ async def mail_filters(name: str = "Ada <&>", amount: float = 1234567.891):
 
 
 @app.get("/mail/build")
-async def mail_build():
+async def mail_build(to: str = "ada@example.com"):
+    # a non-ASCII address in a compat32 message (MIMEText...): encoded whole, on every Python (3.15's
+    # HeaderWriteError is EmailMessage's, under the default policy)
     msg = MIMEMultipart("mixed")
     msg["From"] = formataddr(("Équipe Easy", "noreply@example.com"))
-    msg["To"] = "ada@example.com"
+    msg["To"] = to
     msg["Subject"] = "Votre reçu"
     alt = MIMEMultipart("alternative")
     alt.attach(MIMEText("plain text", "plain"))
@@ -1274,7 +1276,12 @@ async def mail_build():
     att.add_header("Content-Disposition", "attachment", filename="reçu.pdf")
     msg.attach(att)
     text = msg.as_string()
-    return {"text": text, "from": msg["From"], "plain": formataddr(("Ada", "a@b.c")), "quoted": formataddr(("Ada, L.", "a@b.c"))}
+    try:
+        bad = formataddr(("Ada", to))
+    except UnicodeEncodeError as e:
+        bad = [type(e).__name__, str(e)]
+    return {"text": text, "from": msg["From"], "plain": formataddr(("Ada", "a@b.c")), "quoted": formataddr(("Ada, L.", "a@b.c")),
+            "to": bad}
 
 
 @app.post("/mail/send")

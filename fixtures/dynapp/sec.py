@@ -4,6 +4,7 @@ FastAPI where it matters for safety. Request values that reach SQL as names (lab
 below a missing tail; unhandled errors leak nothing; sizes chosen by the request raise, never abort."""
 import secrets
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -134,13 +135,17 @@ async def repeat(n: int):
         return {"err": type(e).__name__}
 
 
-# ---- 0.7.1: exponents and digit counts chosen by the request
+# ---- second review (0.8): exponents, digit counts and widths chosen by the request
 class Price(BaseModel):
     price: Decimal = Field(ge=0)
 
 
 class Amount(BaseModel):
     amount: Decimal = Field(max_digits=12, decimal_places=2)
+
+
+class Ratio(BaseModel):
+    r: Fraction
 
 
 @router.post("/decimal")
@@ -153,6 +158,12 @@ async def decimal_bound(body: Price):
 async def decimal_digits(body: Amount):
     """`max_digits`/`decimal_places` on a long coefficient: linear, not one division per trailing zero."""
     return {"amount": str(body.amount)}
+
+
+@router.post("/fraction")
+async def fraction(body: Ratio):
+    """`Fraction` from text: `int()`'s 4300-digit limit (fraction_parsing past it)."""
+    return {"r": str(body.r)}
 
 
 def _arith(f):
@@ -182,6 +193,47 @@ async def decimal_ops(a: str, b: str):
         "normalize": _arith(lambda: str(x.normalize())),
         "pos": _arith(lambda: str(+x)),
     }
+
+
+@router.get("/pad")
+async def pad(how: str, n: int = 0, w: str = ""):
+    """Widths and precisions from the request: MemoryError/ValueError as CPython, never an aborted process."""
+    try:
+        if how == "zfill":
+            out = "-7".zfill(n)
+        elif how == "ljust":
+            out = "ab".ljust(n, "*")
+        elif how == "center":
+            out = "ab".center(n)
+        elif how == "format":
+            out = format("ab", ">" + w)
+        elif how == "precision":
+            out = format(1.5, "." + w + "f")
+        elif how == "percent":
+            out = ("%" + w + "s") % "ab"
+        else:
+            out = ("%." + w + "f") % 1.5
+        return {"len": len(out), "head": out[:8]}
+    except (MemoryError, OverflowError, ValueError) as e:
+        return {"err": type(e).__name__, "msg": str(e)}
+
+
+@router.get("/range")
+async def range_(start: int, stop: int, step: int = 1):
+    """A range near the 64-bit edge: its length computed without wrapping (it looped for ever)."""
+    return {"items": list(range(start, stop, step))[:4]}
+
+
+@router.get("/regexp")
+async def regexp(flags: str, db: DbDep):
+    """`regexp_match(flags=)` from the request: bound, so a quote cannot leave the string literal."""
+    try:
+        n = await db.scalar(select(func.count(Owner.id)).where(Owner.name.regexp_match("a", flags=flags)))
+        out = {"n": n}
+    except Exception as e:
+        await db.rollback()
+        out = {"err": type(e).__name__}
+    return {**out, "owners": await _owners(db)}
 
 
 @router.post("/upload")

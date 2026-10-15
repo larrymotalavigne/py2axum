@@ -119,7 +119,7 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         }
         _ => {
             let (default_media, json) = match kind {
-                "JSONResponse" => (Some("application/json"), true),
+                "JSONResponse" | "ORJSONResponse" => (Some("application/json"), true),
                 "PlainTextResponse" => (Some("text/plain"), false),
                 "HTMLResponse" => (Some("text/html"), false),
                 _ => (None, false),
@@ -127,6 +127,9 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             let content = arg(args, kwargs, 0, "content").cloned();
             let body: Vec<u8> = match (&content, json) {
                 (None, false) => vec![],
+                // FastAPI's ORJSONResponse.render: orjson.dumps(content, option=OPT_NON_STR_KEYS | OPT_SERIALIZE_NUMPY)
+                (c, true) if kind == "ORJSONResponse" => super::orj::dumps_bytes(c.as_ref().unwrap_or(&V::None),
+                    super::orj::OPT_NON_STR_KEYS | super::orj::OPT_SERIALIZE_NUMPY)?,
                 // Starlette: json.dumps(content, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
                 (c, true) => super::pyd::to_json(c.as_ref().unwrap_or(&V::None), &super::pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false }, false)?.into_bytes(),
                 (Some(V::Bytes(b)), _) => b.to_vec(),

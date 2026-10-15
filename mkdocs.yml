@@ -122,6 +122,7 @@ nav:
       - advanced/index.md
       - How it works: advanced/how-it-works.md
       - Graceful shutdown: advanced/shutdown.md
+      - Database migrations: advanced/migrations.md
       - Logging: advanced/logging.md
       - Large list responses: advanced/streaming.md
       - Sentry: advanced/sentry.md
@@ -143,5 +144,6 @@ nav:
       - Versions: reference/versions.md
       - Python versions: python-versions.md
       - Error codes: reference/errors.md
+      - Versioning and deprecation: reference/versioning.md
   - Coverage: coverage.md
   - Release notes: release-notes.md

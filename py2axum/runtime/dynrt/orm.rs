@@ -969,29 +969,34 @@ impl ObjCell {
     /// `read`: the columns the row holds (those of the class queried); a subclass's own columns past them are
     /// not loaded (inheritance: read on access, like SQLAlchemy)
     fn load_row_from(&self, row: &PgRow, offset: usize, tz: Tz, plan: &[ColLoad], read: usize) -> R<()> {
-        let mut vals = Vec::with_capacity(self.desc.cols.len());
-        let mut defer = Vec::with_capacity(self.desc.cols.len());
-        for i in 0..self.desc.cols.len() {
-            let how = plan.get(i).copied().unwrap_or_else(|| self.desc.cols[i].default_load());
-            vals.push(if i >= read || how != ColLoad::Load {
+        let n = self.desc.cols.len();
+        let how = |i: usize| plan.get(i).copied().unwrap_or_else(|| self.desc.cols[i].default_load());
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            vals.push(if i >= read || how(i) != ColLoad::Load {
                 V::Unbound
             } else {
                 map_col(&self.desc.cols[i], decode(row, offset + i, tz)?)
             });
-            defer.push(how);
         }
-        let mut st = self.st.lock();
-        st.defer = defer;
+        // the object's other vectors are refilled in place (one allocation per row: every row of a list goes
+        // through here, and allocations freed on another worker thread contend in the allocator)
+        let mut guard = self.st.lock();
+        let st = &mut *guard;
+        st.defer.clear();
+        st.defer.extend((0..n).map(how));
         st.comps.iter_mut().for_each(|c| *c = None);
-        st.committed = vals.clone();
+        st.committed.clone_from(&vals);
         st.vals = vals;
-        st.absent = vec![false; self.desc.cols.len()];
+        st.absent.clear();
+        st.absent.resize(n, false);
         st.from_row = true;
-        st.modified = vec![false; self.desc.cols.len()];
+        st.modified.clear();
+        st.modified.resize(n, false);
         st.status = Status::Persistent;
         st.expired = false;
         st.pk_expired = false;
-        drop(st);
+        drop(guard);
         self.build_composites()
     }
 
@@ -1088,7 +1093,9 @@ pub fn quote_ident(name: &str) -> std::borrow::Cow<'_, str> {
     ];
     let plain = name.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
         && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'$');
-    if plain && !RESERVED.contains(&name) {
+    // RESERVED is sorted: a binary search (a linear one cost ~1 000 instructions per column of every SELECT)
+    debug_assert!(RESERVED.windows(2).all(|w| w[0] < w[1]), "quote_ident: RESERVED must stay sorted");
+    if plain && RESERVED.binary_search(&name).is_err() {
         std::borrow::Cow::Borrowed(name)
     } else {
         std::borrow::Cow::Owned(format!("\"{}\"", name.replace('"', "\"\"")))
@@ -1448,7 +1455,13 @@ pub enum Sql {
 pub struct Subq {
     pub sel: Select,
     pub name: String,
+    /// `subquery()` without a name: numbered in each statement that renders it (`anon_1`, `anon_2`... as
+    /// SQLAlchemy's compiler does), so that the same query is the same SQL text at every request
+    pub anon: Option<usize>,
 }
+
+/// `Rend::aliases` keys of the anonymous subqueries (alias ids stay far below)
+const ANON_KEY: usize = usize::MAX / 2;
 
 static ANON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
@@ -2789,11 +2802,14 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
                 return Ok(sql(Sql::Select(Box::new(s))));
             }
             "subquery" | "alias" => {
-                let name = match args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "name").map(|(_, v)| v)) {
-                    Some(n) if !n.is_none() => ops::str_(n)?,
-                    _ => format!("anon_{}", ANON.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+                let (name, anon) = match args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "name").map(|(_, v)| v)) {
+                    Some(n) if !n.is_none() => (ops::str_(n)?, None),
+                    _ => {
+                        let id = ANON.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        (format!("anon_{id}"), Some(id))
+                    }
                 };
-                return Ok(sql(Sql::Subquery(Arc::new(Subq { sel: s, name }))));
+                return Ok(sql(Sql::Subquery(Arc::new(Subq { sel: s, name, anon }))));
             }
             "exists" => return Ok(sql(Sql::Exists(Box::new(s)))),
             _ => return Err(Exc::attr_error(format!("'Select' object has no attribute '{name}'"))),
@@ -3033,10 +3049,11 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
             match &flags {
                 V::None => Sql::Bin("~", b, Box::new(pat)),
                 V::Str(f) if &**f == "i" => Sql::Bin("~*", b, Box::new(pat)),
-                // SQLAlchemy's PostgreSQL dialect: the flags inline, as an embedded option of the pattern
-                V::Str(f) => {
-                    let lit = format!("'{}'", f.replace('\'', "''"));
-                    let concat = Sql::Func("CONCAT".into(), vec![Sql::Text("'(?'".into()), Sql::Text(lit), Sql::Text("')'".into()), pat]);
+                // SQLAlchemy's PostgreSQL dialect: the flags as an embedded option of the pattern. SQLAlchemy inlines
+                // them as a literal (backslashes doubled when standard_conforming_strings is off); bound here, so the
+                // flags can never leave the string whatever the server setting
+                V::Str(_) => {
+                    let concat = Sql::Func("CONCAT".into(), vec![Sql::Text("'(?'".into()), to_sql(&flags, Some(ColTy::Str)), Sql::Text("')'".into()), pat]);
                     Sql::Bin("~", b, Box::new(concat))
                 }
                 o => return Err(Exc::type_error(format!("py2axum: regexp_match(flags=) must be a str, not {}", o.type_name()))),
@@ -3160,6 +3177,18 @@ struct Rend {
 }
 
 impl Rend {
+    /// a subquery's name in this statement: its own, or `anon_<k>` in the order anonymous ones are met
+    fn subq_name(&mut self, q: &Subq) -> String {
+        let Some(id) = q.anon else { return quote_ident(&q.name).into_owned() };
+        let key = ANON_KEY + id % ANON_KEY;
+        if let Some((_, n)) = self.aliases.iter().find(|(k, _)| *k == key) {
+            return n.clone();
+        }
+        let n = format!("anon_{}", self.aliases.iter().filter(|(k, _)| *k >= ANON_KEY).count() + 1);
+        self.aliases.push((key, n.clone()));
+        n
+    }
+
     fn alias_name(&mut self, a: &Alias) -> String {
         if let Some((_, n)) = self.aliases.iter().find(|(id, _)| *id == a.id) {
             return n.clone();
@@ -3470,11 +3499,15 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
                 r.sql += &format!(" AS {t})");
             }
         }
-        Sql::SubCol(q, name) => r.sql += &format!("{}.{}", quote_ident(&q.name), quote_ident(name)),
+        Sql::SubCol(q, name) => {
+            let n = r.subq_name(q);
+            r.sql += &format!("{n}.{}", quote_ident(name))
+        }
         Sql::Subquery(q) => {
+            let n = r.subq_name(q);
             r.sql.push('(');
             render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {}", quote_ident(&q.name));
+            r.sql += &format!(") AS {n}");
         }
         Sql::Composite(m, ci) => {
             for (k, i) in m.composites[*ci].cols.iter().enumerate() {
@@ -3899,16 +3932,18 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             if i > 0 || !from.is_empty() {
                 r.sql += ", ";
             }
+            let n = r.subq_name(q);
             r.sql.push('(');
             render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {}", quote_ident(&q.name));
+            r.sql += &format!(") AS {n}");
         }
     }
     let render_subs = |r: &mut Rend, at: usize| -> R<()> {
         for (_, q, on, outer) in s.join_subs.iter().filter(|j| j.0 == at) {
+            let n = r.subq_name(q);
             r.sql += if *outer { " LEFT OUTER JOIN (" } else { " JOIN (" };
             render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {} ON ", quote_ident(&q.name));
+            r.sql += &format!(") AS {n} ON ");
             render(r, on)?;
         }
         Ok(())
@@ -4556,6 +4591,8 @@ struct SessInner {
     m2m: Vec<M2mOp>,
     /// objects DELETEd by a flush of the open transaction: persistent again (expired) if it rolls back
     tx_deleted: Vec<Weak<ObjCell>>,
+    /// objects INSERTed by a flush of the open transaction: transient again if it rolls back
+    tx_inserted: Vec<Weak<ObjCell>>,
 }
 
 /// What a savepoint's rollback undoes in the session: objects INSERTed (expunged), UPDATEd (expired)
@@ -4611,17 +4648,12 @@ impl SessInner {
 
 impl Drop for SessInner {
     /// Related objects point at each other (parent <-> children): break the cycles with the session. A
-    /// transaction still open is rolled back now (CPython frees a session nothing references at once, and its
-    /// connection goes back rolled back; sqlx would only roll back when the connection is next used, its locks
-    /// held until then).
+    /// transaction still open is rolled back now, as CPython does for a session nothing references: dropping
+    /// the sqlx transaction queues its ROLLBACK and returns its pool connection, whose release (sqlx 0.8
+    /// `return_to_pool`) pings the server, which sends the queued ROLLBACK at once. No task of our own: an
+    /// awaited `rollback()` there cost a second round trip per request (404 of dynapp +9 % CPU, 0.6 -> 0.7).
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    let _ = tx.rollback().await;
-                });
-            }
-        }
+        drop(self.tx.take());
         let gone: Vec<Arc<ObjCell>> = self.expunged.iter().chain(self.attached.iter()).filter_map(|w| w.upgrade()).collect();
         for o in self.identity.values().iter().chain(self.new.iter()).chain(self.deleted.iter()).chain(gone.iter()) {
             let mut st = o.st.lock();
@@ -4771,6 +4803,7 @@ impl Session {
                 attached: Vec::new(),
                 m2m: Vec::new(),
                 tx_deleted: Vec::new(),
+                tx_inserted: Vec::new(),
             })
         }))
     }
@@ -5406,6 +5439,7 @@ impl Session {
             if let Some(f) = s.savepoints.last_mut() {
                 f.inserted.push(o.clone());
             }
+            s.tx_inserted.push(Arc::downgrade(&o));
             for (ti, (table, key)) in tables.iter().enumerate() {
                 let in_t = |i: &usize| desc.cols[*i].table.unwrap_or(desc.table) == *table && !(joined && *i == pki);
                 let gcols: Vec<usize> = cols.iter().copied().filter(|i| in_t(i)).collect();
@@ -5886,6 +5920,7 @@ impl Session {
         let mut s = self.0.lock().await;
         s.conn_closed = false;
         s.tx_deleted.clear();
+        s.tx_inserted.clear();
         if let Some(tx) = s.tx.take() {
             let _ = tx.rollback().await;
         }
@@ -5914,6 +5949,7 @@ impl Session {
             tx.commit().await?;
         }
         s.tx_deleted.clear();
+        s.tx_inserted.clear();
         if s.expire_on_commit {
             for o in s.identity.values() {
                 let mut st = o.st.lock();
@@ -6039,6 +6075,26 @@ impl Session {
         }
         for o in std::mem::take(&mut s.new) {
             o.st.lock().status = Status::Transient;
+        }
+        // pending objects a failed flush took out of `new` before reaching them: transient too
+        for o in s.attached.iter().filter_map(|w| w.upgrade()) {
+            let mut st = o.st.lock();
+            if st.status == Status::Pending {
+                st.status = Status::Transient;
+            }
+        }
+        s.savepoints.clear();
+        // objects INSERTed by a flush of the rolled back transaction (DELETEd since or not): transient again,
+        // keeping their attributes, key included, and their loaded relationships (SQLAlchemy expunges the
+        // transaction's new states and only deletes their identity key)
+        for o in std::mem::take(&mut s.tx_inserted).iter().filter_map(|w| w.upgrade()) {
+            let pk = o.pk();
+            o.st.lock().status = Status::Transient;
+            if let Ok(k) = ident(o.desc, &pk) {
+                if s.identity.get(&k).is_some_and(|x| Arc::ptr_eq(&x, &o)) {
+                    s.identity.remove(&k);
+                }
+            }
         }
         let mut keep = IdMap::default();
         for (k, o) in s.identity.entries() {

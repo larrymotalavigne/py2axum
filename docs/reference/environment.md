@@ -5,11 +5,13 @@ Python (`os.environ`, pydantic-settings). It does not read `.env` files (pydanti
 variables only, see [Models](../tutorial/models.md)): export the variables, as an orchestrator does, or
 `set -a; . ./.env; set +a` locally.
 
+These variables and their defaults are a stable interface ([Versioning and deprecation](versioning.md)).
+
 ## The binary
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://postgres@127.0.0.1/postgres` | SQLAlchemy-style URLs accepted (`postgresql+psycopg://`, `postgresql+asyncpg://`): the driver named there decides details that differ between drivers ([SQL databases](../tutorial/sql.md#what-is-native)) |
+| `DATABASE_URL` | `postgresql://postgres@127.0.0.1/postgres` | also the database of `<binary> migrate`; SQLAlchemy-style URLs accepted (`postgresql+psycopg://`, `postgresql+asyncpg://`): the driver named there decides details that differ between drivers ([SQL databases](../tutorial/sql.md#what-is-native)) |
 | `DB_POOL_SIZE` | `32` | connections in the pool (the binary's own pool replaces the engine's) |
 | `HOST`, `PORT` | `0.0.0.0`, `8080` | listening address when the binary is run without command-line options (with options: uvicorn's, see [Logging](../advanced/logging.md#running-the-binary-like-uvicorn)) |
 | `UVICORN_*`, `FORWARDED_ALLOW_IPS` | | uvicorn's options as variables (`UVICORN_PORT`, `UVICORN_LOG_LEVEL`, `UVICORN_ACCESS_LOG`...), as uvicorn reads them |

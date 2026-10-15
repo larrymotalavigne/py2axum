@@ -18,7 +18,9 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
 - Builtins take CPython's keyword arguments where the runtime implements them (`sorted(key=, reverse=)`,
   `min/max(key=, default=)`, `enumerate(start=)`, `sum(start=)`, `round(ndigits=)`, `int(base=)`,
   `zip(strict=)`); any other is refused. **Difference:** `zip(strict=True)` over iterables of different
-  lengths raises at the call, where CPython raises after yielding the common prefix.
+  lengths raises at the call, where CPython raises after yielding the common prefix. `range()` builds its items
+  (CPython's range is lazy): a range too large to hold is a `MemoryError` at the call, even if the loop over it
+  would have stopped early.
 - Functions: keyword/default/`*args`/`**kwargs` binding with CPython's `TypeError`s, closures, lambdas,
   nested functions and decorators (`functools.wraps`, decorator factories; a decorated function is built
   once at startup), recursion, `global` (one cell per process), generators, `match`. A variable a nested
@@ -81,7 +83,8 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   relationships are released when their session ends. Other reference cycles the application builds
   (`a.append(a)`, two nested functions calling each other, a decorated nested function naming itself, an
   object stored in a container it owns) are never freed: each request that builds one keeps it until the
-  process exits.
+  process exits. A finished task stored in the request's state (`request.state.t = asyncio.create_task(...)`)
+  is freed with the request, unless it failed and its exception was never retrieved.
 - `typing.TypedDict` classes: calling one builds a plain `dict` (keys neither checked nor completed, as in
   CPython); as a Pydantic field or a response model, refused.
 - `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`; a builtin exception
@@ -91,13 +94,21 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
 - A call of an `async def` that is not awaited is a coroutine object (arguments evaluated at the call,
   body run at the first `await`; a second `await` raises like CPython). `asyncio.gather` (concurrent tasks,
   argument order, `return_exceptions`), `create_task` + `await task`, `add_done_callback`, `Semaphore`,
-  `Lock`, `Queue`, `wait_for`, `sleep`, `to_thread`, `open_connection(host, port)` (the addresses of
+  `Lock`, `Queue`, `Event` (`set`, `clear`, `is_set`, `await wait()`), `Future` and `loop.create_future()` (`set_result`,
+  `set_exception`, `result`, `exception`, `done`, `cancel`, `add_done_callback`, `await`; its `repr()` does not list the
+  callbacks), `InvalidStateError`, `wait_for` (of a call, a task or a future), `sleep`, `to_thread`, `open_connection(host, port)` (the addresses of
   `getaddrinfo` tried in order like asyncio, its `ConnectionRefusedError`/`OSError("Multiple exceptions: ...")`
   messages: `[Errno 61] Connect call failed ('127.0.0.1', 9)` under asyncio, `[Errno 61] Connection refused`
   under uvloop, which uvicorn uses when the project's `uv.lock` installs it (`uvicorn[standard]`); `StreamWriter.write/drain/close/is_closing/wait_closed/get_extra_info("peername"|"sockname")`,
   `StreamReader.read/readline/at_eof`; `ssl=`, `limit=` and the other keywords are refused, and so are
   `readexactly`/`readuntil`). The runtime is multi-threaded: two tasks finishing at
   the same instant have no guaranteed order (asyncio follows creation order).
+- The delays of `asyncio.sleep(delay, result)` and `asyncio.wait_for(aw, timeout)` are read like asyncio:
+  `delay <= 0` first (a `str` raises its `TypeError`), then the loop's float time plus the delay (a `Decimal`
+  raises `TypeError`, except for `asyncio.sleep` on uvloop, which rounds it); a timeout `<= 0` raises
+  `TimeoutError` without running the awaitable. Differences: a NaN delay or timeout raises a py2axum
+  `TypeError` (asyncio and the uvloop versions each do something else), and with a timeout `<= 0` the
+  awaitable's arguments are not evaluated (asyncio evaluates them, then cancels the coroutine unstarted).
 - `async with` / `with` follow CPython's protocol (the exception is passed to `__exit__`, a true result
   suppresses it).
 - `threading.Lock/RLock/Event/Thread/get_ident`, `asyncio.new_event_loop()` + `run_forever()` in a

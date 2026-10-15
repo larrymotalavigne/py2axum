@@ -108,10 +108,12 @@ def write_project(root: Path) -> Path:
     return root / "proj"
 
 
-def test_report(tmp_path):
+def test_report(tmp_path, capsys):
     pkg = write_project(tmp_path)
     out = tmp_path / "report.md"
     assert main([str(pkg), "--root", str(tmp_path), "--report", str(out)]) == 0
+    # internal tool, outside the stable interface (docs/reference/versioning.md)
+    assert "warning[deprecated]: --report is an internal tool" in capsys.readouterr().err
     data = json.loads(out.with_suffix(".json").read_text())
     routes = {r["path"]: r for r in data["routes"]}
     assert set(routes) == {"/api/items/{item_id}", "/api/items/stamp/now", "/api/items/me/info",

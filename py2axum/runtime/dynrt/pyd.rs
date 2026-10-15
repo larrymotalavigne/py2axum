@@ -461,6 +461,8 @@ pub struct SchemaX {
     pub model_ser: Option<Ser>,
     /// a `RootModel`: its one field `root` is the whole input and the whole dump
     pub root: bool,
+    /// a plain class's `__new__(cls, ...)`: called before `__init__`, which runs only on an instance of the class
+    pub new_: Option<MethodFn>,
 }
 
 /// a serializer function: plain (its result replaces the value) or wrap (it gets a `handler` that dumps the
@@ -480,7 +482,7 @@ pub struct Ser {
 }
 
 impl SchemaX {
-    pub const NONE: SchemaX = SchemaX { ser_by_alias: false, exclude: &[], norepr: &[], frozen: &[], exclude_if: &[], field_ser: &[], model_ser: None, root: false };
+    pub const NONE: SchemaX = SchemaX { ser_by_alias: false, exclude: &[], norepr: &[], frozen: &[], exclude_if: &[], field_ser: &[], model_ser: None, root: false, new_: None };
 }
 
 impl FieldDesc {
@@ -2127,9 +2129,11 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 V::Native(n) if matches!(&**n, Native::Fraction(_)) => return Some(input.clone()),
                 V::Decimal(_) | V::Str(_) => match fr::parse(&ops::str_(input).ok()?) {
                     Ok(f) => f,
-                    Err(()) => {
+                    // pydantic-core: the ValueError of `Fraction(text)` is `fraction_parsing`
+                    Err(fr::Bad::Limit(_)) => None,
+                    Err(fr::Bad::Unsupported) => {
                         FATAL.with(|f| {
-                            f.borrow_mut().get_or_insert(Exc::runtime("py2axum: a Fraction written with non-ASCII digits is not supported"));
+                            f.borrow_mut().get_or_insert(Exc::runtime("py2axum: a Fraction with non-ASCII digits or an exponent past 100000 is not supported"));
                         });
                         e.n += 1;
                         return None;
@@ -2726,18 +2730,18 @@ fn schema_val_in(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) 
         let n_before = e.n;
         let key = f.alias.unwrap_or(f.name);
         let by_name = desc.populate_by_name && (f.alias.is_some() || !f.paths.is_empty());
-        // (value, the loc it was found at: Pydantic reports errors there, the input key it consumed)
-        let found: Option<(V, Vec<V>, &'static str)> = match &src {
+        // (value, the loc it was found at: Pydantic reports errors there — a path's, else the input key it consumed)
+        let found: Option<(V, Option<Vec<V>>, &'static str)> = match &src {
             Src::Map(m) if !f.paths.is_empty() => f.paths.iter()
-                .find_map(|p| path_lookup(m, p).map(|v| (v, path_loc(p), match p[0] { PK::S(k) => k, PK::I(_) => "" })))
-                .or_else(|| if by_name { m.get(&Key::Str(Arc::from(f.name))).map(|(_, v)| (v.clone(), vec![V::str(f.name)], f.name)) } else { None }),
+                .find_map(|p| path_lookup(m, p).map(|v| (v, Some(path_loc(p)), match p[0] { PK::S(k) => k, PK::I(_) => "" })))
+                .or_else(|| if by_name { m.get(&Key::Str(Arc::from(f.name))).map(|(_, v)| (v.clone(), None, f.name)) } else { None }),
             Src::Map(m) => m
                 .get(&Key::Str(Arc::from(key)))
-                .map(|(_, v)| (v.clone(), vec![V::str(key)], key))
-                .or_else(|| if by_name { m.get(&Key::Str(Arc::from(f.name))).map(|(_, v)| (v.clone(), vec![V::str(f.name)], f.name)) } else { None }),
+                .map(|(_, v)| (v.clone(), None, key))
+                .or_else(|| if by_name { m.get(&Key::Str(Arc::from(f.name))).map(|(_, v)| (v.clone(), None, f.name)) } else { None }),
             Src::Attrs(o) => match attr_lookup(o, key) {
-                Ok(Some(v)) => Some((v, vec![V::str(key)], key)),
-                Ok(None) if by_name => attr_value(o, f.name).map(|v| (v, vec![V::str(f.name)], f.name)),
+                Ok(Some(v)) => Some((v, None, key)),
+                Ok(None) if by_name => attr_value(o, f.name).map(|v| (v, None, f.name)),
                 Ok(None) => None,
                 Err(x) => {
                     // pydantic-core: an exception other than AttributeError from `getattr` is this field's error
@@ -2767,8 +2771,13 @@ fn schema_val_in(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) 
         let (got, used) = match found {
             Some((v, l, k)) => {
                 used_keys.push(k);
-                let mut full = loc.to_vec();
-                full.extend(l);
+                // one allocation per field read (the loc is built even when nothing fails: val() takes it)
+                let mut full = Vec::with_capacity(loc.len() + l.as_ref().map_or(1, Vec::len));
+                full.extend_from_slice(loc);
+                match l {
+                    Some(l) => full.extend(l),
+                    None => full.push(V::str(k)),
+                }
                 (Some(v), full)
             }
             None => (None, missing_loc()),
@@ -2776,7 +2785,7 @@ fn schema_val_in(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) 
         match got {
             Some(v) => {
                 set.push(true);
-                let floc = used.clone();
+                let floc = used;
                 let n_field = e.n;
                 match val(&v, f.td, &floc, e) {
                     Some(x) => {
@@ -3214,7 +3223,28 @@ impl Inst {
         let vals = self.vals.lock().clone();
         self.desc.fields.iter().zip(vals).map(|(f, v)| V::tuple(vec![V::str(f.name), v])).collect()
     }
+    /// `str(model)`: pydantic's `__repr_str__(" ")` (a dataclass or a plain class: its repr)
+    pub fn str_(&self) -> R<String> {
+        if self.desc.open || self.desc.dataclass {
+            return self.repr();
+        }
+        Ok(self.repr_parts()?.join(" "))
+    }
+
     pub fn repr(&self) -> R<String> {
+        if self.desc.open {
+            if std::ptr::eq(self.desc, &super::libs::NAMESPACE) {
+                let extra = self.extra.lock().clone();
+                let parts = extra.iter().map(|(k, v)| Ok(format!("{k}={}", ops::repr(v)?))).collect::<R<Vec<_>>>()?;
+                return Ok(format!("namespace({})", parts.join(", ")));
+            }
+            // CPython: <module.Class object at 0x...> (the address differs anyway)
+            return Ok(format!("<{} object at {:#x}>", self.desc.class.qualname, self as *const Self as usize));
+        }
+        Ok(format!("{}({})", self.desc.name, self.repr_parts()?.join(", ")))
+    }
+
+    fn repr_parts(&self) -> R<Vec<String>> {
         let vals = self.vals.lock().clone();
         let parts = self
             .desc
@@ -3236,16 +3266,7 @@ impl Inst {
                 parts.push(format!("{n}={}", ops::repr(&v)?));
             }
         }
-        if self.desc.open {
-            if std::ptr::eq(self.desc, &super::libs::NAMESPACE) {
-                let extra = self.extra.lock().clone();
-                let parts = extra.iter().map(|(k, v)| Ok(format!("{k}={}", ops::repr(v)?))).collect::<R<Vec<_>>>()?;
-                return Ok(format!("namespace({})", parts.join(", ")));
-            }
-            // CPython: <module.Class object at 0x...> (the address differs anyway)
-            return Ok(format!("<{} object at {:#x}>", self.desc.class.qualname, self as *const Self as usize));
-        }
-        Ok(format!("{}({})", self.desc.name, parts.join(", ")))
+        Ok(parts)
     }
 }
 
@@ -3254,6 +3275,10 @@ impl Inst {
 /// JSON mode: a `float` field holding an int (a default `0`, an assignment without validation) is serialized
 /// as a float by pydantic-core's float serializer. None: the value as it is.
 fn float_ser(v: &V, td: &TD) -> Option<V> {
+    // nothing to convert without a float in the type: no copy of the list or tuple (every field of every row)
+    if !has_float(td) {
+        return None;
+    }
     match (td, v) {
         (TD::Float(_), V::Int(i)) => Some(V::Float(*i as f64)),
         (TD::Optional(t) | TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _), _) => float_ser(v, t),
@@ -3273,6 +3298,16 @@ fn float_ser(v: &V, td: &TD) -> Option<V> {
             Some(V::list(items.into_iter().zip(conv).map(|(x, c)| c.unwrap_or(x)).collect()))
         }
         _ => None,
+    }
+}
+
+/// the types float_ser goes through hold a `float`
+fn has_float(td: &TD) -> bool {
+    match td {
+        TD::Float(_) => true,
+        TD::Optional(t) | TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _) | TD::List(Some(t)) => has_float(t),
+        TD::TupleFix(ts) => ts.iter().any(|t| has_float(t)),
+        _ => false,
     }
 }
 
@@ -3858,6 +3893,17 @@ pub fn tz_utc() -> V {
 pub fn object_new_blank(desc: &'static SchemaDesc) -> V {
     let n = desc.fields.len();
     V::Inst(Arc::new(Inst { desc, vals: Slots::new(vec![V::None; n]), set: Mutex::new(vec![false; n]), extra: Slots::new(IndexMap::new()) }))
+}
+
+/// `object.__new__(cls)`: a bare instance of a plain class held as a value
+pub fn object_new_of(cls: &V) -> R {
+    match cls {
+        V::Class(c) => match &c.kind {
+            ClassKind::Schema(d) if d.open => Ok(object_new(d)),
+            _ => Err(Exc::type_error(format!("py2axum: object.__new__({}) of a class that is not a plain class", c.name))),
+        },
+        o => Err(Exc::type_error(format!("object.__new__(X): X is not a type object ({})", o.type_name()))),
+    }
 }
 
 pub fn object_new(desc: &'static SchemaDesc) -> V {

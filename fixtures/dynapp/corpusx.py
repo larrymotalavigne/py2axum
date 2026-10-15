@@ -133,6 +133,16 @@ def scope_function(v: Annotated[str, Depends(fn_scoped, scope="function")]):
     return StreamingResponse(stream_log(), media_type="text/plain")
 
 
+# the content is iterated once the response is sent, never when the StreamingResponse is built
+@router.get("/scope/late")
+async def scope_late():
+    LOG.clear()
+    r = StreamingResponse(stream_log(), media_type="text/plain")
+    await anyio.sleep(0.05)
+    LOG.append("after")
+    return r
+
+
 @router.get("/scope/request")
 def scope_request(v: Annotated[str, Depends(fn_scoped, scope="request")]):
     LOG.clear()

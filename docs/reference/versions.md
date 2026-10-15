@@ -20,6 +20,11 @@ forced-streaming passes) at both ends of every range: lowest versions on Python 
 | mcp | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
 | asyncpg | 0.31.0 | 0.32.0 | `>=0.31.0,<0.33` |
 | icalendar | 7.0.0 | 7.0.0 | `>=7.0.0,<7.1` |
+| orjson | 3.13.0 | 3.13.0 | `>=3.13.0,<3.14` |
+| unidecode | 1.4.0 | 1.4.0 | `>=1.4.0,<1.5` |
+| ecs-logging | 2.3.0 | 2.3.0 | `>=2.3.0,<2.4` |
+| pyyaml | 6.0.2 | 6.0.3 | `>=6.0.2,<6.1` |
+| croniter | 6.2.4 | 6.2.4 | `>=6.2.4,<6.3` |
 | Python | 3.12 | 3.15 | `>=3.12,<3.16` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;

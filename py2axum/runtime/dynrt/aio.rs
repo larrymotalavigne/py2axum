@@ -24,6 +24,7 @@ pub async fn await_value(v: V) -> R {
                 None => return Err(Exc::runtime("cannot reuse already awaited coroutine")),
             },
             Native::Task(t) => return super::web::task_result(t).await,
+            Native::AFuture(f) => return future_wait(f).await,
             _ => return Ok(v),
         },
         _ => return Ok(v),
@@ -196,6 +197,11 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
         V::Native(n) => match &**n {
             Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) => Ok(v.clone()),
             Native::Sem(s) => sem_method(s, "__aenter__").await,
+            Native::AmqpIter(it) => {
+                super::rmq::iter_enter(it).await?;
+                Ok(v.clone())
+            }
+            Native::AmqpProcess(m, ..) => Ok(V::native(Native::AmqpIncoming(m.clone()))),
             Native::Acm(g) => super::agen::acm_enter(g).await,
             Native::McpRun => {
                 super::mcp::log("mcp.server.streamable_http_manager", "StreamableHTTP session manager started", vec![], None);
@@ -270,6 +276,14 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
             let Native::Sem(s) = &**n else { unreachable!() };
             sem_method(s, "__aexit__").await
         }
+        V::Native(n) if matches!(&**n, Native::AmqpIter(_) | Native::AmqpProcess(..)) => {
+            match &**n {
+                Native::AmqpIter(it) => super::rmq::iter_close(it).await?,
+                Native::AmqpProcess(m, requeue, redelivered, ignore) => super::rmq::process_exit(m, *requeue, *redelivered, *ignore, exc.as_ref()).await?,
+                _ => unreachable!(),
+            }
+            Ok(V::Bool(false))
+        }
         V::Native(n) if matches!(&**n, Native::McpRun) => {
             super::mcp::log("mcp.server.streamable_http_manager", "StreamableHTTP session manager shutting down", vec![], None);
             Ok(V::Bool(false))
@@ -307,4 +321,166 @@ pub async fn collect(cx: &Cx, it: V) -> R {
         out.push(v);
     }
     Ok(V::list(out))
+}
+
+// ---------------------------------------------------------------- asyncio.Future, asyncio.Event
+
+pub enum FutState {
+    Pending,
+    Done(V),
+    Failed(Exc),
+    Cancelled,
+}
+
+/// `asyncio.Future()` / `loop.create_future()`: a result set by someone else, awaited
+pub struct AFut {
+    pub state: parking_lot::Mutex<FutState>,
+    notify: tokio::sync::Notify,
+    callbacks: parking_lot::Mutex<Vec<V>>,
+    cx: Option<Cx>,
+}
+
+pub fn future_new(cx: &Cx) -> V {
+    V::native(Native::AFuture(Arc::new(AFut { state: parking_lot::Mutex::new(FutState::Pending), notify: tokio::sync::Notify::new(),
+                                              callbacks: parking_lot::Mutex::new(vec![]), cx: Some(cx.clone()) })))
+}
+
+fn invalid_state(msg: &str) -> Exc {
+    Exc::msg(&INVALID_STATE_ERROR, msg)
+}
+
+/// the state reached: wakes the waiters, schedules the done callbacks (`call_soon`)
+fn settle(me: &V, f: &Arc<AFut>, st: FutState) -> R<()> {
+    {
+        let mut s = f.state.lock();
+        if !matches!(*s, FutState::Pending) {
+            return Err(invalid_state("invalid state"));
+        }
+        *s = st;
+    }
+    f.notify.notify_waiters();
+    let cbs = std::mem::take(&mut *f.callbacks.lock());
+    if let Some(cx) = &f.cx {
+        for cb in cbs {
+            super::web::spawn_task(cx, cb, vec![me.clone()], vec![])?;
+        }
+    }
+    Ok(())
+}
+
+fn fut_result(f: &AFut) -> R {
+    match &*f.state.lock() {
+        FutState::Pending => Err(invalid_state("Result is not set.")),
+        FutState::Done(v) => Ok(v.clone()),
+        FutState::Failed(e) => Err(e.clone()),
+        FutState::Cancelled => Err(Exc::new(&CANCELLED_ERROR, vec![])),
+    }
+}
+
+/// `await fut`
+pub async fn future_wait(f: &Arc<AFut>) -> R {
+    loop {
+        // registered before the check: a `set_result` in between still wakes this waiter
+        let notified = f.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !matches!(*f.state.lock(), FutState::Pending) {
+            return fut_result(f);
+        }
+        notified.await;
+    }
+}
+
+pub fn future_method(recv: &V, f: &Arc<AFut>, name: &str, args: &[V]) -> R {
+    let one = || args.first().cloned().ok_or_else(|| Exc::type_error(format!("{name}() takes exactly one argument (0 given)")));
+    match name {
+        "set_result" => settle(recv, f, FutState::Done(one()?)).map(|_| V::None),
+        "set_exception" => match one()? {
+            V::Exc(e) => settle(recv, f, FutState::Failed(e)).map(|_| V::None),
+            V::Class(c) => settle(recv, f, FutState::Failed(Exc::new(c, vec![]))).map(|_| V::None),
+            _ => Err(Exc::type_error("exception must derive from BaseException")),
+        },
+        "result" => fut_result(f),
+        "exception" => match &*f.state.lock() {
+            FutState::Pending => Err(invalid_state("Exception is not set.")),
+            FutState::Done(_) => Ok(V::None),
+            FutState::Failed(e) => Ok(V::Exc(e.clone())),
+            FutState::Cancelled => Err(Exc::new(&CANCELLED_ERROR, vec![])),
+        },
+        "done" => Ok(V::Bool(!matches!(*f.state.lock(), FutState::Pending))),
+        "cancelled" => Ok(V::Bool(matches!(*f.state.lock(), FutState::Cancelled))),
+        "cancel" => Ok(V::Bool(settle(recv, f, FutState::Cancelled).is_ok())),
+        "add_done_callback" => {
+            let cb = one()?;
+            if matches!(*f.state.lock(), FutState::Pending) {
+                f.callbacks.lock().push(cb);
+            } else if let Some(cx) = &f.cx {
+                super::web::spawn_task(cx, cb, vec![recv.clone()], vec![])?;
+            }
+            Ok(V::None)
+        }
+        _ => Err(Exc::attr_error(format!("'_asyncio.Future' object has no attribute '{name}'"))),
+    }
+}
+
+/// `repr(fut)` (`_asyncio.Future`'s, without the creation's source line)
+pub fn future_repr(f: &AFut) -> R<String> {
+    Ok(match &*f.state.lock() {
+        FutState::Pending => "<Future pending>".into(),
+        FutState::Done(v) => format!("<Future finished result={}>", super::ops::repr(v)?),
+        FutState::Failed(e) => format!("<Future finished exception={}>", super::ops::repr(&V::Exc(e.clone()))?),
+        FutState::Cancelled => "<Future cancelled>".into(),
+    })
+}
+
+/// `asyncio.Event()`
+pub struct AEvt {
+    set: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+pub fn event_new(args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() || !kwargs.is_empty() {
+        return Err(Exc::type_error("Event.__init__() takes 1 positional argument"));
+    }
+    Ok(V::native(Native::AEvent(Arc::new(AEvt { set: std::sync::atomic::AtomicBool::new(false), notify: tokio::sync::Notify::new() }))))
+}
+
+pub fn event_is_set(e: &AEvt) -> bool {
+    e.set.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub async fn event_method(e: &Arc<AEvt>, name: &str, args: &[V]) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error(format!("Event.{name}() takes 1 positional argument but {} were given", args.len() + 1)));
+    }
+    use std::sync::atomic::Ordering::SeqCst;
+    match name {
+        "is_set" => Ok(V::Bool(e.set.load(SeqCst))),
+        "set" => {
+            e.set.store(true, SeqCst);
+            e.notify.notify_waiters();
+            Ok(V::None)
+        }
+        "clear" => {
+            e.set.store(false, SeqCst);
+            Ok(V::None)
+        }
+        // a coroutine: `await ev.wait()` (or a task made of it)
+        "wait" => {
+            let e = e.clone();
+            Ok(coro(Box::pin(async move {
+                loop {
+                    let notified = e.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if e.set.load(SeqCst) {
+                        return Ok(V::Bool(true));
+                    }
+                    notified.await;
+                }
+            })))
+        }
+        _ => Err(Exc::attr_error(format!("'Event' object has no attribute '{name}'"))),
+    }
 }

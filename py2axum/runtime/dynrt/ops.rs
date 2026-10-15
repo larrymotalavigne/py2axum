@@ -896,7 +896,11 @@ pub fn str_repr(s: &str) -> String {
                 out.push(c);
             }
             c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
+            c if c.is_ascii() || super::methods::printable(c) => out.push(c),
+            // unicode_repr: a non-printable character as \xNN, \uNNNN or \UNNNNNNNN
+            c if (c as u32) < 0x100 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x10000 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
         }
     }
     out.push(q);
@@ -971,6 +975,12 @@ pub fn str_(v: &V) -> R<String> {
     if let Some(t) = row_tuple(v) {
         return str_(&t);
     }
+    // a Pydantic model's str is BaseModel.__str__ (fields separated by spaces), whatever its __repr__
+    if let V::Inst(i) = v {
+        if !i.desc.open && !i.desc.dataclass {
+            return dunder_text(v, &["__str__"]).unwrap_or_else(|| i.str_());
+        }
+    }
     if let Some(r) = dunder_text(v, &["__str__", "__repr__"]) {
         return r;
     }
@@ -1009,6 +1019,9 @@ pub fn str_(v: &V) -> R<String> {
         }
         if let Native::RelDelta(r) = &**n {
             return Ok(super::reldelta::repr(r));
+        }
+        if let Native::YamlMark(m) = &**n {
+            return Ok(m.text());
         }
     }
     Ok(match v {
@@ -1140,6 +1153,20 @@ pub fn repr(v: &V) -> R<String> {
         V::Delta(d) => dt::delta_repr(d),
         V::Tz(t) => dt::tz_repr(t),
         V::Class(c) => format!("<class '{}'>", c.qualname),
+        V::Native(n) if matches!(&**n, Native::AmqpQueue(_) | Native::AmqpExchange(_) | Native::AmqpFrame(..) | Native::AmqpIter(_)) => super::rmq::repr(n)?,
+        V::Native(n) if matches!(&**n, Native::AFuture(_)) => match &**n {
+            Native::AFuture(f) => super::aio::future_repr(f)?,
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::AEvent(_)) => match &**n {
+            Native::AEvent(e) => format!("<asyncio.locks.Event object at {:#x} [{}]>", Arc::as_ptr(n) as usize,
+                                         if super::aio::event_is_set(e) { "set" } else { "unset" }),
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::Type(_) | Native::ExtType(_)) => match &**n {
+            Native::Type(t) | Native::ExtType(t) => format!("<class '{t}'>"),
+            _ => unreachable!(),
+        },
         V::Exc(e) => format!("{}({})", e.0.class.name, e.args().iter().map(repr).collect::<R<Vec<_>>>()?.join(", ")),
         V::Inst(i) => i.repr()?,
         V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Upload(_) | Native::Secret(_) | Native::Fraction(_) | Native::Complex(..)) => match &**n {
@@ -1153,6 +1180,7 @@ pub fn repr(v: &V) -> R<String> {
         },
         // CPython's default repr: the address differs from one process to the other anyway
         V::Obj(o) => format!("<{} object at {:#x}>", o.desc.class_qualname, Arc::as_ptr(o) as usize),
+        V::Native(n) if matches!(&**n, Native::YamlMark(_)) => format!("<yaml.error.Mark object at {:#x}>", Arc::as_ptr(n) as *const () as usize),
         V::Enum(e, i) => format!("<{}.{}: {}>", e.name, e.member_name(*i), repr(&e.value(*i))?),
         other => format!("<{}>", other.type_name()),
     })
@@ -1266,9 +1294,12 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         }
         i += 1;
     }
+    // CPython: a number past Py_ssize_t is a ValueError (it wrapped here, then panicked or aborted)
+    let too_many = || Exc::value_error("Too many decimal digits in format string");
+    let push_digit = |n: usize, c: char| n.checked_mul(10).and_then(|n| n.checked_add(c.to_digit(10).unwrap_or(0) as usize)).filter(|n| *n <= isize::MAX as usize);
     let mut width = 0usize;
     while i < chars.len() && chars[i].is_ascii_digit() {
-        width = width * 10 + chars[i].to_digit(10).unwrap() as usize;
+        width = push_digit(width, chars[i]).ok_or_else(too_many)?;
         i += 1;
     }
     let mut thousands: Option<char> = None;
@@ -1283,7 +1314,7 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         i += 1;
         let mut p = 0;
         while i < chars.len() && chars[i].is_ascii_digit() {
-            p = p * 10 + chars[i].to_digit(10).unwrap() as usize;
+            p = push_digit(p, chars[i]).ok_or_else(too_many)?;
             i += 1;
         }
         prec = Some(p);
@@ -1307,6 +1338,15 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         return Err(invalid());
     }
     let numeric = matches!(v, V::Int(_) | V::Float(_) | V::Bool(_));
+    // a float's precision: past INT_MAX "precision too big", else as many digits as memory holds (MemoryError)
+    if let Some(p) = prec {
+        if numeric && (matches!(ty, Some('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%')) || (ty.is_none() && matches!(v, V::Float(_)))) {
+            if p > i32::MAX as usize {
+                return Err(Exc::value_error("precision too big"));
+            }
+            repeat_room(1, p, "precision too big")?;
+        }
+    }
     let mut body = match (ty, v) {
         // CPython: "nan"/"inf" (upper case for F, E, G), the sign handled below; no '%' suffix scaling
         (Some(c @ ('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%')), V::Float(x)) if !x.is_finite() => {
@@ -1391,6 +1431,7 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
         return Ok(format!("{sign_s}{body}"));
     }
     let pad = width - len;
+    repeat_room(fill.len_utf8(), pad, "Too many decimal digits in format string")?;
     let fills: String = std::iter::repeat_n(fill, pad).collect();
     Ok(match align.unwrap_or(if numeric { '>' } else { '<' }) {
         '<' => format!("{sign_s}{body}{fills}"),
@@ -1513,10 +1554,28 @@ pub fn percent_format(fmt: &str, args: &V) -> R<String> {
         };
         let left = spec.starts_with('-');
         let zero = spec.trim_start_matches('-').starts_with('0');
-        let (w, p) = match spec.trim_start_matches(['-', '+', ' ', '#', '0']).split_once('.') {
-            Some((w, p)) => (w.parse::<usize>().unwrap_or(0), Some(p.parse::<usize>().unwrap_or(0))),
-            None => (spec.trim_start_matches(['-', '+', ' ', '#', '0']).parse::<usize>().unwrap_or(0), None),
+        // CPython: a width past Py_ssize_t is "width too big", a precision past INT_MAX "precision too big"
+        // (they wrapped to 0 here); the text they make is checked against memory below
+        let (ws, ps) = match spec.trim_start_matches(['-', '+', ' ', '#', '0']).split_once('.') {
+            Some((w, p)) => (w, Some(p)),
+            None => (spec.trim_start_matches(['-', '+', ' ', '#', '0']), None),
         };
+        let digits_of = |t: &str, max: u64, what: &str| -> R<usize> {
+            if t.is_empty() {
+                return Ok(0);
+            }
+            // Python 3.15 adds the position of the `%`
+            let msg = if py315 { format!("{what} too big at position {pct}") } else { format!("{what} too big") };
+            t.parse::<u64>().ok().filter(|n| *n <= max).map(|n| n as usize).ok_or_else(|| Exc::value_error(msg))
+        };
+        let w = digits_of(ws, isize::MAX as u64, "width")?;
+        let p = match ps {
+            Some(t) => Some(digits_of(t, i32::MAX as u64, "precision")?),
+            None => None,
+        };
+        if let (Some(p), 'f' | 'e' | 'E' | 'g' | 'G') = (p, conv) {
+            repeat_room(1, p, "precision too big")?;
+        }
         let body = match conv {
             's' => str_(&arg)?,
             'r' => repr(&arg)?,
@@ -1563,6 +1622,7 @@ pub fn percent_format(fmt: &str, args: &V) -> R<String> {
         let n = body.chars().count();
         if n < w {
             let pad = w - n;
+            repeat_room(1, pad, "width too big")?;
             if left {
                 out.push_str(&body);
                 out.push_str(&" ".repeat(pad));
@@ -1757,7 +1817,7 @@ fn counter_add(d: &Arc<DictCell>, src: &V, kwargs: &[(String, V)], sign: i64) ->
             // `self[elem] = count + self_get(elem, 0)`: an absent key gets 0 + count
             None => add(&V::Int(0), &n)?,
         };
-        d.lock().insert(key, (k, v));
+        dict_put(&mut d.lock(), key, k, v);
     }
     Ok(())
 }
@@ -1948,7 +2008,7 @@ pub fn getitem(v: &V, k: &V) -> R {
                     // defaultdict.__missing__: the factory's value is stored, then returned
                     Some(f) => {
                         let v = default_value(f);
-                        d.lock().insert(key, (k.clone(), v.clone()));
+                        dict_put(&mut d.lock(), key, k.clone(), v.clone());
                         v
                     }
                     None => return Err(Exc::new(&KEY_ERROR, vec![k.clone()])),
@@ -1989,7 +2049,7 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
             l[j] = val;
         }
         V::Dict(d) => {
-            d.lock().insert(Key::dict_key(k)?, (k.clone(), val));
+            dict_put(&mut d.lock(), Key::dict_key(k)?, k.clone(), val);
         }
         _ => return Err(Exc::type_error(format!("'{}' object does not support item assignment", v.type_name()))),
     }
@@ -2055,6 +2115,13 @@ pub fn iter(v: &V) -> R<Vec<V>> {
             _ => super::stdlib::iter_lines(v).unwrap_or_default(),
         },
         V::Inst(i) => i.iter_fields(),
+        V::Native(n) if matches!(&**n, Native::CronGen(_)) => match &**n {
+            Native::CronGen(g) => super::croniter::gen_iter(g)?,
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::Cron(_)) => {
+            return Err(Exc::type_error("py2axum: iterating a croniter object is not supported (endless): call get_next() or next() on it"))
+        }
         V::Native(n) if matches!(&**n, Native::UrlParts(_) | Native::Record(..)) => match &**n {
             Native::UrlParts(u) => super::stdlib::url_parts_tuple(u),
             Native::Record(_, f) => f.iter().map(|(_, x)| x.clone()).collect(),

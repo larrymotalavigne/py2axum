@@ -213,11 +213,13 @@ pub fn read_body(cx: &Cx) -> R<Option<V>> {
     // Starlette's `request.json()` is `json.loads(body)`: any error but JSONDecodeError (undecodable
     // bytes, RecursionError) is FastAPI's 400
     let bad = || Exc::http(400, V::str("There was an error parsing the body"), vec![]);
-    let text = super::libs::json_text(bytes).map_err(|_| bad())?;
-    let chars: Vec<char> = text.chars().collect();
+    // the decoded text dropped as soon as it is copied: two copies of the body alive, not three
+    let chars: Vec<char> = super::libs::json_text(bytes).map_err(|_| bad())?.chars().collect();
     match super::pyjson::decode(&chars) {
         Ok(v) => Ok(Some(v)),
         Err(super::pyjson::Fail::Recursion(_)) => Err(bad()),
+        // past int()'s 4300 digits CPython's decoder raises ValueError: Starlette's 400, as for a nesting too deep
+        Err(super::pyjson::Fail::Overflow(t)) if t.trim_start_matches('-').len() > 4300 => Err(bad()),
         Err(super::pyjson::Fail::Overflow(t)) => Err(super::pyjson::overflow(&t)),
         Err(super::pyjson::Fail::Decode(msg, pos)) => Err(Exc::validation(
             &REQUEST_VALIDATION_ERROR,
@@ -728,6 +730,9 @@ pub fn check_body(cx: &Cx, errs: Vec<ErrDetail>, body: &Option<V>) -> R<()> {
 
 pub struct Streaming {
     pub rx: tokio::sync::mpsc::Receiver<V>,
+    /// fired at the body's first read: Starlette iterates the content only once the response is sent,
+    /// after the function-scoped dependencies closed (the producer task waits for it)
+    pub go: tokio::sync::oneshot::Sender<()>,
     pub media_type: Option<String>,
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -998,14 +1003,17 @@ fn stream_response(s: Streaming, extra: &[(String, String)]) -> Response {
     for (k, v) in s.headers.iter().chain(extra.iter()) {
         b = b.header(k.to_ascii_lowercase().as_str(), v.as_str());
     }
-    let stream = futures_util::stream::unfold(s.rx, |mut rx| async move {
+    let stream = futures_util::stream::unfold((s.rx, Some(s.go)), |(mut rx, go)| async move {
+        if let Some(go) = go {
+            let _ = go.send(());
+        }
         rx.recv().await.map(|v| {
             let bytes = match v {
                 V::Str(s) => Bytes::from(s.to_string()),
                 V::Bytes(b) => Bytes::from(b.to_vec()),
                 other => Bytes::from(ops::str_(&other).unwrap_or_default()),
             };
-            (Ok::<Bytes, std::io::Error>(bytes), rx)
+            (Ok::<Bytes, std::io::Error>(bytes), (rx, None))
         })
     })
     .fuse();
@@ -1300,9 +1308,10 @@ impl Drop for TeardownGuard {
 pub use super::agen::{spawn_gen, Yielder};
 
 pub fn streaming_response(content: V, media_type: Option<String>, status: u16, headers: Vec<(String, String)>) -> R {
+    let (go, started) = tokio::sync::oneshot::channel();
     let rx = match &content {
         V::Native(n) if matches!(&**n, Native::Gen(_)) => match &**n {
-            Native::Gen(g) => super::agen::into_channel(g.clone()),
+            Native::Gen(g) => super::agen::into_channel(g.clone(), started),
             _ => unreachable!(),
         },
         // a synchronous iterable (a list, `io.StringIO(...)`: its lines), which Starlette iterates in a
@@ -1311,6 +1320,9 @@ pub fn streaming_response(content: V, media_type: Option<String>, status: u16, h
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let items = ops::iter(&content)?;
             tokio::spawn(async move {
+                if started.await.is_err() {
+                    return;
+                }
                 for it in items {
                     if tx.send(it).await.is_err() {
                         break;
@@ -1320,7 +1332,7 @@ pub fn streaming_response(content: V, media_type: Option<String>, status: u16, h
             rx
         }
     };
-    Ok(V::native(Native::Streaming(Mutex::new(Some(Streaming { rx, media_type, status, headers })))))
+    Ok(V::native(Native::Streaming(Mutex::new(Some(Streaming { rx, go, media_type, status, headers })))))
 }
 
 // ---------------------------------------------------------------- asyncio
@@ -1378,31 +1390,71 @@ impl AQueue {
     }
 }
 
-/// `await asyncio.wait_for(coro, timeout=...)`
+/// A delay as asyncio reads it (`delay <= 0`, then `loop.time() + delay`): None for "no deadline" (inf),
+/// Some(0.0) for a delay <= 0; a Decimal fails the addition to the loop's float time unless the loop is
+/// uvloop's (it rounds `delay * 1000`); NaN, whose handling varies with the Python and the uvloop
+/// version, is refused at run time.
+fn aio_delay(what: &str, v: &V, uvloop: bool) -> R<Option<f64>> {
+    let le0 = |t: &str| Exc::type_error(format!("'<=' not supported between instances of '{t}' and 'int'"));
+    let t = match v {
+        V::Bool(b) => *b as i64 as f64,
+        V::Int(i) => *i as f64,
+        V::Float(f) => *f,
+        V::Decimal(d) => {
+            let f = d.to_f64();
+            if f.is_nan() {
+                return Err(Exc::type_error(format!("py2axum: {what} with a Decimal NaN is not supported")));
+            }
+            if f > 0.0 && !uvloop {
+                return Err(Exc::type_error("unsupported operand type(s) for +: 'float' and 'decimal.Decimal'"));
+            }
+            f
+        }
+        V::Native(n) if matches!(&**n, Native::Fraction(_)) => {
+            let Native::Fraction(f) = &**n else { unreachable!() };
+            use num_traits::ToPrimitive;
+            f.num.to_f64().unwrap_or(f64::NAN) / f.den.to_f64().unwrap_or(f64::NAN)
+        }
+        o => return Err(le0(o.type_name())),
+    };
+    if t.is_nan() {
+        return Err(Exc::type_error(format!("py2axum: {what} with a NaN delay is not supported")));
+    }
+    if t <= 0.0 {
+        return Ok(Some(0.0));
+    }
+    Ok(std::time::Duration::try_from_secs_f64(t).ok().map(|_| t))
+}
+
+/// `await asyncio.wait_for(coro, timeout)`: a timeout <= 0 cancels the coroutine before it starts
+/// (TimeoutError, nothing run: asyncio wraps it in a task that never got a turn); a Decimal timeout fails
+/// on any loop (asyncio.timeout adds it to `loop.time()`, a float on uvloop too)
 pub async fn wait_for<F>(timeout: &V, fut: F) -> R
 where
     F: std::future::Future<Output = R>,
 {
-    let secs = match timeout {
-        V::None => return fut.await,
-        V::Int(i) => *i as f64,
-        V::Float(f) => *f,
-        other => return Err(Exc::type_error(format!("timeout must be a number, not {}", other.type_name()))),
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs_f64(secs.max(0.0)), fut).await {
-        Ok(r) => r,
-        Err(_) => Err(Exc::new(&TIMEOUT_ERROR, vec![])),
+    if timeout.is_none() {
+        return fut.await;
+    }
+    match aio_delay("asyncio.wait_for()", timeout, false)? {
+        None => fut.await,
+        Some(t) if t <= 0.0 => Err(Exc::new(&TIMEOUT_ERROR, vec![])),
+        Some(t) => match tokio::time::timeout(std::time::Duration::from_secs_f64(t), fut).await {
+            Ok(r) => r,
+            Err(_) => Err(Exc::new(&TIMEOUT_ERROR, vec![])),
+        },
     }
 }
 
-pub async fn sleep(secs: &V) -> R {
-    let s = match secs {
-        V::Int(i) => *i as f64,
-        V::Float(f) => *f,
-        _ => 0.0,
-    };
-    tokio::time::sleep(std::time::Duration::from_secs_f64(s.max(0.0))).await;
-    Ok(V::None)
+/// `await asyncio.sleep(delay, result=None)` (and `anyio.sleep(delay)`, asyncio's underneath): `result`
+/// once the delay is over; a delay <= 0 yields to the loop once
+pub async fn sleep(secs: &V, result: V, uvloop: bool) -> R {
+    match aio_delay("asyncio.sleep()", secs, uvloop)? {
+        None => std::future::pending::<()>().await,
+        Some(t) if t <= 0.0 => tokio::task::yield_now().await,
+        Some(t) => tokio::time::sleep(std::time::Duration::from_secs_f64(t)).await,
+    }
+    Ok(result)
 }
 
 pub fn dep_cache_get(cx: &Cx, key: &'static str) -> Option<V> {
@@ -1647,7 +1699,10 @@ pub struct Task {
     cancelled: std::sync::atomic::AtomicBool,
     /// its exception was read (`await task`): otherwise asyncio logs it when the task is collected
     retrieved: AtomicBool,
-    cx: Cx,
+    /// the request's context, for that log (Sentry's scope): kept only while an exception may still need it,
+    /// so that a finished task stored in the request's own state (`request.state.t = create_task(...)`) is no
+    /// cycle through it (CPython's GC collects that one)
+    cx: Mutex<Option<Cx>>,
 }
 
 impl Drop for Task {
@@ -1658,7 +1713,9 @@ impl Drop for Task {
         if let Some(Err(e)) = self.result.lock().take() {
             if !e.isinstance(&CANCELLED_ERROR) {
                 super::logging::emit_sync_not_to_sentry("asyncio", super::logging::ERROR, "Task exception was never retrieved", Some(e.clone()), &super::logging::NO_LOC);
-                super::sentry::task_never_retrieved(self.cx.clone(), e);
+                if let Some(cx) = self.cx.lock().take() {
+                    super::sentry::task_never_retrieved(cx, e);
+                }
             }
         }
     }
@@ -1670,6 +1727,7 @@ pub async fn task_result(t: &Arc<Task>) -> R {
         let wait = t.finished.notified();
         if let Some(r) = t.result.lock().clone() {
             t.retrieved.store(true, Ordering::Relaxed);
+            t.cx.lock().take();
             return r;
         }
         wait.await;
@@ -1691,7 +1749,7 @@ pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
         cancel: tokio::sync::Notify::new(),
         cancelled: std::sync::atomic::AtomicBool::new(false),
         retrieved: AtomicBool::new(false),
-        cx: cx.clone(),
+        cx: Mutex::new(Some(cx.clone())),
     });
     let tv = V::native(Native::Task(task.clone()));
     let (cx2, tv2) = (cx.clone(), tv.clone());
@@ -1700,6 +1758,10 @@ pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
             r = fut => r,
             _ = task.cancel.notified() => Err(Exc::new(&CANCELLED_ERROR, vec![])),
         };
+        // a result (or a cancellation, never logged) needs no context any more
+        if !matches!(&r, Err(e) if !e.isinstance(&CANCELLED_ERROR)) {
+            task.cx.lock().take();
+        }
         *task.result.lock() = Some(r);
         // done before anyone waiting on the result runs again
         let callbacks = {

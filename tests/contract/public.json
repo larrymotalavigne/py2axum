@@ -1,0 +1,541 @@
+{
+ "cli": {
+  "py2axum": [
+   {
+    "flags": [
+     "package"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": true
+   },
+   {
+    "flags": [
+     "-o",
+     "--out"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--root"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--backend"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": [
+     "auto",
+     "typed",
+     "dyn"
+    ],
+    "default": "auto",
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--python-side"
+    ],
+    "action": "AppendAction",
+    "nargs": null,
+    "choices": null,
+    "default": [],
+    "metavar": "PATH|lifespan|mount|auto",
+    "required": false
+   },
+   {
+    "flags": [
+     "--report"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--name"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--no-stream"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--allow-untested-versions"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--python"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "X.Y",
+    "required": false
+   }
+  ],
+  "py2axum check": [
+   {
+    "flags": [
+     "package"
+    ],
+    "action": "StoreAction",
+    "nargs": "?",
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--root"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--backend"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": [
+     "auto",
+     "dyn"
+    ],
+    "default": "auto",
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--python-side"
+    ],
+    "action": "AppendAction",
+    "nargs": null,
+    "choices": null,
+    "default": [],
+    "metavar": "PATH|lifespan|mount|auto",
+    "required": false
+   },
+   {
+    "flags": [
+     "--format"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": [
+     "text",
+     "json",
+     "markdown"
+    ],
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--json"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--explain"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "CODE",
+    "required": false
+   },
+   {
+    "flags": [
+     "--fail-under"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "PCT",
+    "required": false
+   },
+   {
+    "flags": [
+     "--allow-untested-versions"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--python"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "X.Y",
+    "required": false
+   }
+  ],
+  "py2axum watch": [
+   {
+    "flags": [
+     "package"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": true
+   },
+   {
+    "flags": [
+     "-o",
+     "--out"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": true
+   },
+   {
+    "flags": [
+     "--root"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--name"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--python-side"
+    ],
+    "action": "AppendAction",
+    "nargs": null,
+    "choices": null,
+    "default": [],
+    "metavar": "PATH|lifespan|mount|auto",
+    "required": false
+   },
+   {
+    "flags": [
+     "--no-stream"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--allow-untested-versions"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--run"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--release"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--no-build"
+    ],
+    "action": "StoreTrueAction",
+    "nargs": 0,
+    "choices": null,
+    "default": false,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--interval"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": 0.5,
+    "metavar": "S",
+    "required": false
+   },
+   {
+    "flags": [
+     "--debounce"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": 0.3,
+    "metavar": "S",
+    "required": false
+   },
+   {
+    "flags": [
+     "--stop-timeout"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": 5.0,
+    "metavar": "S",
+    "required": false
+   },
+   {
+    "flags": [
+     "--python"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "X.Y",
+    "required": false
+   },
+   {
+    "flags": [
+     "binary_args"
+    ],
+    "action": "StoreAction",
+    "nargs": "*",
+    "choices": null,
+    "default": null,
+    "metavar": "-- ARG",
+    "required": false
+   }
+  ]
+ },
+ "binary_options": [
+  "--access-log",
+  "--app-dir",
+  "--backlog",
+  "--factory",
+  "--forwarded-allow-ips",
+  "--host",
+  "--limit-concurrency",
+  "--log-config",
+  "--log-level",
+  "--no-access-log",
+  "--no-date-header",
+  "--no-proxy-headers",
+  "--no-server-header",
+  "--no-use-colors",
+  "--port",
+  "--proxy-headers",
+  "--timeout-graceful-shutdown",
+  "--timeout-keep-alive",
+  "--use-colors",
+  "--workers"
+ ],
+ "binary_commands": [
+  "migrate [upgrade [head|<revision>]]",
+  "migrate current",
+  "migrate --sql"
+ ],
+ "environment": [
+  "DATABASE_URL",
+  "DB_POOL_SIZE",
+  "FORWARDED_ALLOW_IPS",
+  "HOST",
+  "PORT",
+  "PROMETHEUS_DISABLE_CREATED_SERIES",
+  "PROMETHEUS_MULTIPROC_DIR",
+  "PY2AXUM_DB_TIMEZONE",
+  "PY2AXUM_LOG_LEVEL",
+  "PY2AXUM_MAX_BODY",
+  "PY2AXUM_PYTHON_URL",
+  "PY2AXUM_PYTHON_VERSION",
+  "PY2AXUM_RECORD",
+  "PY2AXUM_RECORD_APP",
+  "PY2AXUM_RECORD_FIELDS",
+  "PY2AXUM_RECORD_HEADERS",
+  "PY2AXUM_RECORD_KEY",
+  "PY2AXUM_RECORD_MAX_BODY",
+  "PY2AXUM_RECORD_RAW",
+  "PY2AXUM_RECORD_SKIP",
+  "PY2AXUM_SHUTDOWN_TIMEOUT",
+  "PY2AXUM_SOURCE_ROOT",
+  "PY2AXUM_SQL_DEBUG",
+  "PY2AXUM_STACK_SIZE",
+  "PY2AXUM_STREAM_CHUNK",
+  "PY2AXUM_STREAM_MIN_ROWS",
+  "PY2AXUM_TARGET_PYTHON",
+  "UVICORN_ACCESS_LOG",
+  "UVICORN_FORWARDED_ALLOW_IPS",
+  "UVICORN_HOST",
+  "UVICORN_LOG_CONFIG",
+  "UVICORN_LOG_LEVEL",
+  "UVICORN_PORT",
+  "UVICORN_PROXY_HEADERS",
+  "UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN",
+  "UVICORN_USE_COLORS"
+ ],
+ "error_codes": [
+  "P2A0101",
+  "P2A0102",
+  "P2A0103",
+  "P2A0104",
+  "P2A0105",
+  "P2A0106",
+  "P2A0107",
+  "P2A0108",
+  "P2A0109",
+  "P2A0110",
+  "P2A0111",
+  "P2A0112",
+  "P2A0113",
+  "P2A0114",
+  "P2A0115",
+  "P2A0116",
+  "P2A0117",
+  "P2A0118",
+  "P2A0201",
+  "P2A0202",
+  "P2A0203",
+  "P2A0204",
+  "P2A0205",
+  "P2A0206",
+  "P2A0207",
+  "P2A0208",
+  "P2A0209",
+  "P2A0301",
+  "P2A0302",
+  "P2A0303",
+  "P2A0304",
+  "P2A0305",
+  "P2A0306",
+  "P2A0307",
+  "P2A0308",
+  "P2A0309",
+  "P2A0310",
+  "P2A0311",
+  "P2A0312",
+  "P2A0313",
+  "P2A0314",
+  "P2A0401",
+  "P2A0402",
+  "P2A0403",
+  "P2A0404",
+  "P2A0405",
+  "P2A0406",
+  "P2A0407",
+  "P2A0408",
+  "P2A0410",
+  "P2A0501",
+  "P2A0502",
+  "P2A0503",
+  "P2A0504",
+  "P2A0505",
+  "P2A0506",
+  "P2A0507",
+  "P2A0508",
+  "P2A0509",
+  "P2A0510",
+  "P2A0601",
+  "P2A0602",
+  "P2A0603",
+  "P2A0901",
+  "P2A0999"
+ ],
+ "retired_error_codes": []
+}

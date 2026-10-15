@@ -41,7 +41,15 @@ pub struct Chan {
     done_notify: tokio::sync::Notify,
     /// `http.response.start` (or a whole response) was sent
     started: AtomicBool,
+    /// the app returned or raised: a streamed body still waiting for its last part ends there
+    ended: AtomicBool,
+    /// a message was read (room in the queue for a `send` that waits)
+    space: tokio::sync::Notify,
 }
+
+/// messages a `send` may post ahead of the reader (uvicorn's `send` waits on the transport's drain): past
+/// them it waits, so a client that does not read holds the app instead of the server's memory
+const SEND_AHEAD: usize = 16;
 
 impl Chan {
     fn new(body: Bytes) -> Arc<Chan> {
@@ -52,6 +60,8 @@ impl Chan {
             done: AtomicBool::new(false),
             done_notify: tokio::sync::Notify::new(),
             started: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            space: tokio::sync::Notify::new(),
         })
     }
     /// the response is complete or abandoned: the messages nobody will read are dropped (a whole response
@@ -61,6 +71,7 @@ impl Chan {
         self.done_notify.notify_waiters();
         let late = std::mem::take(&mut *self.msgs.lock());
         drop(late);
+        self.space.notify_waiters();
     }
     /// a message for the reader (late ones, once the response is complete or the client left, are never
     /// read: CPython's server ignores them too, and they no longer pile up)
@@ -72,7 +83,23 @@ impl Chan {
         self.reader.wake();
     }
     fn pop(&self) -> Option<Msg> {
-        self.msgs.lock().pop_front()
+        let m = self.msgs.lock().pop_front();
+        if m.is_some() {
+            self.space.notify_waiters();
+        }
+        m
+    }
+    /// until the reader has taken enough messages (or the response is over)
+    async fn room(&self) {
+        loop {
+            let n = self.space.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.done.load(Ordering::Acquire) || self.msgs.lock().len() < SEND_AHEAD {
+                return;
+            }
+            n.await;
+        }
     }
     /// the next message, once there is one
     fn poll_msg(&self, cx: &mut Context<'_>) -> Poll<Msg> {
@@ -84,6 +111,24 @@ impl Chan {
             Some(m) => Poll::Ready(m),
             None => Poll::Pending,
         }
+    }
+    /// the next message, or None once the app has ended without posting more
+    fn poll_msg_or_end(&self, cx: &mut Context<'_>) -> Poll<Option<Msg>> {
+        if let Some(m) = self.pop() {
+            return Poll::Ready(Some(m));
+        }
+        self.reader.register(cx.waker());
+        if let Some(m) = self.pop() {
+            return Poll::Ready(Some(m));
+        }
+        if self.ended.load(Ordering::Acquire) {
+            return Poll::Ready(self.pop());
+        }
+        Poll::Pending
+    }
+    fn end(&self) {
+        self.ended.store(true, Ordering::Release);
+        self.reader.wake();
     }
 }
 
@@ -228,6 +273,7 @@ pub async fn send(c: &Arc<Chan>, msg: &V) -> R {
         }
         other => return Err(Exc::runtime(format!("py2axum: ASGI message type '{other}' is not supported"))),
     };
+    c.room().await;
     c.post(m);
     Ok(V::None)
 }
@@ -386,6 +432,7 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
             Ok(v) => super::aio::await_value(v).await,
             Err(e) => Err(e),
         };
+        chan2.end();
         if let Err(e) = &r {
             if chan2.started.load(Ordering::Relaxed) {
                 // the response has started: the server logs the exception (ServerErrorMiddleware re-raises it)
@@ -465,9 +512,13 @@ pub async fn run(cx: &Cx, app: &V, scope: V, body: Bytes) -> R<Response> {
             return None;
         }
         loop {
-            match std::future::poll_fn(|cx| done.0.poll_msg(cx)).await {
-                Msg::Body(b, more) => return Some((Ok(b), (None, done, !more))),
-                Msg::Start(..) | Msg::Whole(_) => continue,
+            match std::future::poll_fn(|cx| done.0.poll_msg_or_end(cx)).await {
+                Some(Msg::Body(b, more)) => return Some((Ok(b), (None, done, !more))),
+                Some(Msg::Start(..) | Msg::Whole(_)) => continue,
+                // the app ended (returned or raised) before `more_body=False`: the connection is closed without
+                // the chunked terminator, as uvicorn closes it ("ASGI callable returned without completing
+                // response"); it waited for the client to leave before
+                None => return Some((Err(std::io::Error::other("ASGI callable returned without completing response")), (None, done, true))),
             }
         }
     });

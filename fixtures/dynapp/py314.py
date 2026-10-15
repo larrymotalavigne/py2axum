@@ -1,6 +1,7 @@
 """Python 3.14 syntax and semantics (imported by main.py under `sys.version_info >= (3, 14)`): `except A, B`
 without brackets (PEP 758), `continue` in a `finally` (PEP 765: a SyntaxWarning, same behaviour), annotations
 evaluated lazily (PEP 649: a model can name a class defined below it, unquoted)."""
+import re
 import uuid
 
 from fastapi import APIRouter
@@ -59,3 +60,12 @@ async def uuid7_shape():
     a, b = uuid.uuid7(), uuid.uuid7()
     return {"version": a.version, "ordered": str(a) < str(b), "len": len(str(a)), "hex": len(a.hex)}
 
+
+
+@router.get("/py314/pattern-error")
+async def pattern_error(p: str = "\\z"):
+    """`re.PatternError` (3.13), `re.error` its alias"""
+    try:
+        return {"ok": re.compile(p).pattern}
+    except re.PatternError as e:
+        return {"t": type(e).__name__, "alias": re.error is re.PatternError, "e": str(e)}

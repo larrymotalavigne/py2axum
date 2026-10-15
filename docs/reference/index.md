@@ -7,4 +7,6 @@
 - [Python semantics](python.md): values, functions, classes, modules, asyncio and threading.
 - [Standard library](stdlib.md): the modules the runtime implements, and `pickle`.
 - [Libraries](libraries.md): the third-party libraries the runtime implements.
+- [Versioning and deprecation](versioning.md): what semver covers from 1.0 (command lines, environment
+  variables, supported subset, JSON of `check`, error codes) and how a deprecation works.
 - [Versions](versions.md): the tested version ranges of FastAPI, Starlette, Pydantic, SQLAlchemy and Python.

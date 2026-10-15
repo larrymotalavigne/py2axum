@@ -105,8 +105,14 @@ def test_backend_option(tmp_path, capsys, backend, rc):
 
     pkg = small_project(tmp_path)
     assert main([str(pkg), "--root", str(tmp_path), "--backend", backend, "-o", str(tmp_path / "out")]) == rc
+    err = capsys.readouterr().err
     if rc:
-        assert "--backend typed was removed in 0.4: use the default backend" in capsys.readouterr().err
+        assert "--backend typed was removed in 0.4: use the default backend" in err
+    else:  # deprecated: still accepted, with a warning (docs/reference/versioning.md)
+        assert "warning[deprecated]: --backend has no effect since 0.4 and will be removed in 1.0" in err
+    if not rc:  # check: typed is not even a choice
+        assert main(["check", str(pkg), "--root", str(tmp_path), f"--backend={backend}"]) == 0
+        assert "warning[deprecated]: --backend" in capsys.readouterr().err
 
 
 def test_untested_version_refused(tmp_path, capsys):

@@ -60,19 +60,31 @@ pub fn from_f64(x: f64) -> Option<Fraction> {
     }
 }
 
-fn digits(s: &str) -> Result<BigInt, ()> {
+/// why a text is not read as a fraction although it has the form of one
+pub enum Bad {
+    /// digits other than ASCII, an exponent past 100 000: not reproduced
+    Unsupported,
+    /// `int()`'s limit on decimal text (4300 digits, CPython's default `sys.set_int_max_str_digits`)
+    Limit(usize),
+}
+
+fn digits(s: &str) -> Result<BigInt, Bad> {
+    let n = s.chars().filter(|c| *c != '_').count();
+    if n > 4300 {
+        return Err(Bad::Limit(n));
+    }
     let mut out = BigInt::zero();
     for c in s.chars().filter(|c| *c != '_') {
         // a non-ASCII decimal digit (CPython accepts any Unicode Nd): not reproduced
-        let d = c.to_digit(10).ok_or(())?;
+        let d = c.to_digit(10).ok_or(Bad::Unsupported)?;
         out = out * 10 + d;
     }
     Ok(out)
 }
 
-/// `Fraction(text)`: Ok(None) when the text is not a fraction, Err(()) for a form the runtime does not read
-/// (digits other than ASCII)
-pub fn parse(s: &str) -> Result<Option<Fraction>, ()> {
+/// `Fraction(text)`: Ok(None) when the text is not a fraction, Err for a form the runtime does not read or a
+/// number past `int()`'s digit limit
+pub fn parse(s: &str) -> Result<Option<Fraction>, Bad> {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(
@@ -109,9 +121,9 @@ pub fn parse(s: &str) -> Result<Option<Fraction>, ()> {
             }
         }
         if let Some(e) = m.name("exp") {
-            let e: i64 = e.as_str().replace('_', "").parse().map_err(|_| ())?;
+            let e: i64 = e.as_str().replace('_', "").parse().map_err(|_| Bad::Unsupported)?;
             if e.unsigned_abs() > 100_000 {
-                return Err(());
+                return Err(Bad::Unsupported);
             }
             if e >= 0 {
                 num *= BigInt::from(10).pow(e as u32);
@@ -149,7 +161,8 @@ pub fn call(args: &[V], kwargs: &[(String, V)]) -> R {
         [x @ (V::Str(_) | V::Decimal(_))] => match parse(&super::ops::str_(x)?) {
             Ok(Some(f)) => Some(f),
             Ok(None) => return Err(Exc::value_error(format!("Invalid literal for Fraction: {}", super::ops::repr(x)?))),
-            Err(()) => return Err(Exc::runtime("py2axum: a Fraction written with non-ASCII digits is not supported")),
+            Err(Bad::Unsupported) => return Err(Exc::runtime("py2axum: a Fraction with non-ASCII digits or an exponent past 100000 is not supported")),
+            Err(Bad::Limit(n)) => return Err(Exc::value_error(format!("Exceeds the limit (4300 digits) for integer string conversion: value has {n} digits; use sys.set_int_max_str_digits() to increase the limit"))),
         },
         _ => return Err(Exc::type_error("py2axum: these Fraction() arguments are not supported")),
     };

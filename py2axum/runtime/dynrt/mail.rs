@@ -591,6 +591,8 @@ fn rand_u64() -> u64 {
 pub fn formataddr(pair: &V) -> R {
     let items = ops::iter(pair)?;
     let (name, addr) = (items.first().cloned().unwrap_or(V::None), ops::str_(items.get(1).unwrap_or(&V::None))?);
+    // CPython: "The address MUST (per RFC) be ascii, so raise a UnicodeError if it isn't."
+    super::methods::str_encode(&addr, &[V::str("ascii")], &[])?;
     let name = if name.is_none() { String::new() } else { ops::str_(&name)? };
     if name.is_empty() {
         return Ok(V::str(addr));

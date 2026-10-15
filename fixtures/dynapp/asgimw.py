@@ -120,6 +120,8 @@ class ShortCircuit:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
         mode = header(scope, b"x-block") if scope["type"] == "http" else None
         if mode == b"send":
             await send({"type": "http.response.start", "status": 403,
@@ -137,6 +139,17 @@ class ShortCircuit:
         elif mode == b"empty":
             await send({"type": "http.response.start", "status": 204, "headers": []})
             await send({"type": "http.response.body"})
+        elif mode == b"halt":
+            # tests/security_check.py: a stream the app leaves unfinished (the connection must close, not hang)
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+        elif mode == b"flood":
+            # tests/security_check.py: 256 MiB to a client that does not read (send must wait, not buffer)
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/octet-stream")]})
+            part = b"x" * 65536
+            for _ in range(4096):
+                await send({"type": "http.response.body", "body": part, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
             await self.app(scope, receive, send)
 
@@ -185,6 +198,8 @@ class Rewrite:
         self.injected = injected
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
         if scope["type"] == "http" and scope["path"].startswith("/mw/old/"):
             path = "/mw/new/" + scope["path"][len("/mw/old/"):]
             scope = {**scope, "path": path, "raw_path": path.encode(),
@@ -227,6 +242,8 @@ class Boom:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
         mode = header(scope, b"x-boom") if scope["type"] == "http" else None
         if mode == b"before":
             raise RuntimeError("boom before the application")

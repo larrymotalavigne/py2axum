@@ -168,9 +168,13 @@ impl AGen {
 }
 
 /// The items of a generator as a channel (StreamingResponse): pulled one `__anext__` at a time.
-pub fn into_channel(g: Arc<AGen>) -> mpsc::Receiver<V> {
+pub fn into_channel(g: Arc<AGen>, go: tokio::sync::oneshot::Receiver<()>) -> mpsc::Receiver<V> {
     let (tx, rx) = mpsc::channel::<V>(1);
     tokio::spawn(async move {
+        // the generator starts when the body is first read (a body never sent leaves it unstarted)
+        if go.await.is_err() {
+            return;
+        }
         loop {
             match g.asend(V::None).await {
                 Ok(v) => {
@@ -218,7 +222,7 @@ pub async fn anext(it: &V) -> R {
 /// a project object calls its `__aiter__`
 pub async fn aiter(cx: &Cx, it: &V) -> R {
     match it {
-        V::Native(n) if matches!(&**n, Native::Gen(_) | Native::WsIter(..) | Native::AsyncItems(_)) => Ok(it.clone()),
+        V::Native(n) if matches!(&**n, Native::Gen(_) | Native::WsIter(..) | Native::AsyncItems(_) | Native::AmqpIter(_)) => Ok(it.clone()),
         V::Inst(_) => super::methods::call_method(cx, it, "__aiter__", vec![], vec![]).await,
         o => Err(Exc::type_error(format!("'async for' requires an object with __aiter__ method, got {}", o.type_name()))),
     }
@@ -230,6 +234,10 @@ pub async fn anext_opt(cx: &Cx, it: &V) -> R<Option<V>> {
         V::Native(n) if matches!(&**n, Native::WsIter(..)) => {
             let Native::WsIter(s, kind) = &**n else { unreachable!() };
             return super::ws::iter_next(s, kind).await;
+        }
+        V::Native(n) if matches!(&**n, Native::AmqpIter(_)) => {
+            let Native::AmqpIter(a) = &**n else { unreachable!() };
+            return super::rmq::iter_next(a).await;
         }
         V::Native(n) if matches!(&**n, Native::Gen(_)) => anext(it).await,
         V::Native(n) if matches!(&**n, Native::AsyncItems(_)) => {
