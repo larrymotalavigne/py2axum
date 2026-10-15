@@ -1,6 +1,8 @@
 """py2axum/migrations.py: alembic revisions rendered for `<binary> migrate`, refusals with file:line (no database:
 tests/migrate_check.py compares the binary with alembic itself)."""
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,8 @@ import pytest
 from py2axum import migrations
 from py2axum.ir import TranspileError
 
-FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "migrapp"
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = ROOT / "fixtures" / "migrapp"
 
 
 def project(tmp_path: Path, extra: dict[str, str] | None = None, env: str | None = None) -> Path:
@@ -82,3 +85,20 @@ def test_transaction_per_migration(tmp_path):
     assert plan.per_migration
     # each revision in its own transaction: BEGIN/COMMIT around it in the whole script
     assert plan.sql.count("BEGIN;") == 5 + 1  # each revision, and the autocommit block's restart
+
+
+def test_generation_without_sqlalchemy_nor_alembic(tmp_path):
+    """every generation imports py2axum.migrations: an app without SQLAlchemy (and without alembic) in the
+    translator's environment must still generate (0.8.0 imported SQLAlchemy at the top of the module)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\n"
+                                 "async def x():\n    return {'a': 1}\n")
+    # None in sys.modules: `import sqlalchemy` raises ImportError, as when it is not installed
+    code = ("import sys\nfor m in ('sqlalchemy', 'alembic'):\n    sys.modules[m] = None\n"
+            "from py2axum.__main__ import main\nsys.exit(main(sys.argv[1:]))")
+    r = subprocess.run([sys.executable, "-c", code, str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")],
+                       cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "MIGRATIONS: Option<&'static" in (tmp_path / "out" / "src" / "gen.rs").read_text()

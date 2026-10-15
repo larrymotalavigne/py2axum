@@ -25,14 +25,17 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import sqlalchemy
-from sqlalchemy.dialects import postgresql
-
 from .ir import TranspileError
 
-# types whose literal (offline) differs from their bound value (online)
-LITERAL_DIFFERS = (sqlalchemy.JSON, postgresql.JSONB, sqlalchemy.ARRAY, sqlalchemy.PickleType, sqlalchemy.LargeBinary,
-                   sqlalchemy.Interval)
+
+def literal_differs() -> tuple:
+    """The types whose literal (offline) differs from their bound value (online). SQLAlchemy and alembic are imported
+    only for a project with an alembic.ini: every generation imports this module (dyn.migrations_item)."""
+    import sqlalchemy
+    from sqlalchemy.dialects import postgresql
+
+    return (sqlalchemy.JSON, postgresql.JSONB, sqlalchemy.ARRAY, sqlalchemy.PickleType, sqlalchemy.LargeBinary,
+            sqlalchemy.Interval, sqlalchemy.types.TypeDecorator)
 
 # what a revision may import: the rest would run the project at translation time
 ALLOWED_IMPORTS = ("alembic", "sqlalchemy", "typing", "typing_extensions", "__future__", "datetime", "enum", "uuid",
@@ -203,6 +206,7 @@ def collect(package: Path, root: Path) -> Plan | None:
     except ImportError:
         raise TranspileError(f"{ini}: translating the migrations needs alembic next to py2axum (pip install alembic)",
                              None, str(ini)) from None
+    differs = literal_differs()
     cp = configparser.ConfigParser(defaults={"here": str(ini.parent)})
     cp.read(ini)
     loc = cp.get("alembic", "script_location", fallback=None)
@@ -278,7 +282,7 @@ def collect(package: Path, root: Path) -> Plan | None:
             # their literal (JSON's None is the JSON null online, SQL NULL offline...) make the revision unrenderable
             for col in getattr(table, "c", []):
                 t = col.type
-                if isinstance(t, LITERAL_DIFFERS) or isinstance(t, sqlalchemy.types.TypeDecorator):
+                if isinstance(t, differs):
                     failed.setdefault(current[0].name, f"{current[0]}: op.bulk_insert into {table.name}.{col.name} "
                                       f"({type(t).__name__}): alembic's offline mode writes its values differently "
                                       "from an online run")
