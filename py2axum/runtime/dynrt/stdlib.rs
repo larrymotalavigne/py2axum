@@ -949,10 +949,7 @@ pub fn math(name: &str, args: &[V]) -> R {
                 return Ok(V::Int(*i));
             }
             let x = a(0)?;
-            if !x.is_finite() {
-                return Err(if x.is_nan() { Exc::value_error("cannot convert float NaN to integer") } else { Exc::msg(&OVERFLOW_ERROR, "cannot convert float infinity to integer") });
-            }
-            V::Int(match name { "ceil" => x.ceil(), "floor" => x.floor(), _ => x.trunc() } as i64)
+            super::ops::float_to_int(match name { "ceil" => x.ceil(), "floor" => x.floor(), _ => x.trunc() })?
         }
         "pow" => {
             let (x, y) = (a(0)?, a(1)?);
@@ -1291,7 +1288,7 @@ pub fn urllib(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         }
         "urlparse" | "urlsplit" => {
             let url = ops::str_(up_arg(name, args, kwargs, 0, "url", &["url", "scheme", "allow_fragments"])?.ok_or_else(|| Exc::type_error("missing 'url'"))?)?;
-            Ok(V::native(Native::UrlParts(Arc::new(url_split(&url, name == "urlparse")))))
+            Ok(V::native(Native::UrlParts(Arc::new(url_split(&url, name == "urlparse")?))))
         }
         _ => Err(Exc::attr_error(format!("module 'urllib.parse' has no attribute '{name}'"))),
     }
@@ -1308,8 +1305,14 @@ pub struct UrlParts {
     pub fragment: String,
 }
 
-fn url_split(url: &str, parse: bool) -> UrlParts {
-    let url = url.trim_start_matches(|c: char| c <= ' ').trim_end_matches(|c: char| c <= ' ');
+/// `urllib.parse.uses_params`: the schemes whose last path segment carries `;params` (urlparse)
+const USES_PARAMS: [&str; 16] = ["", "ftp", "hdl", "prospero", "http", "imap", "https", "shttp", "rtsp", "rtsps", "rtspu", "sip",
+    "sips", "mms", "sftp", "tel"];
+
+/// `_urlsplit` (+ `_splitparams` for `urlparse`): the WHATWG C0 controls and spaces stripped on the left, tabs and
+/// newlines removed, then the netloc's checks (brackets, NFKC), with their ValueErrors
+pub fn url_split(url: &str, parse: bool) -> R<UrlParts> {
+    let url = url.trim_start_matches(|c: char| c <= ' ');
     let url: String = url.chars().filter(|c| !matches!(c, '\t' | '\r' | '\n')).collect();
     let mut rest = url.as_str();
     let mut scheme = String::new();
@@ -1325,6 +1328,12 @@ fn url_split(url: &str, parse: bool) -> UrlParts {
         let end = r.find(['/', '?', '#']).unwrap_or(r.len());
         netloc = r[..end].to_string();
         rest = &r[end..];
+        if netloc.contains('[') != netloc.contains(']') {
+            return Err(Exc::value_error("Invalid IPv6 URL"));
+        }
+        if netloc.contains('[') {
+            check_bracketed_netloc(&netloc)?;
+        }
     }
     let (rest, fragment) = match rest.split_once('#') {
         Some((a, b)) => (a, b.to_string()),
@@ -1334,7 +1343,8 @@ fn url_split(url: &str, parse: bool) -> UrlParts {
         Some((a, b)) => (a.to_string(), b.to_string()),
         None => (rest.to_string(), String::new()),
     };
-    let (path, params) = if parse && path.contains(';') {
+    check_netloc(&netloc)?;
+    let (path, params) = if parse && USES_PARAMS.contains(&scheme.as_str()) && path.contains(';') {
         // params of the last segment only
         let seg = path.rfind('/').map(|i| i + 1).unwrap_or(0);
         match path[seg..].find(';') {
@@ -1344,7 +1354,55 @@ fn url_split(url: &str, parse: bool) -> UrlParts {
     } else {
         (path, String::new())
     };
-    UrlParts { parse, scheme, netloc, path, params, query, fragment }
+    Ok(UrlParts { parse, scheme, netloc, path, params, query, fragment })
+}
+
+/// `_check_bracketed_netloc` / `_check_bracketed_host`
+fn check_bracketed_netloc(netloc: &str) -> R<()> {
+    let host_port = netloc.rsplit_once('@').map(|(_, b)| b).unwrap_or(netloc);
+    let host = match host_port.split_once('[') {
+        Some((before, bracketed)) => {
+            if !before.is_empty() {
+                return Err(Exc::value_error("Invalid IPv6 URL"));
+            }
+            let (host, port) = bracketed.split_once(']').unwrap_or((bracketed, ""));
+            if !port.is_empty() && !port.starts_with(':') {
+                return Err(Exc::value_error("Invalid IPv6 URL"));
+            }
+            host
+        }
+        None => host_port.split_once(':').map(|(a, _)| a).unwrap_or(host_port),
+    };
+    // IPvFuture: `v` only before CPython's fix accepting `V` too (probed: a distribution's patch release may carry it)
+    let upper = super::python_feature("ipvfuture_upper").unwrap_or_else(|| super::python() >= (3, 13));
+    if host.starts_with('v') || (upper && host.starts_with('V')) {
+        // \A[vV][a-fA-F0-9]+\..+\Z (no newline: removed above)
+        let hex = host[1..].find(|c: char| !c.is_ascii_hexdigit()).map(|i| &host[1..1 + i]).unwrap_or(&host[1..]);
+        let tail = &host[1 + hex.len()..];
+        if hex.is_empty() || !tail.starts_with('.') || tail.len() < 2 {
+            return Err(Exc::value_error("IPvFuture address is invalid"));
+        }
+        return Ok(());
+    }
+    match super::net::py_ip_address(host) {
+        Some(std::net::IpAddr::V6(_)) => Ok(()),
+        Some(std::net::IpAddr::V4(_)) => Err(Exc::value_error("An IPv4 address cannot be in brackets")),
+        None => Err(Exc::value_error(format!("{} does not appear to be an IPv4 or IPv6 address", ops::str_repr(host)))),
+    }
+}
+
+/// `_checknetloc`: a non-ASCII netloc whose NFKC form gains a delimiter
+fn check_netloc(netloc: &str) -> R<()> {
+    use unicode_normalization::UnicodeNormalization;
+    if netloc.is_ascii() {
+        return Ok(());
+    }
+    let n: String = netloc.chars().filter(|c| !matches!(c, '@' | ':' | '#' | '?')).collect();
+    let n2: String = n.nfkc().collect();
+    if n == n2 || !n2.contains(['/', '?', '#', '@', ':']) {
+        return Ok(());
+    }
+    Err(Exc::value_error(format!("netloc '{netloc}' contains invalid characters under NFKC normalization")))
 }
 
 pub fn url_parts_attr(u: &UrlParts, name: &str) -> R {

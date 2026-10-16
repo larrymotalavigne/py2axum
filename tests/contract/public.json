@@ -115,6 +115,39 @@
     "default": null,
     "metavar": "X.Y",
     "required": false
+   },
+   {
+    "flags": [
+     "--translate-libs"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": "none",
+    "metavar": "none|auto|DIST,...",
+    "required": false
+   },
+   {
+    "flags": [
+     "--venv"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--allow-license"
+    ],
+    "action": "AppendAction",
+    "nargs": null,
+    "choices": null,
+    "default": [],
+    "metavar": "SPDX",
+    "required": false
    }
   ],
   "py2axum check": [
@@ -233,6 +266,39 @@
     "choices": null,
     "default": null,
     "metavar": "X.Y",
+    "required": false
+   },
+   {
+    "flags": [
+     "--translate-libs"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": "none",
+    "metavar": "none|auto|DIST,...",
+    "required": false
+   },
+   {
+    "flags": [
+     "--venv"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--allow-license"
+    ],
+    "action": "AppendAction",
+    "nargs": null,
+    "choices": null,
+    "default": [],
+    "metavar": "SPDX",
     "required": false
    }
   ],
@@ -394,6 +460,39 @@
    },
    {
     "flags": [
+     "--translate-libs"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": "none",
+    "metavar": "none|auto|DIST,...",
+    "required": false
+   },
+   {
+    "flags": [
+     "--venv"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": null,
+    "required": false
+   },
+   {
+    "flags": [
+     "--allow-license"
+    ],
+    "action": "AppendAction",
+    "nargs": null,
+    "choices": null,
+    "default": [],
+    "metavar": "SPDX",
+    "required": false
+   },
+   {
+    "flags": [
      "binary_args"
     ],
     "action": "StoreAction",
@@ -512,6 +611,7 @@
   "P2A0312",
   "P2A0313",
   "P2A0314",
+  "P2A0315",
   "P2A0401",
   "P2A0402",
   "P2A0403",
@@ -534,6 +634,10 @@
   "P2A0601",
   "P2A0602",
   "P2A0603",
+  "P2A0701",
+  "P2A0702",
+  "P2A0703",
+  "P2A0704",
   "P2A0901",
   "P2A0999"
  ],

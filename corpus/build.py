@@ -1,9 +1,9 @@
 """Translate the corpus and compile it at scale: `py2axum check`, then generation, then a few shared crates.
 
 Compiling one crate per example would rebuild the runtime (~40 000 lines of Rust) hundreds of times. The
-examples are grouped in bundles: one crate holds the runtime once and each example's generated code as a
-module (`gen.rs` and `main.rs` unchanged but for the module paths), and its `main` starts the example named
-by `CORPUS_APP`. All bundles share one target directory (the dependencies compile once), with an
+examples are grouped in bundles: one crate depends on the runtime's library crate and holds each example's
+generated code as a module (`gen.rs` and `main.rs` unchanged but for the module paths), and its `main` starts
+the example named by `CORPUS_APP`. All bundles share one target directory (the dependencies compile once), with an
 incremental, unoptimised-for-size profile: what is compared is behaviour, not speed. A file is rewritten only
 when its content changes, so cargo's incremental cache serves the next run.
 """
@@ -97,7 +97,9 @@ def _write(path: Path, text: str) -> None:
 
 
 def _as_module(main_rs: str, ident: str) -> str:
-    out = re.sub(r"#\[macro_use\]\s*mod dynrt;\s*mod gen;", f"use crate::dynrt;\nuse crate::{ident}_gen as gen;", main_rs)
+    # one global allocator per crate: the bundle keeps the system's
+    main_rs = re.sub(r"// the `mimalloc` feature[^\n]*\n#\[cfg\(feature = \"mimalloc\"\)\]\n#\[global_allocator\]\n[^\n]*\n", "", main_rs)
+    out = re.sub(r"#\[macro_use\]\s*extern crate dynrt;\s*mod gen;", f"use crate::{ident}_gen as gen;", main_rs)
     if out == main_rs:
         raise ValueError("unexpected main.rs layout")
     return re.sub(r"^fn main\(\)", "pub fn main()", out, flags=re.M)
@@ -114,13 +116,16 @@ def write_bundle(bundle: Path, gens: dict[str, Path]) -> None:
     if not (bundle / "Cargo.lock").exists():
         (bundle / "Cargo.lock").write_text(lock.read_text().replace('name = "dynapp_axum"', f'name = "{bundle.name}"'))
     src = bundle / "src"
-    rt = src / "dynrt"
-    for p in sorted((first / "src" / "dynrt").iterdir()):
+    # the runtime's library crate (dynrt/, its path dependency), shared by every bundle's target directory
+    rt = bundle / "dynrt"
+    for p in sorted((first / "dynrt").iterdir()):
         _write(rt / p.name, p.read_text())
     for p in list(rt.iterdir()):
-        if not (first / "src" / "dynrt" / p.name).exists():
+        if not (first / "dynrt" / p.name).exists():
             p.unlink()
-    mods, arms = ["#[macro_use]", "mod dynrt;"], []
+    if (src / "dynrt").exists():
+        shutil.rmtree(src / "dynrt")
+    mods, arms = ["#[macro_use]", "extern crate dynrt;"], []
     for ident, g in sorted(gens.items()):
         _write(src / "apps" / f"{ident}_gen.rs", (g / "src" / "gen.rs").read_text())
         _write(src / "apps" / f"{ident}_main.rs", _as_module((g / "src" / "main.rs").read_text(), ident))

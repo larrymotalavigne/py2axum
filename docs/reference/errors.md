@@ -56,6 +56,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0312](#p2a0312) | Registration outside the app factory |
 | [P2A0313](#p2a0313) | Exception handler |
 | [P2A0314](#p2a0314) | Nested endpoint |
+| [P2A0315](#p2a0315) | Router of a library |
 | [P2A0401](#p2a0401) | Type annotation |
 | [P2A0402](#p2a0402) | Field option |
 | [P2A0403](#p2a0403) | Pydantic validator |
@@ -78,6 +79,10 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0601](#p2a0601) | Library version outside the tested ranges |
 | [P2A0602](#p2a0602) | Cannot be left to Python |
 | [P2A0603](#p2a0603) | Not available on the project's Python |
+| [P2A0701](#p2a0701) | Library licence not admitted |
+| [P2A0702](#p2a0702) | Library not pure Python |
+| [P2A0703](#p2a0703) | Library installation differs from the lock |
+| [P2A0704](#p2a0704) | Standard library source of another Python |
 | [P2A0901](#p2a0901) | Internal transpiler error |
 | [P2A0999](#p2a0999) | Not supported |
 
@@ -497,6 +502,16 @@ Endpoints are compiled as functions of the generated crate: they must be defined
 
 See [Bigger applications](../tutorial/bigger-applications.md).
 
+### P2A0315
+
+**Router of a library** — *whole application*
+
+The routes of a router defined in a library are not translated (py2axum reads only the project); as the app's last registrations, they can stay in Python.
+
+**What to do:** Include the library's router last (`app.include_router(...)` on the app, unconditionally, with a literal prefix or none, nothing registering routes after it) and pass `--python-side mount` (implied by `--python-side auto`).
+
+See [Bigger applications](../tutorial/bigger-applications.md#routers-of-libraries).
+
 ## Pydantic
 
 ### P2A0401
@@ -722,6 +737,48 @@ The construct appeared in a later Python than the one the project runs on (its `
 **What to do:** Check the Python py2axum detected (`--python X.Y` sets it), or write the construct of your Python.
 
 See [python-versions.md](../python-versions.md).
+
+## Libraries translated from source
+
+### P2A0701
+
+**Library licence not admitted**
+
+`--translate-libs` compiles a library's source into the binary, a derived work of the library: only permissive licences are admitted by default (MIT, BSD, Apache-2.0, ISC, PSF, Unlicense). The licence is read from the distribution's `License-Expression`, else its licence classifiers.
+
+**What to do:** Check that the licence allows it for your binary and pass `--allow-license <SPDX>`, or leave the routes that reach the library to Python. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+
+See [Libraries translated from source](../advanced/libraries.md#licences).
+
+### P2A0702
+
+**Library not pure Python**
+
+Only pure-Python libraries are translated from source: a compiled extension (or a C accelerator next to its pure-Python fallback) is code the translation cannot read, and translating the fallback would not translate what CPython runs.
+
+**What to do:** Use a pure-Python alternative, or leave the routes that reach the library to Python. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+
+See [Libraries translated from source](../advanced/libraries.md).
+
+### P2A0703
+
+**Library installation differs from the lock**
+
+The binary carries the library's code as installed in the project's environment: it must be the version the project locks, with files as published (their `RECORD` hashes).
+
+**What to do:** Install the locked versions (`uv sync --frozen`), or point `--venv` at the project's environment.
+
+See [Libraries translated from source](../advanced/libraries.md).
+
+### P2A0704
+
+**Standard library source of another Python**
+
+A few pure-Python modules of the standard library (`gettext`, `html.entities`, `keyword`...) are translated from the source of the Python py2axum runs on: it must be the project's Python, whose behaviour the binary follows.
+
+**What to do:** Run py2axum on the project's Python (the minor its `.python-version` or `--python` names).
+
+See [Libraries translated from source](../advanced/libraries.md#the-standard-library).
 
 ## Other
 

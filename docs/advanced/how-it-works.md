@@ -6,7 +6,7 @@ your package (.py)                py2axum (Python, stdlib only)                 
  app/main.py          │ modules.py   static module index & imports   │     Cargo.toml (+ tested Cargo.lock)
  app/models.py   ───▶ │ frontend.py  apps, routers, routes, models,  │ ──▶ src/main.rs   tokio + axum server
  app/views/...        │              schemas, middleware             │     src/gen.rs    your code, compiled
- uv.lock (versions)   │ dyn.py       compiler of project code        │     src/dynrt/    the runtime (copied)
+ uv.lock (versions)   │ dyn.py       compiler of project code        │     dynrt/        the runtime (library crate)
                       │ libmap.py    closed map of library APIs      │
                       │ report.py    per-route coverage report       │
                       └──────────────────────────────────────────────┘
@@ -37,12 +37,12 @@ validation errors like FastAPI, calls the compiled endpoint and serializes the r
 /// GET /me  (from auth.py:34 `me`)
 async fn route_4_me(cx: &Cx) -> R<axum::response::Response> {
     let __body: Option<V> = None;
-    let mut __errv: Vec<crate::dynrt::pyd::ErrDetail> = Vec::new();
+    let mut __errv: Vec<dynrt::pyd::ErrDetail> = Vec::new();
     let __errs = &mut __errv;
     let p_user = dep_app_security__current_user(cx, &__body, __errs).await?.unwrap_or(V::None);
-    crate::dynrt::web::check(__errv)?;                    // a 422 with FastAPI's body, if any
+    dynrt::web::check(__errv)?;                    // a 422 with FastAPI's body, if any
     let __ret = f_app_routers_auth__me(cx, p_user).await?;
-    crate::dynrt::web::respond(cx, __ret, Some(&TD_5), 200).await    // response_model=UserOut
+    dynrt::web::respond(cx, __ret, Some(&TD_5), 200).await    // response_model=UserOut
 }
 ```
 

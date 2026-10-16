@@ -35,9 +35,19 @@ pub struct ReqCell {
     pub body: Bytes,
     pub state: Mutex<IndexMap<String, V>>,
     pub disconnected: AtomicBool,
+    /// the body a custom route class's Request subclass gives (its `body()` override, e.g. decompressed), what
+    /// the route's handler parses while it runs
+    pub body_override: Mutex<Option<Bytes>>,
+    /// that Request subclass's instance: the endpoint's `request` parameter while the handler runs
+    pub custom_request: Mutex<Option<V>>,
 }
 
 impl ReqCell {
+    /// the body the route parses (`body_override` while a custom request's handler runs)
+    pub fn body_bytes(&self) -> Bytes {
+        self.body_override.lock().clone().unwrap_or_else(|| self.body.clone())
+    }
+
     pub fn empty() -> ReqCell {
         ReqCell {
             method: "GET".into(),
@@ -53,6 +63,8 @@ impl ReqCell {
             body: Bytes::new(),
             state: Mutex::new(IndexMap::new()),
             disconnected: AtomicBool::new(false),
+            body_override: Mutex::new(None),
+            custom_request: Mutex::new(None),
         }
     }
     pub fn from_parts(method: &str, uri: &axum::http::Uri, headers: &HeaderMap, path_params: Vec<(String, String)>, body: Bytes) -> ReqCell {
@@ -75,6 +87,8 @@ impl ReqCell {
             body,
             state: Mutex::new(IndexMap::new()),
             disconnected: AtomicBool::new(false),
+            body_override: Mutex::new(None),
+            custom_request: Mutex::new(None),
         }
     }
     pub fn header(&self, name: &str) -> Option<String> {
@@ -97,6 +111,48 @@ fn loc2(a: &str, b: &str) -> Vec<V> {
 
 /// A path/query/header parameter, validated like FastAPI (`loc = [source, name]`).
 pub async fn param(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
+    param_after(cx, source, name, alias, td, required, default, &[], errs).await
+}
+
+/// A parameter with `Annotated[T, AfterValidator(f), ...]`: once its value passed its type, each function in
+/// turn; a ValueError or an AssertionError there is the parameter's error (its input: the raw value), like
+/// pydantic's field validators (a default other than None is validated too, as FastAPI does).
+pub async fn param_after(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static TD, required: bool, default: fn() -> V,
+                         afters: &[pyd::MethodFn], errs: &mut Vec<ErrDetail>) -> R {
+    let _ = name;
+    let loc = loc2(source, alias);
+    // FastAPI 0.142 (`_get_multidict_value`, `_validate_value_with_model_field`): a missing parameter takes a copy
+    // of its default, validated like a value unless it is None; a computed default (V::Unbound) is the route's
+    let raw = match param_raw(cx, source, alias, td) {
+        Some(v) => v,
+        None if required => {
+            errs.push(ErrDetail { kind: "missing", loc, msg: "Field required".into(), input: V::None, ctx: None, custom: false });
+            return Ok(V::None);
+        }
+        None => match default() {
+            d @ (V::None | V::Unbound) => return Ok(d),
+            d => d,
+        },
+    };
+    let n = errs.len();
+    let mut cur = pyd::validate(cx, &raw, td, &loc, errs).await?.unwrap_or(V::None);
+    if errs.len() > n {
+        return Ok(V::None);
+    }
+    for f in afters {
+        match f(cx, V::None, vec![cur.clone()]).await {
+            Ok(v) => cur = v,
+            Err(x) => {
+                errs.push(pyd::validator_error(x, loc.clone(), raw.clone())?);
+                return Ok(V::None);
+            }
+        }
+    }
+    Ok(cur)
+}
+
+/// the raw value of a path/query/header/cookie parameter (a list parameter: every occurrence)
+fn param_raw(cx: &Cx, source: &str, alias: &str, td: &'static TD) -> Option<V> {
     // a list parameter takes every occurrence (FastAPI: `query_params.getlist`, `headers.getlist`)
     let list = matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_)));
     let raw = match source {
@@ -118,18 +174,7 @@ pub async fn param(cx: &Cx, source: &str, name: &str, alias: &str, td: &'static 
             }
         }
     };
-    let _ = name;
-    match raw {
-        None => {
-            if required {
-                errs.push(ErrDetail { kind: "missing", loc: loc2(source, alias), msg: "Field required".into(), input: V::None, ctx: None, custom: false });
-                Ok(V::None)
-            } else {
-                Ok(default())
-            }
-        }
-        Some(v) => Ok(pyd::validate(cx, &v, td, &loc2(source, alias), errs).await?.unwrap_or(V::None)),
-    }
+    raw
 }
 
 static RESPONSE_DUMP_JSON: AtomicBool = AtomicBool::new(true);
@@ -193,7 +238,7 @@ fn strict_content_type() -> bool {
 /// `request.json()` (json.loads of the bytes: BOM and UTF-16/32 detected); a JSONDecodeError is a 422
 /// `json_invalid` at its character position, any other error (bad UTF-8, nesting too deep) a 400.
 pub fn read_body(cx: &Cx) -> R<Option<V>> {
-    let bytes = &cx.req.body;
+    let bytes = &cx.req.body_bytes();
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -314,6 +359,55 @@ pub static CREDENTIALS: pyd::SchemaDesc = pyd::SchemaDesc {
     x: pyd::SchemaX::NONE,
 };
 
+static SCOPES_CLASS: Class =
+    Class { name: "SecurityScopes", qualname: "SecurityScopes", bases: &[], kind: ClassKind::Schema(&SCOPES) };
+/// `fastapi.security.SecurityScopes` given to a dependency (`.scopes`, `.scope_str`)
+pub static SCOPES: pyd::SchemaDesc = pyd::SchemaDesc {
+    name: "SecurityScopes",
+    class: &SCOPES_CLASS,
+    fields: &[
+        pyd::FieldDesc { name: "scopes", alias: None, ser: None, paths: &[], td: &ANY_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
+        pyd::FieldDesc { name: "scope_str", alias: None, ser: None, paths: &[], td: &STR_TD, default: pyd::Dflt::Required, env: None, validate_default: false },
+    ],
+    from_attributes: false,
+    extra: pyd::Extra::Ignore,
+    validators: &[],
+    validate_assignment: false,
+    populate_by_name: false,
+    methods: &[],
+    open: false,
+    model_after: &[],
+    before: &[],
+    model_before: &[],
+    has_before: false,
+    frozen: false,
+    post_init: None,
+    hash: pyd::HashKind::Unhashable,
+    dataclass: false,
+    async_methods: &[],
+    slots: &[],
+    settings: None,
+    init: None,
+    private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
+    computed: &[],
+    json_schema: None,
+    x: pyd::SchemaX::NONE,
+};
+
+static ANY_TD: TD = TD::Any;
+
+/// `SecurityScopes(scopes=...)` as FastAPI builds it for a dependency's parameter: the scopes of the
+/// dependency chain down to it, without repeats, in order
+pub fn security_scopes(scopes: &[&str]) -> V {
+    V::Inst(Arc::new(pyd::Inst { raw: false,
+        desc: &SCOPES,
+        vals: super::pyd::Slots::new(vec![V::list(scopes.iter().map(|x| V::str(*x)).collect()), V::str(scopes.join(" "))]),
+        set: Mutex::new(vec![true, true]),
+        extra: super::pyd::Slots::new(IndexMap::new()),
+    }))
+}
+
 pub enum Security {
     /// `OAuth2PasswordBearer(tokenUrl=...)`: the bearer token (str)
     OAuth2Bearer,
@@ -381,7 +475,7 @@ fn http_basic(cx: &Cx, realm: Option<&str>, auto_error: bool) -> R {
     }
     let data = String::from_utf8(data).unwrap_or_default();
     let Some((user, password)) = data.split_once(':') else { return denied() };
-    Ok(V::Inst(Arc::new(pyd::Inst {
+    Ok(V::Inst(Arc::new(pyd::Inst { raw: false,
         desc: &BASIC,
         vals: super::pyd::Slots::new(vec![V::str(user), V::str(password)]),
         set: Mutex::new(vec![true, true]),
@@ -413,7 +507,7 @@ pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
     }
     Ok(match kind {
         Security::OAuth2Bearer => V::str(param),
-        Security::HttpBearer => V::Inst(Arc::new(pyd::Inst {
+        Security::HttpBearer => V::Inst(Arc::new(pyd::Inst { raw: false,
             desc: &CREDENTIALS,
             vals: super::pyd::Slots::new(vec![V::str(scheme), V::str(param)]),
             set: Mutex::new(vec![true, true]),
@@ -421,6 +515,32 @@ pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
         })),
         Security::HttpBasic(_) => unreachable!(),
     })
+}
+
+/// A project subclass of a security scheme: its `make_not_authenticated_error()` (the exception raised, instead
+/// of the 401) or `make_authenticate_headers()` (the 401's headers), called where FastAPI calls them: every
+/// refusal of the scheme, `auto_error` or not for HTTPBasic's malformed credentials.
+pub async fn security_with(cx: &Cx, kind: Security, auto_error: bool, error: Option<pyd::MethodFn>,
+                           headers: Option<pyd::MethodFn>) -> R {
+    match security(cx, kind, auto_error) {
+        Err(x) if x.0.http.as_ref().map(|h| h.0) == Some(401) => {
+            if let Some(f) = error {
+                let v = f(cx, V::None, vec![]).await?;
+                return Err(super::raise_v(&v));
+            }
+            let Some(h) = headers else { return Err(x) };
+            let hv = h(cx, V::None, vec![]).await?;
+            let V::Dict(d) = &hv else {
+                return Err(Exc::type_error("py2axum: make_authenticate_headers() must return a dict"));
+            };
+            let mut out = Vec::new();
+            for (_, (k, v)) in d.lock().iter() {
+                out.push((super::ops::str_(k)?, super::ops::str_(v)?));
+            }
+            Err(Exc::http(401, V::str("Not authenticated"), out))
+        }
+        r => r,
+    }
 }
 
 // ---------------------------------------------------------------- forms (Form(), File())
@@ -450,7 +570,7 @@ pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
                 _ => {}
             }
             let boundary = multer::parse_boundary(&ct).map_err(|_| bad())?;
-            let body = cx.req.body.clone();
+            let body = cx.req.body_bytes();
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(body.to_vec())) });
             let mut mp = multer::Multipart::new(stream, boundary);
             let mut out = Vec::new();
@@ -499,7 +619,7 @@ pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
             // field by field like python-multipart's callbacks
             let mut fields = 0;
             let limits = starlette() >= (1, 4);
-            for part in cx.req.body.split(|b| *b == b'&').filter(|p| !p.is_empty() && limits) {
+            for part in cx.req.body_bytes().split(|b| *b == b'&').filter(|p| !p.is_empty() && limits) {
                 if part.len() - usize::from(part.contains(&b'=')) > 1024 * 1024 {
                     return Err(Exc::http(400, V::str("Field exceeded maximum size of 1024KB."), vec![]));
                 }
@@ -508,7 +628,7 @@ pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
                     return Err(Exc::http(400, V::str("Too many fields. Maximum number of fields is 1000."), vec![]));
                 }
             }
-            Ok(form_urlencoded::parse(&cx.req.body).map(|(k, v)| (k.to_string(), FormVal::Text(v.to_string()))).collect())
+            Ok(form_urlencoded::parse(&cx.req.body_bytes()).map(|(k, v)| (k.to_string(), FormVal::Text(v.to_string()))).collect())
         }
         _ => Ok(Vec::new()),
     }
@@ -799,8 +919,22 @@ pub async fn respond(cx: &Cx, ret: V, model: Option<&'static TD>, status: u16) -
 /// for a no-body status, then appends the `response` parameter's headers.
 pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Option<u16>, cls: Option<&'static str>,
                         opts: &'static RespDump) -> R<Response> {
-    let Some(cls) = cls.filter(|c| *c != "JSONResponse") else {
-        return respond_json(cx, ret, model, status.unwrap_or(200), opts).await;
+    respond_custom(cx, ret, model, status, cls, None, None, opts).await
+}
+
+/// `response_class=` a project subclass of a response class: its `media_type` (`media`) and its
+/// `render(self, content)` (`render`, given the encoded value; its bytes are the body).
+#[allow(clippy::too_many_arguments)]
+pub async fn respond_custom(cx: &Cx, ret: V, model: Option<&'static TD>, status: Option<u16>, cls: Option<&'static str>,
+                            media: Option<&'static str>, render: Option<pyd::MethodFn>, opts: &'static RespDump) -> R<Response> {
+    let custom = media.is_some() || render.is_some();
+    let Some(cls) = cls.filter(|c| *c != "JSONResponse" || custom) else {
+        // the class a custom route handler sees (`repr(response)`): the endpoint's Response, else JSONResponse
+        let mut r = respond_json(cx, ret, model, status.unwrap_or(200), opts).await?;
+        if r.extensions().get::<super::resp::RespClass>().is_none() {
+            r.extensions_mut().insert(super::resp::RespClass("starlette.responses.JSONResponse"));
+        }
+        return Ok(r);
     };
     if let V::Native(n) = &ret {
         if matches!(&**n, Native::RespObj(_) | Native::Streaming(_)) {
@@ -816,6 +950,25 @@ pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Opt
         kwargs.push(("status_code".to_string(), V::Int(st as i64)));
     }
     let key = if cls == "RedirectResponse" { "url" } else if cls == "FileResponse" { "path" } else { "content" };
+    let (cls, content) = match render {
+        Some(f) => {
+            // Starlette's `self.body = self.render(content)`, under the subclass's media type (else its base's)
+            let body = f(cx, V::None, vec![content]).await?;
+            if !matches!(body, V::Bytes(_)) {
+                return Err(Exc::type_error(format!("py2axum: render() returned {}, not bytes", body.type_name())));
+            }
+            if let Some(m) = media.or(super::resp::default_media(cls)) {
+                kwargs.push(("media_type".to_string(), V::str(m)));
+            }
+            ("Response", body)
+        }
+        None => {
+            if let Some(m) = media {
+                kwargs.push(("media_type".to_string(), V::str(m)));
+            }
+            (cls, content)
+        }
+    };
     let obj = super::resp::new(cls, &[], &[vec![(key.to_string(), content)], kwargs].concat())?;
     let V::Native(n) = &obj else { unreachable!() };
     let Native::RespObj(r) = &**n else { unreachable!() };
@@ -823,7 +976,7 @@ pub async fn respond_as(cx: &Cx, ret: V, model: Option<&'static TD>, status: Opt
     if u16::try_from(st).is_ok_and(no_body) {
         if let super::resp::RespBody::Bytes(_) = &r.body {
             let r2 = super::resp::RespObj { status: parking_lot::Mutex::new(st), headers: parking_lot::Mutex::new(r.headers.lock().clone()),
-                                            body: super::resp::RespBody::Bytes(vec![]), media: r.media.clone() };
+                                            body: super::resp::RespBody::Bytes(vec![]), media: r.media.clone(), cls: r.cls };
             r2.headers.lock().extend(cx.resp.headers.lock().iter().cloned());
             return super::resp::into_response(&r2);
         }
@@ -841,7 +994,7 @@ async fn encode(cx: &Cx, ret: &V, model: Option<&'static TD>, opts: &RespDump) -
             match pyd::validate(cx, &prepared, td, &[V::str("response")], &mut errs).await? {
                 Some(v) => {
                     let o = pyd::DumpOpts { json: true, by_alias: true, exclude_unset: opts.exclude_unset, exclude_none: opts.exclude_none, ..Default::default() };
-                    let d = pyd::dump(&v, o)?;
+                    let d = pyd::dump(&v, o).map_err(pyd::ser_json_error)?;
                     if opts.include.is_none() && opts.exclude.is_none() {
                         return Ok(d);
                     }
@@ -943,7 +1096,7 @@ async fn stream_list(cx: &Cx, l: super::orm::ListStream, status: u16, extra: Vec
                         return Err(response_validation_error(&cx, errs));
                     }
                 };
-                let content = pyd::dump(&v, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() })?;
+                let content = pyd::dump(&v, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() }).map_err(pyd::ser_json_error)?;
                 if i > 0 {
                     buf.push(',');
                 }
@@ -1003,17 +1156,22 @@ fn stream_response(s: Streaming, extra: &[(String, String)]) -> Response {
     for (k, v) in s.headers.iter().chain(extra.iter()) {
         b = b.header(k.to_ascii_lowercase().as_str(), v.as_str());
     }
-    let stream = futures_util::stream::unfold((s.rx, Some(s.go)), |(mut rx, go)| async move {
+    let stream = futures_util::stream::unfold((Some(s.rx), Some(s.go)), |(rx, go)| async move {
         if let Some(go) = go {
             let _ = go.send(());
         }
-        rx.recv().await.map(|v| {
-            let bytes = match v {
-                V::Str(s) => Bytes::from(s.to_string()),
-                V::Bytes(b) => Bytes::from(b.to_vec()),
-                other => Bytes::from(ops::str_(&other).unwrap_or_default()),
-            };
-            (Ok::<Bytes, std::io::Error>(bytes), (rx, None))
+        // after a failed chunk the body ends (the generator is released with the channel)
+        let mut rx = rx?;
+        rx.recv().await.map(|v| match v {
+            V::Str(s) => (Ok::<Bytes, std::io::Error>(Bytes::from(s.to_string())), (Some(rx), None)),
+            V::Bytes(b) => (Ok(Bytes::from(b.to_vec())), (Some(rx), None)),
+            // Starlette's stream_response: `chunk.encode(self.charset)` for anything but bytes/memoryview; the
+            // response has started: logged, the connection dropped
+            other => {
+                let e = Exc::attr_error(format!("'{}' object has no attribute 'encode'", other.type_name()));
+                super::uvicorn::exception(&super::trace::streaming_error(&e));
+                (Err(std::io::Error::other("streaming response failed")), (None, None))
+            }
         })
     })
     .fuse();
@@ -1029,6 +1187,13 @@ pub fn error_response(e: Exc) -> Response {
 /// NaN/inf (json.dumps(allow_nan=False), in a detail or in a validation error's raw `input`): the
 /// ValueError leaves the ExceptionMiddleware, ServerErrorMiddleware answers 500 outside every other
 /// middleware.
+/// an exception raised by FastAPI's default handler while it handles `handled` (`inf` in a 422's input: the
+/// encoder's ValueError): its `__context__`, as CPython chains it
+fn handling(x: Exc, handled: &Exc) -> Exc {
+    x.0.attrs.lock().entry("__context__".into()).or_insert_with(|| V::Exc(handled.clone()));
+    x
+}
+
 pub fn try_error_response(e: Exc) -> R<Response> {
     let obj = &e.0;
     if let Some((code, detail, headers)) = &e.http_info() {
@@ -1041,12 +1206,12 @@ pub fn try_error_response(e: Exc) -> R<Response> {
             }
             return Ok(b.body(Body::empty()).unwrap_or_else(bad_response));
         }
-        return Ok(json_body(*code, pyd::to_json(&body, &pyd::RESPONSE, true)?, headers));
+        return Ok(json_body(*code, pyd::to_json(&body, &pyd::RESPONSE, true).map_err(|x| handling(x, &e))?, headers));
     }
     if e.isinstance(&REQUEST_VALIDATION_ERROR) {
         let errs: Vec<V> = obj.errors.as_ref().map(|v| v.iter().map(|e| e.to_v()).collect()).unwrap_or_default();
         let body = V::dict_from(vec![(V::str("detail"), pyd::jsonable(&V::list(errs)).unwrap_or(V::None))]).unwrap();
-        return Ok(json_body(422, pyd::to_json(&body, &pyd::RESPONSE, true)?, &[]));
+        return Ok(json_body(422, pyd::to_json(&body, &pyd::RESPONSE, true).map_err(|x| handling(x, &e))?, &[]));
     }
     Ok(internal_error(e))
 }
@@ -1089,13 +1254,24 @@ fn internal_error(e: Exc) -> Response {
 
 /// Run the matched route on the request's context: teardowns, session commit, background tasks.
 /// An exception escapes after the dependencies' exit code (for the exception handlers).
+/// PEP 479: a StopIteration escaping a coroutine (the endpoint, a dependency, AnyIO's worker of a `def` endpoint)
+/// becomes `RuntimeError: coroutine raised StopIteration`, the StopIteration its cause
+fn pep479(e: Exc) -> Exc {
+    if !e.0.class.is_subclass(&STOP_ITERATION) {
+        return e;
+    }
+    let r = Exc::runtime("coroutine raised StopIteration");
+    r.0.attrs.lock().insert("__cause__".into(), V::Exc(e));
+    r
+}
+
 async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
     let mut guard = TeardownGuard(Some(cx.clone()));
     let r = match run(cx).await {
         Ok(r) => r,
         // the exception is raised at the dependencies' `yield` (function scope first), then the session
         // dependency: rollback (the transaction is dropped)
-        Err(e) => return Err(throw_teardowns(cx, e).await),
+        Err(e) => return Err(throw_teardowns(cx, pep479(e)).await),
     };
     // `Depends(scope="function")`: its exit code runs before the response is sent, an exception there
     // goes through the request-scoped ones
@@ -1117,8 +1293,8 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
                 super::uvicorn::exception(&e);
             }
         }
-        tokio::spawn(super::resp::run_background(cx.clone()));
-        return Ok(r);
+        spawn_background(cx);
+        return Ok(phase_while_streaming(cx, r));
     }
     use futures_util::StreamExt;
     let (parts, body) = r.into_parts();
@@ -1126,6 +1302,7 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
     // and the guard with it: the generators are released (else each task waits for its `resume`, held in
     // `cx.teardowns` by the context it holds itself: task, context, session and connection never freed)
     guard.0 = None;
+    let cx2 = cx.clone();
     let cx = cx.clone();
     let left = TeardownGuard(Some(cx.clone()));
     let tail = futures_util::stream::once(async move {
@@ -1139,13 +1316,17 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
                 super::resp::run_background(cx.clone()).await;
             }
             None => {
-                tokio::spawn(super::resp::run_background(cx.clone()));
+                spawn_background(&cx);
             }
         }
         drop(cx);
         Ok::<Bytes, axum::Error>(Bytes::new())
     });
-    Ok(Response::from_parts(parts, Body::from_stream(body.into_data_stream().chain(tail))))
+    let phase = Phase::new(&cx2);
+    Ok(Response::from_parts(parts, Body::from_stream(body.into_data_stream().chain(tail).map(move |c| {
+        let _ = &phase;
+        c
+    }))))
 }
 
 // ---------------------------------------------------------------- generator dependencies
@@ -1291,6 +1472,64 @@ pub async fn run_ws_route(cx: &Cx, run: super::ws::WsRunFn) -> R<()> {
         }
     }
     Ok(())
+}
+
+/// A stage of the request's life (the route, its streamed body, its background tasks). The last one to end
+/// frees `request.state` once no `Request` object outlives the request: CPython frees the scope, and the state
+/// dict in it, by reference count when the ASGI call returns, so a task or an async generator kept there is
+/// collected then (« Task exception was never retrieved », the generator's `finally`). Here the task, or the
+/// generator's body, holds the context that holds the state: a cycle nothing would ever free. With no
+/// `Request` left, no code can read that state any more: freeing it is not observable.
+pub struct Phase(Cx);
+
+impl Phase {
+    pub fn new(cx: &Cx) -> Phase {
+        cx.phases.fetch_add(1, Ordering::AcqRel);
+        Phase(cx.clone())
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        let last = self.0.phases.fetch_sub(1, Ordering::AcqRel) == 1;
+        if last && Arc::strong_count(&self.0.req) == 1 {
+            // taken under the locks, dropped after them (a task's drop logs, a generator's `finally` runs); the
+            // raw ASGI scope of the request holds a copy of the state (`scope["state"]`)
+            let state = std::mem::take(&mut *self.0.req.state.lock());
+            let scope = self.0.asgi_scope.lock().take();
+            let seen = self.0.asgi_seen.lock().take();
+            drop((state, scope, seen));
+        }
+    }
+}
+
+/// The body of a streamed response keeps the request's stage open until it is sent (or dropped).
+pub fn phase_while_streaming(cx: &Cx, r: Response) -> Response {
+    use axum::body::HttpBody as _;
+    use futures_util::StreamExt;
+    if r.body().size_hint().exact().is_some() {
+        return r;
+    }
+    let phase = Phase::new(cx);
+    let (parts, body) = r.into_parts();
+    Response::from_parts(parts, Body::from_stream(body.into_data_stream().map(move |c| {
+        let _ = &phase;
+        c
+    })))
+}
+
+/// the request's background tasks, run after the response was sent (a stage of the request)
+pub fn spawn_background(cx: &Cx) {
+    // none created (the usual case): no task to start
+    if cx.background.get().is_none() {
+        return;
+    }
+    let phase = Phase::new(cx);
+    let cx = cx.clone();
+    tokio::spawn(async move {
+        super::resp::run_background(cx).await;
+        drop(phase);
+    });
 }
 
 struct TeardownGuard(Option<Cx>);
@@ -1490,7 +1729,104 @@ pub struct RouteDef {
     pub sync_endpoint: bool,
     /// the line `inspect.getsourcelines` gives (its first decorator's): FastAPI's endpoint context
     pub first_line: u32,
+    /// a custom `route_class`: `run` calls its `get_route_handler()`'s handler, this is the route's own
+    /// handler (what `super().get_route_handler()` returns)
+    pub raw: Option<RunFn>,
+    /// FastAPI reads the request's body before the endpoint (a body, form or file parameter)
+    pub body: bool,
 }
+
+/// `super().get_route_handler()` in an `APIRoute` subclass: the route's own handler, a callable taking the request
+/// and returning its Response (exceptions raised as they are: RequestValidationError, HTTPException...)
+pub fn original_handler(cx: &Cx) -> R {
+    match cx.route_def.get().and_then(|r| r.raw) {
+        Some(run) => Ok(V::native(Native::RouteOrig(run))),
+        None => Err(Exc::runtime("py2axum: get_route_handler() called outside a request of its route")),
+    }
+}
+
+/// `await original_route_handler(request)`: the route's handler on that request, its response as a Response
+/// object (headers mutable)
+pub async fn call_original(cx: &Cx, run: RunFn, args: &[V]) -> R {
+    let [req] = args else {
+        return Err(Exc::type_error(format!("app() takes 1 positional argument but {} were given", args.len())));
+    };
+    // a project subclass of Request (`GzipRequest(request.scope, request.receive)`): the endpoint's request; when
+    // FastAPI reads the body (a body or form parameter), what its `body()` returns is the body the route parses,
+    // any error there a 400 (`There was an error parsing the body`)
+    match req {
+        V::Native(n) if matches!(&**n, Native::Request(_)) => return Ok(super::resp::from_response(run(cx).await?)),
+        V::Inst(i) if i.extra.lock().contains_key(INNER_REQUEST) => {}
+        _ => return Err(Exc::type_error(format!("py2axum: a route handler called with a '{}' (the request only)", req.type_name()))),
+    }
+    let mut body = None;
+    if cx.route_def.get().is_some_and(|r| r.body) {
+        match Box::pin(super::methods::call_method(cx, req, "body", vec![], vec![])).await {
+            Ok(V::Bytes(b)) => body = Some(Bytes::copy_from_slice(&b)),
+            Ok(other) => return Err(Exc::type_error(format!("py2axum: {}.body() returned a '{}', not bytes", req.type_name(), other.type_name()))),
+            Err(e) if e.0.http.is_some() => return Err(e),
+            Err(e) => {
+                let x = Exc::http(400, V::str("There was an error parsing the body"), vec![]);
+                x.0.attrs.lock().insert("__cause__".into(), V::Exc(e));
+                return Err(x);
+            }
+        }
+    }
+    let prev_body = cx.req.body_override.lock().clone();
+    if let Some(b) = body {
+        *cx.req.body_override.lock() = Some(b);
+    }
+    let prev_req = cx.req.custom_request.lock().replace(req.clone());
+    let r = run(cx).await;
+    *cx.req.body_override.lock() = prev_body;
+    *cx.req.custom_request.lock() = prev_req;
+    Ok(super::resp::from_response(r?))
+}
+
+/// the hidden attribute of a Request subclass's instance: the request it wraps
+pub const INNER_REQUEST: &str = "__py2axum_request";
+
+/// `Request(scope, receive[, send])` for a project subclass of Request without `__init__`: the instance wraps this
+/// request (its attributes and methods fall back to it); the scope must be this request's
+pub async fn request_subclass(cx: &Cx, s: &'static pyd::SchemaDesc, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if !kwargs.is_empty() || !(2..=3).contains(&args.len()) {
+        return Err(Exc::type_error(format!("py2axum: {}(scope, receive) is the only supported form", s.name)));
+    }
+    if !matches!(&args[0], V::Dict(_)) {
+        return Err(Exc::type_error(format!("py2axum: {}(): the scope must be the request's `request.scope`", s.name)));
+    }
+    let inst = super::methods::schema_new(cx, s, vec![], vec![]).await?;
+    if let V::Inst(i) = &inst {
+        i.extra.lock().insert(INNER_REQUEST.to_string(), super::request(cx));
+    }
+    Ok(inst)
+}
+
+/// `super().name(...)` in a Request subclass: the wrapped request's method
+pub async fn request_super(cx: &Cx, me: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    let inner = match me {
+        V::Inst(i) => i.extra.lock().get(INNER_REQUEST).cloned(),
+        _ => None,
+    };
+    let inner = inner.ok_or_else(|| Exc::runtime("py2axum: super() outside a Request subclass instance"))?;
+    Box::pin(super::methods::call_method(cx, &inner, name, args, kwargs)).await
+}
+
+/// A route of a custom `route_class`: the handler its `get_route_handler()` made (once per route, like FastAPI's
+/// `APIRoute.__init__`), called with the request; its returned Response is sent
+pub async fn custom_route(cx: &Cx, cache: &'static std::sync::OnceLock<V>, make: MakeHandler) -> R<Response> {
+    let h = match cache.get() {
+        Some(h) => h.clone(),
+        None => {
+            let h = make(cx).await?;
+            cache.get_or_init(|| h).clone()
+        }
+    };
+    let ret = super::methods::call_value(cx, &h, vec![super::request(cx)], vec![]).await?;
+    super::asgi::to_response(&ret)
+}
+
+pub type MakeHandler = for<'a> fn(&'a Cx) -> std::pin::Pin<Box<dyn std::future::Future<Output = R<V>> + Send + 'a>>;
 
 static ROUTE_RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
 /// `include_router(prefix=<runtime value>)`: their values (raw), in the place of `\u{1}<index>\u{1}` in the patterns
@@ -1703,7 +2039,38 @@ pub struct Task {
     /// so that a finished task stored in the request's own state (`request.state.t = create_task(...)`) is no
     /// cycle through it (CPython's GC collects that one)
     cx: Mutex<Option<Cx>>,
+    /// the `name=` given, else asyncio's default `Task-N` (its number taken at creation)
+    name: Option<String>,
+    no: u64,
+    /// the coroutine function, when known at translation: that log's `coro=<f() done, defined at file:line>`
+    coro: Option<&'static TaskCoro>,
 }
+
+/// A coroutine function of the project as asyncio's task repr shows it.
+pub struct TaskCoro {
+    pub qualname: &'static str,
+    /// relative to the source root
+    pub file: &'static str,
+    /// `co_firstlineno` (its first decorator's line when decorated)
+    pub line: u32,
+}
+
+impl Task {
+    /// asyncio's « Task exception was never retrieved » message, with the `future: <Task finished ...>` line
+    /// of the default exception handler when the coroutine is known
+    fn never_retrieved(&self, e: &Exc) -> String {
+        let repr = ops::repr(&V::Exc(e.clone())).unwrap_or_default();
+        let name = self.name.clone().unwrap_or_else(|| format!("Task-{}", self.no));
+        match self.coro {
+            Some(c) => format!("Task exception was never retrieved\nfuture: <Task finished name='{name}' coro=<{}() done, \
+defined at {}:{}> exception={repr}>", c.qualname, super::logging::source_path(c.file), c.line),
+            None => format!("Task exception was never retrieved\nfuture: <Task finished name='{name}' exception={repr}>"),
+        }
+    }
+}
+
+/// asyncio's task names: `Task-1`, `Task-2`... (one counter for the process)
+static TASK_NO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Drop for Task {
     fn drop(&mut self) {
@@ -1712,9 +2079,10 @@ impl Drop for Task {
         }
         if let Some(Err(e)) = self.result.lock().take() {
             if !e.isinstance(&CANCELLED_ERROR) {
-                super::logging::emit_sync_not_to_sentry("asyncio", super::logging::ERROR, "Task exception was never retrieved", Some(e.clone()), &super::logging::NO_LOC);
+                let msg = self.never_retrieved(&e);
+                super::logging::emit_sync_not_to_sentry("asyncio", super::logging::ERROR, &msg, Some(e.clone()), &super::logging::NO_LOC);
                 if let Some(cx) = self.cx.lock().take() {
-                    super::sentry::task_never_retrieved(cx, e);
+                    super::sentry::task_never_retrieved(cx, e, msg);
                 }
             }
         }
@@ -1736,12 +2104,26 @@ pub async fn task_result(t: &Arc<Task>) -> R {
 
 /// The coroutine of `create_task(f(args...))`: `f` and its arguments, evaluated by the caller.
 pub fn spawn_task(cx: &Cx, f: V, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    spawn_task_at(cx, f, args, kwargs, None, None)
+}
+
+/// `asyncio.create_task(f(...), name=...)` of the project: `coro` = `f` when known at translation
+pub fn spawn_task_at(cx: &Cx, f: V, args: Vec<V>, kwargs: Vec<(String, V)>, coro: Option<&'static TaskCoro>, name: Option<V>) -> R {
     let cx2 = cx.clone();
-    spawn_future(cx, Box::pin(async move { super::methods::call_value(&cx2, &f, args, kwargs).await }))
+    // asyncio: `str(name)` (None: the next `Task-N`)
+    let name = match name {
+        None | Some(V::None) => None,
+        Some(n) => Some(ops::str_(&n)?),
+    };
+    spawn_named(cx, Box::pin(async move { super::methods::call_value(&cx2, &f, args, kwargs).await }), coro, name)
 }
 
 /// A task running `fut` on its own: result kept for `await task`, done callbacks called after.
 pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
+    spawn_named(cx, fut, None, None)
+}
+
+fn spawn_named(cx: &Cx, fut: super::BoxFut<'static>, coro: Option<&'static TaskCoro>, name: Option<String>) -> R {
     let task = Arc::new(Task {
         state: Mutex::new((false, Vec::new())),
         result: Mutex::new(None),
@@ -1750,6 +2132,9 @@ pub fn spawn_future(cx: &Cx, fut: super::BoxFut<'static>) -> R {
         cancelled: std::sync::atomic::AtomicBool::new(false),
         retrieved: AtomicBool::new(false),
         cx: Mutex::new(Some(cx.clone())),
+        no: if name.is_none() { TASK_NO.fetch_add(1, Ordering::Relaxed) } else { 0 },
+        name,
+        coro,
     });
     let tv = V::native(Native::Task(task.clone()));
     let (cx2, tv2) = (cx.clone(), tv.clone());
@@ -1971,6 +2356,8 @@ pub enum GenMode {
     Jsonl,
     Sse,
     Raw,
+    /// a StreamingResponse subclass with its own `media_type`
+    RawAs(&'static str),
 }
 
 /// FastAPI's `_PING_INTERVAL`: an SSE stream idle that long gets a keep-alive comment.
@@ -1992,6 +2379,7 @@ pub async fn gen_response(cx: &Cx, gen: V, mode: GenMode, item: Option<&'static 
                 .header("x-accel-buffering", "no")
         }
         GenMode::Raw => {}
+        GenMode::RawAs(m) => b = b.header(header::CONTENT_TYPE, super::resp::with_charset(m)),
     }
     for (k, v) in cx.resp.headers.lock().iter() {
         b = b.header(k.as_str(), v.as_str());
@@ -2022,7 +2410,7 @@ pub async fn gen_response(cx: &Cx, gen: V, mode: GenMode, item: Option<&'static 
             if mode == GenMode::Sse {
                 super::uvicorn::exception(&super::trace::task_group_error(e));
             } else {
-                super::uvicorn::exception(&e);
+                super::uvicorn::exception(&super::trace::streaming_error(e));
             }
             Err(std::io::Error::other("generator endpoint failed"))
         };
@@ -2072,7 +2460,7 @@ async fn gen_data(cx: &Cx, v: &V, item: Option<&'static TD>) -> R<String> {
             let prepared = prepare_for(v, td)?;
             let mut errs = Vec::new();
             match pyd::validate(cx, &prepared, td, &[V::str("response")], &mut errs).await? {
-                Some(x) => pyd::to_json(&pyd::dump(&x, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() })?, &pyd::DUMP_JSON, false),
+                Some(x) => pyd::to_json(&pyd::dump(&x, pyd::DumpOpts { json: true, by_alias: true, ..Default::default() }).map_err(pyd::ser_json_error)?, &pyd::DUMP_JSON, false),
                 None => {
                     Err(response_validation_error(cx, errs))
                 }
@@ -2088,7 +2476,7 @@ async fn gen_data(cx: &Cx, v: &V, item: Option<&'static TD>) -> R<String> {
 async fn gen_item(cx: &Cx, v: &V, mode: GenMode, item: Option<&'static TD>) -> R<Bytes> {
     match mode {
         GenMode::Jsonl => Ok(Bytes::from(gen_data(cx, v, item).await? + "\n")),
-        GenMode::Raw => match v {
+        GenMode::Raw | GenMode::RawAs(_) => match v {
             V::Str(s) => Ok(Bytes::from(s.to_string())),
             V::Bytes(b) => Ok(Bytes::from(b.to_vec())),
             // StreamingResponse: `chunk.encode(self.charset)`

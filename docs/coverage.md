@@ -22,10 +22,10 @@ The OpenAPI schema and documentation pages are not served by the binary (see [su
 
 | Corpus | Examples | identical | documented | differs | refused | error | untested | docs-only | nondeterministic | reference-fails | Share |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FastAPI | 339 | 284 | 5 | 0 | 35 | 0 | 11 | 4 | 0 | 0 | **90.6 %** |
-| Pydantic | 238 | 213 | 3 | 0 | 22 | 0 | 0 | 0 | 0 | 0 | **90.8 %** |
+| FastAPI | 339 | 301 | 8 | 0 | 13 | 0 | 12 | 4 | 1 | 0 | **96.9 %** |
+| Pydantic | 238 | 227 | 3 | 0 | 8 | 0 | 0 | 0 | 0 | 0 | **96.6 %** |
 
-Bench run: discover 9.8 s, check 93.4 s, generate 543.6 s, build 740.4 s, replay 558.0 s, total 1945.2 s.
+Bench run: discover 133.4 s, check 33.0 s, generate 321.0 s, build 2773.1 s, replay 254.1 s, sqlalchemy 653.6 s, total 4168.1 s.
 
 ## Most frequent refusals
 
@@ -33,23 +33,17 @@ An example may be refused for several reasons; each is counted once per example.
 
 | Construction | Examples |
 |---|---:|
-| Enum or non-Pydantic type | 13 |
-| dependency | 9 |
-| type … | 8 |
-| module-level statement | 5 |
-| Pydantic validator | 5 |
-| route option …= | 4 |
-| library sqlmodel | 4 |
+| type … | 5 |
 | app.mount | 4 |
-| non-constant value | 3 |
-| Annotated metadata | 3 |
-| router registration | 2 |
-| FastAPI() option | 2 |
-| type Json | 2 |
-| Python construct | 1 |
+| non-constant value | 2 |
+| library time | 2 |
+| Enum or non-Pydantic type | 2 |
+| Pydantic validator | 2 |
+| route option …= | 1 |
+| module-level statement | 1 |
+| router of a library | 1 |
+| FastAPI() option | 1 |
 | library opentelemetry | 1 |
-| library yaml | 1 |
-| Field option | 1 |
 
 ## Tutorial - User Guide
 
@@ -59,7 +53,7 @@ An example may be refused for several reasons; each is counted once per example.
 | [Path Parameters](https://fastapi.tiangolo.com/tutorial/path-params/) | 6 | 6 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Query Parameters](https://fastapi.tiangolo.com/tutorial/query-params/) | 6 | 6 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Request Body](https://fastapi.tiangolo.com/tutorial/body/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
-| [Query Parameters and String Validations](https://fastapi.tiangolo.com/tutorial/query-params-str-validations/) | 30 | 29 | 0 | 1 | 0 | 0 | 96.7 % |
+| [Query Parameters and String Validations](https://fastapi.tiangolo.com/tutorial/query-params-str-validations/) | 30 | 29 | 0 | 0 | 0 | 1 | 100.0 % |
 | [Path Parameters and Numeric Validations](https://fastapi.tiangolo.com/tutorial/path-params-numeric-validations/) | 12 | 12 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Query Parameter Models](https://fastapi.tiangolo.com/tutorial/query-param-models/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Body - Multiple Parameters](https://fastapi.tiangolo.com/tutorial/body-multiple-params/) | 9 | 9 | 0 | 0 | 0 | 0 | 100.0 % |
@@ -94,7 +88,7 @@ An example may be refused for several reasons; each is counted once per example.
 | [OAuth2 with Password (and hashing), Bearer with JWT tokens](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Middleware](https://fastapi.tiangolo.com/tutorial/middleware/) | 1 | 0 | 0 | 0 | 0 | 1 | 0.0 % |
 | [CORS (Cross-Origin Resource Sharing)](https://fastapi.tiangolo.com/tutorial/cors/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
-| [SQL (Relational) Databases](https://fastapi.tiangolo.com/tutorial/sql-databases/) | 4 | 0 | 0 | 4 | 0 | 0 | 0.0 % |
+| [SQL (Relational) Databases](https://fastapi.tiangolo.com/tutorial/sql-databases/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Bigger Applications - Multiple Files](https://fastapi.tiangolo.com/tutorial/bigger-applications/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Stream JSON Lines](https://fastapi.tiangolo.com/tutorial/stream-json-lines/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Server-Sent Events (SSE)](https://fastapi.tiangolo.com/tutorial/server-sent-events/) | 5 | 5 | 0 | 0 | 0 | 0 | 100.0 % |
@@ -107,20 +101,9 @@ An example may be refused for several reasons; each is counted once per example.
 
 <details><summary>Tutorial - User Guide: refused, differing and failing examples</summary>
 
-### Query Parameters and String Validations
-
-- `docs_src/query_params_str_validations/tutorial015_an_py310.py` — refused: Pydantic validator at `docs_src/query_params_str_validations/tutorial015_an_py310.py:24`
-
 ### Response Model - Return Type
 
 - `docs_src/response_model/tutorial003_04_py310.py` — refused: type … at `docs_src/response_model/tutorial003_04_py310.py:8`
-
-### SQL (Relational) Databases
-
-- `docs_src/sql_databases/tutorial001_an_py310.py` — refused: library sqlmodel at `docs_src/sql_databases/tutorial001_an_py310.py:22` (+4 more)
-- `docs_src/sql_databases/tutorial001_py310.py` — refused: library sqlmodel at `docs_src/sql_databases/tutorial001_py310.py:20` (+4 more)
-- `docs_src/sql_databases/tutorial002_an_py310.py` — refused: library sqlmodel at `docs_src/sql_databases/tutorial002_an_py310.py:39` (+5 more)
-- `docs_src/sql_databases/tutorial002_py310.py` — refused: library sqlmodel at `docs_src/sql_databases/tutorial002_py310.py:37` (+5 more)
 
 ### Static Files
 
@@ -132,27 +115,27 @@ An example may be refused for several reasons; each is counted once per example.
 
 | Page | Examples | identical | differs | refused | error | other | Share |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| [Stream Data](https://fastapi.tiangolo.com/advanced/stream-data/) | 2 | 1 | 0 | 1 | 0 | 0 | 50.0 % |
-| [Path Operation Advanced Configuration](https://fastapi.tiangolo.com/advanced/path-operation-advanced-configuration/) | 7 | 6 | 0 | 1 | 0 | 0 | 85.7 % |
+| [Stream Data](https://fastapi.tiangolo.com/advanced/stream-data/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
+| [Path Operation Advanced Configuration](https://fastapi.tiangolo.com/advanced/path-operation-advanced-configuration/) | 7 | 7 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Additional Status Codes](https://fastapi.tiangolo.com/advanced/additional-status-codes/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Return a Response Directly](https://fastapi.tiangolo.com/advanced/response-directly/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
-| [Custom Response - HTML, Stream, File, others](https://fastapi.tiangolo.com/advanced/custom-response/) | 15 | 11 | 0 | 4 | 0 | 0 | 84.6 % |
+| [Custom Response - HTML, Stream, File, others](https://fastapi.tiangolo.com/advanced/custom-response/) | 15 | 13 | 0 | 1 | 0 | 1 | 92.9 % |
 | [Additional Responses in OpenAPI](https://fastapi.tiangolo.com/advanced/additional-responses/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Response Cookies](https://fastapi.tiangolo.com/advanced/response-cookies/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Response Headers](https://fastapi.tiangolo.com/advanced/response-headers/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Response - Change Status Code](https://fastapi.tiangolo.com/advanced/response-change-status-code/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Advanced Dependencies](https://fastapi.tiangolo.com/advanced/advanced-dependencies/) | 4 | 2 | 0 | 2 | 0 | 0 | 100.0 % |
-| [OAuth2 scopes](https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/) | 2 | 0 | 0 | 2 | 0 | 0 | 0.0 % |
+| [OAuth2 scopes](https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [HTTP Basic Auth](https://fastapi.tiangolo.com/advanced/security/http-basic-auth/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Using the Request Directly](https://fastapi.tiangolo.com/advanced/using-request-directly/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
-| [Using Dataclasses](https://fastapi.tiangolo.com/advanced/dataclasses/) | 3 | 0 | 0 | 3 | 0 | 0 | 0.0 % |
+| [Using Dataclasses](https://fastapi.tiangolo.com/advanced/dataclasses/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Advanced Middleware](https://fastapi.tiangolo.com/advanced/middleware/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Sub Applications - Mounts](https://fastapi.tiangolo.com/advanced/sub-applications/) | 1 | 0 | 0 | 1 | 0 | 0 | 0.0 % |
 | [Behind a Proxy](https://fastapi.tiangolo.com/advanced/behind-a-proxy/) | 5 | 5 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Templates](https://fastapi.tiangolo.com/advanced/templates/) | 1 | 0 | 0 | 1 | 0 | 0 | 0.0 % |
 | [WebSockets](https://fastapi.tiangolo.com/advanced/websockets/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Lifespan Events](https://fastapi.tiangolo.com/advanced/events/) | 3 | 2 | 0 | 0 | 0 | 1 | 100.0 % |
-| [OpenTelemetry](https://fastapi.tiangolo.com/advanced/opentelemetry/) | 3 | 1 | 0 | 2 | 0 | 0 | 33.3 % |
+| [OpenTelemetry](https://fastapi.tiangolo.com/advanced/opentelemetry/) | 3 | 2 | 0 | 1 | 0 | 0 | 66.7 % |
 | [Testing WebSockets](https://fastapi.tiangolo.com/advanced/testing-websockets/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Testing Events: lifespan and startup - shutdown](https://fastapi.tiangolo.com/advanced/testing-events/) | 2 | 1 | 0 | 0 | 0 | 1 | 100.0 % |
 | [Testing Dependencies with Overrides](https://fastapi.tiangolo.com/advanced/testing-dependencies/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
@@ -167,36 +150,14 @@ An example may be refused for several reasons; each is counted once per example.
 
 <details><summary>Advanced User Guide: refused, differing and failing examples</summary>
 
-### Stream Data
-
-- `docs_src/stream_data/tutorial002_py310.py` — refused: route option …= at `docs_src/stream_data/tutorial002_py310.py:23` (+4 more)
-
-### Path Operation Advanced Configuration
-
-- `docs_src/path_operation_advanced_configuration/tutorial007_py310.py` — refused: library yaml at `docs_src/path_operation_advanced_configuration/tutorial007_py310.py:25`
-
 ### Custom Response - HTML, Stream, File, others
 
 - `docs_src/custom_response/tutorial001_py310.py` — refused: route option …= at `docs_src/custom_response/tutorial001_py310.py:7`
-- `docs_src/custom_response/tutorial001b_py310.py` — refused: route option …= at `docs_src/custom_response/tutorial001b_py310.py:7`
-- `docs_src/custom_response/tutorial008_py310.py` — refused: Python construct at `docs_src/custom_response/tutorial008_py310.py:12`
-- `docs_src/custom_response/tutorial009c_py310.py` — refused: route option …= at `docs_src/custom_response/tutorial009c_py310.py:17`
 
 ### Advanced Dependencies
 
-- `docs_src/dependencies/tutorial013_an_py310.py` — refused: dependency at `docs_src/dependencies/tutorial013_an_py310.py:21`
-- `docs_src/dependencies/tutorial014_an_py310.py` — refused: dependency at `docs_src/dependencies/tutorial014_an_py310.py:21`
-
-### OAuth2 scopes
-
-- `docs_src/security/tutorial005_an_py310.py` — refused: type … at `docs_src/security/tutorial005_an_py310.py:109` (+2 more)
-- `docs_src/security/tutorial005_py310.py` — refused: type … at `docs_src/security/tutorial005_py310.py:108` (+2 more)
-
-### Using Dataclasses
-
-- `docs_src/dataclasses_/tutorial001_py310.py` — refused: Enum or non-Pydantic type at `docs_src/dataclasses_/tutorial001_py310.py:18`
-- `docs_src/dataclasses_/tutorial002_py310.py` — refused: Enum or non-Pydantic type at `docs_src/dataclasses_/tutorial002_py310.py:18`
-- `docs_src/dataclasses_/tutorial003_py310.py` — refused: Enum or non-Pydantic type at `docs_src/dataclasses_/tutorial003_py310.py:27` (+1 more)
+- `docs_src/dependencies/tutorial013_an_py310.py` — refused: library time at `docs_src/dependencies/tutorial013_an_py310.py:33`
+- `docs_src/dependencies/tutorial014_an_py310.py` — refused: library time at `docs_src/dependencies/tutorial014_an_py310.py:34`
 
 ### Sub Applications - Mounts
 
@@ -209,7 +170,6 @@ An example may be refused for several reasons; each is counted once per example.
 ### OpenTelemetry
 
 - `docs_src/opentelemetry/tutorial002_py310.py` — refused: FastAPI() option at `docs_src/opentelemetry/tutorial002_py310.py:8` (+1 more)
-- `docs_src/opentelemetry/tutorial003_py310.py` — refused: FastAPI() option at `docs_src/opentelemetry/tutorial003_py310.py:3`
 
 ### Including WSGI - Flask, Django, others
 
@@ -223,27 +183,19 @@ An example may be refused for several reasons; each is counted once per example.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | [Migrate from Pydantic v1 to Pydantic v2](https://fastapi.tiangolo.com/how-to/migrate-from-pydantic-v1-to-pydantic-v2/) | 3 | 0 | 0 | 0 | 0 | 3 | 0.0 % |
 | [GraphQL](https://fastapi.tiangolo.com/how-to/graphql/) | 1 | 0 | 0 | 1 | 0 | 0 | 0.0 % |
-| [Custom Request and APIRoute class](https://fastapi.tiangolo.com/how-to/custom-request-and-route/) | 5 | 0 | 0 | 5 | 0 | 0 | 0.0 % |
+| [Custom Request and APIRoute class](https://fastapi.tiangolo.com/how-to/custom-request-and-route/) | 5 | 5 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Conditional OpenAPI](https://fastapi.tiangolo.com/how-to/conditional-openapi/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Extending OpenAPI](https://fastapi.tiangolo.com/how-to/extending-openapi/) | 1 | 0 | 0 | 1 | 0 | 0 | 0.0 % |
 | [Separate OpenAPI Schemas for Input and Output or Not](https://fastapi.tiangolo.com/how-to/separate-openapi-schemas/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Custom Docs UI Static Assets (Self-Hosting)](https://fastapi.tiangolo.com/how-to/custom-docs-ui-assets/) | 2 | 0 | 0 | 2 | 0 | 0 | 0.0 % |
 | [Configure Swagger UI](https://fastapi.tiangolo.com/how-to/configure-swagger-ui/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
-| [Use Old 403 Authentication Error Status Codes](https://fastapi.tiangolo.com/how-to/authentication-error-status-code/) | 1 | 0 | 0 | 1 | 0 | 0 | 0.0 % |
+| [Use Old 403 Authentication Error Status Codes](https://fastapi.tiangolo.com/how-to/authentication-error-status-code/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 
 <details><summary>How To - Recipes: refused, differing and failing examples</summary>
 
 ### GraphQL
 
-- `docs_src/graphql_/tutorial001_py310.py` — refused: router registration at `docs_src/graphql_/tutorial001_py310.py:25`
-
-### Custom Request and APIRoute class
-
-- `docs_src/custom_request_and_route/tutorial001_an_py310.py` — refused: module-level statement at `docs_src/custom_request_and_route/tutorial001_an_py310.py:31`
-- `docs_src/custom_request_and_route/tutorial001_py310.py` — refused: module-level statement at `docs_src/custom_request_and_route/tutorial001_py310.py:30`
-- `docs_src/custom_request_and_route/tutorial002_an_py310.py` — refused: module-level statement at `docs_src/custom_request_and_route/tutorial002_an_py310.py:25`
-- `docs_src/custom_request_and_route/tutorial002_py310.py` — refused: module-level statement at `docs_src/custom_request_and_route/tutorial002_py310.py:24`
-- `docs_src/custom_request_and_route/tutorial003_py310.py` — refused: router registration at `docs_src/custom_request_and_route/tutorial003_py310.py:26`
+- `docs_src/graphql_/tutorial001_py310.py` — refused: router of a library at `docs_src/graphql_/tutorial001_py310.py:25`
 
 ### Extending OpenAPI
 
@@ -254,35 +206,31 @@ An example may be refused for several reasons; each is counted once per example.
 - `docs_src/custom_docs_ui/tutorial001_py310.py` — refused: non-constant value at `docs_src/custom_docs_ui/tutorial001_py310.py:22`
 - `docs_src/custom_docs_ui/tutorial002_py310.py` — refused: non-constant value at `docs_src/custom_docs_ui/tutorial002_py310.py:25`
 
-### Use Old 403 Authentication Error Status Codes
-
-- `docs_src/authentication_error_status_code/tutorial001_an_py310.py` — refused: dependency at `docs_src/authentication_error_status_code/tutorial001_an_py310.py:20`
-
 </details>
 
 ## Pydantic
 
 | Page | Examples | identical | differs | refused | error | other | Share |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| [standard_library_types](https://docs.pydantic.dev/2.13/api/standard_library_types/) | 16 | 14 | 0 | 2 | 0 | 0 | 87.5 % |
+| [standard_library_types](https://docs.pydantic.dev/2.13/api/standard_library_types/) | 16 | 16 | 0 | 0 | 0 | 0 | 100.0 % |
 | [alias](https://docs.pydantic.dev/2.13/concepts/alias/) | 11 | 11 | 0 | 0 | 0 | 0 | 100.0 % |
-| [config](https://docs.pydantic.dev/2.13/concepts/config/) | 5 | 4 | 0 | 1 | 0 | 0 | 80.0 % |
+| [config](https://docs.pydantic.dev/2.13/concepts/config/) | 5 | 5 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Experimental Features](https://docs.pydantic.dev/2.13/concepts/experimental/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
 | [fields](https://docs.pydantic.dev/2.13/concepts/fields/) | 16 | 16 | 0 | 0 | 0 | 0 | 100.0 % |
 | [forward_annotations](https://docs.pydantic.dev/2.13/concepts/forward_annotations/) | 2 | 2 | 0 | 0 | 0 | 0 | 100.0 % |
 | [JSON](https://docs.pydantic.dev/2.13/concepts/json/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
-| [json_schema](https://docs.pydantic.dev/2.13/concepts/json_schema/) | 4 | 1 | 0 | 3 | 0 | 0 | 25.0 % |
-| [normal copy gives the same object reference for bar:](https://docs.pydantic.dev/2.13/concepts/models/) | 24 | 22 | 0 | 2 | 0 | 0 | 91.7 % |
+| [json_schema](https://docs.pydantic.dev/2.13/concepts/json_schema/) | 4 | 4 | 0 | 0 | 0 | 0 | 100.0 % |
+| [normal copy gives the same object reference for bar:](https://docs.pydantic.dev/2.13/concepts/models/) | 24 | 24 | 0 | 0 | 0 | 0 | 100.0 % |
 | [Performance tips](https://docs.pydantic.dev/2.13/concepts/performance/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [returns a dictionary:](https://docs.pydantic.dev/2.13/concepts/serialization/) | 13 | 13 | 0 | 0 | 0 | 0 | 100.0 % |
 | [strict_mode](https://docs.pydantic.dev/2.13/concepts/strict_mode/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
 | [`item_data` could come from an API call, eg., via something like:](https://docs.pydantic.dev/2.13/concepts/type_adapter/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
-| [We now create an `Annotated` wrapper that we'll use as the annotation for fields on `BaseModel`s, etc.](https://docs.pydantic.dev/2.13/concepts/types/) | 7 | 1 | 0 | 6 | 0 | 0 | 14.3 % |
+| [We now create an `Annotated` wrapper that we'll use as the annotation for fields on `BaseModel`s, etc.](https://docs.pydantic.dev/2.13/concepts/types/) | 7 | 4 | 0 | 3 | 0 | 0 | 57.1 % |
 | [Errors are quite verbose with a normal union:](https://docs.pydantic.dev/2.13/concepts/unions/) | 8 | 8 | 0 | 0 | 0 | 0 | 100.0 % |
 | [validators](https://docs.pydantic.dev/2.13/concepts/validators/) | 16 | 16 | 0 | 0 | 0 | 0 | 100.0 % |
 | [errors](https://docs.pydantic.dev/2.13/errors/errors/) | 3 | 3 | 0 | 0 | 0 | 0 | 100.0 % |
 | [this works, though](https://docs.pydantic.dev/2.13/errors/usage_errors/) | 4 | 2 | 0 | 2 | 0 | 0 | 50.0 % |
-| [from Python](https://docs.pydantic.dev/2.13/errors/validation_errors/) | 82 | 77 | 0 | 5 | 0 | 0 | 93.9 % |
+| [from Python](https://docs.pydantic.dev/2.13/errors/validation_errors/) | 82 | 80 | 0 | 2 | 0 | 0 | 97.6 % |
 | [custom_validators](https://docs.pydantic.dev/2.13/examples/custom_validators/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
 | [type: ignore](https://docs.pydantic.dev/2.13/integrations/visual_studio_code/) | 5 | 5 | 0 | 0 | 0 | 0 | 100.0 % |
 | [architecture](https://docs.pydantic.dev/2.13/internals/architecture/) | 1 | 1 | 0 | 0 | 0 | 0 | 100.0 % |
@@ -291,34 +239,11 @@ An example may be refused for several reasons; each is counted once per example.
 
 <details><summary>Pydantic: refused, differing and failing examples</summary>
 
-### standard_library_types
-
-- `docs/api/standard_library_types.md:1415` — refused: type … at `docs/api/standard_library_types.md:1421`
-- `docs/api/standard_library_types.md:512` — refused: non-constant value at `docs/api/standard_library_types.md:519`
-
-### config
-
-- `docs/concepts/config.md:236` — refused: Enum or non-Pydantic type at `docs/concepts/config.md:253`
-
-### json_schema
-
-- `docs/concepts/json_schema.md:646` — refused: Enum or non-Pydantic type at `docs/concepts/json_schema.md:695`
-- `docs/concepts/json_schema.md:724` — refused: Annotated metadata at `docs/concepts/json_schema.md:761`
-- `docs/concepts/json_schema.md:792` — refused: Annotated metadata at `docs/concepts/json_schema.md:812`
-
-### normal copy gives the same object reference for bar:
-
-- `docs/concepts/models.md:1420` — refused: Enum or non-Pydantic type at `docs/concepts/models.md (generated route, line 37)` (+1 more)
-- `docs/concepts/models.md:1681` — refused: Field option at `docs/concepts/models.md:1689`
-
 ### We now create an `Annotated` wrapper that we'll use as the annotation for fields on `BaseModel`s, etc.
 
-- `docs/concepts/types.md:518` — refused: Pydantic validator at `docs/concepts/types.md:539`
-- `docs/concepts/types.md:557` — refused: Annotated metadata at `docs/concepts/types.md:634`
-- `docs/concepts/types.md:695` — refused: Pydantic validator at `docs/concepts/types.md:705`
+- `docs/concepts/types.md:557` — refused: Enum or non-Pydantic type at `docs/concepts/types.md:598`
 - `docs/concepts/types.md:746` — refused: type … at `docs/concepts/types.md:834`
 - `docs/concepts/types.md:892` — refused: type … at `docs/concepts/types.md:946`
-- `docs/concepts/types.md:972` — refused: Enum or non-Pydantic type at `docs/concepts/types.md:1003`
 
 ### this works, though
 
@@ -327,10 +252,7 @@ An example may be refused for several reasons; each is counted once per example.
 
 ### from Python
 
-- `docs/errors/validation_errors.md:1261` — refused: type … at `docs/errors/validation_errors.md:1267`
-- `docs/errors/validation_errors.md:1306` — refused: type Json at `docs/errors/validation_errors.md:1310`
-- `docs/errors/validation_errors.md:1325` — refused: type Json at `docs/errors/validation_errors.md:1329`
-- `docs/errors/validation_errors.md:1664` — refused: Enum or non-Pydantic type at `docs/errors/validation_errors.md:1675`
+- `docs/errors/validation_errors.md:1664` — refused: type … at `docs/errors/validation_errors.md:1675`
 - `docs/errors/validation_errors.md:182` — refused: type … at `docs/errors/validation_errors.md:189`
 
 ### V1
@@ -348,40 +270,32 @@ The examples are in three scopes. **ORM**: queries a route runs with the ORM (se
 
 | Scope / variant | Examples | identical | documented | differs | refused | error | untested | docs-only | nondeterministic | reference-fails | Share |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **SQLAlchemy ORM** (1.0 threshold: 90 %) | 276 | 243 | 0 | 0 | 16 | 0 | 0 | 0 | 2 | 15 | **93.8 %** |
-| SQLAlchemy Core (aimed at for 1.1) | 126 | 110 | 0 | 0 | 14 | 0 | 0 | 0 | 2 | 0 | **88.7 %** |
-| outside API use (measured only) | 78 | 32 | 0 | 0 | 44 | 0 | 0 | 0 | 0 | 2 | **42.1 %** |
-| sync | 239 | 201 | 0 | 0 | 36 | 0 | 0 | 0 | 2 | 0 | **84.8 %** |
-| async | 241 | 184 | 0 | 0 | 38 | 0 | 0 | 0 | 2 | 17 | **82.9 %** |
-| all of SQLAlchemy | 480 | 385 | 0 | 0 | 74 | 0 | 0 | 0 | 4 | 17 | **83.9 %** |
+| **SQLAlchemy ORM** (1.0 threshold: 90 %) | 276 | 257 | 0 | 0 | 2 | 0 | 0 | 0 | 2 | 15 | **99.2 %** |
+| SQLAlchemy Core (aimed at for 1.1) | 126 | 124 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | **100.0 %** |
+| outside API use (measured only) | 78 | 44 | 0 | 0 | 32 | 0 | 0 | 0 | 0 | 2 | **57.9 %** |
+| sync | 239 | 221 | 0 | 0 | 16 | 0 | 0 | 0 | 2 | 0 | **93.2 %** |
+| async | 241 | 204 | 0 | 0 | 18 | 0 | 0 | 0 | 2 | 17 | **91.9 %** |
+| all of SQLAlchemy | 480 | 425 | 0 | 0 | 34 | 0 | 0 | 0 | 4 | 17 | **92.6 %** |
 
 Not in the corpus: 22 examples (both variants) the bench cannot run as written: Python fails on PostgreSQL (22) (SQLite-only SQL, a statement of the page that fails before them).
+
+Refused and counted, though the documentation's own block is at fault: the mapping of `ext/associationproxy.rst:592` imports `Mapped` from `sqlalchemy.orm.collections`, which has no such name (`ImportError` under SQLAlchemy 2.1.4; the doctest runner gets by with the `Mapped` an earlier block bound). py2axum refuses the unresolved annotation; the bench does not edit the documentation.
 
 ### SQLAlchemy: most frequent refusals
 
 | Construction | Examples |
 |---|---:|
-| sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only | 14 |
-| `sqlalchemy.union_all()` | 14 |
-| method .cte() not in the runtime | 4 |
-| method .over() not in the runtime | 4 |
-| sqlalchemy.orm.with_polymorphic(): with_polymorphic(Base, [Sub, ...] or "*") only: aliased=, flat=, | 4 |
-| @dataclass(eq=) is not supported (CaseInsensitiveWord) | 4 |
-| `sqlalchemy.literal_column()` | 2 |
-| method .correlate() not in the runtime | 2 |
+| sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla | 8 |
+| method .from_statement() not in the runtime | 6 |
+| method .columns() not in the runtime | 4 |
 | sqlalchemy.orm.joinedload(): joinedload() takes exactly one positional argument here | 2 |
 | `sqlalchemy.orm.contains_eager()` | 2 |
 | `sqlalchemy.orm.Bundle()` | 2 |
-| method .from_statement() not in the runtime | 2 |
-| Model.__table__.join: the Core use of a mapped class's table is not supported (introspection only: n | 2 |
 | method .yield_per() not in the runtime | 2 |
 | method .partitions() not in the runtime | 2 |
 | `sqlalchemy.orm.with_expression()` | 2 |
 | conn.run_sync(fn): only `run_sync(Base.metadata.create_all)` is supported (its DDL is compiled at tr | 2 |
-| option primaryjoin= is not supported | 2 |
 | annotate with Mapped[...] | 2 |
-| @word_insensitive.inplace.comparator is not supported (a hybrid's expression and setter only) | 2 |
-| @dataclass(eq=) is not supported (Point) | 2 |
 
 ### SQLAlchemy: per page
 
@@ -389,50 +303,30 @@ Not in the corpus: 22 examples (both variants) the bench cannot run as written: 
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | [Working with Transactions and the DBAPI](https://docs.sqlalchemy.org/en/21/tutorial/dbapi_transactions.html) | SQLAlchemy Unified Tutorial | 8 | 16 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
 | [Using INSERT Statements](https://docs.sqlalchemy.org/en/21/tutorial/data_insert.html) | SQLAlchemy Unified Tutorial | 3 | 6 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
-| [Using SELECT Statements](https://docs.sqlalchemy.org/en/21/tutorial/data_select.html) | SQLAlchemy Unified Tutorial | 56 | 88 | 0 | 22 | 0 | 2 | 80.0 % | 80.0 % | 80.0 % |
+| [Using SELECT Statements](https://docs.sqlalchemy.org/en/21/tutorial/data_select.html) | SQLAlchemy Unified Tutorial | 56 | 108 | 0 | 2 | 0 | 2 | 98.2 % | 98.2 % | 98.2 % |
 | [Using UPDATE and DELETE Statements](https://docs.sqlalchemy.org/en/21/tutorial/data_update.html) | SQLAlchemy Unified Tutorial | 2 | 4 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
 | [Data Manipulation with the ORM](https://docs.sqlalchemy.org/en/21/tutorial/orm_data_manipulation.html) | SQLAlchemy Unified Tutorial | 8 | 14 | 0 | 0 | 0 | 2 | 100.0 % | 100.0 % | 100.0 % |
 | [Working with ORM Related Objects](https://docs.sqlalchemy.org/en/21/tutorial/orm_related_objects.html) | SQLAlchemy Unified Tutorial | 11 | 17 | 0 | 4 | 0 | 1 | 81.8 % | 80.0 % | 81.0 % |
 | [ORM Quick Start](https://docs.sqlalchemy.org/en/21/orm/quickstart.html) | SQLAlchemy ORM | 8 | 11 | 0 | 0 | 0 | 5 | 100.0 % | 100.0 % | 100.0 % |
-| [Writing SELECT statements for ORM Mapped Classes](https://docs.sqlalchemy.org/en/21/orm/queryguide/select.html) | SQLAlchemy ORM Querying Guide | 42 | 62 | 0 | 22 | 0 | 0 | 73.8 % | 73.8 % | 73.8 % |
+| [Writing SELECT statements for ORM Mapped Classes](https://docs.sqlalchemy.org/en/21/orm/queryguide/select.html) | SQLAlchemy ORM Querying Guide | 42 | 68 | 0 | 16 | 0 | 0 | 81.0 % | 81.0 % | 81.0 % |
 | [ORM API Features for Querying](https://docs.sqlalchemy.org/en/21/orm/queryguide/api.html) | SQLAlchemy ORM Querying Guide | 5 | 5 | 0 | 4 | 0 | 1 | 60.0 % | 50.0 % | 55.6 % |
-| [Writing SELECT statements for Inheritance Mappings](https://docs.sqlalchemy.org/en/21/orm/queryguide/inheritance.html) | SQLAlchemy ORM Querying Guide | 19 | 32 | 0 | 4 | 0 | 2 | 89.5 % | 88.2 % | 88.9 % |
+| [Writing SELECT statements for Inheritance Mappings](https://docs.sqlalchemy.org/en/21/orm/queryguide/inheritance.html) | SQLAlchemy ORM Querying Guide | 19 | 36 | 0 | 0 | 0 | 2 | 100.0 % | 100.0 % | 100.0 % |
 | [ORM-Enabled INSERT, UPDATE, and DELETE statements](https://docs.sqlalchemy.org/en/21/orm/queryguide/dml.html) | SQLAlchemy ORM Querying Guide | 23 | 44 | 0 | 0 | 0 | 2 | 100.0 % | 100.0 % | 100.0 % |
 | [Column Loading Options](https://docs.sqlalchemy.org/en/21/orm/queryguide/columns.html) | SQLAlchemy ORM Querying Guide | 20 | 30 | 0 | 4 | 0 | 6 | 90.0 % | 85.7 % | 88.2 % |
 | [Relationship Loading Techniques](https://docs.sqlalchemy.org/en/21/orm/queryguide/relationships.html) | SQLAlchemy ORM Querying Guide | 6 | 12 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
 | [Working with Large Collections](https://docs.sqlalchemy.org/en/21/orm/large_collections.html) | SQLAlchemy ORM | 12 | 24 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
 | [Asynchronous I/O (asyncio)](https://docs.sqlalchemy.org/en/21/orm/extensions/asyncio.html) | SQLAlchemy ORM | 2 | 0 | 0 | 2 | 0 | 0 | 0.0 % | 0.0 % | 0.0 % |
 | [Composite Column Types](https://docs.sqlalchemy.org/en/21/orm/composites.html) | SQLAlchemy ORM | 5 | 10 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
-| [Special Relationship Persistence Patterns](https://docs.sqlalchemy.org/en/21/orm/relationship_persistence.html) | SQLAlchemy ORM | 1 | 0 | 0 | 2 | 0 | 0 | 0.0 % | 0.0 % | 0.0 % |
+| [Special Relationship Persistence Patterns](https://docs.sqlalchemy.org/en/21/orm/relationship_persistence.html) | SQLAlchemy ORM | 1 | 2 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
 | [Association Proxy](https://docs.sqlalchemy.org/en/21/orm/extensions/associationproxy.html) | SQLAlchemy ORM Extensions | 1 | 0 | 0 | 2 | 0 | 0 | 0.0 % | 0.0 % | 0.0 % |
-| [Hybrid Attributes](https://docs.sqlalchemy.org/en/21/orm/extensions/hybrid.html) | SQLAlchemy ORM Extensions | 9 | 10 | 0 | 8 | 0 | 0 | 55.6 % | 55.6 % | 55.6 % |
+| [Hybrid Attributes](https://docs.sqlalchemy.org/en/21/orm/extensions/hybrid.html) | SQLAlchemy ORM Extensions | 9 | 18 | 0 | 0 | 0 | 0 | 100.0 % | 100.0 % | 100.0 % |
 
 <details><summary>SQLAlchemy: refused, differing and failing examples</summary>
 
 #### Using SELECT Statements (`doc/build/tutorial/data_select.rst`)
 
-- `doc/build/tutorial/data_select.rst:302` async — refused: `sqlalchemy.literal_column()` at `doc/build/tutorial/data_select.rst:303`
-- `doc/build/tutorial/data_select.rst:302` sync — refused: `sqlalchemy.literal_column()` at `doc/build/tutorial/data_select.rst:303`
-- `doc/build/tutorial/data_select.rst:846` async — refused: method .cte() not in the runtime at `doc/build/tutorial/data_select.rst:846`
-- `doc/build/tutorial/data_select.rst:846` sync — refused: method .cte() not in the runtime at `doc/build/tutorial/data_select.rst:846`
-- `doc/build/tutorial/data_select.rst:905` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/tutorial/data_select.rst:906`
-- `doc/build/tutorial/data_select.rst:905` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/tutorial/data_select.rst:906`
-- `doc/build/tutorial/data_select.rst:934` async — refused: method .cte() not in the runtime at `doc/build/tutorial/data_select.rst:934`
-- `doc/build/tutorial/data_select.rst:934` sync — refused: method .cte() not in the runtime at `doc/build/tutorial/data_select.rst:934`
-- `doc/build/tutorial/data_select.rst:1055` async — refused: method .correlate() not in the runtime at `doc/build/tutorial/data_select.rst:1044`
-- `doc/build/tutorial/data_select.rst:1055` sync — refused: method .correlate() not in the runtime at `doc/build/tutorial/data_select.rst:1044`
-- `doc/build/tutorial/data_select.rst:1166` async — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1169`
-- `doc/build/tutorial/data_select.rst:1166` sync — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1169`
-- `doc/build/tutorial/data_select.rst:1189` async — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1169`
-- `doc/build/tutorial/data_select.rst:1189` sync — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1169`
-- `doc/build/tutorial/data_select.rst:1239` async — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1230`
-- `doc/build/tutorial/data_select.rst:1239` sync — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1230`
-- `doc/build/tutorial/data_select.rst:1265` async — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1230`
-- `doc/build/tutorial/data_select.rst:1265` sync — refused: `sqlalchemy.union_all()` at `doc/build/tutorial/data_select.rst:1230`
-- `doc/build/tutorial/data_select.rst:1596` async — refused: method .over() not in the runtime at `doc/build/tutorial/data_select.rst:1596`
-- `doc/build/tutorial/data_select.rst:1596` sync — refused: method .over() not in the runtime at `doc/build/tutorial/data_select.rst:1596`
-- `doc/build/tutorial/data_select.rst:1622` async — refused: method .over() not in the runtime at `doc/build/tutorial/data_select.rst:1622`
-- `doc/build/tutorial/data_select.rst:1622` sync — refused: method .over() not in the runtime at `doc/build/tutorial/data_select.rst:1622`
+- `doc/build/tutorial/data_select.rst:1239` async — refused: method .from_statement() not in the runtime at `doc/build/tutorial/data_select.rst:1239`
+- `doc/build/tutorial/data_select.rst:1239` sync — refused: method .from_statement() not in the runtime at `doc/build/tutorial/data_select.rst:1239`
 
 #### Data Manipulation with the ORM (`doc/build/tutorial/orm_data_manipulation.rst`)
 
@@ -459,26 +353,20 @@ Not in the corpus: 22 examples (both variants) the bench cannot run as written: 
 
 - `doc/build/orm/queryguide/select.rst:214` async — refused: `sqlalchemy.orm.Bundle()` at `doc/build/orm/queryguide/select.rst:215`
 - `doc/build/orm/queryguide/select.rst:214` sync — refused: `sqlalchemy.orm.Bundle()` at `doc/build/orm/queryguide/select.rst:215`
-- `doc/build/orm/queryguide/select.rst:325` async — refused: method .from_statement() not in the runtime at `doc/build/orm/queryguide/select.rst:325`
-- `doc/build/orm/queryguide/select.rst:325` sync — refused: method .from_statement() not in the runtime at `doc/build/orm/queryguide/select.rst:325`
-- `doc/build/orm/queryguide/select.rst:341` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:341`
-- `doc/build/orm/queryguide/select.rst:341` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:341`
-- `doc/build/orm/queryguide/select.rst:373` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:375`
-- `doc/build/orm/queryguide/select.rst:373` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:375`
-- `doc/build/orm/queryguide/select.rst:393` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:400`
-- `doc/build/orm/queryguide/select.rst:393` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:400`
-- `doc/build/orm/queryguide/select.rst:431` async — refused: `sqlalchemy.union_all()` at `doc/build/orm/queryguide/select.rst:432`
-- `doc/build/orm/queryguide/select.rst:431` sync — refused: `sqlalchemy.union_all()` at `doc/build/orm/queryguide/select.rst:432`
-- `doc/build/orm/queryguide/select.rst:457` async — refused: `sqlalchemy.union_all()` at `doc/build/orm/queryguide/select.rst:457`
-- `doc/build/orm/queryguide/select.rst:457` sync — refused: `sqlalchemy.union_all()` at `doc/build/orm/queryguide/select.rst:457`
-- `doc/build/orm/queryguide/select.rst:774` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:774`
-- `doc/build/orm/queryguide/select.rst:774` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:774`
-- `doc/build/orm/queryguide/select.rst:801` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:801`
-- `doc/build/orm/queryguide/select.rst:801` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:801`
-- `doc/build/orm/queryguide/select.rst:845` async — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:838`
-- `doc/build/orm/queryguide/select.rst:845` sync — refused: sqlalchemy.orm.aliased(): aliased(Model) or aliased(Model, name=...) only at `doc/build/orm/queryguide/select.rst:838`
-- `doc/build/orm/queryguide/select.rst:917` async — refused: Model.__table__.join: the Core use of a mapped class's table is not supported (introspection only: n at `doc/build/orm/queryguide/select.rst:922`
-- `doc/build/orm/queryguide/select.rst:917` sync — refused: Model.__table__.join: the Core use of a mapped class's table is not supported (introspection only: n at `doc/build/orm/queryguide/select.rst:922`
+- `doc/build/orm/queryguide/select.rst:325` async — refused: method .columns() not in the runtime at `doc/build/orm/queryguide/select.rst:316`
+- `doc/build/orm/queryguide/select.rst:325` sync — refused: method .columns() not in the runtime at `doc/build/orm/queryguide/select.rst:316`
+- `doc/build/orm/queryguide/select.rst:341` async — refused: method .columns() not in the runtime at `doc/build/orm/queryguide/select.rst:316`
+- `doc/build/orm/queryguide/select.rst:341` sync — refused: method .columns() not in the runtime at `doc/build/orm/queryguide/select.rst:316`
+- `doc/build/orm/queryguide/select.rst:393` async — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:400`
+- `doc/build/orm/queryguide/select.rst:393` sync — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:400`
+- `doc/build/orm/queryguide/select.rst:431` async — refused: method .from_statement() not in the runtime at `doc/build/orm/queryguide/select.rst:435`
+- `doc/build/orm/queryguide/select.rst:431` sync — refused: method .from_statement() not in the runtime at `doc/build/orm/queryguide/select.rst:435`
+- `doc/build/orm/queryguide/select.rst:774` async — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:774`
+- `doc/build/orm/queryguide/select.rst:774` sync — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:774`
+- `doc/build/orm/queryguide/select.rst:801` async — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:801`
+- `doc/build/orm/queryguide/select.rst:801` sync — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:801`
+- `doc/build/orm/queryguide/select.rst:845` async — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:838`
+- `doc/build/orm/queryguide/select.rst:845` sync — refused: sqlalchemy.orm.aliased(): aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and fla at `doc/build/orm/queryguide/select.rst:838`
 
 #### ORM API Features for Querying (`doc/build/orm/queryguide/api.rst`)
 
@@ -491,10 +379,6 @@ Not in the corpus: 22 examples (both variants) the bench cannot run as written: 
 #### Writing SELECT statements for Inheritance Mappings (`doc/build/orm/queryguide/inheritance.rst`)
 
 - `doc/build/orm/queryguide/inheritance.rst:90` async — the Python reference fails: `sqlalchemy.exc.StatementError: (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can't call await_() here. Was IO attemp…`
-- `doc/build/orm/queryguide/inheritance.rst:528` async — refused: sqlalchemy.orm.with_polymorphic(): with_polymorphic(Base, [Sub, ...] or "*") only: aliased=, flat=, at `doc/build/orm/queryguide/inheritance.rst:528`
-- `doc/build/orm/queryguide/inheritance.rst:528` sync — refused: sqlalchemy.orm.with_polymorphic(): with_polymorphic(Base, [Sub, ...] or "*") only: aliased=, flat=, at `doc/build/orm/queryguide/inheritance.rst:528`
-- `doc/build/orm/queryguide/inheritance.rst:572` async — refused: sqlalchemy.orm.with_polymorphic(): with_polymorphic(Base, [Sub, ...] or "*") only: aliased=, flat=, at `doc/build/orm/queryguide/inheritance.rst:572`
-- `doc/build/orm/queryguide/inheritance.rst:572` sync — refused: sqlalchemy.orm.with_polymorphic(): with_polymorphic(Base, [Sub, ...] or "*") only: aliased=, flat=, at `doc/build/orm/queryguide/inheritance.rst:572`
 - `doc/build/orm/queryguide/inheritance.rst:947` async — the Python reference fails: `sqlalchemy.exc.StatementError: (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can't call await_() here. Was IO attemp…`
 
 #### Column Loading Options (`doc/build/orm/queryguide/columns.rst`)
@@ -507,34 +391,18 @@ Not in the corpus: 22 examples (both variants) the bench cannot run as written: 
 - `doc/build/orm/queryguide/columns.rst:507` async — the Python reference fails: `sqlalchemy.exc.StatementError: (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can't call await_() here. Was IO attemp…`
 - `doc/build/orm/queryguide/columns.rst:723` async — refused: `sqlalchemy.orm.with_expression()` at `doc/build/orm/queryguide/columns.rst:724`
 - `doc/build/orm/queryguide/columns.rst:723` sync — refused: `sqlalchemy.orm.with_expression()` at `doc/build/orm/queryguide/columns.rst:724`
-- `doc/build/orm/queryguide/columns.rst:857` async — refused: `sqlalchemy.union_all()` at `doc/build/orm/queryguide/columns.rst:868`
-- `doc/build/orm/queryguide/columns.rst:857` sync — refused: `sqlalchemy.union_all()` at `doc/build/orm/queryguide/columns.rst:868`
+- `doc/build/orm/queryguide/columns.rst:857` async — refused: method .from_statement() not in the runtime at `doc/build/orm/queryguide/columns.rst:869`
+- `doc/build/orm/queryguide/columns.rst:857` sync — refused: method .from_statement() not in the runtime at `doc/build/orm/queryguide/columns.rst:869`
 
 #### Asynchronous I/O (asyncio) (`doc/build/orm/extensions/asyncio.rst`)
 
 - `doc/build/orm/extensions/asyncio.rst:63` async — refused: conn.run_sync(fn): only `run_sync(Base.metadata.create_all)` is supported (its DDL is compiled at tr at `doc/build/orm/extensions/asyncio.rst:76`
 - `doc/build/orm/extensions/asyncio.rst:170` async — refused: conn.run_sync(fn): only `run_sync(Base.metadata.create_all)` is supported (its DDL is compiled at tr at `doc/build/orm/extensions/asyncio.rst:76`
 
-#### Special Relationship Persistence Patterns (`doc/build/orm/relationship_persistence.rst`)
-
-- `doc/build/orm/relationship_persistence.rst:105` async — refused: option primaryjoin= is not supported at `doc/build/orm/relationship_persistence.rst:92`
-- `doc/build/orm/relationship_persistence.rst:105` sync — refused: option primaryjoin= is not supported at `doc/build/orm/relationship_persistence.rst:92`
-
 #### Association Proxy (`doc/build/orm/extensions/associationproxy.rst`)
 
 - `doc/build/orm/extensions/associationproxy.rst:592` async — refused: annotate with Mapped[...] at `doc/build/orm/extensions/associationproxy.rst:548`
 - `doc/build/orm/extensions/associationproxy.rst:592` sync — refused: annotate with Mapped[...] at `doc/build/orm/extensions/associationproxy.rst:548`
-
-#### Hybrid Attributes (`lib/sqlalchemy/ext/hybrid.py`)
-
-- `lib/sqlalchemy/ext/hybrid.py:735` async — refused: @word_insensitive.inplace.comparator is not supported (a hybrid's expression and setter only) at `lib/sqlalchemy/ext/hybrid.py:725`
-- `lib/sqlalchemy/ext/hybrid.py:735` sync — refused: @word_insensitive.inplace.comparator is not supported (a hybrid's expression and setter only) at `lib/sqlalchemy/ext/hybrid.py:725`
-- `lib/sqlalchemy/ext/hybrid.py:922` async — refused: @dataclass(eq=) is not supported (CaseInsensitiveWord) at `lib/sqlalchemy/ext/hybrid.py:885`
-- `lib/sqlalchemy/ext/hybrid.py:922` sync — refused: @dataclass(eq=) is not supported (CaseInsensitiveWord) at `lib/sqlalchemy/ext/hybrid.py:885`
-- `lib/sqlalchemy/ext/hybrid.py:934` async — refused: @dataclass(eq=) is not supported (CaseInsensitiveWord) at `lib/sqlalchemy/ext/hybrid.py:885`
-- `lib/sqlalchemy/ext/hybrid.py:934` sync — refused: @dataclass(eq=) is not supported (CaseInsensitiveWord) at `lib/sqlalchemy/ext/hybrid.py:885`
-- `lib/sqlalchemy/ext/hybrid.py:1052` async — refused: @dataclass(eq=) is not supported (Point) at `lib/sqlalchemy/ext/hybrid.py:990`
-- `lib/sqlalchemy/ext/hybrid.py:1052` sync — refused: @dataclass(eq=) is not supported (Point) at `lib/sqlalchemy/ext/hybrid.py:990`
 
 </details>
 <!-- sqlalchemy:end -->

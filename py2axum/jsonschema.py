@@ -146,7 +146,7 @@ class SchemaGen:
             args = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
             if short == "Literal":
                 return self.with_cons(self.literal_schema(args, module), cons, ann, module)
-            if short in {"list", "List", "Sequence", "set", "Set"}:
+            if short in {"list", "List", "Sequence", "Iterable", "set", "Set"}:
                 s = {"items": self.type_schema(args[0], module, {}), "type": "array"}
                 if short in {"set", "Set"}:
                     s["uniqueItems"] = True

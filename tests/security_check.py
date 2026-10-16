@@ -1,8 +1,8 @@
-"""Hostile inputs against a running binary (fixtures/dynapp, docs/advanced/security.md): the process must survive each
+"""Hostile inputs against a running binary (fixtures/langapp, docs/advanced/security.md): the process must survive each
 one, answer within bounds and keep serving the others. Not a conformance run: FastAPI is not involved, the
 expected behaviours are the binary's own guarantees.
 
-    python tests/security_check.py http://127.0.0.1:8280 [--max-body N]   # N: the server's PY2AXUM_MAX_BODY
+    python tests/security_check.py http://127.0.0.1:8590 [--max-body N]   # N: the server's PY2AXUM_MAX_BODY
 """
 import argparse
 import concurrent.futures as cf
@@ -59,7 +59,7 @@ def check(name, ok, detail=""):
 
 
 def alive(base):
-    return req(base, "GET", "/tasks/0", timeout=10)[0] in (200, 404)
+    return req(base, "GET", "/health", timeout=10)[0] in (200, 404)
 
 
 def main():
@@ -94,7 +94,7 @@ def main():
         time.sleep(0.2)
         lat = []
         for _ in range(5):
-            st, _, dt = req(base, "GET", "/tasks/0", timeout=10)
+            st, _, dt = req(base, "GET", "/health", timeout=10)
             lat.append(dt)
         worst = max(lat)
         check("bcrypt off the loop", all(h.result()[0] == 200 for h in hashes) and worst < 0.5, f"worst {worst:.3f}s")

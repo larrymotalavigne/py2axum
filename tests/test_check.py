@@ -23,7 +23,7 @@ def test_text_output(tmp_path, capsys):
     assert "refused      GET /api/items/me/info" in out
     # the reason, at file:line of the construct (not of the route)
     assert "proj/deps.py:5: library call `boto3.client()` is not supported" in out
-    assert "library boto3" in out and "type Json" in out  # blockers summary
+    assert "library boto3" in out and "type …" in out  # blockers summary
     assert "2/6 routes native (33.3 %), 0 python-side, 4 refused — generation would fail" in out
     assert "hint: --python-side auto" in out
     assert "\x1b[" not in out  # no colour when not a terminal
@@ -40,7 +40,7 @@ def test_json_and_auto(tmp_path, capsys):
     assert info["blockers"] == {"library boto3": [f"{pkg}/deps.py:5"]}
     assert info["where"] == f"{pkg}/views/items.py:{info['where'].rsplit(':', 1)[1]}"
     assert {b["construction"]: (b["routes"], b["only_blocker"]) for b in data["blockers"]} == {
-        "library boto3": (2, 2), "type Json": (2, 2)}
+        "library boto3": (2, 2), "type …": (2, 2)}
     assert data["summary"] == {"total": 6, "native": 2, "python-side": 0, "refused": 4, "native_pct": 33.3,
                                "generates": False}
     # --python-side auto: the same routes stay in Python, generation succeeds

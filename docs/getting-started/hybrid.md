@@ -46,6 +46,6 @@ stack: the Python application's own middlewares answer for them.
     workers: a counter shared by translated and Python-side routes counts each request in one process only
     (e.g. `X-RateLimit-Remaining`).
 
-Mounted applications left to Python (`--python-side mount`) are described in
+Mounted applications and routers of libraries left to Python (`--python-side mount`) are described in
 [Bigger applications](../tutorial/bigger-applications.md#mounted-applications). For containers, see
 [Deployment § Hybrid](../advanced/deployment.md#hybrid-binary-python-for-the-rest).

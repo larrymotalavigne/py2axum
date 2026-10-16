@@ -8,7 +8,7 @@
 # py2axum (--python-side, --no-stream, --allow-untested-versions, --root); `py2axum check` runs first and stops
 # the build, with file:line, when a route neither translates nor is left to Python.
 #
-# The runtime's dependencies are precompiled in CARGO_TARGET_DIR: only the application's crate is compiled.
+# The runtime (dynrt) and its dependencies are precompiled in CARGO_TARGET_DIR: only the application's crate is compiled.
 set -euo pipefail
 
 usage() { sed -n '2,11s/^# \{0,1\}//p' "$0"; }

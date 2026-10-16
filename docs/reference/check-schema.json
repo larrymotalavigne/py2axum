@@ -19,6 +19,27 @@
     "probed": {"type": "object", "additionalProperties": {"type": "boolean"}}
    }
   },
+  "libraries": {
+   "type": "array",
+   "description": "libraries translated from source (--translate-libs); absent when none is",
+   "items": {
+    "type": "object",
+    "required": ["name", "version", "licence", "functions_translated", "functions_refused", "lines", "gen_rs_mb", "peak_gib", "refused"],
+    "additionalProperties": false,
+    "properties": {
+     "name": {"type": "string", "description": "the distribution, as published"},
+     "version": {"type": "string"},
+     "licence": {"type": "string", "description": "SPDX expression read from the distribution"},
+     "functions_translated": {"type": "integer", "minimum": 0},
+     "functions_refused": {"type": "integer", "minimum": 0},
+     "lines": {"type": "integer", "minimum": 0, "description": "lines of the functions translated"},
+     "gen_rs_mb": {"type": "number", "description": "estimated gen.rs added (about 0.5 KB per line)"},
+     "peak_gib": {"type": "number", "description": "estimated rustc peak added (about 0.53 GiB per MB of gen.rs)"},
+     "refused": {"type": "array", "items": {"type": "object", "required": ["function", "code", "error"], "additionalProperties": false,
+                 "properties": {"function": {"type": "string"}, "code": {"type": "string", "pattern": "^P2A\\d{4}$"}, "error": {"type": "string"}}}}
+    }
+   }
+  },
   "routes": {
    "type": "array",
    "items": {

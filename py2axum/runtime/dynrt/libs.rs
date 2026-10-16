@@ -674,6 +674,58 @@ pub fn namespace(args: &[V], kwargs: &[(String, V)]) -> R {
     Ok(o)
 }
 
+static THREAD_LOCAL_CLASS: Class = Class { name: "_local", qualname: "_thread._local", bases: &[], kind: ClassKind::Schema(&THREAD_LOCAL) };
+/// `threading.local()`: an open instance. Every endpoint runs on the event loop's thread in uvicorn, so the binary
+/// keeps one state for the whole process (a sync endpoint, run in a thread pool by FastAPI, sees its thread's own
+/// state in CPython: docs/supported.md)
+pub static THREAD_LOCAL: pyd::SchemaDesc = pyd::SchemaDesc {
+    name: "_local",
+    class: &THREAD_LOCAL_CLASS,
+    fields: &[],
+    from_attributes: false,
+    extra: pyd::Extra::Allow,
+    validators: &[],
+    validate_assignment: false,
+    populate_by_name: false,
+    methods: &[],
+    open: true,
+    model_after: &[],
+    before: &[],
+    model_before: &[],
+    has_before: false,
+    frozen: false,
+    post_init: None,
+    hash: pyd::HashKind::Id,
+    dataclass: false,
+    async_methods: &[],
+    slots: &[],
+    settings: None,
+    init: None,
+    private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
+    computed: &[],
+    json_schema: None,
+    x: pyd::SchemaX::NONE,
+};
+
+/// `threading.local()`
+pub fn thread_local(args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() || !kwargs.is_empty() {
+        return Err(Exc::type_error("Initialization arguments are not supported"));
+    }
+    Ok(pyd::object_new(&THREAD_LOCAL))
+}
+
+/// `operator.index(a)`: an int (a bool is one); project classes with `__index__` are refused at translation
+pub fn operator_index(args: &[V]) -> R {
+    match args {
+        [V::Int(i)] => Ok(V::Int(*i)),
+        [V::Bool(b)] => Ok(V::Int(*b as i64)),
+        [o] => Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+        _ => Err(Exc::type_error(format!("index expected 1 argument, got {}", args.len()))),
+    }
+}
+
 /// `dict.fromkeys(iterable, value=None)`
 pub fn dict_fromkeys(args: &[V]) -> R {
     let keys = ops::iter(args.first().ok_or_else(|| Exc::type_error("fromkeys expected at least 1 argument, got 0"))?)?;

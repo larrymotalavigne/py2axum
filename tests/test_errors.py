@@ -45,7 +45,7 @@ def test_codes_are_well_formed_and_unique():
     codes = [c.code for c in errors.CLASSES]
     assert len(codes) == len(set(codes))
     for c in errors.CLASSES:
-        assert re.fullmatch(r"P2A0[1-69]\d\d", c.code), c.code
+        assert re.fullmatch(r"P2A0[1-79]\d\d", c.code), c.code
         assert c.why.endswith(".") and c.fix.endswith((".", ")")), c.code
         assert (ROOT / "docs" / c.see.split("#")[0]).exists(), c.see
     assert errors.CLASSES[-1] is errors.OTHER

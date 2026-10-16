@@ -317,13 +317,13 @@ pub fn repr(n: &Native) -> R<String> {
                                         py_bool(q.auto_delete), py_bool(q.durable), py_bool(q.exclusive), ops::repr(&q.arguments)?),
         Native::AmqpExchange(x) => format!("<{}({}): auto_delete={}, durable={}, arguments={})>", type_name(n), x.name,
                                            py_bool(x.auto_delete), py_bool(x.durable), ops::repr(&x.arguments)?),
-        Native::AmqpFrame(name, _) => format!("<{name} object at {:#x}>", n as *const Native as usize),
+        Native::AmqpFrame(name, _) => format!("<{name} object at {}>", super::ops::addr(n as *const Native as usize)),
         Native::AmqpIter(it) => {
             let tag = it.state.try_lock().ok().and_then(|g| g.as_ref().map(|(t, _)| t.clone()));
             format!("<QueueIterator: queue={} ctag={}>", ops::str_repr(&it.queue.name),
                     tag.map(|t| ops::str_repr(&t)).unwrap_or_else(|| "None".into()))
         }
-        _ => format!("<{} object at {:#x}>", type_name(n), n as *const Native as usize),
+        _ => format!("<{} object at {}>", type_name(n), super::ops::addr(n as *const Native as usize)),
     })
 }
 

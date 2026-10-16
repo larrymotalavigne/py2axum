@@ -37,6 +37,59 @@ Run it ideally on a dedicated machine. The script,
 next to the [conformance harness](conformance.md). `bench/bench.py --target dynapp --compare` is a performance
 guard comparing a generated binary with a reference.
 
+## Memory allocator
+
+The generated binary uses [mimalloc](https://github.com/microsoft/mimalloc) as its global allocator, not the C
+library's `malloc`, which spent about 30 % of the instructions of an ORM list and contends between worker
+threads. Measured on the `dynapp` test application (Linux, 16 cores, the same binary built with each allocator,
+interleaved, median of 7 runs):
+
+| | 4 worker threads | 16 worker threads |
+|---|---:|---:|
+| Throughput, 20-row ORM list | +21 % | +8 % |
+| Throughput, one row by key | +10 % | +2 % |
+| Throughput, validation only (`POST`) | +11 % | +11 % |
+| Throughput, 404 | +22 % | 0 % |
+| Server CPU per request | −9 to −17 % | −7 to −14 % |
+| RSS at rest | 45 MiB instead of 30 | 66 MiB instead of 44 |
+| RSS peak under load | 49 MiB instead of 31 | 77 MiB instead of 49 |
+
+With 16 threads the database bounds the routes that query it, so the CPU saved shows less in the throughput.
+
+mimalloc keeps per-thread heaps: the binary takes 16 to 28 MiB more memory. It is C code compiled into the binary
+(statically: at run time the binary still needs only the C library, `distroless/cc` included); building needs a C
+compiler, as zlib already did (the official Rust images and the py2axum builder image have one).
+
+To keep the C library's allocator, build the generated crate without its default feature:
+
+```bash
+cargo build --release --no-default-features
+```
+
+## Build profile
+
+The generated crate is a Cargo workspace of two crates: the application (`src/`) and py2axum's runtime
+(`dynrt/`, a library crate, compiled once and reused by every build that shares a target directory). The release
+profile links them with thin LTO and one codegen unit. Measured on the `dynapp` test application (Linux, 16
+cores, the binaries of 0.8 and 0.9 measured in the same pod, interleaved, median of 7 runs), against the runtime
+compiled inside the application's crate with fat LTO (the profile before 0.9):
+
+| | 4 worker threads | 16 worker threads |
+|---|---:|---:|
+| Throughput (one row, 20-row list, `selectinload`, validation, 404) | −2.5 to +0.3 % | −3.0 to +7.9 % |
+| Server CPU per request | +0.1 to +2.4 % | +0.5 to +3.4 % |
+| RSS at rest | 44.4 MiB instead of 43.9 | 68.9 MiB instead of 68.2 |
+
+The library crate alone costs nothing (with fat LTO: −2.4 to +1.3 % CPU per request); thin LTO costs up to 3 %
+CPU per request, within the run-to-run noise of the throughput, in exchange for a lighter and faster build: the
+compilation peak of a 10 MB generated module goes from 6.94 to 4.48 GiB. Without LTO the binary is 4 to 18 %
+slower: keep LTO for a binary that serves traffic. To build with fat LTO (one whole-program optimisation, slower and
+heavier to compile):
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=fat cargo build --release
+```
+
 ## Memory of large responses
 
 Large lists returned straight from the session are streamed: a 57 MB response takes 13–16 MiB of RSS instead of

@@ -119,6 +119,11 @@ class Watcher:
             cmd.append("--no-stream")
         if self.a.allow_untested_versions:
             cmd.append("--allow-untested-versions")
+        cmd += ["--translate-libs", self.a.translate_libs]
+        if self.a.venv is not None:
+            cmd += ["--venv", str(self.a.venv)]
+        for lic in self.a.allow_license:
+            cmd += ["--allow-license", lic]
         shutil.rmtree(self.stage / "crate", ignore_errors=True)
         t = time.monotonic()
         r = subprocess.run(cmd, capture_output=True, text=True, env=self._py_env())
@@ -267,9 +272,11 @@ def parser() -> argparse.ArgumentParser:
                     help="quiet time after the last change before a cycle starts (default 0.3 s)")
     ap.add_argument("--stop-timeout", type=float, default=5.0, metavar="S",
                     help="time the binary gets to exit after SIGTERM before it is killed (default 5 s)")
+    from .libsrc import add_flags as add_libs_flags
     from .versions import add_python_flag
 
     add_python_flag(ap)
+    add_libs_flags(ap)
     ap.add_argument("binary_args", nargs="*", metavar="-- ARG", help="arguments passed to the binary, after --")
     return ap
 

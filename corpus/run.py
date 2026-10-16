@@ -14,7 +14,7 @@ against both (corpus/replay.py). Each example ends up:
     refused     py2axum refuses it (whole application or one of its routes), with the reason at file:line
     error       generation or compilation failed (a translator bug), or the bench could not run it
     documented  the only differences are documented ones (docs/supported.md: the order of a set's elements,
-                an integer beyond 64 bits answered 500)
+                an integer beyond 64 bits answered 500, the order of a SQLModel table instance's keys)
     nondeterministic  Python's own output varies from run to run (random): listed, never counted identical
     untested    translated, but no official test exercises it (no request to compare)
     docs-only   its tests only request the OpenAPI documentation, which the binary does not serve
@@ -72,6 +72,27 @@ def ensure_db() -> None:
         log(f"note: database {DB} not available ({e})")
 
 
+def uses_sqlite(ex, repo: Path) -> bool:
+    """an example whose module opens a SQLite database (`sqlite:` in its source)"""
+    if ex.kind != "fastapi":
+        return False
+    path = repo / ex.source
+    files = sorted(path.rglob("*.py")) if path.is_dir() else [path] if path.is_file() else []
+    return any("sqlite:" in f.read_text() for f in files)
+
+
+def fresh_db(suffix: str) -> str:
+    """an empty database `<DATABASE_URL's>_<suffix>` (dropped first if it exists)"""
+    import psycopg
+
+    base, name = DB.rsplit("/", 1)
+    name = f"{name}_{suffix}"
+    with psycopg.connect(base + "/postgres", autocommit=True) as c:
+        c.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        c.execute(f'CREATE DATABASE "{name}"')
+    return f"{base}/{name}"
+
+
 def wait_port(port: int, proc: subprocess.Popen, timeout: float = 30) -> bool:
     end = time.time() + timeout
     while time.time() < end:
@@ -111,14 +132,22 @@ class Servers:
             logs = work / "logs"
             app_root = repo if ex.kind == "fastapi" else work / "pydantic_apps"
             extra = {k: v for prefix, env in EXAMPLE_ENV.items() if ex.id.startswith(prefix) for k, v in env.items()}
+            ref_db = cand_db = DB
+            ref_path = str(app_root)
+            if uses_sqlite(ex, repo):
+                # a SQLite file of its own in Python, PostgreSQL for the binary: both on a fresh PostgreSQL database
+                # of their own (corpus/sitecustom redirects the reference's engines)
+                ref_db, cand_db = fresh_db(f"{slot}_{len(self.procs)}r"), fresh_db(f"{slot}_{len(self.procs)}c")
+                extra = {**extra, "CORPUS_SQLITE_TO": ref_db.replace("postgresql://", "postgresql+psycopg://", 1)}
+                ref_path = f"{HERE / 'sitecustom'}{os.pathsep}{app_root}"
             ref = subprocess.Popen([sys.executable, "-m", "uvicorn", f"{ex.module}:app", "--port", str(ref_port),
                                     "--log-level", "warning", "--no-access-log"], cwd=cwd,
-                                   env={**os.environ, **extra, "PYTHONPATH": str(app_root), "DATABASE_URL": DB},
+                                   env={**os.environ, **extra, "PYTHONPATH": ref_path, "DATABASE_URL": ref_db},
                                    stdout=open(logs / f"{ex.id}.ref.log", "w"), stderr=subprocess.STDOUT)
             self.procs.append(ref)
             cand = subprocess.Popen([str(work / "target" / "release" / binaries[ex.id])], cwd=cwd,
                                     env={**os.environ, **extra, "CORPUS_APP": ex.id, "PORT": str(cand_port), "HOST": "127.0.0.1",
-                                         "DATABASE_URL": DB, "DB_POOL_SIZE": "2"},
+                                         "DATABASE_URL": cand_db, "DB_POOL_SIZE": "2"},
                                     stdout=open(logs / f"{ex.id}.cand.log", "w"), stderr=subprocess.STDOUT)
             self.procs.append(cand)
             ok_ref, ok_cand = wait_port(ref_port, ref), wait_port(cand_port, cand)
@@ -202,9 +231,23 @@ def _permuted_lists_only(a, b) -> bool:
     return a == b
 
 
+def _same_up_to_key_order(a, b) -> bool:
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a) == set(b) and all(_same_up_to_key_order(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_up_to_key_order(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def documented(src: Path, d: dict) -> str | None:
     """The documented difference a response differs by, if any."""
     r, c = d["ref"], d["cand"]
+    if {k for k in set(r) | set(c) if r.get(k) != c.get(k)} <= {"body"} and _same_up_to_key_order(r.get("body"), c.get("body")):
+        # a SQLModel table instance dumped as itself: CPython follows its __dict__, ordered by string hashing after a
+        # load (docs/supported.md#sqlmodel)
+        text = "".join(p.read_text() for p in ([src] if src.is_file() else src.rglob("*.py")))
+        if "sqlmodel" in text and re.search(r"table\s*=\s*True", text):
+            return "order of a SQLModel table instance's keys"
     if {k for k in set(r) | set(c) if r.get(k) != c.get(k)} == {"body"} and _permuted_lists_only(r["body"], c["body"]):
         text = "".join(p.read_text() for p in ([src] if src.is_file() else src.rglob("*.py")))
         if re.search(r"\b(set|frozenset|Set|FrozenSet)\[|:\s*(set|frozenset)\b", text):

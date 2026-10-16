@@ -42,7 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, amqp, apiv, asgimw, bgloop, colls, composite, corpusx, ddl, decos, docsx, dunders, edges, enumcols, expire, extras, greenlet, idict, inherit, kwargs, lazyimp, leaks, libs, life, logs, mounted, outbound, pk, prom, pydcorpus, pydmore, pyjwt_auth, pyver, rds, realworld, retrying, sec, small, sqlmore, stdmore, tracing, wsock
+from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, mounted, sqlmore, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -66,63 +66,26 @@ app.add_middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(), plu
 app.add_middleware(asgimw.ShortCircuit)
 app.add_middleware(asgimw.Boom)
 app.add_middleware(asgimw.HeaderStamp, name="outer")
-app.include_router(libs.router)
 app.include_router(ddl.router)
 app.include_router(inherit.router)
 app.include_router(enumcols.router)
-app.include_router(decos.router)
 app.include_router(composite.router)
 app.include_router(expire.router)
-app.include_router(dunders.router)
 app.include_router(aio.router)
 app.include_router(life.router)
-app.include_router(bgloop.router)
-app.include_router(pk.router)
-app.include_router(rds.router)
-app.include_router(amqp.router)
 app.include_router(lazyimp.router)
-app.include_router(colls.router)
-app.include_router(retrying.router)
 app.include_router(sqlmore.router)
-app.include_router(sec.router)
-app.include_router(extras.router)
-app.include_router(prom.router)
-app.include_router(outbound.router)
 app.include_router(apiv.router, prefix=apiv.settings.API_PREFIX, dependencies=[Depends(apiv.require_user)])
-app.include_router(tracing.router)
-app.include_router(small.router)
-app.include_router(corpusx.router)
-app.include_router(edges.router)
 app.include_router(wsock.router)
-app.include_router(pyjwt_auth.router)
 app.include_router(asgimw.router)
-app.include_router(pydmore.router)
-app.include_router(pydcorpus.router)
-app.include_router(stdmore.router)
-app.include_router(kwargs.router)
-app.include_router(docsx.router)
 app.include_router(leaks.router)
-app.include_router(realworld.router)
-app.include_router(pyver.router)
-# the syntax of newer Pythons: py2axum folds `sys.version_info` against the project's Python (a 3.12 project never
-# parses these modules)
-if sys.version_info >= (3, 14):
-    from . import py314
-
-    app.include_router(py314.router)
-if sys.version_info >= (3, 15):
-    from . import py315
-
-    app.include_router(py315.router)
-
-app.include_router(logs.router)
 app.include_router(idict.router)
 app.include_router(greenlet.router)
 
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exc_default(request, exc):
-    """FastAPI's default handlers, called by the application's own (fixtures/dynapp/corpusx.py)"""
+    """FastAPI's default handlers, called by the application's own (as fixtures/langapp/main.py and integapp/main.py)"""
     return await http_exception_handler(request, exc)
 
 

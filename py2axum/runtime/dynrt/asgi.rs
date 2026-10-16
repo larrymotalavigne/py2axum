@@ -434,6 +434,7 @@ pub async fn app(
         }
     };
     let cx: Cx = Arc::new(CxInner::new(app, cell));
+    let _phase = web::Phase::new(&cx);
     // sentry_sdk's FastAPI integration (SentryAsgiMiddleware): nothing to do while it is not initialised
     let traced = super::sentry::active() && super::sentry::request_start(&cx).await;
     let mut unhandled = vec![];
@@ -467,7 +468,7 @@ pub async fn app(
     for e in &unhandled {
         super::uvicorn::request_exception(&cx, e);
     }
-    r
+    web::phase_while_streaming(&cx, r)
 }
 
 /// the access log line of a request served without a request context (relayed, refused early)
@@ -552,6 +553,8 @@ pub async fn call_app(cx: &Cx, slot: &Slot, args: Vec<V>) -> R {
     };
     let inner = super::rawasgi::derive(cx, scope, body)?;
     let icx = inner.as_ref().unwrap_or(cx);
+    // a derived request is a stage of its own: its state is freed when it ends (`web::Phase`)
+    let _phase = inner.as_ref().map(web::Phase::new);
     let prev = icx.asgi_scope.lock().replace(scope.clone());
     super::rawasgi::state_in(icx, scope)?;
     let r = chain(icx, &stack, *i, routes).await;

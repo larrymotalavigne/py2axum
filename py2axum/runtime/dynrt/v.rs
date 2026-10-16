@@ -138,6 +138,12 @@ pub enum Native {
     Hmac(Mutex<super::stdlib::Hmac>),
     /// a stateful iterator (csv.reader...): next() pops, iteration drains
     Iter(Mutex<std::collections::VecDeque<V>>),
+    /// `super().get_route_handler()` of a custom route class: the route's own handler
+    RouteOrig(super::web::RunFn),
+    /// `request.receive` (given to a Request subclass's constructor; not callable here)
+    RequestReceive,
+    /// a pydantic `Iterable[T]` field's value (pydantic-core's ValidatorIterator)
+    ValIter(Arc<super::pyd::ValIter>),
     /// hashlib.sha256 & co used as a value (hmac digestmod)
     HashCtor(&'static str),
     Jinja(Arc<super::mail::Jinja>),
@@ -148,6 +154,13 @@ pub enum Native {
     /// `Environment.filters`: item assignment registers a filter
     JinjaFilters(Arc<super::mail::Jinja>),
     Mime(Arc<super::mail::Mime>),
+    /// `email.message.EmailMessage` (dynrt/emailmsg.rs)
+    EmailMsg(Arc<super::emailmsg::EmailMsg>),
+    /// dnspython (dynrt/dnsres.rs): a Resolver, a resolve() Answer, an rdata, a dns.name.Name
+    DnsResolver(Arc<super::dnsres::Resolver>),
+    DnsAnswer(Arc<super::dnsres::Answer>),
+    DnsRdata(Arc<super::dnsres::Rdata>),
+    DnsName(Arc<super::dnsres::Name>),
     Tasks(super::resp::Tasks),
     BytesIO(super::files::BytesIO),
     Path(String),
@@ -164,6 +177,13 @@ pub enum Native {
     Upload(Arc<super::files::Upload>),
     /// a method bound to its receiver (`obj.method` read as a value)
     Bound(super::pyd::MethodFn, V),
+    /// `NotImplemented`, returned by an operator method to pass the turn (dynrt/proto.rs)
+    NotImplemented,
+    /// `object()`: a bare object, its identity only (a sentinel: `MISSING = object()`)
+    Object,
+    /// a method read on its class (`Cls.method`): a function whose first argument is the receiver, or that takes
+    /// none for a `@staticmethod` (true)
+    Unbound(super::pyd::MethodFn, bool),
     /// keyword arguments riding at the end of a method's argument vector (see `pack`)
     Kwargs(Vec<(String, V)>),
     /// a `mode="before"` validator failed on this input: (type, msg, input), reported in place by the
@@ -210,6 +230,8 @@ pub enum Native {
     FieldInfo,
     /// A first-class function value (lambda, bound method, function passed as argument).
     Func(super::FnVal),
+    /// A builtin function of CPython's C modules used as a value (`operator.eq`): repr `<built-in function eq>`
+    Builtin(&'static str, super::FnVal),
     /// A project `def` as a value (see `pyfn`).
     PyFn(PyFn),
     /// `pydantic.TypeAdapter(T)`: (its type, `repr` of the type for messages)
@@ -303,7 +325,7 @@ impl V {
         V::Tuple(Arc::new(v))
     }
     pub fn dict_from(items: Vec<(V, V)>) -> R {
-        let mut m = IndexMap::new();
+        let mut m = IndexMap::with_capacity(items.len());
         for (k, v) in items {
             dict_put(&mut m, Key::dict_key(&k)?, k, v);
         }
@@ -359,9 +381,9 @@ impl V {
                 Native::Log(o) => super::logging::type_name(o),
                 Native::Queue(_) => "Queue",
                 Native::Hash(_) => "HASH",
-                Native::Serializer(_) => "URLSafeTimedSerializer",
+                Native::Serializer(s) => s.class_name(),
                 Native::Fernet(_) => "Fernet",
-                Native::RespObj(_) => "Response",
+                Native::RespObj(r) => r.cls.rsplit('.').next().unwrap_or("Response"),
                 Native::RespHeaders(_) | Native::CellHeaders(_) => "MutableHeaders",
                 Native::CallNext(_) => "function",
                 Native::Address(..) => "Address",
@@ -399,11 +421,19 @@ impl V {
                 Native::Hmac(_) => "HMAC",
                 Native::HashCtor(_) => "builtin_function_or_method",
                 Native::Iter(_) => "iterator",
+                Native::ValIter(_) => "ValidatorIterator",
+                Native::RouteOrig(_) => "function",
+                Native::RequestReceive => "method",
                 Native::Jinja(j) => if j.templates { "Jinja2Templates" } else { "Environment" },
                 Native::JinjaTpl(_) => "Template",
                 Native::JinjaFilters(_) => "dict",
                 Native::Property(_) => "property",
                 Native::Mime(_) => "MIMEBase",
+                Native::EmailMsg(_) => "EmailMessage",
+                Native::DnsResolver(_) => "Resolver",
+                Native::DnsAnswer(_) => "Answer",
+                Native::DnsRdata(d) => super::dnsres::rdata_class(d),
+                Native::DnsName(_) => "Name",
                 Native::Tasks(_) => "BackgroundTasks",
                 Native::BytesIO(_) => "BytesIO",
                 Native::Path(_) => "PosixPath",
@@ -415,6 +445,8 @@ impl V {
                 Native::Complex(..) => "complex",
                 Native::Upload(_) => "UploadFile",
                 Native::Bound(..) => "method",
+                Native::NotImplemented => "NotImplementedType",
+                Native::Object => "object",
                 Native::Kwargs(_) => "kwargs",
                 Native::ValErr(..) => "ValErr",
                 Native::Streaming(_) => "StreamingResponse",
@@ -438,7 +470,8 @@ impl V {
                 Native::CronGen(_) => "generator",
                 Native::Type(_) => "type",
                 Native::FieldInfo => "FieldInfo",
-                Native::Func(_) | Native::PyFn(_) => "function",
+                Native::Func(_) | Native::PyFn(_) | Native::Unbound(..) => "function",
+                Native::Builtin(..) => "builtin_function_or_method",
                 Native::Coro(_) => "coroutine",
                 Native::YarlUrl(_) => "URL",
                 Native::AmqpConn(c) => if c.robust { "RobustConnection" } else { "Connection" },
@@ -494,10 +527,11 @@ impl V {
 
 /// `d[k] = v`: a key already there keeps its first object (`{1: "a", True: "b"}` is `{1: "b"}`), as in CPython
 pub fn dict_put(m: &mut IndexMap<Key, (V, V)>, key: Key, k: V, v: V) {
-    match m.get_mut(&key) {
-        Some(slot) => slot.1 = v,
-        None => {
-            m.insert(key, (k, v));
+    // one lookup (the key hashed once); an existing key keeps its first key object, as in CPython
+    match m.entry(key) {
+        indexmap::map::Entry::Occupied(mut e) => e.get_mut().1 = v,
+        indexmap::map::Entry::Vacant(e) => {
+            e.insert((k, v));
         }
     }
 }
@@ -931,6 +965,34 @@ builtin_exc!(PYJWK_CLIENT_CONNECTION_ERROR, "PyJWKClientConnectionError", [PYJWK
 builtin_exc!(PYJWT_INVALID_SUBJECT, "InvalidSubjectError", [PYJWT_INVALID_TOKEN]);
 builtin_exc!(PYJWT_INVALID_JTI, "InvalidJTIError", [PYJWT_INVALID_TOKEN]);
 builtin_exc!(BAD_DATA, "BadData", [EXCEPTION]);
+builtin_exc!(EMAIL_MESSAGE_ERROR, "MessageError", [EXCEPTION]);
+builtin_exc!(HEADER_PARSE_ERROR, "HeaderParseError", [EMAIL_MESSAGE_ERROR]);
+builtin_exc!(HEADER_WRITE_ERROR, "HeaderWriteError", [EMAIL_MESSAGE_ERROR]);
+builtin_exc!(STRUCT_ERROR, "error", [EXCEPTION]);
+// dnspython 2.8 (dynrt/dnsres.rs)
+builtin_exc!(DNS_EXCEPTION, "DNSException", [EXCEPTION]);
+builtin_exc!(DNS_FORM_ERROR, "FormError", [DNS_EXCEPTION]);
+builtin_exc!(DNS_SYNTAX_ERROR, "SyntaxError", [DNS_EXCEPTION]);
+builtin_exc!(DNS_TIMEOUT, "Timeout", [DNS_EXCEPTION]);
+builtin_exc!(DNS_LIFETIME_TIMEOUT, "LifetimeTimeout", [DNS_TIMEOUT]);
+builtin_exc!(DNS_NXDOMAIN, "NXDOMAIN", [DNS_EXCEPTION]);
+builtin_exc!(DNS_YXDOMAIN, "YXDOMAIN", [DNS_EXCEPTION]);
+builtin_exc!(DNS_NO_ANSWER, "NoAnswer", [DNS_EXCEPTION]);
+builtin_exc!(DNS_NO_NAMESERVERS, "NoNameservers", [DNS_EXCEPTION]);
+builtin_exc!(DNS_NOT_ABSOLUTE, "NotAbsolute", [DNS_EXCEPTION]);
+builtin_exc!(DNS_NO_ROOT_SOA, "NoRootSOA", [DNS_EXCEPTION]);
+builtin_exc!(DNS_NO_METAQUERIES, "NoMetaqueries", [DNS_EXCEPTION]);
+builtin_exc!(DNS_NO_RESOLVER_CONFIGURATION, "NoResolverConfiguration", [DNS_EXCEPTION]);
+builtin_exc!(DNS_EMPTY_LABEL, "EmptyLabel", [DNS_SYNTAX_ERROR]);
+builtin_exc!(DNS_BAD_ESCAPE, "BadEscape", [DNS_SYNTAX_ERROR]);
+builtin_exc!(DNS_LABEL_TOO_LONG, "LabelTooLong", [DNS_SYNTAX_ERROR]);
+builtin_exc!(DNS_NAME_TOO_LONG, "NameTooLong", [DNS_FORM_ERROR]);
+builtin_exc!(DNS_BAD_POINTER, "BadPointer", [DNS_FORM_ERROR]);
+builtin_exc!(DNS_BAD_LABEL_TYPE, "BadLabelType", [DNS_FORM_ERROR]);
+builtin_exc!(DNS_UNKNOWN_RDATATYPE, "UnknownRdatatype", [DNS_EXCEPTION]);
+builtin_exc!(DNS_SHORT_HEADER, "ShortHeader", [DNS_FORM_ERROR]);
+builtin_exc!(DNS_TRAILING_JUNK, "TrailingJunk", [DNS_FORM_ERROR]);
+builtin_exc!(DNS_BAD_EDNS, "BadEDNS", [DNS_FORM_ERROR]);
 builtin_exc!(BAD_SIGNATURE, "BadSignature", [BAD_DATA]);
 builtin_exc!(BAD_TIME_SIGNATURE, "BadTimeSignature", [BAD_SIGNATURE]);
 builtin_exc!(SIGNATURE_EXPIRED, "SignatureExpired", [BAD_TIME_SIGNATURE]);

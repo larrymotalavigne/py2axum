@@ -51,9 +51,15 @@ python tests/conformance.py http://127.0.0.1:8200 http://127.0.0.1:8280 --scenar
 ## Where things are
 
 - `py2axum/dyn.py` — the compiler of project code; `libmap.py` — the library map.
-- `py2axum/runtime/dynrt/*.rs` — the runtime (one module per area or library).
-- `fixtures/dynapp/` — the reference app; add your case to the module that fits (or a new router) and a
-  request to `tests/scenarios/dynapp.py`.
+- `py2axum/runtime/dynrt/` — the runtime, a library crate (`Cargo.toml`, whose dependencies the generated crate
+  declares too; `*.rs`, one module per area or library). After adding a dependency, update
+  `py2axum/runtime/Cargo.lock` from a generated crate's.
+- `fixtures/dynapp/` — the reference app (CRUD, ORM, raw ASGI middlewares, lifespan, WebSockets);
+  `fixtures/langapp/` — the Python language, its standard library and Pydantic; `fixtures/integapp/` — the
+  libraries and the platform (logging, metrics, JWT, retries, messaging); `fixtures/libapp/` — the popular
+  libraries of 0.8. Add your case to the module that fits (or a new router) and a request to that app's
+  `tests/scenarios/<app>.py`. They are separate apps because one generated crate must compile within the CI's
+  6 GiB build containers: a new big router goes to the smallest app.
 
 ## Pull requests
 

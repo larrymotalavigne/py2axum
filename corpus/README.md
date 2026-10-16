@@ -59,8 +59,10 @@ up to 60 examples compile in about 7 minutes, one crate per example would take h
 nothing in the translator changed (checks and generated crates are cached by the translator's hash, cargo
 recompiles nothing), most of it replaying the tests.
 
-Ports 10000–10999, database `py2axum_corpus` (`DATABASE_URL` overrides; only the examples that use a
-database need it).
+Ports 10000–10999 (`CORPUS_PORT_BASE` moves them), database `py2axum_corpus` (`DATABASE_URL` overrides; only the
+examples that use a database need it). An example that opens a SQLite database (SQLModel's tutorials) gets two
+fresh databases of its own, `<name>_<slot>_<n>r` and `..c`: the binary serves PostgreSQL only, so the Python
+reference's SQLite engines are redirected to its database by `corpus/sitecustom/sitecustomize.py`.
 
 ```bash
 uv venv -p 3.13 .venv-corpus && . .venv-corpus/bin/activate

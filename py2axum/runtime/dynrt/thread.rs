@@ -35,7 +35,7 @@ pub fn get_ident() -> u64 {
 }
 
 /// runs `f`, which may block the OS thread: on a loop worker, tokio is told first
-pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
+pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
     if IDENT.with(|c| c.get()) == 0 && tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(f)
     } else {

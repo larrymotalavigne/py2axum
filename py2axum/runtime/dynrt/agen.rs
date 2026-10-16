@@ -185,7 +185,7 @@ pub fn into_channel(g: Arc<AGen>, go: tokio::sync::oneshot::Receiver<()>) -> mps
                 }
                 Err(e) => {
                     if !e.isinstance(&STOP_ASYNC_ITERATION) && !e.isinstance(&GENERATOR_EXIT) {
-                        super::uvicorn::exception(&e);
+                        super::uvicorn::exception(&super::trace::streaming_error(&e));
                     }
                     break;
                 }

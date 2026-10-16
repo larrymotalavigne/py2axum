@@ -21,6 +21,12 @@ gets FastAPI's 422, `loc`, `msg` and `input` included.
   a list header parameter takes every occurrence of the header, like `headers.getlist` —,
   `Query/Path/Header/Cookie(...)` constraints and aliases, and `Annotated` constraints from `annotated_types`
   or `StringConstraints`). Errors are FastAPI's 422 bodies, byte for byte.
+- A marker kept in a module variable (`RadiusQuery = Query(50.0, ge=5)`, then `radius: float = RadiusQuery` or
+  `Annotated[float, RadiusMeta]`; `Path`, `Body`, `Header`, `Cookie`, `Form`, `File`, `Depends` too, also imported
+  from another module) stands for the call it holds. Refused with `file:line`: a variable a function rebinds with
+  `global`, and a marker without `alias=` shared by parameters of different names (FastAPI writes the first
+  parameter's name into the marker as its alias, so the others read that name: it depends on the registration
+  order).
 - `Cookie()` parameters read `request.cookies` (Starlette's lenient parser, first `Cookie` header, last value
   wins), under the parameter's name or `alias`, after the path, query and header parameters as FastAPI does
   (`loc` `["cookie", name]`).
@@ -43,13 +49,18 @@ routing, as in Starlette ([Bigger applications](bigger-applications.md)).
   the query (the last value of a repeated query parameter). Constraints (`Query(max_length=...)`) without an
   annotation are refused.
 
+- A missing parameter with a default other than `None` takes a copy of the default **validated** like a value,
+  as FastAPI does (`q: int = Query(0, ge=1)` answers 422 when `q` is missing; `AfterValidator`s run on it).
+
 ## What stays in Python
 
 - Refused at compile time: a model of parameters next to another parameter of the same source, in a route with
   dependencies (FastAPI merges the dependencies' parameters, which changes how the model is read), in a
   dependency, or with a default; an `Annotated` metadata that changes validation or serialisation
-  (`AfterValidator`, `BeforeValidator`, `WrapSerializer`, `Discriminator`, a class with
-  `__get_pydantic_core_schema__`...).
+  (`BeforeValidator`, `WrapSerializer`, `Discriminator`, a class with `__get_pydantic_core_schema__`...).
+  `AfterValidator(f)` is native on path, query, header and cookie parameters (`f` a lambda or a function of the
+  project, without `info`): run once the value passed its type, in order, a `ValueError` or `AssertionError` there
+  is the parameter's 422.
 
 ## Differences
 

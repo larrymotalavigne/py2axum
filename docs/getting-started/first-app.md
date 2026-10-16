@@ -21,7 +21,7 @@ generated build/bookshelf: 28 functions, 3 models, 12 schemas
 ```
 
 `build/bookshelf` is an ordinary Cargo project: `src/gen.rs` is your application compiled to Rust (each
-handler starts with a `/// METHOD path (from file:line)` comment), `src/dynrt/` is py2axum's runtime, and the
+handler starts with a `/// METHOD path (from file:line)` comment), `dynrt/` is py2axum's runtime (a library crate the application's depends on), and the
 `Cargo.lock` is the one py2axum is tested with. Do not edit it: change the Python and generate again. The
 binary is `build/bookshelf/target/release/bookshelf`.
 

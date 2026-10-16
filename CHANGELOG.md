@@ -5,6 +5,235 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-16
+
+The runtime becomes a library crate of its own, compiled once and shared by every generated crate (link-time
+optimisation thin by default: a generated crate builds in under 3.1 GiB on Linux), and the binary allocates with
+mimalloc. The documentation corpora reach FastAPI 96.9 %, Pydantic 96.6 %, SQLAlchemy ORM 99.2 % and Core 100 %
+with no silent difference. Pure-Python libraries can be translated from their source (`--translate-libs`, off by
+default), and itsdangerous' `URLSafeSerializer`, `mimetypes`, `email.message.EmailMessage` and dnspython's resolver
+are translated natively.
+
+### Added
+
+- `--translate-libs none|auto|DIST,...` (generation, `check`, `watch`), with `--venv` and `--allow-license`:
+  pure-Python libraries of the project's environment translated from their source, only the functions the routes
+  reach (see Libraries translated from source). The project and the library map keep precedence; a distribution
+  is refused with a code of the new 07xx family when its licence is not admitted (P2A0701), when it is not pure
+  Python (P2A0702), or when it is not installed as the project locks it (P2A0703). `check` lists the translated
+  libraries (functions translated and refused, lines, estimated gen.rs and rustc peak; new `libraries` key of its
+  JSON output). Off by default. With it, a closed list of pure-Python modules of the standard library is
+  translated from the project's Python's `Lib/` (`colorsys`, `gettext`, `html.entities`, `keyword`, never a module with a C accelerator such as `bisect`; P2A0704
+  when py2axum runs on another minor); a library's module statements run at import, its `try: import x / except
+  ImportError:` is decided by the environment, and the lazy imports of a package's `__getattr__` are followed.
+- Protocol methods of plain classes and dataclasses: `__iter__`/`__next__` (a `for` loop and a comprehension call
+  `__next__` between their bodies), `next()`, `__len__`, `__bool__`, `__contains__`, `__getitem__`/`__setitem__`/
+  `__delitem__`, the arithmetic and bitwise operators with their reflected and in-place forms and
+  `NotImplemented`, `__neg__`/`__pos__`/`__invert__`/`__abs__`, with CPython's errors. Pickle and copy methods
+  (`__getstate__`, `__reduce__`, `__deepcopy__`...) are ignored when nothing imports copy or pickle.
+- Bases `Generic[T]`, `Protocol[T]` and subscripted project bases; method defaults read in the class body;
+  statements after `return`/`raise`/`break`/`continue` no longer translated; `mod.X = v` / `mod.X += v` rebind a
+  module variable (they were refused).
+- `threading.local()`, `operator.index()`, `sys.maxsize`, `str.isascii()`, `object()` as a sentinel, `bytearray`,
+  `memoryview` and `complex` as `isinstance` members, `s.__contains__` (and `__getitem__`, `__len__`) of a builtin
+  container read as a value (`keyword.iskeyword`), `@typing.overload` signatures dropped, module flags made of a
+  version or platform test (`PY3 = sys.version_info[0] == 3`) folded, `isinstance(x, string_types)` with a module
+  variable holding types, `__slots__` as one string, `if TYPE_CHECKING:` in a class body.
+- `FastAPI(telemetry={...})` with its literal switches (the binary emits no OpenTelemetry data: documented).
+- Pydantic `create_model("M", ...)` at module level, compiled as the class it creates (fields, `__base__`,
+  validators and computed fields of `__namespace__` / `__validators__`).
+- SQLModel (FastAPI's SQL databases tutorials): classes rewritten at translation into SQLAlchemy mapped classes and
+  Pydantic models (same DDL as SQLModel), `Session(engine)` dependencies, `session.exec(select(...))`,
+  `model_validate`, `sqlmodel_update`, `SQLModel.metadata.create_all(engine)`; `Base.metadata.create_all(engine)`
+  with a synchronous engine. fixtures/sqlmodelapp.
+
+- Pydantic: `datetime`/`date` bounds (`Field(gt=datetime(...))`, `annotated_types`), `AwareDatetime`,
+  `NaiveDatetime`; `model_post_init(self, context)`; `PrivateAttr(default_factory=...)` computed (`datetime.now`);
+  `@with_config(...)` on a stdlib dataclass; a method of a builtin type as a value (`MyAfterValidator(str.lower)`,
+  `key=str.lower`).
+- FastAPI: subclasses of `HTTPBearer`/`HTTPBasic`/`OAuth2PasswordBearer` overriding
+  `make_not_authenticated_error` / `make_authenticate_headers`; `SecurityScopes` and `Security(dep, scopes=[...])`
+  (scopes of the chain, cache per set of scopes); `AfterValidator` on path, query, header and cookie parameters;
+  `yield from` over a file, a literal or a builtin's result; iterating an open file.
+
+- `Model.__table__` as a Core table when the code uses it as one (`t.join(...)`, `t.c.col`, `select(t)`,
+  `select_from(t)`): rows of values, columns by their column name. A value both used as a Core table and iterated
+  for introspection (or given to other code), and the table of an inheriting class, are refused at translation.
+- Core `Table.join(right, onclause=None, isouter=, full=)` and `outerjoin()`, chained; a Join given to
+  `select_from()` supersedes the FROM entries of its tables, as in SQLAlchemy.
+- `with_polymorphic(Base, [Sub, ...], aliased=True, flat=...)`: an alias of the base with its subclass tables
+  LEFT OUTER JOINed under their own aliases, two of them joined to each other, `poly.Sub.col` in the criteria, the
+  subclass columns loaded with the objects. SQLAlchemy ORM corpus 93.8 % → 95.4 % (0 differences).
+- `Model.model_construct(...)` (pydantic 2.12 to 2.14: aliases, validation aliases, defaults, `_fields_set`, extras,
+  private attributes) and `model_extra`. A value of another type than its field is refused when the instance is
+  dumped (pydantic dumps it with a serializer warning), a required field left out at run time.
+- A router of a library included last in the app (`app.include_router(lib.router)`) stays on the Python side
+  with `--python-side mount` (or `auto`), like a final `app.mount()`: refused with `file:line` under the new code
+  P2A0315 when something registers routes after it (also through a function given the app), when it is
+  conditional, or when its prefix is not literal. It used to stop the generation of the whole application.
+- FastAPI parameter markers kept in module variables (`RadiusQuery = Query(50.0, ge=5)` given as a default or
+  in `Annotated`) were evaluated as values (a library call, refused); they now stand for the call they hold. A
+  marker without `alias=` shared by parameters of different names is refused (FastAPI gives it the first one's
+  name).
+- A function held as a plain class attribute through `staticmethod(f)` (read through the class or an instance,
+  never bound).
+- Hybrid attributes with a custom comparator (`@x.comparator`, `@x.inplace.comparator`) and hybrid value objects:
+  `sqlalchemy.ext.hybrid.Comparator` is translated from Python source of py2axum's own (`py2axum/shims/`, its frames
+  left out of tracebacks like a library's); its subclasses, plain classes or `@dataclass(eq=False)`, are compared in
+  Python and in SQL through `operate()`, coerced to SQL by `__clause_element__()` (also on an `aliased()` class).
+  A hybrid setter runs for a keyword of the default constructor.
+- Rich comparisons of project classes (`__ne__`, `__lt__`, `__le__`, `__gt__`, `__ge__`, reflected ones, the
+  result as returned), `sorted()`/`min()`/`max()` of such instances, `__hash__ = object.__hash__`,
+  `@dataclass(eq=False)`, a dataclass deriving from a plain class, `operator.eq` & co. as values
+  (`<built-in function eq>`).
+- `relationship(primaryjoin=fk == col)` (a foreign key equal to the column it references) and
+  `post_update=True` on a many-to-one relationship: two tables referencing each other are flushed (INSERT, then
+  UPDATE of the key; UPDATE to NULL before the DELETEs). `select(tuple_(...))` raises SQLAlchemy's CompileError.
+- fixtures/ormapp (116 cases). SQLAlchemy ORM corpus 95.4 % → 99.2 % (257/259, 0 differences; all SQLAlchemy
+  85.2 % → 87.4 %); the last ORM refusal is the documentation's own defect (`ext/associationproxy.rst:592`). The
+  corpus leaves out a definition block Python fails to run (a fragment such as `class X(Base): # ...`), which made
+  the Python reference of the later blocks of its page fail.
+- itsdangerous `URLSafeSerializer` (the serializer without timestamp): `dumps(obj, salt)`, `loads(s, salt)`, same
+  tokens byte for byte, key rotation, the library's exceptions; itsdangerous joins the tested version ranges (2.2).
+- `mimetypes.guess_type`, `guess_file_type` (Python 3.13+), `guess_extension`, `guess_all_extensions` (`strict=`):
+  the project's Python built-in tables, then the host's `mime.types` files, `data:` URLs, suffix and encoding maps,
+  the order of `guess_all_extensions`.
+- SQL of reporting queries: window functions (`func.f(...).over(partition_by=, order_by=)`, frames refused), CTEs
+  (`select(...).cte(name)`, anonymous, chained, read in a subquery: all in the WITH clause of the outermost
+  statement), LATERAL subqueries (`.lateral()`, correlated to their statement's FROM list), `correlate(*entities)`
+  and `correlate(None)`, `union_all()`/`union()`/`intersect()`/`except_()` (and `_all`, functions or methods) made
+  a subquery, a CTE or executed, `case(*whens)` from a list built at run time (no WHEN: built, then refused by
+  PostgreSQL as with SQLAlchemy; a list of whens: SQLAlchemy's `ArgumentError`), `icontains`/`istartswith`/
+  `iendswith`, `cast(x, Numeric)`, `literal_column(text)`, `postgresql.array([...])` with `any_()`/`all_()`,
+  `bindparam(key, type_=ARRAY(String()))`, `Result.fetchone()`, `mapped_column(..., type_=T)`,
+  `aliased(Model, subquery or cte())` (a union of such selects too), `aliased(Model, flat=True)` on a plain table,
+  `scalar_subquery().correlate(t)`. SQLAlchemy corpus: Core 88.7 % → 100 %, all of SQLAlchemy 87.4 % → 92.6 %
+  (0 differences); `text(...).columns(...)` is refused at translation (it failed at run time).
+- Dependencies built by a factory (`Depends(make_dep(Query([], alias="id"), int))`): the function it returns, its
+  defaults and annotations holding the factory's arguments (constants, builtin types, FastAPI markers of
+  constants); tracebacks name it as CPython does (`make_dep.<locals>.inner`).
+- `typing.NamedTuple` classes: built like a dataclass, a tuple everywhere else (indexing, unpacking, equality and
+  hash with tuples, concatenation, `isinstance(x, tuple)`, JSON as an array), `_asdict()`, `_replace()`, `_make()`,
+  `_fields`, `_field_defaults`, read-only fields with CPython's messages per version.
+- `string.Formatter().parse(s)` consumed whole (`list(...)`, `tuple(...)`): CPython's parser, items and errors;
+  `itertools.chain(*its)` / `chain.from_iterable(its)` consumed whole (`list()`, `tuple()`, `set()`, `sorted()`);
+  `float.is_integer()` / `int.is_integer()`; `from builtins import list` (the builtins called by that name);
+  `Ellipsis`.
+- Dataclasses (stdlib and `pydantic.dataclasses`) as FastAPI request and response types and as model fields:
+  validated like pydantic dataclasses (`dataclass_type`), into instances of the class.
+- `pydantic.Json` / `Json[T]`, parsed with jiter (the crate pydantic-core uses: same error messages and positions),
+  then validated as `T`. New runtime dependency: `jiter` 0.16 (no Python feature).
+- `__get_pydantic_core_schema__` (a field type's classmethod, an Annotated metadata's) and `GetPydanticSchema`,
+  read at translation as the equivalent annotation (scalar schemas and constraints, after/before/wrap/plain
+  validator functions, `chain_schema`, plain serializers, `schema['max_length'] = 10`, `if`/`assert` known at
+  translation): the documentation's CompressedString, RestrictCharacters, SmallString, CustomType examples.
+- Custom route classes: `APIRouter(route_class=R)` and `app.router.route_class = R`, `R.get_route_handler()` wrapping
+  the route's own handler (request validation errors caught, the Response object's headers changed), and a
+  project `Request` subclass whose `body()` the route parses (FastAPI's GzipRequest). `repr()` of a Response and
+  of its headers as Starlette writes them, `request.headers.getlist()`.
+- Pydantic `Iterable[T]` fields (pydantic-core's ValidatorIterator): any iterable accepted, items validated when
+  reached (`next`, loops, `list`, JSON dumps, responses), with pydantic's errors and titles.
+- `email.message.EmailMessage` under the modern policies (`email.policy.default`, `SMTP`, `SMTPUTF8`, `HTTP`):
+  unstructured and address headers set and read back (`msg[name] = value`, a list of addresses, `None`), `get`,
+  `get_all`, `keys`/`values`/`items`, `del`, `in`, `len`, `set_content(str, subtype=, charset=, cte=)` (the text
+  handler's choice of 7bit, 8bit, quoted-printable or base64), `as_bytes()`, `as_string()`, `str()` and `bytes()`:
+  a port of `email._header_value_parser` (address lists, encoded words, folding), byte for byte on every CPython
+  release from 3.12.12 to 3.15.0 (the folder changed in 3.12.13, 3.13.12 to 3.13.14, 3.14.3 to 3.14.6 and 3.15:
+  each change follows the project's Python, probed on the transpiler's own when it is the same minor). Headers with
+  a structured value of their own (Date, Message-ID, Content-*, MIME-Version, In-Reply-To, References) and the
+  other methods (`add_attachment`, `get_content`, `iter_parts`...) are refused.
+- dnspython 2.8's stub resolver: `dns.resolver.Resolver(filename=, configure=)` read from `/etc/resolv.conf` as
+  dnspython reads it, its settings (`nameservers`, `nameserver_ports`, `port`, `timeout`, `lifetime`, `search`,
+  `use_search_by_default`, `retry_servfail`, `rotate`, `ndots`, `use_edns()`), `resolve()` and the module's
+  `resolve()` on the default resolver: the same queries over UDP (TCP when truncated or `tcp=True`), retries,
+  backoff, timeouts and nameserver eviction, CNAME chains, answers of MX, TXT, A, AAAA, CNAME and NS records
+  (`to_text()`, `str()`, `repr()`, their attributes), `dns.name.from_text`, and the exceptions with their messages
+  (`NXDOMAIN`, `NoAnswer`, `NoNameservers`, `LifetimeTimeout`, `NoMetaqueries`, `dns.name` errors...). dnspython
+  joins the tested version ranges (2.8). tests/dns_stub.py serves the conformance.
+
+### Changed
+
+- The runtime is a library crate of its own (`dynrt/`, next to the generated crate, its path dependency) instead
+  of a module copied into `src/dynrt/`, and the release profile uses thin LTO instead of fat
+  (`CARGO_PROFILE_RELEASE_LTO=fat` restores it). Throughput within the noise (−3.0 to +7.9 %), up to 3 % more
+  server CPU per request, compilation peak of a large project 6.94 → 4.48 GiB; the runtime compiles once for every
+  crate that shares a target directory (the Docker image precompiles it). The generated crate is a Cargo workspace; a `Cargo.lock`
+  generated by an earlier version is replaced. The generated project stays outside the public contract.
+- The generated binary allocates with mimalloc instead of the C library's `malloc` (a default Cargo feature of the
+  generated crate; `cargo build --release --no-default-features` keeps the system's): 7 to 17 % less server CPU
+  per request, up to 22 % more throughput, at the price of 16 to 28 MiB more RSS. Building needs a C compiler
+  (already needed for zlib).
+- Fewer instructions per request (callgrind, the dynapp fixture): a 20-row ORM list −6.8 %, a single row −4.9 %,
+  a `selectinload` −7.2 %, a 404 −5.1 %. Table and column names are quoted at translation, a row's object is
+  built once, the response model reads loaded attributes without a future per field, dict keys are hashed once.
+
+### Fixed
+
+- `float(str)` follows CPython's grammar: underscores between digits (`"1_000"`), Unicode decimal digits; it
+  used to refuse the first and accept Rust-only forms.
+- Iterating a plain class instance or a dataclass without `__iter__` raises CPython's `TypeError` (it iterated
+  nothing).
+- An ORM object whose autoincrement primary key was set to None was inserted with NULL (SQLAlchemy leaves the key
+  out and lets the sequence give it).
+- A missing parameter's default other than None is validated, as FastAPI does (`Query(0, ge=1)` is a 422 when the
+  parameter is missing); it was returned as is.
+- `model_post_init` was never called (now refused only with `model_construct`).
+- A stdlib dataclass inside a model takes that model's `str_*` and `use_enum_values` config, as in pydantic (it
+  was validated without it); under `strict=` or `extra=` it is refused.
+- A `typing.NamedTuple` as a Pydantic type was validated like a model (other errors): refused.
+
+- A method named like a library function (`stmt.compile()`, named like `re.compile`) passed the translation's
+  check that some runtime value implements it, then failed at run time (AttributeError): refused at its line now
+  (P2A0203). No route of the ATOM applications changes.
+- `str()` of a SQL statement or expression (also in an f-string or `format()`) returned the PostgreSQL text the
+  binary runs, never SQLAlchemy's (its default compiler: `:param_1`, line breaks before `FROM`...): it now raises
+  TypeError; `str()` of a column (`table.col`) is unchanged.
+- `tuple * int` (and `int * tuple`) raised TypeError: the repeated tuple, as in CPython.
+- `int(x)`, `round(x)`, `math.floor/ceil/trunc(x)` of a float beyond 64 bits returned 2⁶³−1 (a saturating
+  conversion) instead of failing: OverflowError, like the other integers py2axum does not represent; `int(inf)`
+  raised ValueError instead of CPython's OverflowError, `round(nan)` / `round(inf)` returned 0 / 2⁶³−1.
+- `from pkg import name` where `pkg/name.py` exists and `pkg/__init__.py` binds `name` (`from .name import name`,
+  `from .name import *`) resolved to the submodule; it is now the object the package binds, as CPython reads the
+  package's attribute first (python-slugify, tenacity, email-validator do it).
+- A class held as a class attribute (`class G: NT = _NT`) called through the class held as a value
+  (`alias = G; alias.NT()`) raised AttributeError at run time. A method read on its class (`Cls.method`, through
+  a value too) now gives a function (taking the receiver first, none for a `@staticmethod`), or the method bound
+  to the class for a `@classmethod`, instead of raising AttributeError; an `async def` read that way is refused at
+  translation (P2A0101, `file:line`) when the class is named, at run time through a class held as a value
+  (fixtures/resolveapp).
+- An integer expression of literals beyond 64 bits (`10**100`, `1 << 70`, also through a comprehension variable
+  over a literal tuple: `[10**x for x in (3, 100)]`, seen in humanize) raised OverflowError at run time, at
+  startup for a module constant; it is now refused at translation with `file:line` (P2A0101).
+- A function or lambda held as a plain class attribute was read unbound through an instance (CPython binds it to
+  the instance): it is now refused, `staticmethod(f)` is the supported form.
+- `from module import *` ignored the names the module imports itself (`HTTPException` imported there from
+  FastAPI was an unknown name), and bound names that `__all__` leaves out or that start with `_`.
+- `isinstance(x, Parent)` was false for an instance of a Pydantic model that subclasses another model of the
+  project (and `Parent.model_validate(child)` raised a validation error).
+
+- An exception raised while FastAPI's default handler encodes a 422 or an HTTPException's detail (`inf` in the
+  input) carries the handled exception as its `__context__` (the traceback of the 500 differed).
+- A StopIteration escaping an endpoint or a dependency is `RuntimeError: coroutine raised StopIteration` (PEP 479),
+  with the StopIteration as its cause, as in CPython (the traceback of the 500 differed).
+- `urllib.parse.urlparse/urlsplit`: a URL's trailing spaces were stripped (CPython strips only the leading ones),
+  `;params` were split for every scheme (CPython: only those of `uses_params`), and the netloc checks were missing
+  (unbalanced or invalid brackets, an IPv4 address in brackets, NFKC delimiters raise `ValueError`). `FileResponse`
+  guessed its type with the same lenient split.
+- Attribute reads that a runtime value provides (httpx `Response.reason_phrase`, `insert().excluded`,
+  `__wrapped__`, `OAuth2PasswordRequestForm.grant_type`/`client_id`/...) or that a raw ASGI middleware sets through
+  `scope["state"]` (`request.state.<key>`) were refused at generation as certain AttributeErrors, unless another
+  module of the project had a `__getattr__`.
+- With Starlette before 1.3, an exception raised while a `StreamingResponse` (or a generator endpoint) streams
+  is logged as Python logs it: re-raised out of anyio's `ExceptionGroup`, which becomes its `__context__`.
+- A `StreamingResponse` chunk that is neither `str` nor `bytes` (an `int`, a `float`) was sent as its `str()`;
+  it now fails as in Starlette (`AttributeError: 'int' object has no attribute 'encode'`, logged, the connection
+  dropped).
+- A task that failed without being awaited, or an async generator, stored in the request's state
+  (`request.state.t = asyncio.create_task(...)`) kept the whole request alive until the process exited (a few KiB
+  per request), and asyncio's « Task exception was never retrieved » / the generator's `finally` never came. Both
+  are now freed with the request, as in CPython; the log line carries the task's repr (`future: <Task finished
+  name=... coro=<f() done, defined at file:line> exception=...>`).
+
 ## [0.8.0] — 2026-10-15
 
 The public contract is frozen ahead of 1.0 (versioning and deprecation policy, tests that pin the command lines,

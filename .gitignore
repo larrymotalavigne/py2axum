@@ -19,5 +19,5 @@ bench/soak/*.log
 # mkdocs build output
 site/
 # corpus/: the cloned sources and the bench's work directory
-corpus/.cache/
+corpus/.cache
 corpus/out/

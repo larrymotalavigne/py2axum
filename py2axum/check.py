@@ -26,6 +26,7 @@ from .report import RouteReport, _where, aggregate, classify
 
 _DECLARED = re.compile(r"^(?P<where>.+?:\d+): (?P<method>[A-Z]+) (?P<path>\S+) declared Python-side$")
 _MOUNT = re.compile(r"^(?P<where>.+?:\d+): app\.mount\(\.\.\.\) stays on the Python side")
+_LIB_ROUTER = re.compile(r"^(?P<where>.+?:\d+): include_router\((?P<arg>.*)\) stays on the Python side")
 _DECLARED_RAW = re.compile(r"^(?P<where>.+?:\d+): .* — (?P<path>\S+) declared Python-side$")
 
 
@@ -104,6 +105,12 @@ def run(package: Path, root: Path | None, python_side: list[str], backend: str =
         return _summarise(result, codes)
     for e in fe.global_errors:
         _global(result, e)
+    if getattr(fe, "libstats", None):
+        result["libraries"] = [{"name": st.name, "version": st.version, "licence": st.licence,
+                                "functions_translated": len(st.ok), "functions_refused": len(st.refused),
+                                "lines": st.lines, "gen_rs_mb": round(st.gen_mb, 2), "peak_gib": round(st.peak_gib, 2),
+                                "refused": [{"function": f, "code": c, "error": m} for f, c, m in st.refused]}
+                               for st in fe.libstats]
     moving = auto and not fe.global_errors
     for info, errs in per_route:
         rr = RouteReport(info["method"].upper(), info["path"], info["func"], f"{info['file']}:{info['line']}",
@@ -137,6 +144,16 @@ def run(package: Path, root: Path | None, python_side: list[str], backend: str =
                                      "error": f"{mnt['where']}: app.mount(...) is not translated: as the app's last "
                                               "registration it can stay on the Python side (--python-side mount, or "
                                               "--python-side auto)"})
+            continue
+        lib = _LIB_ROUTER.match(n)
+        if lib and "mount" not in side and not auto:
+            # the same for an include_router() of a library's router
+            c = errors.BY_CODE["P2A0315"]
+            result["global"].append({"construction": "router of a library", "where": lib["where"], "code": c.code,
+                                     "suggestion": c.fix,
+                                     "error": f"{lib['where']}: include_router({lib['arg']}): a router of a library is not "
+                                              "translated; as the app's last registration it can stay on the Python side "
+                                              "(--python-side mount, or --python-side auto)"})
             continue
         m = _DECLARED.match(n) or _DECLARED_RAW.match(n)
         if m:
@@ -229,6 +246,14 @@ def to_text(result: dict, color: bool = False) -> str:
         for b in result["blockers"]:
             where = ", ".join(b["where"][:3]) + (f", +{len(b['where']) - 3}" if len(b["where"]) > 3 else "")
             o.append(f"  {b['routes']:>4} {b['only_blocker']:>4}  {b['construction']}  ({where})")
+    if result.get("libraries"):
+        o += ["", "Libraries translated from source (--translate-libs):"]
+        for lib in result["libraries"]:
+            o.append(f"  {lib['name']} {lib['version']} ({lib['licence']}): {lib['functions_translated']} functions "
+                     f"translated, {lib['functions_refused']} refused, {lib['lines']} lines, "
+                     f"~{lib['gen_rs_mb']} MB of gen.rs, ~{lib['peak_gib']} GiB of rustc peak")
+            for r in lib["refused"]:
+                o.append(f"    refused {r['function']} [{r['code']}]: {r['error']}")
     if result["notes"]:
         o += ["", "Notes:"] + [f"  {n}" for n in result["notes"]]
     o += ["", _verdict(s) + ("generation would succeed" if s["generates"] else c("31", "generation would fail"))]
@@ -271,6 +296,13 @@ def to_markdown(result: dict) -> str:
             code = f" [{u['code']}]({link}{u['code'].lower()})" if u["code"] else ""
             o.append(f"| +{u['new_native']} | {u['native_after']}/{s['total']} | {_md(u['construction'])}{code} | "
                      f"{_md(u['suggestion'])} |")
+    if result.get("libraries"):
+        o += ["", "### Libraries translated from source", "",
+              "| Library | Licence | Functions translated | Refused | Lines | gen.rs (est.) | rustc peak (est.) |",
+              "|---|---|---|---|---|---|---|"]
+        for lib in result["libraries"]:
+            o.append(f"| {lib['name']} {lib['version']} | {_md(lib['licence'])} | {lib['functions_translated']} | "
+                     f"{lib['functions_refused']} | {lib['lines']} | {lib['gen_rs_mb']} MB | {lib['peak_gib']} GiB |")
     if result["notes"]:
         o += ["", "### Notes", ""] + [f"- {_md(n)}" for n in result["notes"]]
     return "\n".join(o) + "\n"
@@ -300,9 +332,11 @@ def parser():
                     help="also exit 1 when fewer than PCT %% of the routes are native")
     ap.add_argument("--allow-untested-versions", action="store_true",
                     help="do not refuse library versions outside the tested ranges")
+    from .libsrc import add_flags as add_libs_flags
     from .versions import add_python_flag
 
     add_python_flag(ap)
+    add_libs_flags(ap)
     return ap
 
 
@@ -312,6 +346,9 @@ def main(argv: list[str]) -> int:
     ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
+    from .libsrc import apply_flags
+
+    apply_flags(args)
     from .__main__ import deprecated_backend
 
     deprecated_backend(argv)

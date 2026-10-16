@@ -71,6 +71,16 @@ async def team(team_id: int, s: AsyncSession = Depends(db)):
          "a write-only many-to-one relationship is not supported"),
         ('owner: Mapped["User"] = relationship(foreign_keys=[owner_id], lazy="write_only", back_populates="x")',
          "back_populates= on a write-only collection is not supported"),
+        # primaryjoin=: a foreign key equal to the column it references, nothing else
+        ('owner: Mapped["User"] = relationship(primaryjoin="Team.owner_id == User.id")', "primaryjoin= must be `column == column`"),
+        ('owner: Mapped["User"] = relationship(primaryjoin=lambda: Team.owner_id == User.id)', "primaryjoin= must be `column == column`"),
+        ('owner: Mapped["User"] = relationship(primaryjoin=name == User.id)', "must equate a foreign key with the column it references"),
+        ('owner: Mapped["User"] = relationship(primaryjoin=owner_id != User.id)', "primaryjoin= must be `column == column`"),
+        ('owner: Mapped["User"] = relationship(primaryjoin=owner_id == User.id, foreign_keys=[backup_id])',
+         "foreign_keys= names another column than primaryjoin="),
+        ('parent: Mapped["Team"] = relationship(primaryjoin=parent_id == id)', "primaryjoin= is only supported between two classes"),
+        # post_update=: the many-to-one side only (SQLAlchemy's advice)
+        ('children: Mapped[list["Team"]] = relationship(post_update=True)', "post_update=True is only supported on a many-to-one"),
     ],
 )
 def test_relationship_rejected(tmp_path, capsys, rel, message):
@@ -273,8 +283,8 @@ JOINED_SUB = ('kind: Mapped[str]\n    __mapper_args__ = {"polymorphic_on": "kind
 @pytest.mark.parametrize("stmt, message", [
     ('await s.execute(pg_insert(Squad).on_conflict_do_nothing())', "insert(Squad) of a joined table inheritance subclass"),
     ("await s.scalars(select(aliased(Squad)))", "aliased(Squad) of a joined table inheritance subclass"),
-    ("await s.scalars(select(with_polymorphic(Team, [Squad], aliased=True, flat=True)))",
-     "aliased=, flat=, selectable= and polymorphic_on= are not supported"),
+    ("await s.scalars(select(with_polymorphic(Team, [Squad], aliased=True, selectable=None)))",
+     "selectable= and polymorphic_on= are not supported"),
     ("await s.scalars(select(Team).options(selectin_polymorphic(Team, [Squad], extra=1)))",
      "selectin_polymorphic(Base, [Sub, ...]) only"),
 ])
@@ -379,6 +389,11 @@ def test_column_type_factory_other_module(tmp_path, capsys):
         ("    d = {}\n    return {'a': d.model_dump(round_trip=True)}", ".model_dump(round_trip=) is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicated}", "attribute .frobnicated is not provided by the runtime"),
         ("    import os\n    os.environ['X'] = '1'\n    return {}", "writing into os.environ is not supported"),
+        # integer constants beyond 64 bits: CPython makes a big integer, the runtime raises OverflowError
+        ("    return {'a': 10**100}", "integer expression out of 64-bit range"),
+        ("    return {'a': (1 << 70) - 1}", "integer expression out of 64-bit range"),
+        ("    return {'a': 2**62 * 4}", "integer expression out of 64-bit range"),
+        ("    return {'a': [10**x for x in (3, 6, 100)]}", "integer expression out of 64-bit range (with x = 100)"),
     ],
 )
 def test_python_semantics_rejected(tmp_path, capsys, body, message):
@@ -447,8 +462,10 @@ def test_execute_with_parameters_rejected(tmp_path, capsys, call, message):
          "selectinload() takes exactly one positional argument"),
         ("await s.scalars(select(Team).options(undefer_group('g', 'h')))", "undefer_group() takes exactly one positional"),
         ("await s.execute(select(Team).where(Team.name == bindparam('n', type_=None)), {'n': 'a'})",
-         "bindparam(key, value=None): other arguments are not supported"),
-        ("await s.scalars(select(aliased(Team, flat=True)))", "aliased(Model) or aliased(Model, name=...) only"),
+         "bindparam(type_=) is supported with ARRAY(String()) only"),
+        ("await s.execute(select(Team).where(Team.name == bindparam('n', required=True)), {'n': 'a'})",
+         "bindparam(key, value=None, type_=ARRAY(String())): other arguments are not supported"),
+        ("await s.scalars(select(aliased(Team, adapt_on_names=True)))", "aliased(Model, subquery) and flat= only"),
         ("await s.scalars(select(Team).where(with_parent(Team.owner)))", "with_parent(instance, Parent.relationship) only"),
     ],
 )
@@ -470,16 +487,22 @@ def test_loader_option_arguments_rejected(tmp_path, capsys, call, message):
 
 
 @pytest.mark.parametrize("body, message", [
-    ("    t = Team.__table__\n    return {'x': str(t.c.id)}", "Model.__table__.c.id: a column of a mapped class's table"),
-    ("    return {'x': str(Team.__table__.join(Team.__table__))}", "Model.__table__.join: the Core use"),
+    # one value both iterated (introspection) and joined (Core): two different runtime values
+    ("    t = Team.__table__\n    names = [c.name for c in t.columns]\n    return {'x': str(select(t)), 'n': names}",
+     "Model.__table__ used both as a Core table and for its introspection"),
+    ("    t = Team.__table__\n    helper(t)\n    return {'x': str(t.c.id)}",
+     "Model.__table__ used both as a Core table and for its introspection (or given to other code)"),
+    ("    return {'x': str(Squad.__table__.join(Team.__table__))}",
+     "Squad.__table__: the Core use of the table of an inheriting class is not supported"),
 ])
 def test_model_table_core_use_rejected(tmp_path, capsys, body, message):
-    """Model.__table__ is introspection only: its Core use is refused at translation (a TypeError at run time before)."""
+    """Model.__table__ is introspection, or a Core table when the code uses it as one; never both for one value."""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
-    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
-    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom .models import Team\n\napp = FastAPI()\n\n\n"
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", JOINED_SUB[0]) + "\n\n" + JOINED_SUB[1] + "\n")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom sqlalchemy import select\nfrom .models import Squad, Team\n\n"
+                                 "app = FastAPI()\n\n\ndef helper(t):\n    return t\n\n\n"
                                  "@app.get('/x')\nasync def x():\n" + body + "\n")
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
     assert message in capsys.readouterr().err
@@ -508,11 +531,13 @@ HYBRID = '''
 
 @pytest.mark.parametrize("extra, message", [
     ("    @label.inplace.update_expression\n    def _u(cls, value):\n        return []\n", "@label.inplace.update_expression is not supported"),
-    ("    @label.inplace.comparator\n    def _c(cls):\n        return None\n", "@label.inplace.comparator is not supported"),
+    ("    @label.inplace.expression\n    def _e(cls):\n        return cls.name\n\n    @label.inplace.comparator\n    def _c(cls):\n"
+     "        return None\n", "a hybrid takes one @label.expression or @label.comparator"),
+    ("    @label.inplace.getter\n    def _g(self):\n        return self.name\n", "@label.inplace.getter is not supported"),
     ("    @label.expression\n    def other(cls):\n        return cls.name\n", "needs `.inplace`"),
 ])
 def test_hybrid_rejected(tmp_path, capsys, extra, message):
-    """sqlalchemy.ext.hybrid: expression and setter only."""
+    """sqlalchemy.ext.hybrid: expression, comparator and setter only."""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
@@ -537,6 +562,27 @@ def test_execute_text_with_parameters_translates(tmp_path):
                               "    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
     assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+
+
+@pytest.mark.parametrize("imp, base", [("from sqlalchemy.ext import hybrid", "hybrid.Comparator"),
+                                        ("import sqlalchemy.ext.hybrid as h", "h.Comparator[str]")])
+def test_hybrid_comparator_translates(tmp_path, capsys, imp, base):
+    """sqlalchemy.ext.hybrid.Comparator reached through its module: the class translated from py2axum's source
+    (its methods, `self.__clause_element__()`, known to the attribute check)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    models = textwrap.dedent(MODELS).replace("{rel}", "").replace("from sqlalchemy.orm import", imp + "\nfrom sqlalchemy import func\nfrom sqlalchemy.ext.hybrid import hybrid_property\nfrom sqlalchemy.orm import", 1)
+    models = models.replace('    name: Mapped[str] = mapped_column(String(50))\n', '    name: Mapped[str] = mapped_column(String(50))\n'
+                            + HYBRID + "    @label.inplace.comparator\n    @classmethod\n    def _c(cls):\n        return CI(cls.name)\n", 1)
+    models += f"\n\nclass CI({base}):\n    def __eq__(self, other):\n        return func.lower(self.__clause_element__()) == func.lower(other)\n"
+    (pkg / "models.py").write_text(models)
+    main_py = textwrap.dedent(MAIN).replace("from .models import Team", "from sqlalchemy import select\nfrom .models import Team")
+    main_py = main_py.replace("    t = await s.get(Team, team_id)\n", "    await s.execute(select(Team).filter_by(label='x'))\n"
+                              "    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(main_py)
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+    assert "not implemented by the runtime" not in (tmp_path / "out" / "src" / "gen.rs").read_text()
 
 
 def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
@@ -660,7 +706,10 @@ def test_imported_rebound_global_rejected(tmp_path, capsys):
     "decl, message",
     [
         ("@dataclass(slots=True)\nclass C:\n    a: int\n", "@dataclass(slots=) is not supported"),
-        ("@dataclass\nclass C:\n    a: int\n\n    def __lt__(self, other):\n        return True\n", "method __lt__ is not supported"),
+        ("@dataclass\nclass C:\n    a: int\n\n    def __index__(self):\n        return 1\n", "method __index__ is not supported"),
+        # a base class: one plain class (SQLAlchemy's hybrid Comparator), without class attributes
+        ("@dataclass\nclass C(Exception):\n    a: int\n", "base classes are not supported (a plain class only)"),
+        ("class P:\n    k = 1\n\n\n@dataclass(eq=False)\nclass C(P):\n    a: int\n", "a base class with class attributes"),
         ("@dataclass\nclass C:\n    a: int = field(default=1, repr=False)\n", "field() supports default= and default_factory= only"),
     ],
 )
@@ -855,7 +904,7 @@ async def c():
     [
         ("defaultdict(lambda: 0)", "defaultdict(lambda: 0): only a builtin type factory is supported"),
         ("defaultdict()", "defaultdict(factory[, mapping]) with a builtin type as factory is the only supported form"),
-        ('list(string.Formatter().parse("{a}"))', "string.Formatter().parse() is not supported"),
+        ('next(string.Formatter().parse("{a}"))', "parse() inside list() or tuple()"),
     ],
 )
 def test_collections_rejected(tmp_path, capsys, expr, message):
@@ -1780,7 +1829,7 @@ async def x():
      "PrivateAttr() supports default= and default_factory= only", 13),
     ("class E(str, enum.Enum):\n    A = ('a', 'utf-8')\n\n\ndef use():\n    return E.A.value", "member value ('a', 'utf-8') is not supported", 12),
     ("from typing import Iterable\n\n\nclass M(BaseModel):\n    xs: Iterable[int] = Field(max_length=1)\n\n\ndef use():\n"
-     "    return M(xs=[1]).model_dump()", "`Iterable[int]` is not supported (pydantic validates it differently from a list)", 16),
+     "    return M(xs=[1]).model_dump()", "`Iterable[int]` with Field(max_length=) is not supported", 16),
 ])
 def test_library_ports_rejected(tmp_path, capsys, body, msg, line):
     pkg = tmp_path / "proj"
@@ -1918,6 +1967,199 @@ def test_mount_left_to_python(tmp_path, capsys, tail, other, flags, message, lin
         return
     assert code == 1
     assert message in err and f"main.py:{line}" in err, err
+
+
+LIB_ROUTER_APP = """
+import os
+
+from fastapi import APIRouter, FastAPI
+from extlib.views import make_router, router as ext_router
+
+app = FastAPI()
+
+
+@app.get("/x")
+async def x():
+    return {{}}
+
+
+{tail}
+"""
+
+
+@pytest.mark.parametrize(
+    "tail, flags, message, line",
+    [
+        # a router of a library, included last: its routes stay in Python (relayed when nothing native matches)
+        ("app.include_router(ext_router)", ["--python-side", "mount"], None, ['""']),
+        ('app.include_router(ext_router, prefix="/lib/")\napp.include_router(make_router("a"), prefix="/b")',
+         ["--python-side", "auto"], None, ['"/b"', '"/lib"']),
+        ('app.include_router(ext_router)\napp.mount("/sub", x)', ["--python-side", "mount"], None, ['""', '"/sub"']),
+        ("app.include_router(ext_router)", [], "it can stay on the Python side (--python-side mount, or --python-side auto)", 15),
+        # Starlette tries the routes in order and the library's are unknown: nothing may register after it
+        ('app.include_router(ext_router)\n\n\n@app.get("/y")\nasync def y():\n    return {}', ["--python-side", "mount"],
+         "`app.get(...)` at ", 15),
+        ("def setup(a):\n    a.add_route('/m', x)\n\n\napp.include_router(ext_router)\nsetup(app)", ["--python-side", "mount"],
+         "registers routes after it (`a.add_route(...)` at ", 19),
+        ("def inner(b):\n    b.add_api_route('/m', x)\n\n\ndef setup(a):\n    inner(a)\n\n\napp.include_router(ext_router)\n"
+         "setup(app)", ["--python-side", "mount"], "registers routes after it (`b.add_api_route(...)` at ", 23),
+        ("if os.environ.get('LIB'):\n    app.include_router(ext_router)", ["--python-side", "mount"], "registered conditionally", 16),
+        ("app.include_router(ext_router, prefix=os.environ['P'])", ["--python-side", "mount"], "must be a literal string", 15),
+        ("r = APIRouter()\nr.include_router(ext_router)\napp.include_router(r)", ["--python-side", "mount"],
+         "only `app.include_router(...)` on the application itself", 16),
+        ("def setup():\n    app.include_router(ext_router)", ["--python-side", "mount"], "is in another function", 16),
+    ],
+)
+def test_library_router_left_to_python(tmp_path, capsys, tail, flags, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(LIB_ROUTER_APP.format(tail=tail))
+    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", *flags, "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert code == 0, err
+        main_rs = " ".join((tmp_path / "out" / "src" / "main.rs").read_text().split())
+        assert f"set_python_side(&[], &[{', '.join(line)}])" in main_rs, main_rs
+        return
+    assert code == 1
+    assert message in err and f"main.py:{line}" in err and "P2A0315" in err, err
+
+
+CONSTRUCT_APP = """
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, RootModel
+
+app = FastAPI()
+
+
+{model}
+
+
+@app.get("/c")
+async def c():
+    return {call}
+"""
+
+
+@pytest.mark.parametrize(
+    "model, call, message",
+    [
+        ("class M(BaseModel):\n    a: int\n    b: int = 0", "M.model_construct(b=1).model_dump()",
+         "M.model_construct() without the required field `a`"),
+        ("class M(BaseModel):\n    a: int\n\n    def model_post_init(self, ctx):\n        pass", "M.model_construct(a=1)",
+         "model_post_init is not supported"),
+        ("class M(RootModel[int]):\n    pass", "M.model_construct(1)", "a RootModel is not supported"),
+        ("class M(BaseModel):\n    a: int = Field(0, alias='A', validation_alias='aa')", "M.model_construct(A=1)",
+         "has both alias= and validation_alias="),
+        ("class M(BaseModel):\n    a: int = 0", "M.model_construct(set(), set(), a=1)", "`_fields_set` as its only positional"),
+    ],
+)
+def test_model_construct_refusals(tmp_path, capsys, model, call, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(CONSTRUCT_APP.format(model=model, call=call))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and "main.py:" in err, err
+
+
+CLASS_ATTR_APP = """
+import json
+
+from fastapi import FastAPI
+
+from .names import *
+
+app = FastAPI()
+
+
+def double(x):
+    return x * 2
+
+
+class Holder:
+    {attr}
+
+    def run(self):
+        return {use}
+
+
+H = Holder()
+
+
+@app.get("/h")
+async def h():
+    return {{"v": H.run()}}
+"""
+
+
+@pytest.mark.parametrize(
+    "attr, use, message, line",
+    [
+        # Python binds a function held as a class attribute to the instance it is read through
+        ("f = double", "self.f(2)", "the function `f = double` as a class attribute is not supported", 16),
+        ("f = lambda self, x: x", "self.f(2)", "the function `f = lambda self, x: x` as a class attribute", 16),
+        ("f = classmethod(double)", "self.f(2)", "(only staticmethod(f))", 16),
+        ("f = staticmethod(double, 1)", "self.f(2)", "(only staticmethod(f))", 16),
+        # `from m import *`: the names without a leading `_`, or those of a literal __all__
+        ("f = staticmethod(double)", "_HIDDEN", "unknown name `_HIDDEN`", 19),
+        ("f = staticmethod(double)", "LISTED + UNLISTED", "unknown name `UNLISTED`", 19),
+    ],
+)
+def test_class_attribute_functions(tmp_path, capsys, attr, use, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "names.py").write_text("__all__ = ['LISTED', 'OK']\nLISTED = 1\nUNLISTED = 2\n_HIDDEN = 3\nOK = 4\n")
+    (pkg / "main.py").write_text(CLASS_ATTR_APP.format(attr=attr, use=use))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and f"main.py:{line}" in err, err
+
+
+MARKER_APP = """
+from fastapi import FastAPI, Query
+
+app = FastAPI()
+{globals}
+
+
+@app.get("/a")
+async def a({a}):
+    return {{}}
+
+
+@app.get("/b")
+async def b({b}):
+    return {{}}
+"""
+
+
+@pytest.mark.parametrize(
+    "globals_, a, b, message",
+    [
+        # a marker kept in a module variable stands for its call; shared without alias= by parameters of other
+        # names, FastAPI gives it the first one's name
+        ("Limit = Query(10, ge=1)", "limit: int = Limit", "limit: int = Limit", None),
+        ("Limit = Query(10, alias='n')", "limit: int = Limit", "size: int = Limit", None),
+        ("Limit = Query(10, ge=1)", "limit: int = Limit", "size: int = Limit", "is the default of parameters `limit` and `size`"),
+        ("Limit = Query(10)\n\n\ndef reset():\n    global Limit\n    Limit = Query(5)", "limit: int = Limit", "x: int = 1",
+         "rebinds with `global`"),
+    ],
+)
+def test_parameter_markers_in_module_variables(tmp_path, capsys, globals_, a, b, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(MARKER_APP.format(globals=globals_, a=a, b=b))
+    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert code == 0, err
+        return
+    assert code == 1 and message in err and "main.py:" in err, err
 
 
 
@@ -2276,8 +2518,9 @@ def test_super_cls_cls_with_subclass_rejected(tmp_path, capsys):
     assert "main.py:" in err
 
 
-def test_module_attribute_assignment_rejected(tmp_path, capsys):
-    """`mod.ATTR = v` rebinds another module's global: refused (it used to fail at startup, read-only)."""
+def test_module_attribute_assignment_accepted(tmp_path, capsys):
+    """`mod.ATTR = v` rebinds another module's variable, as `global` in that module would (`stripe.api_key = ...`);
+    it used to be refused (and before, to fail at startup, read-only)."""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
@@ -2294,10 +2537,7 @@ def test_module_attribute_assignment_rejected(tmp_path, capsys):
             conf.LIMIT = 2
             return {"limit": conf.LIMIT}
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
-    err = capsys.readouterr().err
-    assert "assigning `conf.LIMIT` (an attribute of module proj.conf) is not supported" in err
-    assert "main.py:" in err
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
 
 
 NET_MAIN = """
@@ -2418,13 +2658,13 @@ class LoggingRoute(APIRoute):
 
 
 app = FastAPI()
-app.router.route_class = LoggingRoute
+app.openapi = LoggingRoute
 
 
 @app.get("/")
 async def root():
     return {}
-''', "main.py:10: assigning `app.router.route_class` at module level is not supported (only `app.state` attributes)"),
+''', "main.py:10: assigning `app.openapi` at module level is not supported (only `app.state` attributes)"),
 ]
 
 
@@ -2739,7 +2979,7 @@ def test_typeddict_response_model_rejected(tmp_path, capsys):
     ''')
     assert "is not a Pydantic model or an enum" in err and "main.py:14" in err
 PYD_CORPUS_MAIN = """
-from collections.abc import Iterable
+from collections.abc import Iterable, MutableSequence
 from typing import Annotated, Any, Generic, TypeVar
 
 from fastapi import FastAPI
@@ -2791,7 +3031,8 @@ async def x(b: In):
     ("class In(BaseModel):\n    b: Base[int]", "Base is not a generic model"),
     ("class In(BaseModel):\n    k: type[ValueError]", "unsupported type annotation `type[ValueError]`"),
     ("class In(BaseModel):\n    t: tuple[int, str, ...]", "a variable tuple has one type"),
-    ("class In(BaseModel):\n    xs: Iterable[int]", "`Iterable[int]` is not supported"),
+    ("class In(BaseModel):\n    xs: MutableSequence[int]", "`MutableSequence[int]` is not supported"),
+    ("class In(BaseModel):\n    xs: Iterable[int] = [1]", "an Iterable field with a default other than None is not supported"),
     ("class In(BaseModel):\n    p: Base | Holder[int] = Field(discriminator=Discriminator(lambda v: 'x'))",
      "needs a Tag('...')"),
     ("class In(BaseModel):\n    p: Annotated[Base, Tag('b')] | Annotated[Holder[int], Tag('h')] = "
@@ -2799,7 +3040,7 @@ async def x(b: In):
      "Discriminator custom errors: a type, a message and a dict of strings are supported"),
     ("from pydantic import MISSING\n\n\nclass In(BaseModel):\n    f: MISSING = MISSING", "library value `pydantic.MISSING` is not supported"),
     ("class Odd:\n    @classmethod\n    def __get_pydantic_core_schema__(cls, s, h):\n        return h(int)\n\n\n"
-     "class In(BaseModel):\n    o: Odd", "customizes its Pydantic schema"),
+     "class In(BaseModel):\n    o: list[Odd]", "customizes its Pydantic schema"),
     ("from pydantic import RootModel\n\n\nclass In(RootModel[list[int]]):\n    @field_validator('root')\n    @classmethod\n"
      "    def v(cls, x):\n        return x", "validators, serializers, extra= or aliases on a RootModel are not supported"),
     ("class In(BaseModel):\n    c: complex = Field(0, ge=1)", "constraints on `complex` are not supported"),
@@ -3040,3 +3281,700 @@ def test_pyyaml_outside_subset_rejected(tmp_path, capsys, body, msg):
     err = capsys.readouterr().err
     assert msg in err, err
     assert "main.py:10" in err
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # match arms of a tuple pattern: `(Kind::Httpx, "reason_phrase") | (..)`, `(Sql::Insert(..), "excluded") if ..`
+        "import httpx\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n"
+        "    async with httpx.AsyncClient() as c:\n        r = await c.get('http://h')\n    return {'a': r.reason_phrase}\n",
+        # `methods::setattr(wrapper, "__wrapped__", ..)`: functools.wraps
+        "import functools\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\ndef deco(f):\n    @functools.wraps(f)\n"
+        "    def w(*a):\n        return f(*a)\n    return w\n\n\n@deco\ndef g():\n    return 1\n\n\n"
+        "@app.get('/x')\nasync def x():\n    return {'a': g.__wrapped__.__name__}\n",
+        # OAuth2PasswordRequestForm's fields, built by the generator
+        "from fastapi import Depends, FastAPI\nfrom fastapi.security import OAuth2PasswordRequestForm\n\napp = FastAPI()\n\n\n"
+        "@app.post('/x')\nasync def x(form: OAuth2PasswordRequestForm = Depends()):\n"
+        "    return {'a': [form.grant_type, form.scopes, form.client_id]}\n",
+    ],
+)
+def test_runtime_attributes_accepted(tmp_path, source):
+    """Attributes some runtime value provides are not refused as certain AttributeErrors (they were only accepted
+    when another module of the project made every attribute open, as fixtures/dynapp did with a __getattr__)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(source)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+
+
+def test_scope_state_keys_are_request_state_attributes(tmp_path):
+    """A raw ASGI middleware's `scope.setdefault("state", {})["rid"] = v` is Starlette's `request.state.rid`."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI, Request\n\napp = FastAPI()\n\n\n"
+        "class Stamp:\n    def __init__(self, app):\n        self.app = app\n\n"
+        "    async def __call__(self, scope, receive, send):\n"
+        "        scope.setdefault('state', {})['rid'] = 'r1'\n        await self.app(scope, receive, send)\n\n\n"
+        "app.add_middleware(Stamp)\n\n\n"
+        "@app.get('/x')\nasync def x(request: Request):\n    return {'a': request.state.rid}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+
+
+LIBS9_APP = """
+import mimetypes
+
+from fastapi import FastAPI
+from itsdangerous import URLSafeSerializer
+
+app = FastAPI()
+S = URLSafeSerializer("k", salt="s")
+
+
+@app.get("/x")
+async def x(t: str):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("mimetypes.add_type('a/b', '.ab')", "library call `mimetypes.add_type()` is not supported"),
+    ("mimetypes.guess_type(t, strict=False, x=1)", "mimetypes.guess_type(x=) is not supported"),
+    ("mimetypes.guess_type(t, False, 1)", "mimetypes.guess_type() takes at most 2 positional arguments here"),
+    ("mimetypes.guess_type()", "mimetypes.guess_type() needs its url argument"),
+    ("mimetypes.guess_file_type(t)", "mimetypes.guess_file_type() needs Python 3.13 (the project runs on 3.12"),
+    ("mimetypes.types_map[t]", "mimetypes.types_map"),
+    ("URLSafeSerializer('k', serializer=None).dumps(1)", "URLSafeSerializer(serializer=) is not supported"),
+    ("S.loads_unsafe(t)", "method .loads_unsafe() is not implemented by the runtime"),
+])
+def test_libs_09_outside_subset_rejected(tmp_path, capsys, monkeypatch, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(LIBS9_APP.format(stmt=stmt))
+    monkeypatch.setenv("PY2AXUM_TARGET_PYTHON", "3.12")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:13" in err
+
+
+QUERY_MAIN = """
+import itertools
+import string
+
+from fastapi import Depends, FastAPI, Query
+from sqlalchemy import ARRAY, Integer, bindparam, case, func, literal_column, select, text, union_all
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .models import Team
+from .deps import make
+
+app = FastAPI()
+
+
+def use(s, x):
+    return {body}
+
+
+@app.get("/x")
+async def x(s: str, d=Depends({dep})):
+    return use(s, d)
+"""
+
+QUERY_DEPS = """
+from fastapi import Query
+
+LIMIT = 3
+
+
+def make(query: Query = Query(None), kind: type = str):
+{factory}
+"""
+
+GOOD_FACTORY = "    def inner(v: list[str] = query):\n        return [kind(x) for x in v]\n\n    return inner\n"
+
+
+@pytest.mark.parametrize("body, dep, factory, msg, where", [
+    # window frames, recursive CTEs, LATERAL/CTE options: not rendered
+    ("func.rank().over(order_by=Team.id, rows=(None, 0))", "make()", GOOD_FACTORY, ".over(rows=) is not supported", "main.py:17"),
+    ("func.rank().over(Team.id)", "make()", GOOD_FACTORY, ".over() takes at most 0 positional arguments", "main.py:17"),
+    ("select(Team.id).cte('c', recursive=True)", "make()", GOOD_FACTORY, ".cte(recursive=) is not supported", "main.py:17"),
+    ("select(Team.id).cte('c', True)", "make()", GOOD_FACTORY, ".cte() takes at most 1 positional argument", "main.py:17"),
+    ("select(Team.id).lateral('l', flat=True)", "make()", GOOD_FACTORY, ".lateral(flat=) is not supported", "main.py:17"),
+    ("postgresql.array(s, type_=int)", "make()", GOOD_FACTORY, "array(items) only: type_= is not supported", "main.py:17"),
+    ("literal_column('x', type_=int)", "make()", GOOD_FACTORY, "literal_column(text) only", "main.py:17"),
+    ("union_all(select(Team.id), select(Team.id), x=1)", "make()", GOOD_FACTORY, "keyword arguments are not supported", "main.py:17"),
+    ("select(Team.id).where(Team.name == func.any(bindparam('b', type_=ARRAY(Integer))))", "make()", GOOD_FACTORY,
+     "bindparam(type_=) is supported with ARRAY(String()) only", "main.py:17"),
+    ("list(itertools.chain([1], [2]))[0] + next(itertools.chain([s]))", "make()", GOOD_FACTORY,
+     "itertools.chain() is supported consumed whole only", "main.py:17"),
+    ("select(Team).subquery(text('SELECT 1').columns(Team.id))", "make()", GOOD_FACTORY,
+     "method .columns() (text().columns(), a TextualSelect) is not supported", "main.py:17"),
+    # a library function's name is no method of a runtime value: `re.compile` does not make `stmt.compile()` exist
+    ("str(select(Team.id).compile())", "make()", GOOD_FACTORY, "method .compile() is not implemented by the runtime", "main.py:17"),
+    # Formatter().parse() only consumed whole: CPython's iterator raises on the failing item, after the others
+    ("[p for p in string.Formatter().parse(s)]", "make()", GOOD_FACTORY, "parse() inside list() or tuple()", "main.py:17"),
+    # dependency factories: only functions defined then one returned; constant arguments named alike in both modules
+    ("x", "make(Query([]), int)", "    n = 1\n\n    def inner(v: list[str] = query):\n        return v\n\n    return inner\n",
+     "a dependency factory must only define functions and return one of them", "deps.py:7"),
+    ("x", "make(Query([]), int)", "    def inner(v: list[str] = query):\n        kind = int\n        return v\n\n    return inner\n",
+     "the factory parameter `kind` is reassigned in inner()", "deps.py:9"),
+    ("x", "make(Query([]), int)", "    def inner(v: list[str] = query):\n        return [query, v]\n\n    return inner\n",
+     "a FastAPI marker argument is only supported as a parameter default", "deps.py:9"),
+    ("x", "make(Query([]), lambda v: v)", GOOD_FACTORY, "unsupported argument `lambda v: v`", "main.py:21"),
+    ("x", "make(Query(LIMIT))", GOOD_FACTORY, "`LIMIT` does not name the same object", "main.py:21"),
+    ("x", "make(Query(), str)", "    def inner(v: list[str] = query):\n        return query.default\n\n    return inner\n",
+     "`query.default`: the marker has no default", "deps.py:9"),
+])
+def test_query_constructs_outside_subset_rejected(tmp_path, capsys, body, dep, factory, msg, where):
+    """Window functions, CTEs, LATERAL, Formatter().parse() and dependency factories: what the runtime does not
+    reproduce is refused with its line."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(MODELS.format(rel=""))
+    (pkg / "deps.py").write_text(QUERY_DEPS.format(factory=factory))
+    (pkg / "main.py").write_text(QUERY_MAIN.format(body=body, dep=dep))
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert where in err, err
+
+
+def test_column_type_keyword_with_positional_type_rejected(tmp_path, capsys):
+    """mapped_column(type_=T) is the column's type; with a positional type too, SQLAlchemy raises: refused"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(MODELS.format(rel="size = mapped_column(String(5), type_=String(9))"))
+    (pkg / "main.py").write_text(MAIN)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "column size: type_= with a positional type is not supported" in err, err
+    assert "models.py:17" in err, err
+
+
+NT_MAIN = """
+from typing import NamedTuple
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+class P(NamedTuple):
+    a: int
+{body}
+
+
+@app.get("/x")
+async def x():
+    return P(1)
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("    _b: int = 0", "field names cannot start with an underscore: '_b'"),
+    ("    b: list = []", "only a literal immutable default"),
+    ("    b: int = len('x')", "only a literal immutable default"),
+    ("    def __repr__(self):\n        return 'p'", "NamedTuple P: method __repr__ is not supported"),
+    ("    def _hidden(self):\n        return 1", "NamedTuple P: method _hidden is not supported"),
+    ("    def a(self):\n        return 1", "NamedTuple P: method a is not supported"),
+])
+def test_namedtuple_outside_subset_rejected(tmp_path, capsys, body, msg):
+    """typing.NamedTuple: what CPython refuses at class creation, a default shared by every instance that is not a
+    literal immutable value, and the tuple's own dunders or _methods overridden are refused with their line."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(NT_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:1" in err, err
+ROUTE_CLASS_APP = """
+from collections.abc import Callable
+
+from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi.routing import APIRoute
+
+
+class R(APIRoute):
+{body}
+
+
+app = FastAPI()
+router = APIRouter(route_class=R)
+
+
+@router.get("/x")
+async def x():
+    return {{}}
+
+
+app.include_router(router)
+{tail}
+"""
+
+GRH = """    def get_route_handler(self) -> Callable:
+        original = super().get_route_handler()
+
+        async def h(request: Request) -> Response:
+            return await original(request)
+
+        return h"""
+
+
+@pytest.mark.parametrize("body, tail, msg", [
+    (GRH.replace("original = super().get_route_handler()", "original = super().get_route_handler()\n        print(self.path)"), "",
+     "R.get_route_handler(): `self` (the APIRoute: path, endpoint, dependant...) is not supported"),
+    (GRH + "\n\n    def matches(self, scope):\n        return super().matches(scope)", "",
+     "R.matches(): a custom route class may only override get_route_handler()"),
+    (GRH, "app.router.route_class = R\napp.router.route_class = APIRoute",
+     "`app.router.route_class` set more than once is not supported"),
+    (GRH, "app.openapi = None", "assigning `app.openapi` at module level is not supported"),
+])
+def test_route_class_outside_subset_rejected(tmp_path, capsys, body, tail, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(ROUTE_CLASS_APP.format(body=body, tail=tail))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+CORE_SCHEMA_APP = """
+from dataclasses import dataclass
+from typing import Annotated, Any
+
+from fastapi import FastAPI
+from pydantic import BaseModel, GetPydanticSchema
+from pydantic_core import core_schema
+
+
+class T:
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler) -> core_schema.CoreSchema:
+{hook}
+
+
+class M(BaseModel):
+    x: {ann}
+
+
+app = FastAPI()
+
+
+@app.post("/x")
+def x(m: M):
+    return {use}
+"""
+
+
+@pytest.mark.parametrize("hook, ann, use, msg", [
+    ("        return core_schema.union_schema([core_schema.int_schema(), core_schema.str_schema()])", "T", "1",
+     "core_schema.union_schema() is not supported"),
+    ("        raise ValueError('no')", "T", "1", "this hook raises (pydantic refuses the model)"),
+    ("        return handler(source)", "T", "1", "handler(source) on the class that defines the hook is not supported"),
+    ("        return core_schema.int_schema(multiple_of=2, foo=1)", "T", "1", "core_schema.int_schema(foo=) is not supported"),
+    ("        return core_schema.no_info_after_validator_function(lambda v: cls, handler(int))", "T", "1",
+     "a lambda using the hook's names is not supported"),
+    ("        return core_schema.int_schema()", "Annotated[int, GetPydanticSchema(lambda tp, h: h(tp)), 'doc']", "1",
+     "after a schema hook in Annotated[...] is not supported"),
+    ("        print(source)\n        return core_schema.int_schema()", "T", "1", "`print(source)` is not supported"),
+    ("        return core_schema.int_schema()", "T", "M.model_json_schema()", "model_json_schema"),
+])
+def test_core_schema_outside_subset_rejected(tmp_path, capsys, hook, ann, use, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(CORE_SCHEMA_APP.format(hook=hook, ann=ann, use=use))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+DC_APP = """
+from fastapi import FastAPI
+import pydantic.dataclasses as pdc
+
+
+@pdc.dataclass{opts}
+class P:
+    name: str
+
+
+app = FastAPI()
+
+
+@app.post("/x")
+def x(p: P):
+    return {use}
+"""
+
+
+@pytest.mark.parametrize("opts, use, msg", [
+    ("", "P(name='a')", "calling the pydantic dataclass P(...) is not supported"),
+    ("(frozen=True)", "p", "@pydantic.dataclasses.dataclass(...) options are not supported (P)"),
+])
+def test_pydantic_dataclass_outside_subset_rejected(tmp_path, capsys, opts, use, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(DC_APP.format(opts=opts, use=use))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize("expr", ["2**62 - 1 + 2**62", "-(2**62) * 2", "[10**x for x in (3, 6, 18)]", "1 << 62", "2**-1",
+                                  "[x * 2**40 for x in range(10**6)]", "10**18 // 3"])
+def test_integer_expressions_in_range_accepted(tmp_path, expr):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(f"from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n"
+                                 f"    return {{'a': {expr}}}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+
+
+@pytest.mark.parametrize("use", ["await H.am(H(), 1)", "await (H.am)(H(), 1)", "len([H.am])"])
+def test_async_method_read_on_its_class_rejected(tmp_path, capsys, use):
+    """the runtime reads a method on its class as a function it runs at once: an `async def` would not make a
+    coroutine (refused at run time too, through a class held as a value)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\n\napp = FastAPI()\n\n\nclass H:\n    async def am(self, n):\n        return n\n\n\n"
+        f"@app.get('/x')\nasync def x():\n    return {{'a': {use}, 'b': await H().am(2)}}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "the async method H.am read on its class is not supported" in err
+    assert "P2A0101" in err and "main.py:13" in err
+
+
+MAIL_DNS_APP = """
+import email.policy
+from email.message import EmailMessage
+
+import dns.resolver
+from fastapi import FastAPI
+
+app = FastAPI()
+R = dns.resolver.Resolver(configure=False)
+
+
+@app.get("/x")
+async def x(t: str):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("EmailMessage(policy=email.policy.compat32)", "email.policy.compat32"),
+    ("EmailMessage(email.policy.SMTP)", "EmailMessage() takes at most 0 positional arguments here"),
+    ("EmailMessage().set_content(t, disposition='attachment')", ".set_content(disposition=) is not supported"),
+    ("EmailMessage().set_content(b'x', maintype='application', subtype='pdf')", ".set_content(maintype=) is not supported"),
+    ("EmailMessage().get_content()", "method .get_content() is not implemented by the runtime"),
+    ("EmailMessage().add_attachment(b'x')", "method .add_attachment() is not implemented by the runtime"),
+    ("dns.resolver.resolve(t, 'MX', source='10.0.0.1')", "resolve(source=) is not supported"),
+    ("R.resolve(t, 'MX', source_port=5353)", ".resolve(source_port=) is not supported"),
+    ("dns.resolver.Resolver(filename='/x', configure=True, extra=1)", "Resolver(extra=) is not supported"),
+    ("dns.resolver.query(t, 'MX')", "dns.resolver.query"),
+    ("R.resolve_name(t)", "method .resolve_name() is not implemented by the runtime"),
+])
+def test_email_dns_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(MAIL_DNS_APP.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:14" in err, err
+
+
+@pytest.mark.parametrize("ann", ["P", "list[P] = []", "P | None = None"])
+def test_namedtuple_as_pydantic_type_rejected(tmp_path, capsys, ann):
+    """pydantic-core validates a NamedTuple field as call arguments (tuple, list or dict; named_tuple_type in 2.14,
+    arguments_type before): validated like a model it gave other errors (corpus validation_errors.md:1664)"""
+    err = _reject(tmp_path, capsys, f'''
+        from typing import NamedTuple
+
+        from fastapi import FastAPI
+        from pydantic import BaseModel
+
+        app = FastAPI()
+
+
+        class P(NamedTuple):
+            x: int
+
+
+        class M(BaseModel):
+            p: {ann}
+
+
+        @app.post("/m")
+        def m(item: M):
+            return 1
+    ''')
+    assert "type `P` is not supported as a Pydantic type: a NamedTuple" in err, err
+    assert "main.py:15" in err, err
+PYDX_APP = """
+import dataclasses
+from datetime import date, datetime, timezone
+from typing import Annotated, Any, NamedTuple
+
+from fastapi import FastAPI
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, PrivateAttr, with_config
+from zoneinfo import ZoneInfo
+
+
+class P(NamedTuple):
+    x: int
+
+
+@dataclasses.dataclass
+class D:
+    name: str
+
+
+{defs}
+
+
+app = FastAPI()
+
+
+@app.post("/x")
+def x(m: M):
+    return {use}
+"""
+
+
+@pytest.mark.parametrize("defs, use, msg", [
+    ("class M(BaseModel):\n    p: P", "1", "type `P` is not supported as a Pydantic type: a NamedTuple"),
+    ("class M(BaseModel):\n    p: list[P] = []", "1", "type `P` is not supported as a Pydantic type: a NamedTuple"),
+    ("class M(BaseModel):\n    d: datetime = Field(gt=date(2000, 1, 1))", "1", "a `datetime` bound must be a datetime(...) value"),
+    ("class M(BaseModel):\n    d: date = Field(lt=datetime(2000, 1, 1))", "1", "a `date` bound must be a date(...) value"),
+    ("class M(BaseModel):\n    d: datetime = Field(gt=5)", "1", "a `datetime` bound must be a datetime(...) value"),
+    ("class M(BaseModel):\n    d: AwareDatetime = Field(max_length=3)", "1", "max_length= does not apply to `datetime`"),
+    ("class M(BaseModel):\n    n: int = Field(gt=datetime(2000, 1, 1))", "1", "a datetime bound does not apply to `int`"),
+    ("class M(BaseModel):\n    d: datetime = Field(gt=datetime(2000, 13, 1))", "1", "raises ValueError: month must be in 1..12"),
+    ("class M(BaseModel):\n    d: datetime = Field(gt=datetime(2000, 1, 1, tzinfo=ZoneInfo('Europe/Paris')))", "1",
+     "`ZoneInfo('Europe/Paris')` is not a constant"),
+    ("class M(BaseModel):\n    model_config = ConfigDict(strict=True)\n    d: D", "1",
+     "dataclass D in a model with strict= or extra= in its model_config is not supported"),
+    ("class M(BaseModel):\n    model_config = ConfigDict(extra='forbid')\n    d: list[D] = []", "1",
+     "dataclass D in a model with strict= or extra= in its model_config is not supported"),
+    ("@dataclasses.dataclass\n@with_config(extra='forbid')\nclass W:\n    a: str\n\n\nclass M(BaseModel):\n    w: W", "1",
+     "@with_config(extra=) is not supported"),
+    ("class M(BaseModel):\n    x: int\n    def model_post_init(self, context, other):\n        pass", "1",
+     "only `def model_post_init(self, context)` is supported"),
+    ("class M(BaseModel):\n    x: int\n    def model_post_init(self, context: Any) -> None:\n        pass", "M.model_construct(x=1)",
+     "model_construct(): model_post_init is not supported, nor a private attribute with a computed default"),
+    ("class M(BaseModel):\n    x: int\n    _at: datetime = PrivateAttr(default_factory=datetime.now)", "M.model_construct(x=1)",
+     "model_construct(): model_post_init is not supported, nor a private attribute with a computed default"),
+])
+def test_pydantic_corpus_constructions_outside_subset_rejected(tmp_path, capsys, defs, use, msg):
+    """NamedTuple fields (validated as call arguments, differently by pydantic version), datetime bounds of another
+    type, a stdlib dataclass under a model whose strict=/extra= would apply to it, model_post_init's signature"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PYDX_APP.format(defs=defs, use=use))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+FAPI_APP = """
+from typing import Annotated, Any
+
+from fastapi import Body, Depends, FastAPI, HTTPException, Response, Security
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, SecurityScopes
+from pydantic import AfterValidator
+
+app = FastAPI()
+SCOPES = ["a"]
+
+
+def gen():
+    yield 1
+
+
+def dep(s: SecurityScopes):
+    return s.scopes
+
+
+{defs}
+"""
+
+
+@pytest.mark.parametrize("defs, msg", [
+    ("class B(HTTPBearer):\n    def make_not_authenticated_error(self):\n        return HTTPException(403, self.scheme_name)\n\n\n"
+     "@app.get('/x')\ndef x(c=Depends(B())):\n    return 1", "reading `self` is not supported"),
+    ("class B(HTTPBearer):\n    realm = 'x'\n\n\n@app.get('/x')\ndef x(c=Depends(B())):\n    return 1",
+     "only `def make_not_authenticated_error(self)` and `def make_authenticate_headers(self)` overrides are supported"),
+    ("@app.get('/x')\ndef x(s=Security(dep, scopes=SCOPES)):\n    return 1", "Security(scopes=) must be a literal list of strings"),
+    ("@app.get('/x')\ndef x(s=Depends(dep, scopes=['a'])):\n    return 1", "Depends(scopes=) is not supported"),
+    ("@app.get('/x')\ndef x(q: Annotated[list[int], AfterValidator(sorted)] = []):\n    return 1",
+     "AfterValidator(sorted) on a parameter: a lambda or a function of the project is supported"),
+    ("@app.post('/x')\ndef x(b: Annotated[dict, Body(), AfterValidator(lambda v: v)]):\n    return 1",
+     "AfterValidator on a body parameter is not supported"),
+    ("@app.get('/x')\ndef x(q: Annotated[str, AfterValidator(lambda v, info: v)] = 'a'):\n    return 1",
+     "an AfterValidator taking `info` on a parameter is not supported"),
+    ("@app.get('/x')\ndef x():\n    def g():\n        yield from gen()\n    return StreamingResponse(g())",
+     "`yield from` is supported as a statement over a file"),
+    ("class R(Response):\n    charset = 'latin-1'\n\n\n@app.get('/x', response_class=R)\ndef x():\n    return 1",
+     "only `media_type = \"...\"` and `def render(self, content)` are supported"),
+    ("class R(Response):\n    def render(self, content: Any) -> bytes:\n        return self.media_type.encode()\n\n\n"
+     "@app.get('/x', response_class=R)\ndef x():\n    return 1", "response class R.render: reading `self` is not supported"),
+    ("class R:\n    pass\n\n\n@app.get('/x', response_class=R)\ndef x():\n    return 1",
+     "response_class=R: a subclass of one fastapi/starlette response class"),
+    ("class R(StreamingResponse):\n    def render(self, content: Any) -> bytes:\n        return b''\n\n\n"
+     "@app.get('/x', response_class=R)\ndef x():\n    yield b'a'", "a generator endpoint with a response class overriding render()"),
+])
+def test_fastapi_corpus_constructions_outside_subset_rejected(tmp_path, capsys, defs, msg):
+    """security scheme subclasses and response class subclasses beyond their overridable hooks, Security scopes not
+    literal, AfterValidator on parameters beyond functions of the project, `yield from` a generator"""
+    err = _reject(tmp_path, capsys, FAPI_APP.format(defs=defs))
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize("call", [
+    "create_model('M', x=int, __config__={'strict': True})",
+    "create_model('Other', x=int)",
+    "create_model('M', x=(int,))",
+    "create_model('M', __validators__={'v': field_validator('x')(lambda cls, v: v)}, x=int)",
+    "create_model(NAME, x=int)",
+])
+def test_create_model_outside_subset_rejected(tmp_path, capsys, call):
+    """`create_model` is rewritten into a class only in the forms listed in py2axum/pydrewrite.py; any other call is
+    left as written and refused"""
+    err = _reject(tmp_path, capsys, f'''
+        from fastapi import FastAPI
+        from pydantic import create_model, field_validator
+
+        NAME = "M"
+        M = {call}
+        app = FastAPI()
+
+
+        @app.post("/x")
+        def x(m: M):
+            return 1
+    ''')
+    assert "create_model" in err or "is not a Pydantic model" in err, err
+    assert "main.py:" in err, err
+
+
+@pytest.mark.parametrize("opt", ["{'tracer_provider': None}", "{'tracing': 1}", "CFG", "{'exclude': lambda scope: True}"])
+def test_fastapi_telemetry_outside_subset_rejected(tmp_path, capsys, opt):
+    """FastAPI(telemetry=): only the literal on/off switches (the binary emits no OpenTelemetry data)"""
+    err = _reject(tmp_path, capsys, f'''
+        from fastapi import FastAPI
+
+        CFG = {{"tracing": False}}
+        app = FastAPI(telemetry={opt})
+
+
+        @app.get("/x")
+        def x():
+            return 1
+    ''')
+    # FastAPI(telemetry=) appeared in FastAPI 0.142: before, any use is refused for that reason
+    from importlib.metadata import version
+
+    old = tuple(int(x) for x in version("fastapi").split(".")[:2]) < (0, 142)
+    msg = "FastAPI(telemetry=...) appeared in FastAPI 0.142" if old else "FastAPI(telemetry=...) is supported as a dict literal"
+    assert msg in err, err
+    assert "main.py:" in err, err
+
+
+def test_graphql_router_rejected(tmp_path, capsys):
+    """strawberry's GraphQLRouter held in a module variable: a router of a library (refused, decision of 16/10),
+    with the way to leave it to Python"""
+    err = _reject(tmp_path, capsys, '''
+        import strawberry
+        from fastapi import FastAPI
+        from strawberry.fastapi import GraphQLRouter
+
+
+        @strawberry.type
+        class Query:
+            @strawberry.field
+            def hello(self) -> str:
+                return "x"
+
+
+        graphql_app = GraphQLRouter(strawberry.Schema(query=Query))
+        app = FastAPI()
+        app.include_router(graphql_app, prefix="/graphql")
+    ''')
+    assert "`graphql_app` is a router of the library `strawberry`" in err, err
+    assert "--python-side mount" in err and "main.py:16" in err, err
+
+
+PROTO_APP = """
+from fastapi import FastAPI
+{imports}
+
+
+class K:
+    LIMIT = 3
+{body}
+
+
+app = FastAPI()
+
+
+@app.get('/x')
+async def x():
+    return {{'a': {use}}}
+"""
+
+
+@pytest.mark.parametrize("imports, body, use, msg", [
+    ("", "    def __hash__(self):\n        return 1", "len({K(): 1})", "class K: method __hash__ is not supported"),
+    ("import copy", "    def __deepcopy__(self, memo):\n        return self", "K() is not None",
+     "class K: method __deepcopy__ is not supported"),
+    ("", "    def __getstate__(self):\n        return {}", "K().__getstate__()", "class K: method __getstate__ is not supported"),
+    ("", "    def f(self, n=LIMIT):\n        return n\n    LIMIT = 4", "K().f()", "LIMIT__rebound_later_in_class_K"),
+    ("", "    def __index__(self):\n        return 1", "[1, 2][K()]", "class K: method __index__ is not supported"),
+])
+def test_protocol_outside_subset_rejected(tmp_path, capsys, imports, body, use, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PROTO_APP.format(imports=imports, body=body, use=use))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+def test_module_function_attribute_rebound_rejected(tmp_path, capsys):
+    """`mod.f = other` replaces a function of a module (monkeypatching): refused (only variables are rebound)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "conf.py").write_text("def f():\n    return 1\n")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom . import conf\n\napp = FastAPI()\n\n\n@app.get('/x')\n"
+                                 "async def x():\n    conf.f = len\n    return {'a': 1}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "assigning `conf.f` (an attribute of module proj.conf) is not supported" in err, err

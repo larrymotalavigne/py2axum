@@ -61,7 +61,7 @@ release then (`--python 3.13.5` or `.python-version`).
 
 | Status | Meaning |
 |---|---|
-| **Supported** | Translated with the behaviour of the project's Python; a conformance case proves it (`fixtures/dynapp`: `pyver.py` on every Python, `py314.py` and `py315.py` on the Pythons that have their syntax) |
+| **Supported** | Translated with the behaviour of the project's Python; a conformance case proves it (`fixtures/langapp`: `pyver.py` on every Python, `py314.py` and `py315.py` on the Pythons that have their syntax) |
 | **Refused** | Refused at translation with `file:line` and an error code, or by a run-time `TypeError` of py2axum where the value is only known then (noted). `--python-side` leaves the route to Python |
 | **Difference** | Translated, with a documented difference |
 | **N/A** | Not observable by an HTTP client of a web API (packaging, interpreter internals, command-line tools, platforms), or concerns a library py2axum does not translate |
@@ -177,7 +177,7 @@ release then (`--python 3.13.5` or `.python-version`).
 | `collections.Counter` `^` (symmetric difference) | Supported | `/pyver/counter_xor`; before 3.15 the `TypeError` names `Counter` (the runtime said `dict` on every Python) |
 | `functools.singledispatchmethod`, `threading` iterator helpers, `pprint(expand=)` | Refused | |
 | `typing`: `TypeForm`, `TypedDict(closed=, extra_items=)` (PEP 728), `@disjoint_base` | Refused | A `TypedDict` as a request or response type is refused (P2A0410); elsewhere it is a `dict`, unchanged |
-| `email` refuses to flatten a non-ASCII address it cannot encode (`HeaderWriteError`) | N/A | Only under a policy with header objects (`EmailMessage`, `policy.default`), not translated (P2A0201). The compat32 messages the runtime builds (`MIMEText`, `MIMEMultipart`...) encode such an address whole on every Python, unchanged (`/mail/build?to=...`) |
+| `email` refuses to flatten a non-ASCII address it cannot encode (`HeaderWriteError`) | Supported | `EmailMessage` (dynrt/emailhdr.rs) folds with 3.15's rules on 3.15 (`/emailx/run`). The compat32 messages the runtime builds (`MIMEText`, `MIMEMultipart`...) encode such an address whole on every Python, unchanged (`/mail/build?to=...`) |
 | `unicodedata` 17.0 and its new functions | Refused (P2A0201) for the new functions; Supported for `normalize`, `combining` | See 3.14 |
 | `importlib.metadata`, `hashlib`, `http.client`, `http.cookies`, `ssl`, `sqlite3`, `tomllib` 1.1, `xml`, `zlib`, `os.statx`, `Path.mkdir(parent_mode=)`... | N/A | Not used by a request handler, or not translated |
 

@@ -73,6 +73,7 @@ What a scenario can define:
 | `normalize(body)` or `normalize(body, path)` | applied to every parsed JSON body before comparison. |
 | `normalize_text(text)` | the same for bodies that are not JSON. |
 | `SETTLE` | seconds to wait after each request that is not a GET or HEAD. |
+| `REFERENCE_APP` | `"module:app"`: wait (`SETTLE`) only after the writes that can do work once answered, read from that application — a `yield` dependency, BackgroundTasks, a module that starts tasks or threads, user middlewares, a route not found (`tests/settle.py`); the same for both servers. |
 | `HEADER_MASKS` | names of compared headers whose value is random on both sides (`x-request-id`). |
 | `COOKIE_MASKS`, `FILE_MASKS` | `(regex, replacement)` pairs applied to `Set-Cookie` values and download headers. |
 
@@ -117,7 +118,9 @@ which have no `content-length` and are therefore compressed even under `GZipMidd
 - **Empty tables, do not recreate them** while the servers run: the binary keeps prepared statements, and
   PostgreSQL refuses a cached plan whose result type changed.
 - **`SETTLE`**: a FastAPI session dependency with `yield` commits *after* the response is sent, so the next
-  request can read the database before the commit lands (the reference is racy; the binary is not).
+  request can read the database before the commit lands (the reference is racy; the binary is not). With many
+  writes the pause dominates the run: `REFERENCE_APP` keeps it only where work can follow the response (a write
+  without any cannot hide a difference by going faster, only show a race).
 - **Order without `ORDER BY`** is up to PostgreSQL, on both sides: give your queries an order, or normalize.
 - **Keep-alive after a 500**: uvicorn closes the connection after an unhandled exception; the harness resends
   the next request once.
@@ -191,7 +194,10 @@ URL taken from the request.
 
 | Scenario | Application | Steps |
 |---|---|---:|
-| `dynapp` | `fixtures/dynapp`: the reference app (every supported construct) | ~1 000 |
+| `dynapp` | `fixtures/dynapp`: the reference app (CRUD, ORM, raw ASGI middlewares, lifespan, WebSockets) | ~630 |
+| `langapp` | `fixtures/langapp`: the Python language, its standard library and Pydantic | ~1 300 |
+| `integapp` | `fixtures/integapp`: libraries and platform (logging, metrics, JWT, retries, messaging) | ~370 |
+| `libapp` | `fixtures/libapp`: orjson, PyYAML, croniter, Unidecode, aio-pika, ecs-logging | ~2 000 |
 | `syncapp` | `fixtures/syncapp`: synchronous SQLAlchemy sessions | 57 |
 | `factoryapp` | `fixtures/factoryapp`: app factory, middleware stack, exception handlers | 37 |
 | `examples/bookshelf/scenario.py` | [`examples/bookshelf`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/bookshelf), in hybrid mode | 75 |

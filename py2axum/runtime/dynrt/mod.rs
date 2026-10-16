@@ -24,11 +24,15 @@ pub mod thread;
 pub mod types;
 pub mod sysmon;
 pub mod mail;
+pub mod emailhdr;
+pub mod emailmsg;
+pub mod dnsres;
 pub mod nh3;
 pub mod net;
 pub mod resp;
 pub mod pathio;
 pub mod pickle;
+pub mod proto;
 pub mod rds;
 pub mod rmq;
 pub mod satable;
@@ -126,6 +130,8 @@ pub struct CxInner {
     pub task_no: std::sync::OnceLock<u64>,
     /// the route the router chose (FastAPI's endpoint context of a validation error)
     pub route_def: std::sync::OnceLock<&'static web::RouteDef>,
+    /// the stages of the request still running (`web::Phase`): the last to end frees `request.state`
+    pub phases: std::sync::atomic::AtomicUsize,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -152,6 +158,7 @@ impl CxInner {
             root: std::sync::atomic::AtomicBool::new(false),
             task_no: std::sync::OnceLock::new(),
             route_def: std::sync::OnceLock::new(),
+            phases: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -179,6 +186,10 @@ pub async fn session(cx: &Cx) -> R {
 }
 
 pub fn request(cx: &Cx) -> V {
+    // a custom route class's Request subclass, while the route's handler runs on it
+    if let Some(r) = cx.req.custom_request.lock().clone() {
+        return r;
+    }
     V::native(Native::Request(cx.req.clone()))
 }
 
@@ -520,6 +531,9 @@ fn settings_complex(td: &pyd::TD) -> Option<bool> {
 
 /// `x += y`: lists are extended in place (aliases see it), everything else is `x = x + y`.
 pub fn iadd(a: &V, b: &V) -> R {
+    if let Some(r) = proto::inplace(a, "+", b) {
+        return r;
+    }
     if let V::List(l) = a {
         let items = ops::iter(b)?;
         l.lock().extend(items);

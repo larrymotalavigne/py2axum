@@ -183,7 +183,7 @@ pub fn is_asgi_app(f: &V) -> bool {
     matches!(f, V::Obj(_) | V::Inst(_))
 }
 
-pub(crate) fn d(items: Vec<(&str, V)>) -> R {
+pub fn d(items: Vec<(&str, V)>) -> R {
     V::dict_from(items.into_iter().map(|(k, v)| (V::str(k), v)).collect())
 }
 
@@ -204,7 +204,7 @@ static MSG_KEYS: std::sync::LazyLock<Vec<(&'static str, Key)>> = std::sync::Lazy
         .collect()
 });
 
-pub(crate) fn get(m: &V, k: &str) -> R<Option<V>> {
+pub fn get(m: &V, k: &str) -> R<Option<V>> {
     match m {
         V::Dict(dm) => Ok(match MSG_KEYS.iter().find(|(n, _)| *n == k) {
             Some((_, key)) => dm.lock().get(key).map(|(_, v)| v.clone()),
@@ -698,6 +698,8 @@ pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
         body: body.unwrap_or_else(|| r.body.clone()),
         state: Mutex::new(r.state.lock().clone()),
         disconnected: std::sync::atomic::AtomicBool::new(false),
+        body_override: Mutex::new(None),
+        custom_request: Mutex::new(None),
     };
     let inner = super::CxInner::new(cx.app.clone(), cell);
     *inner.asgi_seen.lock() = Seen::of(scope)?;

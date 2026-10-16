@@ -357,7 +357,7 @@ fn default_release() -> Option<String> {
     None
 }
 
-fn hostname() -> Option<String> {
+pub fn hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if r != 0 {
@@ -850,7 +850,7 @@ fn level_name(levelno: i64) -> String {
 
 /// `type(exc).__module__` when it is not builtins: the project module, or the library's (a table of
 /// the library exceptions this runtime raises).
-pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
+pub fn exc_module(c: &'static Class) -> Option<&'static str> {
     if let ClassKind::UserException(d) = &c.kind {
         return Some(d.module);
     }
@@ -937,6 +937,33 @@ pub(crate) fn exc_module(c: &'static Class) -> Option<&'static str> {
         (&PYJWK_CLIENT_CONNECTION_ERROR, "jwt.exceptions"),
         (&PYJWT_INVALID_SUBJECT, "jwt.exceptions"),
         (&PYJWT_INVALID_JTI, "jwt.exceptions"),
+        (&STRUCT_ERROR, "struct"),
+        (&DNS_EXCEPTION, "dns.exception"),
+        (&DNS_FORM_ERROR, "dns.exception"),
+        (&DNS_SYNTAX_ERROR, "dns.exception"),
+        (&DNS_TIMEOUT, "dns.exception"),
+        (&DNS_LIFETIME_TIMEOUT, "dns.resolver"),
+        (&DNS_NXDOMAIN, "dns.resolver"),
+        (&DNS_YXDOMAIN, "dns.resolver"),
+        (&DNS_NO_ANSWER, "dns.resolver"),
+        (&DNS_NO_NAMESERVERS, "dns.resolver"),
+        (&DNS_NOT_ABSOLUTE, "dns.resolver"),
+        (&DNS_NO_ROOT_SOA, "dns.resolver"),
+        (&DNS_NO_METAQUERIES, "dns.resolver"),
+        (&DNS_NO_RESOLVER_CONFIGURATION, "dns.resolver"),
+        (&DNS_EMPTY_LABEL, "dns.name"),
+        (&DNS_BAD_ESCAPE, "dns.name"),
+        (&DNS_LABEL_TOO_LONG, "dns.name"),
+        (&DNS_NAME_TOO_LONG, "dns.name"),
+        (&DNS_BAD_POINTER, "dns.name"),
+        (&DNS_BAD_LABEL_TYPE, "dns.name"),
+        (&DNS_UNKNOWN_RDATATYPE, "dns.rdatatype"),
+        (&DNS_SHORT_HEADER, "dns.message"),
+        (&DNS_TRAILING_JUNK, "dns.message"),
+        (&DNS_BAD_EDNS, "dns.message"),
+        (&EMAIL_MESSAGE_ERROR, "email.errors"),
+        (&HEADER_PARSE_ERROR, "email.errors"),
+        (&HEADER_WRITE_ERROR, "email.errors"),
         (&BAD_DATA, "itsdangerous.exc"),
         (&BAD_SIGNATURE, "itsdangerous.exc"),
         (&BAD_TIME_SIGNATURE, "itsdangerous.exc"),
@@ -2199,15 +2226,13 @@ pub async fn request_end(cx: &Cx, status: u16) {
 /// `Task exception was never retrieved`: the task was dropped without its exception being read
 /// (asyncio's default exception handler logs it on the `asyncio` logger, the logging integration
 /// turns it into an event).
-pub fn task_never_retrieved(cx: Cx, e: Exc) {
+pub fn task_never_retrieved(cx: Cx, e: Exc, msg: String) {
     if !active() {
         return;
     }
     let Ok(h) = tokio::runtime::Handle::try_current() else { return };
     let trace = cx.sentry.get().map(|i| i.trace.lock().clone());
     h.spawn(async move {
-        let repr = ops::repr(&V::Exc(e.clone())).unwrap_or_default();
-        let msg = format!("Task exception was never retrieved\nfuture: <Task finished exception={repr}>");
         log_record_at(&cx, "asyncio", 40, &V::str(&msg), &[], &msg, Some(e), None, trace).await;
     });
 }

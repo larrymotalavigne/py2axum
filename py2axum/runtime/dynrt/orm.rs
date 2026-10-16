@@ -178,6 +178,9 @@ pub struct ColDesc {
     pub jsonb: bool,
     /// joined table inheritance: the table the column lives in, when it is not the model's (an inherited column)
     pub table: Option<&'static str>,
+    /// `sql` quoted like SQLAlchemy quotes it (`"end"`), and `table.column` the same way: computed at translation
+    pub qsql: &'static str,
+    pub qref: &'static str,
 }
 
 /// What a query does with a column of an entity it loads: load it, defer it (loaded when read), or leave
@@ -202,7 +205,7 @@ impl ColDesc {
     }
     /// the column's name in SQL (quoted when SQLAlchemy quotes it: `"end"`)
     pub fn q(&self) -> std::borrow::Cow<'static, str> {
-        quote_ident(self.sql)
+        std::borrow::Cow::Borrowed(self.qsql)
     }
 }
 
@@ -210,6 +213,9 @@ pub struct ModelDesc {
     pub name: &'static str,
     pub class_qualname: &'static str,
     pub table: &'static str,
+    /// `table` quoted, and every column as `table.column` (the columns clause of the entity): computed at translation
+    pub qtable: &'static str,
+    pub sel: &'static str,
     pub class: &'static Class,
     pub cols: &'static [ColDesc],
     /// first primary key column (the only one unless the key is composite)
@@ -404,12 +410,12 @@ impl ModelDesc {
     }
     /// the table's name in SQL (quoted like SQLAlchemy's PostgreSQL IdentifierPreparer: `"user"`)
     pub fn qt(&self) -> std::borrow::Cow<'static, str> {
-        quote_ident(self.table)
+        std::borrow::Cow::Borrowed(self.qtable)
     }
 
     /// `table.column` of a column (joined table inheritance: an inherited column is in its own table)
-    pub fn col_ref(&self, i: usize) -> String {
-        format!("{}.{}", quote_ident(self.cols[i].table.unwrap_or(self.table)), self.cols[i].q())
+    pub fn col_ref(&self, i: usize) -> &'static str {
+        self.cols[i].qref
     }
 
     /// the tables a row of the class is read from (joined table inheritance: the root's, then each subclass's)
@@ -422,6 +428,9 @@ impl ModelDesc {
 
     /// the class in a FROM list: its table, or the join of its hierarchy's tables on their keys
     pub fn from_sql(&self) -> String {
+        if self.joins.is_empty() {
+            return self.qtable.to_string();
+        }
         let mut out = self.tables()[0].to_string();
         out = quote_ident(&out).into_owned();
         for (t, c, pt, pc) in self.joins {
@@ -489,6 +498,9 @@ pub struct RelDesc {
     pub write_only: bool,
     /// `cascade=` with `refresh-expire` ("all"): `session.expire(obj)` reaches the loaded related objects
     pub refresh_expire: bool,
+    /// `post_update=True` (many-to-one): the foreign key is set by an UPDATE after the INSERTs (NULL in the INSERT),
+    /// and set to NULL by an UPDATE before the DELETEs; rows referencing each other (a cycle) can be flushed
+    pub post_update: bool,
 }
 
 /// A row of an association table to insert or delete at flush: (table, [(column, object, its column)] x2)
@@ -598,17 +610,24 @@ fn same(a: &V, b: &V) -> bool {
 impl ObjCell {
     pub fn transient(desc: &'static ModelDesc) -> Arc<ObjCell> {
         let n = desc.cols.len();
+        ObjCell::with_vals(desc, vec![V::Unbound; n], vec![V::Unbound; n], vec![ColLoad::Load; n])
+    }
+
+    /// a new object's state around its column values (unset: `V::Unbound`), as they were last loaded or
+    /// flushed (`committed`), and how each unloaded one loads
+    fn with_vals(desc: &'static ModelDesc, vals: Vec<V>, committed: Vec<V>, defer: Vec<ColLoad>) -> Arc<ObjCell> {
+        let n = desc.cols.len();
         Arc::new(ObjCell {
             desc,
             st: Mutex::new(ObjState {
-                vals: vec![V::Unbound; n],
-                committed: vec![V::Unbound; n],
+                vals,
+                committed,
                 modified: vec![false; n],
                 status: Status::Transient,
                 expired: false,
                 pk_expired: false,
                 extra: Vec::new(),
-                defer: vec![ColLoad::Load; n],
+                defer,
                 rels: vec![None; desc.rels.len()],
                 rel_opts: vec![None; desc.rels.len()],
                 comps: vec![None; desc.composites.len()],
@@ -682,8 +701,8 @@ impl ObjCell {
         }
         if self.detached(st) {
             return Err(Exc::msg(&DETACHED_INSTANCE_ERROR, format!(
-                "Parent instance <{} at 0x{:x}> is not bound to a Session; lazy load operation of attribute '{}' cannot proceed \
-                 (Background on this error at: https://sqlalche.me/e/21/bhk3)", self.desc.name, self as *const Self as usize, rel.name)));
+                "Parent instance <{} at {}> is not bound to a Session; lazy load operation of attribute '{}' cannot proceed \
+                 (Background on this error at: https://sqlalche.me/e/21/bhk3)", self.desc.name, ops::addr(self as *const Self as usize), rel.name)));
         }
         // the lazy load's SELECT would need IO: SQLAlchemy's StatementError, caused by MissingGreenlet
         Err(greenlet_error())
@@ -833,16 +852,19 @@ impl ObjCell {
         if name == "__dict__" {
             return self.instance_dict();
         }
-        if let Some(ri) = self.desc.rel_index(name) {
+        // a column (what most reads are) is looked up first: no name is both a column and a relationship
+        let col = self.desc.col_index(name);
+        let rel = if col.is_none() { self.desc.rel_index(name) } else { None };
+        if let Some(ri) = rel {
             if self.desc.rels[ri].write_only {
                 return Ok(V::native(Native::WriteOnly(self.clone(), ri)));
             }
         }
         let mut st = self.st.lock();
-        if let Some(ri) = self.desc.rel_index(name) {
+        if let Some(ri) = rel {
             return self.rel_get(&mut st, ri);
         }
-        if let Some(ci) = self.desc.composite(name) {
+        if let Some(ci) = if col.is_none() { self.desc.composite(name) } else { None } {
             let c = &self.desc.composites[ci];
             if let Some(i) = c.cols.iter().copied().find(|i| matches!(st.vals[*i], V::Unbound)) {
                 if !matches!(st.status, Status::Transient | Status::Pending) {
@@ -865,7 +887,7 @@ impl ObjCell {
             self.st.lock().comps[ci] = Some((v.clone(), vals));
             return Ok(v);
         }
-        if let Some(i) = self.desc.col_index(name) {
+        if let Some(i) = col {
             // a key expired on its own reads like an unloaded column
             let cur = if self.desc.is_pk(i) && self.key_expired(&st) { &V::Unbound } else { &st.vals[i] };
             return match cur {
@@ -876,8 +898,8 @@ impl ObjCell {
                         Err(Exc::msg(&INVALID_REQUEST_ERROR, format!("'{}.{}' is not available due to raiseload=True", self.desc.name, name)))
                     } else if self.detached(&st) {
                         Err(Exc::msg(&DETACHED_INSTANCE_ERROR, format!(
-                            "Instance <{} at 0x{:x}> is not bound to a Session; attribute refresh operation cannot proceed \
-                             (Background on this error at: https://sqlalche.me/e/21/bhk3)", self.desc.name, Arc::as_ptr(self) as usize)))
+                            "Instance <{} at {}> is not bound to a Session; attribute refresh operation cannot proceed \
+                             (Background on this error at: https://sqlalche.me/e/21/bhk3)", self.desc.name, ops::addr(Arc::as_ptr(self) as usize))))
                     } else {
                         Err(greenlet_error())
                     }
@@ -971,14 +993,7 @@ impl ObjCell {
     fn load_row_from(&self, row: &PgRow, offset: usize, tz: Tz, plan: &[ColLoad], read: usize) -> R<()> {
         let n = self.desc.cols.len();
         let how = |i: usize| plan.get(i).copied().unwrap_or_else(|| self.desc.cols[i].default_load());
-        let mut vals = Vec::with_capacity(n);
-        for i in 0..n {
-            vals.push(if i >= read || how(i) != ColLoad::Load {
-                V::Unbound
-            } else {
-                map_col(&self.desc.cols[i], decode(row, offset + i, tz)?)
-            });
-        }
+        let vals = row_vals(self.desc, row, offset, tz, plan, read)?;
         // the object's other vectors are refilled in place (one allocation per row: every row of a list goes
         // through here, and allocations freed on another worker thread contend in the allocator)
         let mut guard = self.st.lock();
@@ -998,6 +1013,21 @@ impl ObjCell {
         st.pk_expired = false;
         drop(guard);
         self.build_composites()
+    }
+
+    /// a new persistent object loaded from a row: `transient` then `load_row_from`, without filling the
+    /// vectors twice (every row of a list goes through here)
+    fn from_row(desc: &'static ModelDesc, row: &PgRow, offset: usize, tz: Tz, plan: &[ColLoad], read: usize) -> R<Arc<ObjCell>> {
+        let vals = row_vals(desc, row, offset, tz, plan, read)?;
+        let defer = (0..desc.cols.len()).map(|i| plan.get(i).copied().unwrap_or_else(|| desc.cols[i].default_load())).collect();
+        let o = ObjCell::with_vals(desc, vals.clone(), vals, defer);
+        {
+            let mut st = o.st.lock();
+            st.from_row = true;
+            st.status = Status::Persistent;
+        }
+        o.build_composites()?;
+        Ok(o)
     }
 
     /// the composites whose columns are all loaded, built now (SQLAlchemy's load and refresh handlers)
@@ -1024,6 +1054,17 @@ impl ObjCell {
     }
 }
 
+/// the column values of a row (`read` columns from `offset`), those the plan does not load left unset
+fn row_vals(desc: &'static ModelDesc, row: &PgRow, offset: usize, tz: Tz, plan: &[ColLoad], read: usize) -> R<Vec<V>> {
+    let n = desc.cols.len();
+    let mut vals = Vec::with_capacity(n);
+    for i in 0..n {
+        let how = plan.get(i).copied().unwrap_or_else(|| desc.cols[i].default_load());
+        vals.push(if i >= read || how != ColLoad::Load { V::Unbound } else { map_col(&desc.cols[i], decode(row, offset + i, tz)?) });
+    }
+    Ok(vals)
+}
+
 /// `Model(*args, **kwargs)` of a mapped class with its own `__init__`: run on a new transient object (the
 /// discriminator of single table inheritance already set, as SQLAlchemy's instrumented constructor does)
 pub async fn construct_init(cx: &super::Cx, desc: &'static ModelDesc, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
@@ -1045,6 +1086,13 @@ pub fn construct(desc: &'static ModelDesc, kwargs: Vec<(String, V)>) -> R {
         st.modified[p] = true;
     }
     for (k, v) in kwargs {
+        if let Some(h) = desc.hybrid(&k).filter(|h| !h.method) {
+            // `setattr(self, k, v)`: a hybrid property's setter (a def of the project: no I/O)
+            let Some(f) = h.set else { return Err(Exc::attr_error("can't set attribute")) };
+            let o = V::Obj(obj.clone());
+            ops::block_on_sync(async move { f(&super::root_cx(), o, vec![v]).await }, &k)?;
+            continue;
+        }
         if desc.col_index(&k).is_none() && desc.rel_index(&k).is_none() && desc.composite(&k).is_none() {
             return Err(Exc::type_error(format!("'{}' is an invalid keyword argument for {}", k, desc.name)));
         }
@@ -1070,6 +1118,11 @@ pub struct Alias {
     pub id: usize,
     /// `aliased(Model, name="x")`: its name in the FROM list
     pub name: Option<String>,
+    /// `with_polymorphic(Base, [Sub, ...], aliased=True)`: the subclasses whose tables the alias LEFT OUTER JOINs
+    /// (each under an alias of its own) and whose columns are loaded with the objects
+    pub poly: Vec<&'static ModelDesc>,
+    /// `aliased(Model, select(Model)...subquery())`: the entity read from that subquery (named like it)
+    pub sub: Option<Arc<Subq>>,
 }
 
 static ALIAS_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -1077,6 +1130,7 @@ static ALIAS_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// a name the application gives (label, subquery alias, `index_elements` string) as SQLAlchemy's
 /// IdentifierPreparer writes it: as is when it is a plain lowercase identifier and not a reserved word,
 /// else between double quotes with any `"` doubled (never spliced raw into the SQL text)
+/// Mirrored by `dyn.quote_ident` (names known at translation: `ColDesc.qsql`, `ModelDesc.qtable`...).
 pub fn quote_ident(name: &str) -> std::borrow::Cow<'_, str> {
     const RESERVED: &[&str] = &[
         "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "authorization", "binary",
@@ -1281,14 +1335,36 @@ fn infer_between(left: &Side, right: &Side) -> R<Sql> {
 /// `sqlalchemy.orm.aliased(Model)`
 pub fn aliased(v: &V) -> R {
     let model = model_of(v)?;
-    Ok(sql(Sql::Alias(Arc::new(Alias { model, id: ALIAS_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), name: None }))))
+    Ok(sql(Sql::Alias(Arc::new(Alias { model, id: ALIAS_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), name: None, poly: Vec::new(), sub: None }))))
 }
 
 /// `aliased(Model, name="x")`
 pub fn aliased_named(v: &V, name: &V) -> R {
     let model = model_of(v)?;
     let name = if name.is_none() { None } else { Some(ops::str_(name)?.to_string()) };
-    Ok(sql(Sql::Alias(Arc::new(Alias { model, id: ALIAS_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), name }))))
+    Ok(sql(Sql::Alias(Arc::new(Alias { model, id: ALIAS_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), name, poly: Vec::new(), sub: None }))))
+}
+
+/// `aliased(Model, sq)` with `sq = select(Model)....subquery()`: the entity's columns read
+/// from the subquery, objects of Model loaded from its rows
+pub fn aliased_sub(v: &V, sel: &V) -> R {
+    let model = model_of(v)?;
+    let sub = match sel {
+        V::Sql(x) => match &**x {
+            Sql::Subquery(q) if q.kind != SubKind::Lateral => q.clone(),
+            _ => return Err(Exc::type_error("py2axum: aliased(Model, selectable): a select(Model)...subquery() or cte() only")),
+        },
+        _ => return Err(Exc::type_error("py2axum: aliased(Model, selectable): a select(Model)...subquery() or cte() only")),
+    };
+    // its columns must be the entity's own (SQLAlchemy matches them by correspondence), in each member of a union
+    let entity_alone = |s: &Select| s.cols.len() == 1 && matches!(s.cols[0], SelCol::Entity(m) if std::ptr::eq(m, model));
+    if !entity_alone(&sub.sel) || !sub.sel.compound.iter().all(|(_, m)| entity_alone(m)) {
+        return Err(Exc::type_error(format!("py2axum: aliased({}, selectable): the selectable must select the {} entity alone", model.name, model.name)));
+    }
+    if !model.joins.is_empty() {
+        return Err(Exc::type_error(format!("py2axum: aliased({}, selectable) of a joined table inheritance class is not supported", model.name)));
+    }
+    Ok(sql(Sql::Alias(Arc::new(Alias { model, id: ALIAS_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), name: None, poly: Vec::new(), sub: Some(sub) }))))
 }
 
 /// `with_parent(obj, Parent.rel)`: the criteria of the related rows of `obj` (its key bound, as SQLAlchemy renders
@@ -1329,6 +1405,10 @@ pub struct Select {
     pub from_subs: Vec<Arc<Subq>>,
     /// aliases put in the FROM list explicitly (`join_from(alias, ...)`)
     pub from_aliases: Vec<Arc<Alias>>,
+    /// `union_all(a, b, ...)` (this SELECT is `a`): each further SELECT and its operator, rendered after `a`
+    pub compound: Vec<(&'static str, Select)>,
+    /// `correlate(...)`: None = auto-correlation, else the only tables correlated away (empty: `correlate(None)`)
+    pub correlate: Option<Vec<&'static ModelDesc>>,
     /// the joins (indexes into `joins`) that are FULL OUTER JOINs
     pub full_joins: Vec<usize>,
     /// `join(sq, on)`: (rendered before `joins[pos]`, the subquery, ON, outer)
@@ -1370,6 +1450,8 @@ pub enum Sql {
     InSelect(Box<Sql>, Box<Select>, bool),
     /// an unresolvable string label in ORDER BY / GROUP BY: CompileError when rendered
     BadLabel(String),
+    /// the exception a project `__clause_element__()` raised while coercing its object (raised when rendered)
+    Failed(Exc),
     /// `desc("name")` / `asc("name")`: a label of the columns clause, resolved by order_by/group_by
     LabelRef(String),
     /// a column of an `aliased()` model
@@ -1408,8 +1490,15 @@ pub enum Sql {
     Text(String),
     /// `text("... :name ...").bindparams(name=value)`: the text cut at its bound parameters
     TextBound(Vec<Sql>),
+    /// `table.join(right, on, isouter=, full=)` (Core): the left table and each (right, ON, outer, full), for
+    /// `select_from()` only
+    TableJoin(Box<V>, Vec<(V, Option<V>, bool, bool)>),
     /// `Model.relationship` (class attribute): loader options, `join()`, comparisons with an object
     Rel(&'static ModelDesc, usize),
+    /// `poly.Manager` of an aliased `with_polymorphic()`: the subclass's namespace under the alias
+    APoly(Arc<Alias>, &'static ModelDesc),
+    /// `poly.Manager.manager_name`: a column of that subclass (index into its columns), under the alias of its table
+    APCol(Arc<Alias>, &'static ModelDesc, usize),
     /// `aliased(Model).relationship`: `join()` only
     ARel(Arc<Alias>, usize),
     /// `selectinload(...)`, `noload(...)`, `undefer(...)` ... (a `.options()` argument)
@@ -1443,6 +1532,8 @@ pub enum Sql {
     SubCol(Arc<Subq>, String),
     /// aggregate `FILTER (WHERE ...)`
     Filter(Box<Sql>, Box<Sql>),
+    /// `func.f(...).over(partition_by=..., order_by=...)`: a window function, its PARTITION BY and ORDER BY
+    Over(Box<Sql>, Vec<Sql>, Vec<Sql>),
     /// `cast(expr, type)`
     Cast(Box<Sql>, &'static str),
     /// `extract(field, expr)`
@@ -1458,6 +1549,17 @@ pub struct Subq {
     /// `subquery()` without a name: numbered in each statement that renders it (`anon_1`, `anon_2`... as
     /// SQLAlchemy's compiler does), so that the same query is the same SQL text at every request
     pub anon: Option<usize>,
+    pub kind: SubKind,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SubKind {
+    /// `select(...).subquery()`: `(SELECT ...) AS name`, never correlated
+    Plain,
+    /// `select(...).lateral()`: `LATERAL (SELECT ...) AS name`, correlated to the FROM list of its statement
+    Lateral,
+    /// `select(...).cte("name")`: named in the FROM list, its SELECT in the WITH clause of the outermost statement
+    Cte,
 }
 
 /// `Rend::aliases` keys of the anonymous subqueries (alias ids stay far below)
@@ -1535,6 +1637,42 @@ pub fn with_polymorphic(base: &V, classes: &V) -> R {
         return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!("{} has no mapped subclasses (inheritance)", b.name)));
     }
     Ok(sql(Sql::WithPoly(b, poly_classes(b, classes, true)?)))
+}
+
+/// `with_polymorphic(Base, [Sub, ...], aliased=True, flat=...)`: an alias of the base whose subclass tables are
+/// LEFT OUTER JOINed under aliases (`flat=` only changes the SQL text: aliased tables or a subquery, same rows)
+pub fn with_polymorphic_opts(base: &V, classes: &V, aliased: &V, flat: &V) -> R {
+    let flat = ops::truthy(flat)?;
+    if !ops::truthy(aliased)? {
+        let _ = flat;
+        return with_polymorphic(base, classes);
+    }
+    let b = model_of(base)?;
+    if b.subs.is_empty() || b.poly_on.is_none() {
+        return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!("{} has no mapped subclasses (inheritance)", b.name)));
+    }
+    if !b.joins.is_empty() {
+        return Err(Exc::type_error(format!("py2axum: with_polymorphic({}, aliased=True) of a joined-inheritance subclass is not supported (the base of the hierarchy only)", b.name)));
+    }
+    let poly = poly_classes(b, classes, true)?;
+    Ok(sql(Sql::Alias(Arc::new(Alias { model: b, id: ALIAS_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed), name: None, poly, sub: None }))))
+}
+
+/// the LEFT OUTER JOINs of an aliased `with_polymorphic()`'s subclass tables, each under its own alias
+fn poly_alias_joins(r: &mut Rend, a: &Alias) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<&str> = vec![a.model.table];
+    for d in &a.poly {
+        for (t, c, pt, pc) in d.joins {
+            if !seen.contains(t) {
+                seen.push(t);
+                let tn = r.poly_alias_name(a, t);
+                let pn = r.poly_alias_name(a, pt);
+                out += &format!(" LEFT OUTER JOIN {} AS {tn} ON {pn}.{} = {tn}.{}", quote_ident(t), quote_ident(pc), quote_ident(c));
+            }
+        }
+    }
+    out
 }
 
 /// What the column options of this level (`load_only`, `defer`, `undefer`) do with each column of `desc`,
@@ -1725,6 +1863,13 @@ fn to_sql(v: &V, hint: Option<ColTy>) -> Sql {
             Native::Query(_, sel) => to_sql(sel, hint),
             _ => unreachable!(),
         },
+        // an object with `__clause_element__()` (a hybrid's Comparator or value object): coerced like SQLAlchemy does
+        V::Inst(_) | V::Obj(_) if ops::dunder(v, "__clause_element__").is_some() => {
+            match ops::call_dunder(ops::dunder(v, "__clause_element__").unwrap(), v, vec![], "__clause_element__") {
+                Ok(e) => to_sql(&e, hint),
+                Err(e) => Sql::Failed(e),
+            }
+        }
         // a value for a JSON column: None is JSON null (SQLAlchemy's JSON type, none_as_null=False)
         V::None if hint == Some(ColTy::Json) => Sql::Param(V::None, hint, bind_id()),
         V::None => Sql::Null,
@@ -1755,6 +1900,10 @@ fn hint_of(s: &Sql) -> Option<ColTy> {
         Sql::ExCol(m, i) => Some(m.cols[*i].ty),
         Sql::Case(whens, els) => whens.iter().find_map(|(_, v)| hint_of(v)).or_else(|| els.as_deref().and_then(hint_of)),
         Sql::Label(e, _) | Sql::Order(e, _, _) | Sql::Filter(e, _) => hint_of(e),
+        Sql::Over(f, _, _) => match &**f {
+            Sql::Func(n, _) if matches!(n.as_str(), "row_number" | "rank" | "dense_rank" | "ntile") => Some(ColTy::BigInt),
+            f => hint_of(f),
+        },
         Sql::Func(name, args) if matches!(name.as_str(), "max" | "min" | "coalesce" | "sum") => args.first().and_then(hint_of),
         Sql::Func(name, _) if name == "count" => Some(ColTy::BigInt),
         Sql::Bin("||", _, _) => Some(ColTy::Str),
@@ -1791,7 +1940,7 @@ pub fn text(v: &V) -> R {
 /// a `text()` statement with its parameters, rendered (`$n` per value, with its type)
 fn text_rend(q: &str, params: Option<&V>) -> R<Rend> {
     let (sql_text, binds) = text_binds(q, params)?;
-    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
     let mut marks = Vec::new();
     for v in binds {
         let start = r.sql.len();
@@ -2076,6 +2225,9 @@ fn expect_sql(v: &V) -> R<Sql> {
     match v {
         V::Col(..) | V::Sql(_) => Ok(to_sql(v, None)),
         V::Native(n) if matches!(&**n, Native::Query(..)) => Ok(to_sql(v, None)),
+        V::Inst(_) | V::Obj(_) if ops::dunder(v, "__clause_element__").is_some() => {
+            expect_sql(&ops::call_dunder(ops::dunder(v, "__clause_element__").unwrap(), v, vec![], "__clause_element__")?)
+        }
         other => Err(Exc::type_error(format!("expected a SQL expression, got {}", other.type_name()))),
     }
 }
@@ -2137,7 +2289,12 @@ fn select_item(s: &mut Select, it: V) -> R<()> {
         // `select(1)`: SQLAlchemy coerces a number to its literal text (`SELECT 1`, no bound parameter)
         V::Int(i) => s.cols.push(SelCol::Expr(Sql::Text(i.to_string()))),
         V::Float(f) if f.is_finite() => s.cols.push(SelCol::Expr(Sql::Text(ops::repr(&V::Float(f))?))),
-        other => s.cols.push(SelCol::Expr(expect_sql(&other)?)),
+        other => match expect_sql(&other)? {
+            // `select(tuple_(a, b))` (a composite hybrid value object's __clause_element__): CompileError when run
+            Sql::Func(f, _) if f.is_empty() => s.cols.push(SelCol::Expr(Sql::Failed(Exc::msg(&COMPILE_ERROR,
+                "Most backends don't support SELECTing from a tuple() object.  If this is an ORM query, consider using the Bundle object.")))),
+            e => s.cols.push(SelCol::Expr(e)),
+        },
     }
     Ok(())
 }
@@ -2149,6 +2306,31 @@ fn sel_cols(m: &'static ModelDesc) -> Vec<SelCol> {
     } else {
         vec![SelCol::Entity(m)]
     }
+}
+
+/// `table.join(right, onclause=None, isouter=False, full=False)` of a Core table: a Join for `select_from()`
+pub fn table_join(left: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    model_of(left)?;
+    Ok(sql(Sql::TableJoin(Box::new(left.clone()), vec![join_segment(name, args, kwargs)?])))
+}
+
+fn join_segment(name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R<(V, Option<V>, bool, bool)> {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "isouter" && k != "full") {
+        return Err(Exc::type_error(format!("py2axum: {name}({k}=) is not supported")));
+    }
+    if args.is_empty() || args.len() > 2 {
+        return Err(Exc::type_error(format!("py2axum: {name}() takes the right table and an optional ON clause here")));
+    }
+    let flag = |k: &str| -> R<bool> {
+        match kwargs.iter().find(|(x, _)| x == k) {
+            Some((_, v)) => ops::truthy(v),
+            None => Ok(false),
+        }
+    };
+    let right = args[0].clone();
+    model_of(&right)?;
+    let on = args.get(1).cloned().filter(|v| !v.is_none());
+    Ok((right, on, name == "outerjoin" || flag("isouter")?, flag("full")?))
 }
 
 fn model_of(v: &V) -> R<&'static ModelDesc> {
@@ -2228,10 +2410,14 @@ pub fn case(args: &[V], kwargs: &[(String, V)]) -> R {
                 whens.push((Sql::Bin("=", Box::new(base.clone()), Box::new(to_sql(k, hint_of(&base)))), to_sql(v, None)));
             }
         }
+        ([V::List(_)], None) => {
+            return Err(Exc::msg(&ARGUMENT_ERROR, "The \"whens\" argument to case(), when referring to a sequence of items, is now passed as a series of positional elements, rather than as a list. "));
+        }
         (_, None) => {
             for a in args {
                 let pair = match a {
                     V::Tuple(t) if t.len() == 2 => t.clone(),
+                    V::Tuple(t) if t.len() > 2 => return Err(Exc::value_error("too many values to unpack (expected 2)")),
                     _ => return Err(Exc::msg(&ARGUMENT_ERROR, "py2axum: case() takes (condition, value) tuples")),
                 };
                 whens.push((to_sql(&pair[0], None), to_sql(&pair[1], None)));
@@ -2239,10 +2425,54 @@ pub fn case(args: &[V], kwargs: &[(String, V)]) -> R {
         }
         _ => return Err(Exc::type_error("py2axum: case(value=) takes a dict of whens")),
     }
-    if whens.is_empty() {
-        return Err(Exc::msg(&ARGUMENT_ERROR, "case() requires at least one WHEN"));
-    }
+    // no WHEN: built as SQLAlchemy does, `CASE ELSE ... END` then refused by PostgreSQL
     Ok(sql(Sql::Case(whens, kw("else_").map(|e| Box::new(to_sql(&e, None))))))
+}
+
+/// `union_all(a, b, ...)`, `union()`, `intersect[_all]()`, `except_[_all]()`: the first SELECT carrying the others.
+/// Members with ORDER BY / LIMIT / OFFSET (parenthesized by SQLAlchemy) are not supported.
+pub fn compound(op: &'static str, args: &[V]) -> R {
+    let mut sels = Vec::new();
+    for a in args {
+        let s = match a {
+            V::Sql(x) => match &**x {
+                Sql::Select(s) => (**s).clone(),
+                _ => return Err(Exc::type_error(format!("py2axum: {op} of a {} is not supported (select() only)", a.type_name()))),
+            },
+            V::Native(n) if matches!(&**n, Native::Query(..)) => match to_sql(a, None) {
+                Sql::Select(s) => *s,
+                _ => unreachable!(),
+            },
+            other => return Err(Exc::type_error(format!("py2axum: {op} of a {} is not supported (select() only)", other.type_name()))),
+        };
+        if !s.order.is_empty() || s.limit.is_some() || s.offset.is_some() || s.for_update.is_some() || !s.compound.is_empty() {
+            return Err(Exc::type_error(format!("py2axum: {op} of a SELECT with ORDER BY, LIMIT, OFFSET, FOR UPDATE or its own compound is not supported")));
+        }
+        sels.push(s);
+    }
+    let mut it = sels.into_iter();
+    let Some(mut first) = it.next() else { return Err(Exc::type_error(format!("py2axum: {op} needs at least one select()"))) };
+    first.compound = it.map(|s| (op, s)).collect();
+    Ok(sql(Sql::Select(Box::new(first))))
+}
+
+/// the function name of a `postgresql.array()` literal (no SQL function can be named so)
+const PG_ARRAY: &str = "\0ARRAY";
+
+/// `postgresql.array([a, b])`: an ARRAY literal of bound values (or expressions)
+pub fn pg_array(v: &V) -> R {
+    let items = ops::iter(v)?;
+    Ok(sql(Sql::Func(PG_ARRAY.into(), items.iter().map(|x| to_sql(x, None)).collect())))
+}
+
+/// `any_(expr)` / `all_(expr)`: `ANY (expr)`, compared with `==` and the other operators
+pub fn any_all(name: &str, v: &V) -> R {
+    Ok(sql(Sql::Func(if name == "all_" { "ALL" } else { "ANY" }.into(), vec![to_sql(v, None)])))
+}
+
+/// `literal_column("text")`: the text as is, in any clause
+pub fn literal_column(v: &V) -> R {
+    Ok(sql(Sql::Text(ops::str_(v)?)))
 }
 
 /// `literal(value)`: a bound parameter
@@ -2424,6 +2654,8 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         "regexp_match" => &["flags"],
         // an INSERT's RETURNING rows in the order of its parameters: what the per-row bulk INSERT gives
         "returning" => &["sort_by_parameter_order"],
+        "over" => &["partition_by", "order_by"],
+        "cte" | "lateral" => &["name"],
         _ => &[],
     };
     if allowed != ["*"] {
@@ -2432,6 +2664,14 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
     }
     let kw = |k: &str| kwargs.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+    if let Sql::TableJoin(left, segs) = &base {
+        if !matches!(name, "join" | "outerjoin") {
+            return Err(Exc::attr_error(format!("py2axum: Join.{name}() is not supported (join, outerjoin and select_from(join) only)")));
+        }
+        let mut segs = segs.clone();
+        segs.push(join_segment(name, args, kwargs)?);
+        return Ok(sql(Sql::TableJoin(left.clone(), segs)));
+    }
     if let Sql::Exists(sel) = &base {
         // `exists().where(...)`: the criteria go to its SELECT
         if !matches!(name, "where" | "filter") {
@@ -2443,9 +2683,33 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
         return Ok(sql(Sql::Exists(Box::new(s))));
     }
+    if let (Sql::Scalar(sel), "correlate") = (&base, name) {
+        // `select(...).scalar_subquery().correlate(t)`: the correlation of its SELECT
+        let r = sql_method(&sql(Sql::Select(sel.clone())), name, args, kwargs)?;
+        let V::Sql(x) = &r else { unreachable!() };
+        let Sql::Select(s) = &**x else { unreachable!() };
+        return Ok(sql(Sql::Scalar(s.clone())));
+    }
     if let Sql::Select(sel) = &base {
+        if !sel.compound.is_empty() && !matches!(name, "subquery" | "alias" | "cte") {
+            // a CompoundSelect: only made a subquery or a CTE (its ORDER BY / LIMIT name the result's columns)
+            return Err(Exc::type_error(format!("py2axum: CompoundSelect.{name}() is not supported (subquery(), alias() and cte() are)")));
+        }
         let mut s = (**sel).clone();
         match name {
+            "union_all" | "union" | "intersect" | "intersect_all" | "except_" | "except_all" => {
+                let op = match name {
+                    "union_all" => "UNION ALL",
+                    "union" => "UNION",
+                    "intersect" => "INTERSECT",
+                    "intersect_all" => "INTERSECT ALL",
+                    "except_" => "EXCEPT",
+                    _ => "EXCEPT ALL",
+                };
+                let mut all = vec![sql(Sql::Select(Box::new(s)))];
+                all.extend(args.iter().cloned());
+                return compound(op, &all);
+            }
             "where" | "filter" => {
                 for a in &args {
                     s.wheres.push(to_sql(a, None));
@@ -2478,8 +2742,10 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
                         return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!(
                             "None of the FROM clause entities have a property \"{k}\". Searched entities: Mapper[{}({})]", m.name, m.table)));
                     };
-                    if let V::Sql(x) = sql_cmp(&lhs, "=", v)? {
-                        s.wheres.push((*x).clone());
+                    // `lhs == v` (a hybrid's Comparator or value object answers it)
+                    match ops::eq(&lhs, v)? {
+                        V::Sql(x) => s.wheres.push((*x).clone()),
+                        other => s.wheres.push(to_sql(&other, None)),
                     }
                 }
             }
@@ -2507,6 +2773,28 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
                     if let V::Sql(x) = a {
                         if let Sql::Subquery(q) = &**x {
                             s.from_subs.push(q.clone());
+                            continue;
+                        }
+                        if let Sql::TableJoin(left, segs) = &**x {
+                            // the Join supersedes the FROM entries of its tables, then reads as join_from()
+                            let mut tables = vec![model_of(left)?];
+                            for seg in segs {
+                                tables.push(model_of(&seg.0)?);
+                            }
+                            if !s.joins.is_empty() || !s.join_subs.is_empty() {
+                                return Err(Exc::type_error("py2axum: select_from(join) after join() is not supported"));
+                            }
+                            s.from.retain(|m| !tables.iter().any(|t| std::ptr::eq(*t, *m)));
+                            let mut cur = sql(Sql::Select(Box::new(s.clone())));
+                            for (i, (right, on, outer, full)) in segs.iter().enumerate() {
+                                let mut a = if i == 0 { vec![(**left).clone(), right.clone()] } else { vec![right.clone()] };
+                                a.extend(on.clone());
+                                let kw = vec![("isouter".to_string(), V::Bool(*outer)), ("full".to_string(), V::Bool(*full))];
+                                cur = sql_method(&cur, if i == 0 { "join_from" } else { "join" }, a, kw)?;
+                            }
+                            let V::Sql(x) = &cur else { unreachable!() };
+                            let Sql::Select(s2) = &**x else { unreachable!() };
+                            s = (**s2).clone();
                             continue;
                         }
                     }
@@ -2809,7 +3097,39 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
                         (format!("anon_{id}"), Some(id))
                     }
                 };
-                return Ok(sql(Sql::Subquery(Arc::new(Subq { sel: s, name, anon }))));
+                return Ok(sql(Sql::Subquery(Arc::new(Subq { sel: s, name, anon, kind: SubKind::Plain }))));
+            }
+            "cte" | "lateral" => {
+                let kind = if name == "cte" { SubKind::Cte } else { SubKind::Lateral };
+                let (name, anon) = match args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "name").map(|(_, v)| v)) {
+                    Some(n) if !n.is_none() => (ops::str_(n)?, None),
+                    _ => {
+                        let id = ANON.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        (format!("anon_{id}"), Some(id))
+                    }
+                };
+                if args.len() > 1 {
+                    // cte(name, recursive, nesting): refused when translating (METHOD_MAX_ARGS)
+                    return Err(Exc::type_error(format!("py2axum: {name}() takes only its name")));
+                }
+                return Ok(sql(Sql::Subquery(Arc::new(Subq { sel: s, name, anon, kind }))));
+            }
+            // `correlate(A, ...)`: these enclosing tables are correlated away (no other one, and even with a single
+            // FROM); `correlate(None)`: none
+            "correlate" => {
+                match args.as_slice() {
+                    [] | [V::None] | [V::Bool(false)] => s.correlate = Some(Vec::new()),
+                    [V::None | V::Bool(false), ..] => {
+                        return Err(Exc::msg(&ARGUMENT_ERROR, "additional FROM objects not accepted when passing None/False to correlate()"));
+                    }
+                    _ => {
+                        let mut list = Vec::new();
+                        for a in &args {
+                            list.push(model_of(a)?);
+                        }
+                        s.correlate.get_or_insert_with(Vec::new).extend(list);
+                    }
+                }
             }
             "exists" => return Ok(sql(Sql::Exists(Box::new(s)))),
             _ => return Err(Exc::attr_error(format!("'Select' object has no attribute '{name}'"))),
@@ -3125,6 +3445,20 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
             };
             Sql::Like(b, "LIKE", Box::new(pat), false)
         }
+        // as SQLAlchemy 2: `lower(col) LIKE '%' || lower(:p) || '%'`
+        "istartswith" | "iendswith" | "icontains" => {
+            if !matches!(hint, None | Some(ColTy::Str) | Some(ColTy::Enum(_))) {
+                return Err(Exc::type_error(format!("py2axum: {name}() on a {hint:?} column is not supported (only string LIKE)")));
+            }
+            let p = Sql::Func("lower".into(), vec![to_sql(&one(&args)?, Some(ColTy::Str))]);
+            let pct = || Box::new(Sql::Text("'%'".into()));
+            let pat = match name {
+                "istartswith" => Sql::Bin("||", Box::new(p), pct()),
+                "iendswith" => Sql::Bin("||", pct(), Box::new(p)),
+                _ => Sql::Bin("||", Box::new(Sql::Bin("||", pct(), Box::new(p))), pct()),
+            };
+            Sql::Like(Box::new(Sql::Func("lower".into(), vec![*b])), "LIKE", Box::new(pat), false)
+        }
         "between" => {
             if args.len() != 2 {
                 return Err(Exc::type_error("between() takes two arguments"));
@@ -3154,6 +3488,20 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
             Sql::Filter(b, Box::new(cond))
         }
         "distinct" => Sql::Distinct(b),
+        "over" if matches!(*b, Sql::Func(..) | Sql::Filter(..)) => {
+            if !args.is_empty() {
+                return Err(Exc::type_error("over() takes keyword arguments only"));
+            }
+            // a single clause or a list/tuple of them, as SQLAlchemy's ClauseList
+            let clauses = |n: &str| -> R<Vec<Sql>> {
+                Ok(match kwargs.iter().find(|(k, _)| k == n).map(|(_, v)| v) {
+                    None | Some(V::None) => vec![],
+                    Some(v @ (V::List(_) | V::Tuple(_))) => ops::iter(v)?.iter().map(|x| to_sql(x, None)).collect(),
+                    Some(v) => vec![to_sql(v, None)],
+                })
+            };
+            Sql::Over(b, clauses("partition_by")?, clauses("order_by")?)
+        }
         _ => return Err(Exc::attr_error(format!("SQL expression has no method '{name}'"))),
     }))
 }
@@ -3164,6 +3512,7 @@ enum Bind {
     V(V, Option<ColTy>),
 }
 
+#[derive(Default)]
 struct Rend {
     sql: String,
     binds: Vec<Bind>,
@@ -3174,6 +3523,10 @@ struct Rend {
     /// tables of the enclosing statements: a nested SELECT whose FROM comes from its WHERE correlates
     /// them away (SQLAlchemy's auto-correlation, `exists().where(...)`)
     outer: Vec<&'static ModelDesc>,
+    /// nesting of render_select: the outermost SELECT takes the WITH clause
+    depth: usize,
+    /// the CTEs met so far, each once: (identity, `name AS (SELECT ...)`), a CTE's own CTEs before it
+    with: Vec<(usize, String)>,
 }
 
 impl Rend {
@@ -3190,6 +3543,9 @@ impl Rend {
     }
 
     fn alias_name(&mut self, a: &Alias) -> String {
+        if let Some(q) = &a.sub {
+            return self.subq_name(q);
+        }
         if let Some((_, n)) = self.aliases.iter().find(|(id, _)| *id == a.id) {
             return n.clone();
         }
@@ -3203,6 +3559,23 @@ impl Rend {
         self.aliases.push((a.id, n.clone()));
         n
     }
+
+    /// the name of table `t` in an aliased `with_polymorphic()`: the alias itself for the base table, an alias
+    /// of its own (numbered per statement) for each subclass table
+    fn poly_alias_name(&mut self, a: &Alias, t: &str) -> String {
+        if t == a.model.table {
+            return self.alias_name(a);
+        }
+        let tables: Vec<&str> = a.poly.iter().flat_map(|d| d.joins.iter().map(|j| j.0)).collect();
+        let key = usize::MAX - (a.id * 64 + tables.iter().position(|x| *x == t).unwrap_or(63));
+        if let Some((_, n)) = self.aliases.iter().find(|(id, _)| *id == key) {
+            return n.clone();
+        }
+        let k = self.aliases.iter().filter(|(_, n)| n.rsplit_once('_').map(|x| x.0) == Some(t)).count() + 1;
+        let n = format!("{t}_{k}");
+        self.aliases.push((key, n.clone()));
+        n
+    }
 }
 
 fn push_alias(out: &mut Vec<Arc<Alias>>, a: &Arc<Alias>) {
@@ -3213,12 +3586,13 @@ fn push_alias(out: &mut Vec<Arc<Alias>>, a: &Arc<Alias>) {
 
 fn aliases_in(e: &Sql, out: &mut Vec<Arc<Alias>>) {
     match e {
-        Sql::ACol(a, _) => push_alias(out, a),
+        Sql::ACol(a, _) | Sql::APCol(a, _, _) => push_alias(out, a),
         Sql::Bin(_, a, b) | Sql::Like(a, _, b, _) | Sql::Filter(a, b) => {
             aliases_in(a, out);
             aliases_in(b, out);
         }
         Sql::Bool(_, items) | Sql::Func(_, items) => items.iter().for_each(|i| aliases_in(i, out)),
+        Sql::Over(f, p, o) => std::iter::once(&**f).chain(p).chain(o).for_each(|i| aliases_in(i, out)),
         Sql::Case(whens, els) => {
             for (c, v) in whens {
                 aliases_in(c, out);
@@ -3311,7 +3685,7 @@ thread_local! {
 /// the names of the `bindparam()`s of a statement, in order
 fn bind_names(st: &Sql) -> Vec<String> {
     COLLECT.with(|c| *c.lock() = Some(Vec::new()));
-    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
     let _ = render(&mut r, st);
     COLLECT.with(|c| c.lock().take()).unwrap_or_default()
 }
@@ -3321,9 +3695,20 @@ pub fn bindparam(name: &V, value: Option<&V>) -> R {
     Ok(sql(Sql::BindParam(ops::str_(name)?.to_string(), value.cloned(), None)))
 }
 
+/// `bindparam(key, type_=ARRAY(String()))`: the parameter typed as a VARCHAR[] (a list bound as an array)
+pub fn str_array_param(p: &V) -> R {
+    match p {
+        V::Sql(s) => match &**s {
+            Sql::BindParam(n, d, _) => Ok(sql(Sql::BindParam(n.clone(), d.clone(), Some(ColTy::StrArray)))),
+            _ => Err(Exc::type_error("py2axum: type_= on a bindparam() only")),
+        },
+        _ => Err(Exc::type_error("py2axum: type_= on a bindparam() only")),
+    }
+}
+
 fn render(r: &mut Rend, e: &Sql) -> R<()> {
     match e {
-        Sql::Col(m, i) => r.sql += &m.col_ref(*i),
+        Sql::Col(m, i) => r.sql += m.col_ref(*i),
         Sql::InSelect(a, q, neg) => {
             render(r, a)?;
             r.sql += if *neg { " NOT IN (" } else { " IN (" };
@@ -3336,6 +3721,7 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
         }
         Sql::Alias(_) => return Err(Exc::msg(&ARGUMENT_ERROR, "py2axum: an aliased() entity used as an SQL expression")),
         Sql::BadLabel(m) => return Err(Exc::msg(&COMPILE_ERROR, m.clone())),
+        Sql::Failed(e) => return Err(e.clone()),
         Sql::LabelRef(n) => {
             return Err(Exc::msg(&COMPILE_ERROR, format!(
                 "Can't resolve label reference for ORDER BY / GROUP BY / DISTINCT etc. Textual SQL expression '{n}' should be explicitly declared as text('{n}')"
@@ -3426,6 +3812,17 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
             r.sql += &format!(" {}{} ", if *neg { "NOT " } else { "" }, op);
             render(r, p)?;
         }
+        // postgresql.array([...]): `ARRAY[a, b]`
+        Sql::Func(name, args) if name == PG_ARRAY => {
+            r.sql += "ARRAY[";
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    r.sql += ", ";
+                }
+                render(r, a)?;
+            }
+            r.sql.push(']');
+        }
         Sql::Func(name, args) => {
             r.sql += name;
             r.sql.push('(');
@@ -3466,6 +3863,27 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
             render(r, cond)?;
             r.sql.push(')');
         }
+        // as SQLAlchemy: `f(...) OVER (PARTITION BY a, b ORDER BY c DESC)`, an empty window as `OVER ()`
+        Sql::Over(f, part, order) => {
+            render(r, f)?;
+            r.sql += " OVER (";
+            for (kw, items) in [("PARTITION BY ", part), ("ORDER BY ", order)] {
+                if items.is_empty() {
+                    continue;
+                }
+                if !r.sql.ends_with('(') {
+                    r.sql.push(' ');
+                }
+                r.sql += kw;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        r.sql += ", ";
+                    }
+                    render(r, it)?;
+                }
+            }
+            r.sql.push(')');
+        }
         Sql::Extract(f, a) => {
             r.sql += &format!("EXTRACT({f} FROM ");
             render(r, a)?;
@@ -3503,12 +3921,7 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
             let n = r.subq_name(q);
             r.sql += &format!("{n}.{}", quote_ident(name))
         }
-        Sql::Subquery(q) => {
-            let n = r.subq_name(q);
-            r.sql.push('(');
-            render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {n}");
-        }
+        Sql::Subquery(q) => render_subq(r, q, &[])?,
         Sql::Composite(m, ci) => {
             for (k, i) in m.composites[*ci].cols.iter().enumerate() {
                 if k > 0 {
@@ -3519,6 +3932,13 @@ fn render(r: &mut Rend, e: &Sql) -> R<()> {
         }
         Sql::SubColumns(_) | Sql::TableCols(_) | Sql::AliasCols(_) | Sql::Cols(_) | Sql::RelJoin { .. } => return Err(Exc::type_error("py2axum: a .c columns namespace is not an expression")),
         Sql::WithPoly(b, _) => return Err(Exc::type_error(format!("py2axum: with_polymorphic({}) is not an expression", b.name))),
+        Sql::TableJoin(..) => return Err(Exc::type_error("py2axum: a Join is used in select_from() only here")),
+        Sql::APoly(_, d) => return Err(Exc::type_error(format!("py2axum: the {} namespace of with_polymorphic() is not an expression", d.name))),
+        Sql::APCol(a, d, i) => {
+            let c = &d.cols[*i];
+            let n = r.poly_alias_name(a, c.table.unwrap_or(d.table));
+            r.sql += &format!("{n}.{}", c.q());
+        }
         Sql::Scalar(s) => {
             r.sql.push('(');
             render_select(r, s)?;
@@ -3671,7 +4091,7 @@ fn render_returning(r: &mut Rend, returning: &[SelCol]) -> R<()> {
                 r.sql += ", ";
             }
             match c {
-                SelCol::Entity(e) => r.sql += &(0..e.cols.len()).map(|i| e.col_ref(i)).collect::<Vec<_>>().join(", "),
+                SelCol::Entity(e) => r.sql += e.sel,
                 SelCol::Expr(e) => render(r, e)?,
                 SelCol::AEntity(_) => return Err(Exc::type_error("py2axum: returning(aliased(...)) is not supported")),
             }
@@ -3701,6 +4121,7 @@ fn subs_in(e: &Sql, out: &mut Vec<Arc<Subq>>) {
             subs_in(b, out);
         }
         Sql::Bool(_, items) | Sql::Func(_, items) => items.iter().for_each(|i| subs_in(i, out)),
+        Sql::Over(f, p, o) => std::iter::once(&**f).chain(p).chain(o).for_each(|i| subs_in(i, out)),
         Sql::Case(whens, els) => {
             for (c, v) in whens {
                 subs_in(c, out);
@@ -3752,6 +4173,7 @@ fn cols_in(e: &Sql, out: &mut Vec<(&'static ModelDesc, usize)>) {
             cols_in(b, out);
         }
         Sql::Bool(_, items) | Sql::Func(_, items) => items.iter().for_each(|i| cols_in(i, out)),
+        Sql::Over(f, p, o) => std::iter::once(&**f).chain(p).chain(o).for_each(|i| cols_in(i, out)),
         Sql::Case(whens, els) => {
             for (c, v) in whens {
                 cols_in(c, out);
@@ -3805,11 +4227,66 @@ fn tables_in(e: &Sql, out: &mut Vec<&'static ModelDesc>) {
             tables_in(a, out);
             tables_in(b, out);
         }
+        Sql::Over(f, p, o) => std::iter::once(&**f).chain(p).chain(o).for_each(|i| tables_in(i, out)),
         _ => {}
     }
 }
 
+/// A SELECT; the outermost one of the statement gets the WITH clause of every CTE met inside it (SQLAlchemy puts
+/// them all at the top level).
 fn render_select(r: &mut Rend, s: &Select) -> R<()> {
+    let start = r.sql.len();
+    let ctes = r.with.len();
+    r.depth += 1;
+    let out = render_select_body(r, s);
+    r.depth -= 1;
+    out?;
+    if r.depth == 0 && r.with.len() > ctes {
+        let with: Vec<String> = r.with.drain(ctes..).map(|(_, t)| t).collect();
+        r.sql.insert_str(start, &format!("WITH {} ", with.join(", ")));
+    }
+    Ok(())
+}
+
+/// A subquery in a FROM list or a join: `(SELECT ...) AS name`, `LATERAL (SELECT ...) AS name` (correlated to
+/// `ctx`, the tables of its statement's FROM list), or a CTE's name (its SELECT rendered once, for the WITH clause).
+fn render_subq(r: &mut Rend, q: &Arc<Subq>, ctx: &[&'static ModelDesc]) -> R<()> {
+    let n = r.subq_name(q);
+    match q.kind {
+        SubKind::Plain => {
+            r.sql.push('(');
+            render_select(r, &q.sel)?;
+            r.sql += &format!(") AS {n}");
+        }
+        SubKind::Lateral => {
+            let outer_len = r.outer.len();
+            r.outer.extend(ctx.iter().copied());
+            r.sql += "LATERAL (";
+            let out = render_select(r, &q.sel);
+            r.outer.truncate(outer_len);
+            out?;
+            r.sql += &format!(") AS {n}");
+        }
+        SubKind::Cte => {
+            let id = Arc::as_ptr(q) as usize;
+            if !r.with.iter().any(|(k, _)| *k == id) {
+                // its SELECT apart (never correlated), numbered with the statement's parameters
+                let body = std::mem::take(&mut r.sql);
+                let outer = std::mem::take(&mut r.outer);
+                r.sql = format!("{n} AS (");
+                let out = render_select(r, &q.sel);
+                let text = std::mem::replace(&mut r.sql, body);
+                r.outer = outer;
+                out?;
+                r.with.push((id, text + ")"));
+            }
+            r.sql += &n;
+        }
+    }
+    Ok(())
+}
+
+fn render_select_body(r: &mut Rend, s: &Select) -> R<()> {
     r.sql += "SELECT ";
     if !s.distinct_on.is_empty() {
         r.sql += "DISTINCT ON (";
@@ -3857,13 +4334,17 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             push_from(&mut from, f);
         }
     }
-    // (SQLAlchemy's _get_display_froms: only a statement with more than one FROM correlates implicitly)
-    if !r.outer.is_empty() && from.len() + s.from_subs.len() + s.from_aliases.len() > 1 {
+    // (SQLAlchemy's _get_display_froms: only a statement with more than one FROM correlates implicitly; an explicit
+    // correlate() takes away its enclosing tables, however many FROMs are left)
+    if let Some(list) = &s.correlate {
+        from.retain(|m| !(list.iter().any(|c| covers(c, m)) && r.outer.iter().any(|o| covers(o, m))));
+    } else if !r.outer.is_empty() && from.len() + s.from_subs.len() + s.from_aliases.len() > 1 {
         from.retain(|m| !r.outer.iter().any(|o| covers(o, m)));
         if from.is_empty() && s.from_subs.is_empty() && s.from_aliases.is_empty() {
             return Err(Exc::msg(&INVALID_REQUEST_ERROR, "Select statement returned no FROM clauses due to auto-correlation; specify correlate(<tables>) to control correlation manually."));
         }
     }
+    let from_models = from.clone();
     let outer_len = r.outer.len();
     // the scalar subqueries of the columns correlate to this SELECT's tables too
     r.outer.extend(from.iter().copied().chain(s.joins.iter().map(|j| j.0)));
@@ -3872,9 +4353,7 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             r.sql += ", ";
         }
         match c {
-            SelCol::Entity(m) => {
-                r.sql += &(0..m.cols.len()).map(|i| m.col_ref(i)).collect::<Vec<_>>().join(", ");
-            }
+            SelCol::Entity(m) => r.sql += m.sel,
             SelCol::AEntity(a) => {
                 let n = r.alias_name(a);
                 r.sql += &a.model.cols.iter().map(|c| format!("{n}.{}", c.q())).collect::<Vec<_>>().join(", ");
@@ -3924,26 +4403,35 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
             if !a.model.joins.is_empty() {
                 return Err(Exc::type_error(format!("py2axum: an alias of {} (joined table inheritance) is not supported", a.model.name)));
             }
-            items.push(format!("{} AS {n}", a.model.qt()));
+            if let Some(q) = &a.sub {
+                // aliased(Model, subquery or CTE): rendered as such (apart, parameters numbered on)
+                let _ = n;
+                let saved = std::mem::take(&mut r.sql);
+                let out = render_subq(r, q, &[]);
+                let body = std::mem::replace(&mut r.sql, saved);
+                out?;
+                items.push(body);
+                continue;
+            }
+            let pj = poly_alias_joins(r, a);
+            items.push(format!("{} AS {n}{pj}", a.model.qt()));
         }
         r.sql += &items.join(", ");
         let from = items;
+        let ctx: Vec<&'static ModelDesc> = from_models.iter().copied().chain(s.joins.iter().map(|j| j.0)).collect();
         for (i, q) in subs.iter().enumerate() {
             if i > 0 || !from.is_empty() {
                 r.sql += ", ";
             }
-            let n = r.subq_name(q);
-            r.sql.push('(');
-            render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {n}");
+            render_subq(r, q, &ctx)?;
         }
     }
+    let join_ctx: Vec<&'static ModelDesc> = from_models.iter().copied().chain(s.joins.iter().map(|j| j.0)).collect();
     let render_subs = |r: &mut Rend, at: usize| -> R<()> {
         for (_, q, on, outer) in s.join_subs.iter().filter(|j| j.0 == at) {
-            let n = r.subq_name(q);
-            r.sql += if *outer { " LEFT OUTER JOIN (" } else { " JOIN (" };
-            render_select(r, &q.sel)?;
-            r.sql += &format!(") AS {n} ON ");
+            r.sql += if *outer { " LEFT OUTER JOIN " } else { " JOIN " };
+            render_subq(r, q, &join_ctx)?;
+            r.sql += " ON ";
             render(r, on)?;
         }
         Ok(())
@@ -3952,7 +4440,15 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
         render_subs(r, i)?;
         r.sql += if s.full_joins.contains(&i) { " FULL OUTER JOIN " } else if *outer { " LEFT OUTER JOIN " } else { " JOIN " };
         let pj = if al.is_none() { poly_joins(s, m) } else { String::new() };
-        if m.joins.is_empty() && pj.is_empty() {
+        if let Some(q) = al.as_ref().and_then(|a| a.sub.clone()) {
+            // a join to aliased(Model, subquery or CTE): its name follows (` AS name` for a subquery)
+            render_subq(r, &q, &[])?;
+        } else if let Some(a) = al.as_ref().filter(|a| a.poly.iter().any(|d| !d.joins.is_empty())) {
+            // an aliased with_polymorphic(): its tables joined first, the base alias named inside
+            let n = r.alias_name(a);
+            let apj = poly_alias_joins(r, a);
+            r.sql += &format!("({} AS {n}{apj})", m.qt());
+        } else if m.joins.is_empty() && pj.is_empty() {
             r.sql += &m.qt();
         } else if al.is_none() {
             // a joined-inheritance subclass (or a with_polymorphic() entity): its tables joined first, like
@@ -3961,7 +4457,7 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
         } else {
             return Err(Exc::type_error(format!("py2axum: an alias of {} (joined table inheritance) is not supported", m.name)));
         }
-        if let Some(a) = al {
+        if let Some(a) = al.as_ref().filter(|a| a.sub.is_none() && !a.poly.iter().any(|d| !d.joins.is_empty())) {
             let n = r.alias_name(a);
             r.sql += &format!(" AS {n}");
         }
@@ -4006,6 +4502,14 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
         r.sql += if i == 0 { " HAVING " } else { " AND " };
         render(r, h)?;
     }
+    if !s.compound.is_empty() {
+        // the other members of a UNION ...: correlated like the first one, to the enclosing statements only
+        r.outer.truncate(outer_len);
+        for (op, m) in &s.compound {
+            r.sql += &format!(" {op} ");
+            render_select(r, m)?;
+        }
+    }
     if !s.order.is_empty() {
         r.sql += " ORDER BY ";
         for (i, o) in s.order.iter().enumerate() {
@@ -4031,7 +4535,7 @@ fn render_select(r: &mut Rend, s: &Select) -> R<()> {
 }
 
 fn render_expr_standalone(e: &Sql) -> R<(String, usize)> {
-    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+    let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
     render(&mut r, e)?;
     Ok((r.sql, r.binds.len()))
 }
@@ -4316,6 +4820,16 @@ pub fn result_method(res: &Arc<Mutex<QResult>>, name: &str) -> R {
             Ok(V::Result(Arc::new(Mutex::new(QResult { rows: Some(out), width: 1, scalars: true, rowcount: q.rowcount, names: None }))))
         }
         "first" => Ok(q.take_rows_as(true)?.into_iter().next().unwrap_or(V::None)),
+        "fetchone" if q.scalars => Err(Exc::attr_error("'ScalarResult' object has no attribute 'fetchone'")),
+        // the next row (the result stays open), None once exhausted
+        "fetchone" => match q.rows.as_mut() {
+            Some(rows) if rows.is_empty() => Ok(V::None),
+            Some(rows) => {
+                let r = rows.remove(0);
+                Ok(q.row_value(r))
+            }
+            None => q.take_rows_as(true).map(|_| V::None),
+        },
         "one" | "scalar_one" | "one_or_none" | "scalar_one_or_none" => {
             if name.starts_with("scalar_") {
                 q.scalars = true;
@@ -4695,6 +5209,24 @@ pub async fn run_create_all(conn: &V, ddl: &'static Ddl) -> R {
     }
 }
 
+/// `Base.metadata.create_all(engine)` with a synchronous engine: a connection of its own, the DDL in its
+/// transaction (checkfirst), committed.
+pub async fn create_all_engine(cx: &super::Cx, engine: &V, ddl: &'static Ddl) -> R {
+    match engine {
+        V::Native(n) if matches!(&**n, Native::Engine(true)) => {
+            let s = Session::new(cx.app.pool.clone(), false, true, true, Arc::downgrade(cx));
+            s.create_all(ddl).await?;
+            s.commit().await?;
+            s.close_connection().await?;
+            Ok(V::None)
+        }
+        V::Native(n) if matches!(&**n, Native::Engine(false)) => {
+            Err(Exc::new(&super::v::INVALID_REQUEST_ERROR, vec![V::str("py2axum: metadata.create_all(async_engine): use `await conn.run_sync(metadata.create_all)`")]))
+        }
+        other => Err(Exc::type_error(format!("py2axum: metadata.create_all() takes an engine, not {}", other.type_name()))),
+    }
+}
+
 /// `AsyncSession`: one per request (FastAPI dependency cache), cheap to clone.
 #[derive(Clone)]
 pub struct Session(Arc<tokio::sync::Mutex<SessInner>>);
@@ -4828,8 +5360,8 @@ impl Session {
             if let Some(other) = s.identity.get(&k) {
                 if !Arc::ptr_eq(&other, &o) {
                     return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!(
-                        "Can't attach instance <{} at 0x{:x}>; another instance with key {} is already present in this session.",
-                        o.desc.name, Arc::as_ptr(&o) as usize, ops::repr(&o.pk()).unwrap_or_default())));
+                        "Can't attach instance <{} at {}>; another instance with key {} is already present in this session.",
+                        o.desc.name, ops::addr(Arc::as_ptr(&o) as usize), ops::repr(&o.pk()).unwrap_or_default())));
                 }
             }
             *o.sess.lock() = s.me.clone();
@@ -4927,7 +5459,7 @@ impl Session {
                     wheres: vec![Sql::In(Box::new(Sql::Col(d, d.pk)), keys.into_iter().map(|k| Sql::Param(k, Some(ty), 0)).collect(), false)],
                     ..Default::default()
                 };
-                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                 render_select(&mut r, &sel)?;
                 for row in Session::run(s, &r).await? {
                     Session::entity(s, d, &row, 0, &[])?;
@@ -5061,7 +5593,7 @@ impl Session {
                 order: rel.order.iter().map(|&(i, desc)| Sql::Order(Box::new(Sql::Col(t, i)), desc, None)).collect(),
                 ..Default::default()
             };
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
             render_select(&mut r, &sel)?;
             let rows = Session::run(s, &r).await?;
             for row in &rows {
@@ -5131,7 +5663,7 @@ impl Session {
             wheres: vec![Sql::In(Box::new(Sql::Col(assoc, a)), keys.into_iter().map(|k| Sql::Param(k, Some(ty), 0)).collect(), false)],
             ..Default::default()
         };
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
         render_select(&mut r, &sel)?;
         let rows = Session::run(s, &r).await?;
         let mut found: HashMap<Key, Vec<Arc<ObjCell>>> = HashMap::new();
@@ -5217,7 +5749,7 @@ impl Session {
                         };
                         if src.as_ref().is_some_and(|x| Arc::ptr_eq(x, &o)) {
                             // the unit of work cannot order a row after itself (no post_update)
-                            let at = format!("<{} at 0x{:x}>", o.desc.name, Arc::as_ptr(&o) as usize);
+                            let at = format!("<{} at {}>", o.desc.name, ops::addr(Arc::as_ptr(&o) as usize));
                             return Err(Exc::msg(&CIRCULAR_DEPENDENCY_ERROR, format!(
                                 "Circular dependency detected. (SaveUpdateState({at}), ProcessState(ManyToOneDP({}.{}), {at}, delete=False))",
                                 o.desc.name, rel.name)));
@@ -5295,6 +5827,24 @@ impl Session {
             st.absent[col] = false;
             st.modified[col] = true;
         }
+    }
+
+    /// The links of an object about to be INSERTed: a post_update relationship's foreign key waits for the UPDATE
+    /// pass (SQLAlchemy's post-update: NULL in the INSERT, then `UPDATE ... SET fk=`)
+    fn apply_links_insert(o: &Arc<ObjCell>) {
+        let post = |col: usize| o.desc.rels.iter().any(|r| r.post_update && r.m2o && r.local == col);
+        if !o.st.lock().links.iter().any(|(col, _, _)| post(*col)) {
+            return Session::apply_links(o);
+        }
+        let (later, now): (Vec<_>, Vec<_>) = std::mem::take(&mut o.st.lock().links).into_iter().partition(|(col, src, _)| post(*col) && src.is_some());
+        o.st.lock().links = now;
+        Session::apply_links(o);
+        let mut st = o.st.lock();
+        for (col, _, _) in &later {
+            st.vals[*col] = V::None;
+            st.absent[*col] = false;
+        }
+        st.links = later;
     }
 
     async fn begin(s: &mut SessInner) -> R<()> {
@@ -5382,7 +5932,7 @@ impl Session {
         let mut new = std::mem::take(&mut s.new);
         new.sort_by_key(|o| o.desc.uow_rank());
         for o in new {
-            Session::apply_links(&o);
+            Session::apply_links_insert(&o);
             let desc = o.desc;
             let mut cols = Vec::new();
             let mut dyn_defaults = Vec::new();
@@ -5409,6 +5959,10 @@ impl Session {
             {
                 let mut st = o.st.lock();
                 for (i, c) in desc.cols.iter().enumerate() {
+                    if i == desc.pk && c.autoincrement && matches!(st.vals[i], V::None) {
+                        // SQLAlchemy: a primary key set to None is no value, the sequence gives it (SQLModel sets it)
+                        st.vals[i] = V::Unbound;
+                    }
                     if matches!(st.vals[i], V::Unbound) {
                         if let ColDefault::Value(f) = c.default {
                             st.vals[i] = f();
@@ -5452,7 +6006,7 @@ impl Session {
                 if key_val.is_some() {
                     names.insert(0, quote_ident(key).into_owned());
                 }
-                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                 if names.is_empty() {
                     r.sql = format!("INSERT INTO {} DEFAULT VALUES", quote_ident(table));
                 } else {
@@ -5560,7 +6114,7 @@ impl Session {
                 if !changes.iter().any(|(i, _)| in_t(*i)) {
                     continue;
                 }
-                let mut r = Rend { sql: format!("UPDATE {} SET ", quote_ident(table)), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                let mut r = Rend { sql: format!("UPDATE {} SET ", quote_ident(table)), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                 let mut first = true;
                 for (i, v) in changes.iter().filter(|(i, _)| in_t(*i)) {
                     if !first {
@@ -5651,7 +6205,7 @@ impl Session {
             for op in ops.iter().filter(|op| op.add == add) {
                 let vals: Vec<(usize, V)> = op.pairs.iter().map(|(c, x, src)| (*c, x.st.lock().vals[*src].clone())).collect();
                 let t = op.assoc;
-                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                 if add {
                     r.sql = format!("INSERT INTO {} ({}, {}) VALUES (", t.qt(), t.cols[vals[0].0].q(), t.cols[vals[1].0].q());
                     r.bind(vals[0].1.clone(), Some(t.cols[vals[0].0].ty));
@@ -5667,6 +6221,25 @@ impl Session {
                 Session::run_exec(s, &r).await?;
             }
         }
+        // post_update relationships of the rows to delete: their foreign key set to NULL first (SQLAlchemy
+        // de-associates them, so that rows referencing each other can be deleted)
+        for o in s.deleted.clone() {
+            let desc = o.desc;
+            for rel in desc.rels.iter().filter(|r| r.post_update && r.m2o) {
+                if o.st.lock().vals[rel.local].is_none() || matches!(o.st.lock().vals[rel.local], V::Unbound) {
+                    continue;
+                }
+                let c = &desc.cols[rel.local];
+                let table = c.table.unwrap_or(desc.table);
+                let mut r = Rend { sql: format!("UPDATE {} SET {}=", quote_ident(table), c.q()), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
+                r.bind(V::None, Some(c.ty));
+                desc.where_pk(&mut r, &o.pk());
+                Session::run_exec(s, &r).await?;
+                let mut st = o.st.lock();
+                st.vals[rel.local] = V::None;
+                st.committed[rel.local] = V::None;
+            }
+        }
         // DELETEs
         for o in std::mem::take(&mut s.deleted) {
             let desc = o.desc;
@@ -5676,13 +6249,13 @@ impl Session {
                 if let (Some((t, a, _)), false) = (rel.secondary, rel.passive_deletes) {
                     let v = o.st.lock().vals[rel.local].clone();
                     let mut r = Rend { sql: format!("DELETE FROM {} WHERE {}.{} = ", t.qt(), t.qt(), t.cols[a].q()),
-                                       binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                                       binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                     r.bind(v, Some(t.cols[a].ty));
                     Session::run_exec(s, &r).await?;
                 }
             }
             if desc.joins.is_empty() {
-                let mut r = Rend { sql: format!("DELETE FROM {}", desc.qt()), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                let mut r = Rend { sql: format!("DELETE FROM {}", desc.qt()), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                 desc.where_pk(&mut r, &pk);
                 Session::run_exec(s, &r).await?;
             } else {
@@ -5691,7 +6264,7 @@ impl Session {
                     std::iter::once((desc.joins[0].2, desc.joins[0].3)).chain(desc.joins.iter().map(|j| (j.0, j.1))).collect();
                 for (table, key) in tables.into_iter().rev() {
                     let mut r = Rend { sql: format!("DELETE FROM {} WHERE {}.{} = ", quote_ident(table), quote_ident(table), quote_ident(key)),
-                                       binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+                                       binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
                     r.bind(pk.clone(), Some(desc.cols[desc.pk].ty));
                     Session::run_exec(s, &r).await?;
                 }
@@ -5883,8 +6456,8 @@ impl Session {
         }
         if let Some(o) = &one {
             if objs.is_empty() {
-                return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!("Instance <{} at 0x{:x}> is not present in this Session",
-                                                                     o.desc.name, Arc::as_ptr(o) as usize)));
+                return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!("Instance <{} at {}> is not present in this Session",
+                                                                     o.desc.name, ops::addr(Arc::as_ptr(o) as usize))));
             }
         }
         for o in objs {
@@ -5994,7 +6567,7 @@ impl Session {
             && ident(o.desc, &o.pk()).ok().and_then(|k| s.identity.get(&k)).is_some_and(|x| Arc::ptr_eq(&x, &o));
         if !mine {
             return Err(Exc::msg(&INVALID_REQUEST_ERROR, format!(
-                "Instance '<{} at 0x{:x}>' is not persistent within this Session", o.desc.name, Arc::as_ptr(&o) as usize)));
+                "Instance '<{} at {}>' is not persistent within this Session", o.desc.name, ops::addr(Arc::as_ptr(&o) as usize))));
         }
         let names = match names {
             Some(n) if ops::truthy(n)? => ops::iter(n)?,
@@ -6167,7 +6740,7 @@ impl Session {
         }
         let mut s = self.0.lock().await;
         if !cols.is_empty() {
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
             render_select(&mut r, &desc.pk_select(&o.pk()))?;
             let rows = Session::run(&mut s, &r).await?;
             let row = rows.first().ok_or_else(|| Exc::msg(&SQLALCHEMY_ERROR, format!("Could not refresh instance '{}'", desc.name)))?;
@@ -6229,13 +6802,13 @@ impl Session {
             }
         };
         if !expired.is_empty() {
-            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+            let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
             render_select(&mut r, &desc.pk_select(&o.pk()))?;
             let rows = Session::run(&mut s, &r).await?;
             let Some(row) = rows.first() else {
                 return Err(Exc::msg(
                     &OBJECT_DELETED_ERROR,
-                    format!("Instance '<{} at 0x{:x}>' has been deleted, or its row is otherwise not present.", desc.name, Arc::as_ptr(o) as usize),
+                    format!("Instance '<{} at {}>' has been deleted, or its row is otherwise not present.", desc.name, ops::addr(Arc::as_ptr(o) as usize)),
                 ));
             };
             let mut decoded = Vec::new();
@@ -6295,7 +6868,7 @@ impl Session {
         let mut s = self.0.lock().await;
         let desc = o.desc;
         let pk = o.pk();
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
         render_select(&mut r, &desc.pk_select(&pk))?;
         let rows = Session::run(&mut s, &r).await?;
         match rows.first() {
@@ -6351,7 +6924,7 @@ impl Session {
         if s.autoflush {
             Session::flush_inner(&mut s).await?;
         }
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
         render_select(&mut r, &desc.pk_select(pk))?;
         let rows = Session::run(&mut s, &r).await?;
         match rows.first() {
@@ -6391,11 +6964,12 @@ impl Session {
     /// `plan`: the statement's column options (empty: the mapping's); a column it loads is also loaded into an
     /// identity already there whose value is not loaded (SQLAlchemy's partial population of unloaded attributes)
     fn entity(s: &mut SessInner, desc: &'static ModelDesc, row: &PgRow, off: usize, plan: &[ColLoad]) -> R<Arc<ObjCell>> {
-        let mut vals = vec![V::None; desc.cols.len()];
-        for i in desc.pks {
-            vals[*i] = decode(row, off + i, row_tz())?;
-        }
-        let key = ident(desc, &desc.pk_of(&vals))?;
+        // the identity (`pk_of` of the key columns), without a vector of every column
+        let pk = match desc.pks {
+            [i] => decode(row, off + i, row_tz())?,
+            pks => V::tuple(pks.iter().map(|i| decode(row, off + i, row_tz())).collect::<R<Vec<V>>>()?),
+        };
+        let key = ident(desc, &pk)?;
         let read = desc.cols.len();
         if let Some(o) = s.identity.get(&key) {
             if o.st.lock().expired {
@@ -6416,8 +6990,7 @@ impl Session {
             }
             return Ok(o);
         }
-        let o = ObjCell::transient(poly_pick(desc, row, off)?);
-        o.load_row_from(row, off, row_tz(), plan, read)?;
+        let o = ObjCell::from_row(poly_pick(desc, row, off)?, row, off, row_tz(), plan, read)?;
         Session::loaded(s, &o);
         *o.sess.lock() = s.me.clone();
         s.attach(&o);
@@ -6480,6 +7053,23 @@ impl Session {
             out.push(vals);
         }
         for (k, c) in sel.cols.iter().enumerate() {
+            if let SelCol::AEntity(a) = c {
+                // an aliased with_polymorphic(): the subclass columns of its objects
+                if a.poly.is_empty() {
+                    continue;
+                }
+                let mut objs: Vec<Arc<ObjCell>> = Vec::new();
+                for row in &out {
+                    if let V::Obj(o) = &row[k] {
+                        if !objs.iter().any(|x| Arc::ptr_eq(x, o)) {
+                            objs.push(o.clone());
+                        }
+                    }
+                }
+                let opts = a.poly.iter().map(|d| vec![(Lazy::SubPoly, *d, 0)]).collect();
+                Session::eager(s, objs, a.model, opts, vec![a.model as *const ModelDesc as usize]).await?;
+                continue;
+            }
             if let SelCol::Entity(m) = c {
                 // (eager: relationships, and the subclass columns of an inheritance hierarchy)
                 if m.rels.is_empty() && m.subs.is_empty() {
@@ -6877,7 +7467,7 @@ impl Session {
         if s.autoflush && !matches!(&st, Sql::Select(sel) if sel.no_autoflush) {
             Session::flush_inner(&mut s).await?;
         }
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
         match &st {
             Sql::Insert(ins) => {
                 render(&mut r, &st)?;
@@ -7036,7 +7626,7 @@ impl Session {
         if !(s.new.is_empty() && s.deleted.is_empty() && s.strong.is_empty()) || (s.tx.is_some() && s.wrote) {
             return Ok(None);
         }
-        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new() };
+        let mut r = Rend { sql: String::new(), binds: Vec::new(), aliases: Vec::new(), shared: Vec::new(), outer: Vec::new(), ..Default::default() };
         render_select(&mut r, sel)?;
         let args = Session::args(&s, &r).await?;
         Ok(Some((s.pool.clone(), r.sql, args)))
@@ -7105,8 +7695,8 @@ pub async fn defer_list(cx: &super::Cx, fname: &'static str, session: &V, stmt: 
 /// One row of a `ListStream`: a detached object (not in the session's identity map), TypeDecorator results
 /// applied.
 pub async fn row_object(cx: &super::Cx, desc: &'static ModelDesc, row: &PgRow) -> R {
-    let o = ObjCell::transient(poly_pick(desc, row, 0)?);
-    o.load_row_from(row, 0, row_tz(), &[], desc.cols.len())?; // streamed only without loader options: the mapping's column strategies
+    // streamed only without loader options: the mapping's column strategies
+    let o = ObjCell::from_row(poly_pick(desc, row, 0)?, row, 0, row_tz(), &[], desc.cols.len())?;
     for (i, c) in desc.cols.iter().enumerate() {
         if let ColTy::Decorated(TypeDec { result: Some(f), .. }) = c.ty {
             let raw = o.st.lock().vals[i].clone();
@@ -7188,6 +7778,15 @@ fn rel_exists(m: &'static ModelDesc, ri: usize, name: &str, args: &[V], kwargs: 
     Ok(sql(Sql::Exists(Box::new(sel))))
 }
 
+/// A hybrid of the model of an ORM `aliased()` class (not a Core table's alias)
+pub fn alias_hybrid(v: &V, name: &str) -> Option<&'static HybridDesc> {
+    let V::Sql(x) = v else { return None };
+    match &**x {
+        Sql::Alias(a) if !a.model.core && a.poly.is_empty() => a.model.hybrid(name),
+        _ => None,
+    }
+}
+
 /// `sq.c` / `sq.c.name`
 pub fn sql_attr(v: &V, name: &str) -> Option<R> {
     let V::Sql(x) = v else { return None };
@@ -7217,6 +7816,9 @@ pub fn sql_attr(v: &V, name: &str) -> Option<R> {
             let known = q.sel.cols.iter().any(|c| match c {
                 SelCol::Expr(Sql::Label(_, l)) => l == n,
                 SelCol::Expr(Sql::Col(m, i)) => m.cols[*i].sql == n,
+                SelCol::Expr(Sql::ACol(a, i)) => a.model.cols[*i].sql == n,
+                // a column of a subquery (or CTE) selected again: its name
+                SelCol::Expr(Sql::SubCol(_, c)) => c == n,
                 SelCol::Entity(m) => m.col_index(n).is_some(),
                 SelCol::AEntity(a) => a.model.col_index(n).is_some(),
                 _ => false,
@@ -7227,6 +7829,16 @@ pub fn sql_attr(v: &V, name: &str) -> Option<R> {
         (Sql::Excluded(m), n) => Some(match m.col_index(n) {
             Some(i) => Ok(sql(Sql::ExCol(m, i))),
             None => Err(Exc::attr_error(format!("{n}"))),
+        }),
+        (Sql::Alias(a), n) if a.poly.iter().any(|d| d.name == n) => {
+            let d = *a.poly.iter().find(|d| d.name == n).unwrap();
+            Some(Ok(sql(Sql::APoly(a.clone(), d))))
+        }
+        // a column the base maps too is the base table's (SQLAlchemy's first column of the property)
+        (Sql::APoly(a, _), n) if a.model.col_index(n).is_some() => Some(Ok(sql(Sql::ACol(a.clone(), a.model.col_index(n).unwrap())))),
+        (Sql::APoly(a, d), n) => Some(match d.col_index(n) {
+            Some(i) => Ok(sql(Sql::APCol(a.clone(), d, i))),
+            None => Err(Exc::attr_error(format!("py2axum: {n} is not a column of {} (a with_polymorphic() subclass namespace gives its columns only)", d.name))),
         }),
         (Sql::Alias(a), n) if a.model.rel_index(n).is_some() => Some(Ok(sql(Sql::ARel(a.clone(), a.model.rel_index(n).unwrap())))),
         (Sql::Alias(a), n) => Some(match a.model.col_index(n) {
@@ -7263,6 +7875,7 @@ pub fn cast(e: &V, ty: &V) -> R {
         "Float" | "float" => "FLOAT",
         "Date" => "DATE",
         "Boolean" => "BOOLEAN",
+        "Numeric" => "NUMERIC",
         _ => return Err(Exc::type_error(format!("py2axum: cast(..., {name}) is not supported"))),
     };
     Ok(sql(Sql::Cast(Box::new(to_sql(e, None)), pg)))

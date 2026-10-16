@@ -6,8 +6,8 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
 
 ## Values, functions, classes, modules
 
-- Values and operators with CPython's semantics: int (64-bit: beyond is an `OverflowError`), float formatting
-  and `repr`, str methods (`isdigit`, `isdecimal`, `isnumeric`, `isalpha`, `isalnum`, `isspace` from the Unicode
+- Values and operators with CPython's semantics: int (64-bit: beyond is an `OverflowError`, refused at translation
+  when the expression is made of literals), float formatting and `repr`, str methods (`isdigit`, `isdecimal`, `isnumeric`, `isalpha`, `isalnum`, `isspace` from the Unicode
   database of the Python that transpiles), `%`/`format`/f-strings (presentations `d f % e g x o b` and their upper-case forms, `#`;
   not `n`, `c`, `=` with non-numbers), slicing, comparisons, `**`, bit operators, truthiness,
   `hash()` rules (unhashable Pydantic models and dataclasses unless frozen, `__hash__ = None`, `__eq__`
@@ -28,14 +28,43 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   (`[lambda: i for i in range(3)]` all see the last `i`; a variable assigned after the `def` raises CPython's
   `NameError` if read before). `nonlocal` rebinds a local of the enclosing function.
   Refused: `nonlocal` of a parameter of the enclosing function, a project decorator on a method.
-- Classes: plain classes (`__init__`, methods, properties, static/class methods, class attributes,
+- Classes: plain classes (`__init__`, methods, properties, static/class methods, class attributes (a function
+  held as one must be wrapped, `impl = staticmethod(f)`: it is then never bound, read through the class or an
+  instance; a bare function or lambda, which CPython binds to the instance, and `classmethod(f)` are refused),
   `__slots__`; single inheritance from another plain class and/or `abc.ABC`, `@abstractmethod` (instantiating
-  a class left abstract raises CPython's `TypeError` when called by name), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `__post_init__`; `dataclasses.astuple()` / `asdict()`, recursive like CPython), exceptions (class attributes,
+  a class left abstract raises CPython's `TypeError` when called by name), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `eq=False` (identity, or the base's `__eq__`), `__post_init__`, one plain class as base; `dataclasses.astuple()` / `asdict()`, recursive like CPython), `typing.NamedTuple` classes (fields with literal immutable defaults, methods and properties; a tuple in every sequence operation, compared and hashed as one, `json.dumps` and responses as an array; `_asdict()`, `_replace()`, `_make()`, `_fields`, `_field_defaults`, read-only fields; refused as a Pydantic field or response type, and with its own dunders or `_` methods), exceptions (class attributes,
   methods, `super().__init__` of `HTTPException`), Enums (methods, `_missing_`). Special methods:
   `__str__`, `__repr__`, `__eq__` (used by `str()`, f-strings, `==`, `in`, `index`, `count`, `remove`),
+  `__ne__`, `__lt__`, `__le__`, `__gt__`, `__ge__` (CPython's rich comparison: the left operand's method, then the
+  right one's reflected method, their result as is; `sorted()`, `min()`, `max()` compare with `<`),
+  `__hash__ = object.__hash__`, `operator.eq`/`ne`/`lt`/`le`/`gt`/`ge` as values,
   `__enter__/__exit__`, `__aenter__/__aexit__`; they are `def`s (the only I/O one may do is a synchronous
   session's lazy load, a `__repr__` reading a deferred column: done blocking, as CPython does); other special methods
   are refused. In containers, an exception raised by `__eq__` counts as "not equal" (CPython propagates it).
+  Protocol methods (`def`s too): `__iter__`/`__next__` (a `for` loop or a comprehension calls `__next__` between
+  its bodies, `break` ends an endless iterator; `list()`, `sorted()`, `sum()`, `in`... consume the whole iteration;
+  `__iter__` may return `self`, another iterator, or `iter(container)`, which iterates a snapshot of the container (difference: a container returned as such, which CPython refuses with a TypeError, is iterated too);
+  the old protocol: `__getitem__(0)`, `__getitem__(1)`... until `IndexError`), `next(obj[, default])`, `__len__`,
+  `__bool__`, `__contains__`, `__getitem__`/`__setitem__`/`__delitem__` (not with a slice: `obj[a:b]` raises a
+  py2axum `TypeError`), the arithmetic and bitwise operators with their reflected (`__radd__`) and in-place
+  (`__iadd__`) forms, `NotImplemented` passing the turn as in CPython (the right operand first when its class is a
+  subclass of the left one's), `__neg__`, `__pos__`, `__invert__`, `__abs__`, with CPython's errors for a wrong
+  result (`__bool__ should return bool`, `__len__() should return >= 0`, `iter() returned non-iterator`, and their 3.15 wording). `bool(NotImplemented)` raises TypeError from Python 3.14; before, it is true and CPython's DeprecationWarning is not printed.
+  `__getstate__`, `__setstate__`, `__reduce__`, `__reduce_ex__`, `__copy__`, `__deepcopy__` and `__getnewargs__`
+  are ignored when nothing translated imports `copy` or `pickle` nor reads them (only those call them), refused
+  otherwise. Still refused: `__hash__` as a method, `__index__`, descriptors (`__get__`), `__getattribute__`.
+- Bases that only type a class are dropped: `Generic[T]`, `Protocol[T]`, the parameters of a generic project base
+  (`class Typed(Box[int])`). A method's default reads the class body first, as CPython evaluates it there
+  (`def check(self, tolerance=DEFAULT_TOLERANCE)` after `DEFAULT_TOLERANCE = 300` in the class); a name the class
+  body binds again after the method is refused. Statements after `return`, `raise`, `break` or `continue` are
+  never run, and never translated.
+- `@typing.overload` signatures are dropped (the implementation that follows is the function). A module constant
+  made of a version or platform test (`PY3 = sys.version_info[0] == 3`) decides its `if PY3:` like the test itself.
+  `object()` is a sentinel (identity, `is`); `bytearray`, `memoryview` and `complex` can be named (an `isinstance`
+  member: the runtime never makes the first two), not called.
+- `mod.X = v` and `mod.X += v` for a variable of a project module (or of a library translated from source,
+  `stripe.api_key = ...`) rebind it, as `global X` in that module would; replacing a function or a class of a
+  module stays refused.
 - Types as values: `list[X]`, `X | None`, library classes (`BaseModel`, `AsyncSession`...),
   `isinstance`/`issubclass` with run-time types, `inspect.isclass`, `typing.get_args/get_origin/
   get_type_hints` (annotations kept on decorated functions).
@@ -47,6 +76,10 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   an argument) is called like the class named in the source: Pydantic model, settings (environment read again),
   dataclass, plain class, Enum, `SimpleNamespace`, with CPython's `TypeError`s. Difference: pydantic-settings
   init options (positional arguments, `_env_prefix=`…) on a settings class held as a value raise a `TypeError`.
+- `from module import *` binds what CPython binds: the names of the module's literal `__all__`, else its names
+  without a leading `_`, the ones it imports included (`HTTPException` imported there from FastAPI). A
+  `__all__` that is not one literal list or tuple of strings exports nothing (the names read through the star
+  import are refused as unknown).
 - Module globals are evaluated at startup in import order, like importing the app; module-level calls too, and
   module-level `try`, `if`, `for`, `while` and `with` statements, whose bindings are module variables
   (`except E as e` names are deleted as in CPython). A `try` whose body only imports and assigns constants is an
@@ -83,8 +116,18 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   relationships are released when their session ends. Other reference cycles the application builds
   (`a.append(a)`, two nested functions calling each other, a decorated nested function naming itself, an
   object stored in a container it owns) are never freed: each request that builds one keeps it until the
-  process exits. A finished task stored in the request's state (`request.state.t = asyncio.create_task(...)`)
-  is freed with the request, unless it failed and its exception was never retrieved.
+  process exits. A task or an async generator stored in the request's state (`request.state.t =
+  asyncio.create_task(...)`, `request.state.g = agen()`) is freed with the request, as in CPython: a failed task
+  never awaited logs « Task exception was never retrieved » then, a suspended generator runs its `finally`. Unless
+  a `Request` object outlives the request (kept by the task, the generator or a global): then they stay.
+- « Task exception was never retrieved »: its `future: <Task finished ...>` line names the coroutine (`coro=<f()
+  done, defined at file:line>`) when the task runs a module-level `async def` of the project; for any other
+  coroutine (a method, a nested function) the line has no `coro=` part.
+- Object addresses in reprs (`<X object at 0x...>`, SQLAlchemy's `<X at 0x...>`) are the binary's own: never
+  CPython's, and on 64-bit Linux written on 12 hex digits (zero-padded), CPython's width there, so that a truncated
+  repr (pydantic's `input_value`) is cut at the same place. On macOS addresses are not padded and their width
+  depends on where each allocator places its heap (CPython's usually 9 digits, the binary's 9 to 11, with mimalloc
+  or the system allocator alike): a truncated repr may be cut elsewhere in the logs. Compare logs on Linux.
 - `typing.TypedDict` classes: calling one builds a plain `dict` (keys neither checked nor completed, as in
   CPython); as a Pydantic field or a response model, refused.
 - `map`/`filter` return lists (materialized); `frozenset` behaves as `set`; `callable()`; a builtin exception
@@ -121,6 +164,11 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   `__anext__`, `anext()`, `asend`, `athrow`, `aclose` (`GeneratorExit` at the `yield`, `finally` blocks run).
   `@asynccontextmanager` follows `contextlib` (exception thrown in at the `yield`, `generator didn't yield`,
   `generator didn't stop`). `contextlib.suppress(*excs)`.
+- `yield from it` as a statement of a generator, `it` a file opened by `with open(...) as f` in the same function,
+  a literal or a builtin's result (`sorted`, `range`...): the same items as a `for` loop. Over a generator (which
+  would also take `send()`/`throw()`/`close()` and give its return value) it is refused.
+- A method of a builtin type read on the type (`str.lower`, `dict.get`) is a function: `sorted(xs, key=str.lower)`,
+  a validator; called on another type it raises CPython's `descriptor ... doesn't apply to a ... object`.
 - `task.cancel()`, `task.cancelled()`: `await task` then raises `CancelledError`. Difference: the task's
   coroutine is stopped at its current `await` without `CancelledError` being raised inside it (its own
   `except CancelledError` / `finally` blocks do not run).

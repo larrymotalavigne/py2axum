@@ -124,6 +124,22 @@ def _jwt_parts(token: str):
     return dec(head), dec(payload)
 
 
+def _durations(o: dict) -> dict:
+    """A measured duration in a response header (`X-Response-Time: 0.000162...`, the "Custom APIRoute" recipe)
+    differs at each call: its shape (a non-negative float) is compared, not its value."""
+    mw = o.get("mw")
+    if not isinstance(mw, dict):
+        return o
+    out = dict(mw)
+    for k, v in mw.items():
+        if k.endswith("-time") and isinstance(v, str):
+            try:
+                out[k] = "<duration>" if float(v) >= 0 else v
+            except ValueError:
+                pass
+    return {**o, "mw": out}
+
+
 def same_but_clock(a, b, slack: int = 2):
     """Two bodies equal except for JWTs minted a second apart (the reference and the binary are called one
     after the other: `exp = now + delta` crosses a second when hashing a password takes long): same header,
@@ -199,7 +215,7 @@ class LockstepTransport(httpx.BaseTransport):
         # a test that overrides dependencies changes the in-process app only: the servers cannot see it
         overridden = bool(getattr(self.app, "dependency_overrides", None))
         kind = "docs" if path in self.docs else "overridden" if overridden else "http"
-        same = json.dumps(obs["ref"], ensure_ascii=False) == json.dumps(obs["cand"], ensure_ascii=False)
+        same = json.dumps(_durations(obs["ref"]), ensure_ascii=False) == json.dumps(_durations(obs["cand"]), ensure_ascii=False)
         if not same and {k: v for k, v in obs["ref"].items() if k != "body"} == \
                 {k: v for k, v in obs["cand"].items() if k != "body"}:
             same = same_but_clock(obs["ref"].get("body"), obs["cand"].get("body"))

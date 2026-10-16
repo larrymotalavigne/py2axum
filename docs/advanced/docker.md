@@ -7,8 +7,8 @@ image holds the binary alone.
 
 | Tag | |
 |---|---|
-| `X.Y.Z` | one py2axum release (`0.8.0`); pin this in production builds |
-| `X.Y` | the latest patch release of a minor version (`0.8`) |
+| `X.Y.Z` | one py2axum release (`0.9.0`); pin this in production builds |
+| `X.Y` | the latest patch release of a minor version (`0.9`) |
 | `latest` | the latest release |
 
 Each tag is a multi-arch image (`linux/amd64`, `linux/arm64`) built by GitHub Actions from the release
@@ -19,8 +19,9 @@ What is inside:
 
 - Python 3.14 (the transpiler must run on a Python at least as recent as your application's) and py2axum;
 - Rust 1.99 (`rustc`, `cargo`), `gcc` for linking;
-- the runtime's crates, compiled with the release profile py2axum generates (fat LTO, one codegen unit) into
-  `CARGO_TARGET_DIR=/opt/py2axum/target`: a build compiles your application's crate and links, nothing else;
+- the runtime's library crate and its dependencies, compiled with the release profile py2axum generates (thin
+  LTO, one codegen unit) into `CARGO_TARGET_DIR=/opt/py2axum/target`: a build compiles your application's crate
+  and links, nothing else;
 - Debian bookworm (glibc 2.36): the binaries run on bookworm, trixie, Ubuntu 22.04 and later, and
   `gcr.io/distroless/cc-debian12`;
 - a non-root user, `py2axum` (uid 1000), working directory `/app`.
@@ -30,7 +31,7 @@ What is inside:
 Mount the directory you run uvicorn from on `/app`, then name the application package:
 
 ```bash
-docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum:0.8 build app --python-side auto
+docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum:0.9 build app --python-side auto
 ```
 
 ```
@@ -69,7 +70,7 @@ builds with the image and ships the binary on `gcr.io/distroless/cc-debian12:non
 certificates; no shell, no package manager):
 
 ```dockerfile
-FROM ghcr.io/larrymotalavigne/py2axum:0.8 AS build
+FROM ghcr.io/larrymotalavigne/py2axum:0.9 AS build
 COPY --chown=py2axum:py2axum . /app/
 RUN py2axum-build app --name app --out /tmp/out --python-side auto
 
@@ -86,7 +87,7 @@ library behaviours follow them. The reference file takes build arguments (`APP_D
 
 ```bash
 docker build -f examples/docker/Dockerfile --build-arg APP_DIR=. --build-arg PACKAGE=api \
-  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.8.0 -t myapp .
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.9.0 -t myapp .
 ```
 
 [`compose.yaml`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/compose.yaml), next to
@@ -100,8 +101,9 @@ curl -s localhost:8080/health
 
 ## Build time and size
 
-The fat LTO link of the whole program dominates a build: the runtime's crates are precompiled, but LTO
-optimises them again with your code. Measured on the bookshelf example:
+The LTO link dominates a build: the runtime and its dependencies are precompiled, but LTO optimises them again
+with your code. Measured on the bookshelf example (with fat LTO, before 0.9; thin LTO, the default since,
+links faster):
 
 | | |
 |---|---|
@@ -121,7 +123,7 @@ Rust versions.
 from a published version or from a checkout:
 
 ```bash
-docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.8.0 -t py2axum .   # a release
+docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.9.0 -t py2axum .   # a release
 docker build -f docker/Dockerfile --build-arg PY2AXUM=/src -t py2axum .              # this checkout
 ```
 

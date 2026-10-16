@@ -193,6 +193,11 @@ def render_sqlalchemy(data: dict, sq: list[dict]) -> list[str]:
         o += ["", f"Not in the corpus: {sum(skipped.values())} examples (both variants) the bench cannot run as "
               "written: " + ", ".join(f"{k} ({n})" for k, n in sorted(skipped.items(), key=lambda kv: -kv[1]))
               + " (SQLite-only SQL, a statement of the page that fails before them)."]
+    if any("associationproxy.rst:592" in r.get("source", "") and r["status"] == "refused" for r in sq):
+        o += ["", "Refused and counted, though the documentation's own block is at fault: the mapping of "
+              "`ext/associationproxy.rst:592` imports `Mapped` from `sqlalchemy.orm.collections`, which has no such name "
+              "(`ImportError` under SQLAlchemy 2.1.4; the doctest runner gets by with the `Mapped` an earlier block "
+              "bound). py2axum refuses the unresolved annotation; the bench does not edit the documentation."]
     reasons = Counter()
     for r in sq:
         if r["status"] == "refused":

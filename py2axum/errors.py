@@ -7,7 +7,7 @@ that disappears keeps its number retired. The reference page of the site (docs/r
 generated from this table (`python -m py2axum.errors --markdown`, checked by tests/test_errors.py).
 
 Numbering: 01xx Python language, 02xx libraries, 03xx FastAPI/Starlette, 04xx Pydantic, 05xx SQLAlchemy,
-06xx project and versions, 09xx the rest.
+06xx project and versions, 07xx libraries translated from source, 09xx the rest.
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ CLASSES: list[ErrorClass] = [
     E("P2A0201", "Library call not supported",
       (r"library call `([a-zA-Z0-9_]+)\.?[^`]*\(\)` is not supported", r"library function `([\w.]+)` cannot be used",
        r"py2axum maps sentry_sdk", r"string\.Formatter\(\)\.\w+\(\) is not supported",
-       r"^Formatter\(\)\."),
+       r"^Formatter\(\)\.", r"is supported consumed whole only"),
       "The call goes to a library the binary has no equivalent for: py2axum maps a closed list of library "
       "functions to its runtime and never calls Python libraries from the binary.",
       "Use a supported library or the standard library for the same job (see Libraries and Standard library). "
@@ -76,7 +76,7 @@ CLASSES: list[ErrorClass] = [
       "A value of a library outside py2axum's library map is read (a constant, a class used as a value...).",
       "Read it from a supported library or write the value itself. " + PY_SIDE,
       "reference/libraries.md", "lib \\1", "library \\1"),
-    E("P2A0203", "Method not implemented by the runtime", r"method \.(\w+)\(\) is not implemented by the runtime",
+    E("P2A0203", "Method not implemented by the runtime", (r"method \.(\w+)\(\) is not implemented by the runtime", r"method \.(\w+)\(\) \(text"),
       "No value type of the runtime has this method, and no project class defines it: the binary would fail "
       "with a 500 where Python runs it.",
       "Use a supported method of the value (see Python semantics), or check the receiver's type: it may be a "
@@ -132,6 +132,37 @@ CLASSES: list[ErrorClass] = [
       "Make the construct translate, or route it to Python at your ingress instead of through the binary.",
       "getting-started/hybrid.md", "python-side impossible", "cannot be python-side"),
 
+    # ------------------------------------------------------------------ 07xx libraries translated from source
+    E("P2A0701", "Library licence not admitted",
+      (r"has licence .* not admitted for translation",),
+      "`--translate-libs` compiles a library's source into the binary, a derived work of the library: only "
+      "permissive licences are admitted by default (MIT, BSD, Apache-2.0, ISC, PSF, Unlicense). The licence is read "
+      "from the distribution's `License-Expression`, else its licence classifiers.",
+      "Check that the licence allows it for your binary and pass `--allow-license <SPDX>`, or leave the routes "
+      "that reach the library to Python. " + PY_SIDE,
+      "advanced/libraries.md#licences", "licence de bibliothèque", "library licence"),
+    E("P2A0702", "Library not pure Python",
+      (r"is not pure Python \(compiled extension",),
+      "Only pure-Python libraries are translated from source: a compiled extension (or a C accelerator next to its "
+      "pure-Python fallback) is code the translation cannot read, and translating the fallback would not translate "
+      "what CPython runs.",
+      "Use a pure-Python alternative, or leave the routes that reach the library to Python. " + PY_SIDE,
+      "advanced/libraries.md", "bibliothèque compilée", "compiled library"),
+    E("P2A0703", "Library installation differs from the lock",
+      (r"the project locks .* is\s+installed in", r"the project locks .* installed in", r"does not match its RECORD hash"),
+      "The binary carries the library's code as installed in the project's environment: it must be the version "
+      "the project locks, with files as published (their `RECORD` hashes).",
+      "Install the locked versions (`uv sync --frozen`), or point `--venv` at the project's environment.",
+      "advanced/libraries.md", "installation de bibliothèque", "library installation"),
+
+    E("P2A0704", "Standard library source of another Python",
+      (r"is translated from the source of the project's Python",),
+      "A few pure-Python modules of the standard library (`gettext`, `html.entities`, `keyword`...) are translated "
+      "from the source of the Python py2axum runs on: it must be the project's Python, whose behaviour the binary "
+      "follows.",
+      "Run py2axum on the project's Python (the minor its `.python-version` or `--python` names).",
+      "advanced/libraries.md#the-standard-library", "stdlib d'un autre Python", "standard library source"),
+
     # ------------------------------------------------------------------ 03xx FastAPI / Starlette
     E("P2A0303", "Lifespan or startup event",
       (r"FastAPI\(lifespan=", r"lifespan state", r"on_event"),
@@ -143,6 +174,16 @@ CLASSES: list[ErrorClass] = [
       "A mounted sub-application is not compiled; as the app's last registrations, mounts can stay in Python.",
       "Register mounts last and pass `--python-side mount` (implied by `--python-side auto`).",
       "tutorial/bigger-applications.md#mounted-applications", "app.mount", "app.mount"),
+    E("P2A0315", "Router of a library", (r"is a router of the library `([^`]+)`",
+                                         r"only as one of the app's last registrations",
+                                         r"; as the app's last registration it can stay"),
+      "The routes of a router defined in a library are not translated (py2axum reads only the project); as the "
+      "app's last registrations, they can stay in Python.",
+      "Include the library's router last (`app.include_router(...)` on the app, unconditionally, with a literal "
+      "prefix or none, nothing registering routes after it) and pass `--python-side mount` (implied by "
+      "`--python-side auto`).",
+      "tutorial/bigger-applications.md#routers-of-libraries", "routeur de la bibliothèque \\1",
+      "router of library \\1", whole_app=True),
     E("P2A0313", "Exception handler", (r"exception_handler", r"add_exception_handler"),
       "This form of exception handler registration is not reproduced.",
       "Register handlers with `@app.exception_handler(Exc)` or `app.add_exception_handler(Exc, handler)` at "
@@ -167,7 +208,7 @@ CLASSES: list[ErrorClass] = [
       "in Python: the whole application then runs in Python (a middleware wraps every route).",
       "tutorial/middleware.md", "middleware \\1", "middleware \\1", whole_app=True),
     E("P2A0304", "Router registration",
-      (r"include_router", r"APIRouter", r"add_route\(\)"),
+      (r"include_router", r"APIRouter", r"add_route\(\)", r"route_class", r"custom route class", r"get_route_handler\(\)"),
       "Routes are discovered statically: py2axum must know at translation time which routes exist and under "
       "which prefix.",
       "Call `include_router` unconditionally, at module level or at the top level of the app factory, with a "
@@ -196,12 +237,13 @@ CLASSES: list[ErrorClass] = [
     E("P2A0305", "Route or response option",
       (r"unsupported route option (\w+)=", r"response_class=", r"EventSourceResponse", r"generator endpoint",
        r"is only supported with a Pydantic model as the response model", r"must be a literal set or list of field",
-       r"default_response_class"),
+       r"default_response_class", r"^response class "),
       "This option of the route decorator changes the response in a way the binary does not reproduce.",
       "Use the supported response classes and options (see Responses), or return a response object.",
       "tutorial/responses.md", "option de route \\1=", "route option \\1="),
     E("P2A0306", "Endpoint parameter",
       (r"(Cookie|Form|File)\(\) parameters", r"needs a type annotation", r"without annotation",
+       r"FastAPI parameter marker",
        r"File\(\) default", r"OAuth2PasswordRequestForm", r"model of \w+ parameters", r"model of cookies",
        r"path convertor", r"constraints without a type annotation", r"are not supported in endpoints",
        r"only plain positional parameters"),
@@ -257,7 +299,7 @@ CLASSES: list[ErrorClass] = [
       "tutorial/sql.md#what-is-native", "relation", "relationship"),
     E("P2A0501", "Column type",
       (r"unsupported column type `(?:[\w.]*\.)?(\w+)", r"^column \w+: (ARRAY|Enum|Numeric|Identity)\(",
-       r"as_uuid=False", r"type factory", r"type_= is not supported", r"changes the column type",
+       r"as_uuid=False", r"^column \w+: type factory", r"type_= is not supported", r"changes the column type",
        r"only ARRAY\(String\)", r"Enum\(\) (needs|of string)"),
       "The column type decides how values are bound and decoded; this one has no mapping in the runtime.",
       "Use a supported column type (String, Integer, Numeric, Boolean, Date/DateTime, JSON/JSONB, Uuid, Enum of a "
@@ -320,12 +362,14 @@ CLASSES: list[ErrorClass] = [
     E("P2A0402", "Field option",
       (r"Field\(", r"constraint \w+= on", r"^constraints on", r"Decimal bound", r"applies to Decimal",
        r"PrivateAttr", r"private attribute", r"default_factory", r"alias must be", r"AliasPath", r"when_used",
-       r"discriminat", r"Discriminator", r"one function, no options", r"does not apply to `str`"),
+       r"discriminat", r"Discriminator", r"one function, no options", r"does not apply to `",
+       r"datetime bound", r"bound must be a", r"only fixed offsets"),
       "This `Field()` option or constraint is not reproduced on this type.",
       "Use the supported options (see Models) or a validator.",
       "tutorial/models.md#what-is-native", "option de Field", "Field option"),
     E("P2A0410", "Enum or non-Pydantic type",
-      (r"is not a Pydantic model \(enums", r"is not a Pydantic model or an enum", r"customizes its Pydantic schema"),
+      (r"is not a Pydantic model \(enums", r"is not a Pydantic model or an enum", r"customizes its Pydantic schema",
+       r"__get_pydantic_core_schema__", r"GetPydanticSchema"),
       "Models, parameters and bodies are validated like Pydantic; only Pydantic models, enums, dataclasses and "
       "the supported scalar types can be validated.",
       "Turn the class into a `BaseModel` (or a dataclass), or use a supported type.",
@@ -343,7 +387,7 @@ CLASSES: list[ErrorClass] = [
       "tutorial/models.md#what-is-native", "type \\1", "type \\1"),
     E("P2A0406", "Model class body",
       (r"class attribute `.*` is not supported", r"^schema \w+", r"BaseModel\.__init__", r"Pydantic models take keyword",
-       r"of BaseModel are supported", r"unsupported statement in schema"),
+       r"of BaseModel are supported", r"unsupported statement in schema", r"model_construct\("),
       "Model classes are compiled from their fields, validators and simple methods; this member is not reproduced.",
       "Keep the model to fields, `model_config`, validators, `@property` and plain methods.",
       "tutorial/models.md#what-is-native", "attribut de classe de schéma", "model class body"),
@@ -375,7 +419,8 @@ CLASSES: list[ErrorClass] = [
       "Decorators are applied at translation time; only the decorators py2axum knows are reproduced.",
       "Remove the decorator or use a supported one (see Python semantics). " + PY_SIDE,
       "reference/python.md", "décorateur @\\1", "decorator @\\1"),
-    E("P2A0112", "Dataclass", (r"^dataclass", r"@dataclass", r"unsupported statement in dataclass"),
+    E("P2A0112", "Dataclass", (r"^dataclass", r"@dataclass", r"unsupported statement in dataclass", r"^NamedTuple",
+                                r"unsupported statement in NamedTuple", r"pydantic dataclass", r"@pydantic\.dataclasses"),
       "Dataclasses are compiled with plain fields, `field(default=, default_factory=)` and methods.",
       "Keep the dataclass to fields and plain methods, without options or base classes.",
       "reference/python.md", "dataclass", "dataclass"),
@@ -391,7 +436,8 @@ CLASSES: list[ErrorClass] = [
       (r"only exception classes are supported", r"^exception class", r"super\(", r"__slots__", r"is not a class",
        r"^no method", r"object\.__(init|setattr)__", r"BaseException\.__init__", r"^base class `",
        r"class variables", r"method \w+ is not supported",
-       r"unsupported statement in class", r"a decorated __new__"),
+       r"unsupported statement in class", r"a decorated __new__", r"as a class attribute is not supported",
+       r"only staticmethod\(f\)"),
       "Project classes are compiled when they are models, schemas, exceptions, dataclasses, enums or plain "
       "classes with plain methods; this member or form is not reproduced.",
       "Keep the class to `__init__`, plain methods and properties, or turn it into a dataclass or a model.",
@@ -443,7 +489,8 @@ CLASSES: list[ErrorClass] = [
       "Use a supported builtin (see Python semantics).",
       "reference/python.md", "builtin \\1()", "builtin \\1()"),
     E("P2A0106", "Value not known at translation time",
-      (r"is not a constant", r"expected a literal value", r"f-strings are not constants",
+      (r"is not a constant", r"expected a literal value", r"f-strings are not constants", r"`: \*\* arguments are not supported",
+       r"` raises \w+: ",
        r"evaluated at translation time", r"must be a literal", r"must be a constant", r"must be literals",
        r"only a plain function whose body is `return", r"only type subscripts are evaluated",
        r"is not a JSON value", r"must be True or False", r"cannot be used as a value", r"is not callable",
@@ -455,7 +502,7 @@ CLASSES: list[ErrorClass] = [
     E("P2A0101", "Python construct not supported",
       (r"unsupported statement `(\w+)`", r"unsupported expression", r"^unsupported (augmented assignment|binary "
        r"operator|comparison|comprehension target|del target)", r"conversion is not supported",
-       r"integer literal out of 64-bit", r"bare `raise`", r"break/continue outside", r"`yield` outside",
+       r"integer literal out of 64-bit", r"integer expression out of 64-bit", r"read on its class is not supported", r"bare `raise`", r"break/continue outside", r"`yield` outside", r"`yield from`",
        r"stored in a variable",
        r"^unsupported (default value|constant|name|call|assignment target)"),
       "py2axum compiles a subset of Python; this construct has no equivalent in the runtime yet.",
@@ -541,7 +588,7 @@ def markdown() -> str:
          "Classes marked *whole application* refuse the generation whatever the routes: "
          "`--python-side auto` cannot move them to Python.", ""]
     groups = [("01", "Python language"), ("02", "Libraries"), ("03", "FastAPI and Starlette"),
-              ("04", "Pydantic"), ("05", "SQLAlchemy"), ("06", "Project and versions"), ("09", "Other")]
+              ("04", "Pydantic"), ("05", "SQLAlchemy"), ("06", "Project and versions"), ("07", "Libraries translated from source"), ("09", "Other")]
     o += ["| Code | Class |", "|---|---|"]
     for prefix, _ in groups:
         for c in sorted((c for c in CLASSES if c.code[3:5] == prefix), key=lambda c: c.code):
@@ -569,7 +616,8 @@ def _page_title(see: str) -> str:
               "tutorial/middleware.md": "Middleware", "tutorial/websockets.md": "WebSockets",
               "tutorial/security.md": "Security", "tutorial/responses.md": "Responses",
               "tutorial/parameters.md": "Parameters", "tutorial/dependencies.md": "Dependencies",
-              "tutorial/sql.md": "SQL databases", "tutorial/models.md": "Models (Pydantic)"}
+              "tutorial/sql.md": "SQL databases", "tutorial/models.md": "Models (Pydantic)",
+              "advanced/libraries.md": "Libraries translated from source"}
     return titles.get(page, page)
 
 

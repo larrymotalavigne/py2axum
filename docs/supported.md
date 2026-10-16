@@ -60,6 +60,8 @@ it does not read `.env` files (pydantic-settings reads environment variables onl
 [Models](tutorial/models.md)): export the variables, as an orchestrator does.
 Limits on untrusted input (an optional body cap, the stack size) and the differences they imply are in
 [Security § Request input](advanced/security.md#request-input).
+Object addresses in reprs (`<X object at 0x...>`) are the binary's own; their width matches CPython's on 64-bit
+Linux, not on macOS, where a truncated repr in the logs is cut elsewhere ([Python](reference/python.md)).
 
 ## Deeply nested JSON on Python 3.14+
 
@@ -121,15 +123,60 @@ croniter 6.2 is ported line by line ([Libraries](reference/libraries.md)); what 
   are refused at compile time; a start time other than a `datetime`, an `int` or a `float`, and `croniter_range`
   bounds other than datetimes and numbers raise a py2axum `TypeError`.
 
+## email.message.EmailMessage
+
+The header parser and folder of `email.policy.default` are ported with the behaviour of each supported CPython
+release ([standard library](reference/stdlib.md)); what the binary does not reproduce:
+
+- `msg[name]` returns the header's text as a `str`, not a header object (`.addresses`, `.defects`, `.name`
+  are not available; assigning one message's header to another parses its text again).
+- An encoded word (`=?charset?q?...?=`) in a header value whose charset is not UTF-8, Latin-1 or ASCII, or whose
+  bytes do not decode with it, raises a py2axum `TypeError`: Python keeps undecodable bytes as surrogate escapes.
+- Header values are `str`, `None`, or for address headers a list of `str`; other values (header and `Address`
+  objects, numbers) raise a py2axum `TypeError`.
+
+## dnspython
+
+dnspython 2.8's stub resolver is ported ([Libraries](reference/libraries.md)); what the binary does not reproduce:
+
+- Names are ASCII: a non-ASCII name (dnspython encodes it with IDNA 2008, or 2003 without the `idna` package)
+  raises a py2axum `TypeError`.
+- Records of other types than MX, TXT, A, AAAA, CNAME and NS are skipped when a response is read: a response
+  holding a malformed record of such a type is accepted where dnspython drops it (and waits for another one);
+  an answer of such a type raises a py2axum `TypeError`.
+- The exceptions carry their message only (`NXDOMAIN.qnames()`, `NoAnswer.response()`, `kwargs`... are not
+  available). An answer's `rrset`, `response` and `expiration` are not available.
+- Durations in `LifetimeTimeout`'s message and the order of `rotate` follow the clock and the random generator,
+  as in Python, not Python's own draws.
+
+## OpenTelemetry (FastAPI 0.142+)
+
+FastAPI 0.142 traces requests, records metrics and logs through OpenTelemetry when its SDK is configured (a global
+provider, or exporters added from the `OTEL_*` environment variables). **Known difference:** the binary emits no
+OpenTelemetry data and does not read `OTEL_*`. `FastAPI(telemetry={...})` is accepted with its switches
+(`tracing`, `metrics`, `logs`, `operation_spans`, `auto_configure`) as literals; a provider (`tracer_provider=`...),
+`exclude=` and the `opentelemetry` SDK calls are refused.
+
+## SQLModel
+
+SQLModel classes are rewritten into SQLAlchemy mapped classes and Pydantic models at translation (see
+[Libraries](reference/libraries.md)). **Known differences:**
+
+- A table instance dumped as itself (a table class as the return type or `response_model=`, or returned without
+  one): CPython lists its keys in the order of its `__dict__`, which after a load from the database depends on
+  Python's string hashing (it changes from one process to the next); the binary lists the fields in their
+  declaration order. A response model without a table (`HeroPublic`) has the same output on both sides.
+- A table class as a route's body, a required field left out: SQLModel leaves the attribute unset (absent from the
+  dumped response), the binary reads it as `None`.
+
 ## Not supported
 
 An application wrapped in a project ASGI class at module level (`app = Wrapper(api)`, refused: the
-binary would serve `api` without it) and mounted ASGI apps (left to Python with `--python-side mount` when
-registered last), libraries not listed, C extensions, `eval`/`exec`, metaclasses, multiple inheritance of
+binary would serve `api` without it), mounted ASGI apps and routers of libraries (left to Python with
+`--python-side mount` when registered last), libraries not listed, C extensions, `eval`/`exec`, metaclasses, multiple inheritance of
 project classes, OpenAPI `/docs` in the binary, and assigning an attribute of the application at module level
-other than `app.state` and `app.dependency_overrides[f] = g` (`app.router.route_class = ...`, a custom
-`APIRoute`, `app.openapi = ...` are refused with `file:line`). Not native, counted apart in the
+other than `app.state`, `app.dependency_overrides[f] = g` and `app.router.route_class = R` (`app.openapi = ...`
+is refused with `file:line`). Not native, counted apart in the
 [documentation coverage](coverage.md): what only changes the OpenAPI schema or the documentation pages
-(`/openapi.json`, `/docs`, custom docs assets), SQLModel, OpenTelemetry's `FastAPI(telemetry=...)`, GraphQL
-routers, `ORJSONResponse`/`UJSONResponse`, stdlib dataclasses as request or response types, security scopes
-(`SecurityScopes`, `Security(scopes=)`), `AfterValidator` and other functional validators in `Annotated`.
+(`/openapi.json`, `/docs`, custom docs assets), OpenTelemetry providers in `FastAPI(telemetry=...)`, GraphQL
+routers, `UJSONResponse`.

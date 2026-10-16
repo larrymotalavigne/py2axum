@@ -2,8 +2,8 @@
 
 The runtime reproduces the behaviour of precise library versions (Pydantic's error messages and URLs,
 Starlette's routing and middlewares, SQLAlchemy's session), so py2axum only accepts the ranges its
-conformance suites run on. CI runs the test suite and the full `fixtures/dynapp` conformance (normal and
-forced-streaming passes) at both ends of every range: lowest versions on Python 3.12, highest on 3.14 and on
+conformance suites run on. CI runs the test suite and the full conformance of the reference apps (`fixtures/dynapp`,
+`langapp`, `integapp`, `libapp`; normal and forced-streaming passes) at both ends of every range: lowest versions on Python 3.12, highest on 3.14 and on
 3.15, and highest with pydantic 2.13 on 3.13 (every supported pydantic minor is run).
 
 | Library | Lowest tested | Highest tested | Accepted |
@@ -25,6 +25,8 @@ forced-streaming passes) at both ends of every range: lowest versions on Python 
 | ecs-logging | 2.3.0 | 2.3.0 | `>=2.3.0,<2.4` |
 | pyyaml | 6.0.2 | 6.0.3 | `>=6.0.2,<6.1` |
 | croniter | 6.2.4 | 6.2.4 | `>=6.2.4,<6.3` |
+| itsdangerous | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
+| dnspython | 2.8.0 | 2.8.0 | `>=2.8.0,<2.9` |
 | Python | 3.12 | 3.15 | `>=3.12,<3.16` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;

@@ -157,10 +157,11 @@ def mask_file(scenario, value: str | None) -> str | None:
 
 
 def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str = DB, on_response=None,
-             ctx: dict | None = None) -> dict | None:
+             ctx: dict | None = None, settle: bool | None = None) -> dict | None:
     """Play one step on one server and return what is compared (None for a SQL fixture step, run on `db`).
     `on_response(r)` sees the raw response first (tests/difftest.py learns the credentials it hands out).
-    `ctx`: what this server answered so far, for the `Dyn` values of the step."""
+    `ctx`: what this server answered so far, for the `Dyn` values of the step. `settle`: pause after it (the
+    scenario's SETTLE), else after every write (tests/settle.py)."""
     method, path, payload = step[:3]
     ctx = {"bodies": {}, "last": None} if ctx is None else ctx
     shown = path.label if is_dyn(path) else path
@@ -207,7 +208,7 @@ def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str
         ctx["last"] = ctx["bodies"][f"{method} {shown}"] = r.json() if r.content else None
     except ValueError:
         ctx["last"] = ctx["bodies"][f"{method} {shown}"] = None
-    out = observe(r, base, scenario, method, path, sent)
+    out = observe(r, base, scenario, method, path, sent, settle)
     out["req"] = f"{method} {shown}"
     if ctx.get("masks"):
         text = json.dumps(out, ensure_ascii=False)
@@ -217,7 +218,8 @@ def exchange(c: httpx.Client, base: str, scenario, step, sent: set[str], db: str
     return out
 
 
-def observe(r: httpx.Response, base: str, scenario, method: str, path: str, sent: set[str]) -> dict:
+def observe(r: httpx.Response, base: str, scenario, method: str, path: str, sent: set[str],
+            settle: bool | None = None) -> dict:
     """What is compared of one response (corpus/ compares the official FastAPI tests' requests with it too)."""
     normalize = getattr(scenario, "normalize", lambda body: body)
     ctype = r.headers.get("content-type", "").split(";")[0]
@@ -225,9 +227,10 @@ def observe(r: httpx.Response, base: str, scenario, method: str, path: str, sent
         body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
     except ValueError:
         body = getattr(scenario, "normalize_text", lambda text: text)(r.text)
-    if method not in ("GET", "HEAD") and getattr(scenario, "SETTLE", 0):
+    if (method not in ("GET", "HEAD") if settle is None else settle) and getattr(scenario, "SETTLE", 0):
         # FastAPI commits a `yield` session dependency after sending the response: let it land
-        # before the next request reads (the reference is racy otherwise, the binary is not)
+        # before the next request reads (the reference is racy otherwise, the binary is not); with the
+        # scenario's REFERENCE_APP, only after the writes that can do work after their response (tests/settle.py)
         time.sleep(scenario.SETTLE)
     shapes = getattr(scenario, "HEADER_SHAPES", {})
     out = {"req": f"{method} {path}", "status": r.status_code, "ctype": ctype,
@@ -267,13 +270,26 @@ def client(base: str) -> httpx.Client:
     return httpx.Client(base_url=base, timeout=10, headers={"accept-encoding": "gzip"})
 
 
+def settle_flags(scenario) -> list[bool] | None:
+    """The steps after which SETTLE pauses, the same for both servers: computed once from the scenario's
+    REFERENCE_APP ("module:app"), else None (after every write)."""
+    ref = getattr(scenario, "REFERENCE_APP", None)
+    if not ref or not getattr(scenario, "SETTLE", 0):
+        return None
+    if getattr(scenario, "_settle_flags", None) is None:
+        import settle
+        scenario._settle_flags = settle.flags(ref, scenario.STEPS)
+    return scenario._settle_flags
+
+
 def run(base: str, scenario) -> list[dict]:
     scenario.reset(DB)
     sent = sent_datetimes(scenario.STEPS)
     out, ctx = [], {"bodies": {}, "last": None}
+    pauses = settle_flags(scenario)
     with client(base) as c:
-        for step in scenario.STEPS:
-            got = exchange(c, base, scenario, step, sent, ctx=ctx)
+        for i, step in enumerate(scenario.STEPS):
+            got = exchange(c, base, scenario, step, sent, ctx=ctx, settle=pauses[i] if pauses else None)
             if got is not None:
                 out.append(got)
     return out

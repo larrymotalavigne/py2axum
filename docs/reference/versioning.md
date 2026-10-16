@@ -43,9 +43,12 @@ retired. A minor release may add codes, for example to split a class in two for 
 
 ## What is not
 
-- **The generated Rust project**: its layout, the names in it, its dependencies and `Cargo.lock`. Generate it
-  again after each upgrade; do not edit it nor depend on its internals.
-- **The runtime** (`dynrt`, copied into each crate): an implementation detail of the generated binary.
+- **The generated Rust project**: its layout, the names in it, its dependencies, its build profile and
+  `Cargo.lock`. Generate it again after each upgrade; do not edit it nor depend on its internals. (0.9 turned
+  the runtime, a module of the crate until then, into a library crate next to it, and the release profile from
+  fat to thin LTO.)
+- **The runtime** (`dynrt`, the library crate copied next to each generated crate): an implementation detail of
+  the generated binary, not a crate to depend on.
 - **The Python modules of py2axum** (`import py2axum...`), except the recorder's `RecordMiddleware`, and the
   internal coverage report (`--report`, deprecated).
 - **Performance figures**, memory use, and the format of the binary's own log lines that do not come from

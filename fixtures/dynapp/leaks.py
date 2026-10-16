@@ -2,6 +2,7 @@
 function naming itself, objects a failed flush, a rollback or a DELETE left linked, a stream cut by the client
 while a `yield` dependency is open. Measured by bench/leak_isolate.py (kind `leak_*` of bench/soak.py)."""
 import asyncio
+import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -12,6 +13,7 @@ from .db import DbDep
 from .models import Project, Task
 
 router = APIRouter(prefix="/leak")
+log = logging.getLogger(__name__)
 
 
 @router.get("/selfref")
@@ -112,6 +114,41 @@ async def task_state(request: Request, n: int = 3):
 
     request.state.task = asyncio.create_task(work())
     return {"v": await request.state.task, "done": request.state.task.done()}
+
+
+async def _boom(n: int) -> int:
+    await asyncio.sleep(0)
+    raise ValueError(f"boom {n}")
+
+
+@router.get("/task_failed_state")
+async def task_failed_state(request: Request, n: int = 3):
+    """A task that failed, kept in the request's state and never awaited: asyncio logs « Task exception was never
+    retrieved » once the request is gone (CPython frees it with the scope, by reference count)."""
+    payload = "v" * 100000
+    ended = asyncio.Event()
+    request.state.task = asyncio.create_task(_boom(n))
+    request.state.task.add_done_callback(lambda t: ended.set())
+    await ended.wait()
+    return {"done": request.state.task.done(), "n": len(payload)}
+
+
+async def _ticks(n: int):
+    try:
+        for i in range(n):
+            yield i
+    finally:
+        log.warning("ticks closed after %s", n)
+
+
+@router.get("/agen_state")
+async def agen_state(request: Request, n: int = 3, start: bool = True):
+    """An async generator kept in the request's state, suspended at its first `yield` (or never started): closed
+    once the request is gone, its `finally` runs."""
+    payload = "u" * 100000
+    request.state.gen = _ticks(n)
+    first = await anext(request.state.gen) if start else None
+    return {"first": first, "n": len(payload)}
 
 
 @router.post("/rolled_back/state")

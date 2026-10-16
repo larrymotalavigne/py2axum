@@ -163,7 +163,7 @@ pub fn td_of(v: &V) -> R<&'static TD> {
 /// the value of a validator's type (what `get_args` returns for its members)
 pub fn td_value(td: &'static TD) -> V {
     match td {
-        TD::Len(t, _, _) => td_value(t),
+        TD::Len(t, _, _) | TD::DtC(t, _) => td_value(t),
         TD::Any => V::native(Native::ExtType("typing.Any")),
         TD::NoneT => V::native(Native::Type("NoneType")),
         TD::Bool => V::native(Native::Type("bool")),

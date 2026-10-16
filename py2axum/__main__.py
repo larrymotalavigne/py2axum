@@ -31,6 +31,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
+    from .libsrc import apply_flags
+
+    try:
+        apply_flags(args)
+    except ValueError as e:
+        ap.error(str(e))
     if args.backend == "typed":
         print("error: --backend typed was removed in 0.4: use the default backend (drop --backend)", file=sys.stderr)
         return 2
@@ -103,7 +109,8 @@ def parser() -> argparse.ArgumentParser:
                          "typed was removed in 0.4)")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
-                         "mount: the app's last app.mount(), which gets every request no translated route fully matches); "
+                         "mount: the app's last app.mount() and include_router() of a library's router, which get every "
+                         "request no translated route fully matches); "
                          "auto: every route that does not translate, and such mounts")
     ap.add_argument("--report", type=Path, default=None,
                     help="deprecated (internal tool, use `py2axum check --format json|markdown`): coverage report "
@@ -112,9 +119,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-stream", action="store_true", help="buffer list responses instead of streaming them")
     ap.add_argument("--allow-untested-versions", action="store_true",
                     help="translate even if the project locks library versions outside the tested ranges")
+    from .libsrc import add_flags as add_libs_flags
     from .versions import add_python_flag
 
     add_python_flag(ap)
+    add_libs_flags(ap)
     return ap
 
 
@@ -139,7 +148,7 @@ def auto_python_side(package: Path, root: Path | None, python_side: set[str]) ->
         return None
     moved: dict[str, tuple[str, TranspileError]] = {p: ("raw route", e) for p, e in fe.auto_side.items()}
     if fe.__dict__.get("mount_fallback"):
-        moved["mount"] = ("app.mount", None)
+        moved["mount"] = ("app.mount() or a library's router", None)
     for info, errs in per_route:
         if errs and info["path"] not in moved:
             moved[info["path"]] = (f"{info['method'].upper()} {info['func']}", errs[0])

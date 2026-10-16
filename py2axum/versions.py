@@ -37,7 +37,9 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "unidecode": ("1.4.0", "1.4.0", "1.5"),  # its transliteration tables (tools/gen_unidecode.py)
     "ecs-logging": ("2.3.0", "2.3.0", "2.4"),
     "pyyaml": ("6.0.2", "6.0.3", "6.1"),  # yaml.safe_load / safe_dump / dump: a port of its pure-Python loader and dumper
-    "croniter": ("6.2.4", "6.2.4", "6.3"),  # dynrt/croniter.rs ports 6.2.4's croniter.py (6.0 differs: no W, no strict)
+    "croniter": ("6.2.4", "6.2.4", "6.3"),
+    "dnspython": ("2.8.0", "2.8.0", "2.9"),  # dynrt/dnsres.rs: the stub resolver (Resolver, resolve), its retries and messages
+    "itsdangerous": ("2.2.0", "2.2.0", "2.3"),  # dynrt/itsd.rs: URLSafe(Timed)Serializer, tokens byte for byte  # dynrt/croniter.rs ports 6.2.4's croniter.py (6.0 differs: no W, no strict)
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
@@ -47,7 +49,8 @@ PYTHON: tuple[str, str, str] = ("3.12", "3.15", "3.16")
 _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlalchemy", "psycopg", "asyncpg"),
               "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",), "icalendar": ("icalendar",),
               "orjson": ("orjson",), "unidecode": ("unidecode",), "ecs_logging": ("ecs-logging",),
-              "yaml": ("pyyaml",), "croniter": ("croniter",)}
+              "yaml": ("pyyaml",), "croniter": ("croniter",),
+              "itsdangerous": ("itsdangerous",), "dns": ("dnspython",)}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
 _FEATURES = [("WebSocket routes (Starlette 1.7's WebSocketDisconnected semantics)", r"\.websocket\(", "starlette", "1.7.0")]
@@ -278,7 +281,17 @@ PROBES = {
     # json: a `\\uXXXX` escape ending the text is an unterminated string (3.13.13 / 3.14.4)
     "json_u_escape_unterminated": "import json\ntry:\n json.loads('\"\\\\u0041')\nexcept ValueError as e:\n r=str(e).startswith('Unterminated')",
     # a C timeout or timestamp out of range: one message for float and int from 3.13.15 / 3.14.7
+    # urlsplit accepts an IPvFuture host written `[V...]` (only `[v...]` before; mimetypes.guess_type too)
+    "ipvfuture_upper": "import urllib.parse\ntry:\n urllib.parse.urlsplit('http://[V1.x]/')\n r=True\nexcept ValueError:\n r=False",
     "pytime_range": "import socket\ntry:\n socket.socket().settimeout(1e20)\n r=False\nexcept OverflowError as e:\n r='C PyTime_t' in str(e)",
+    # the email header folder (dynrt/emailhdr.rs), changed in security releases (3.12.13, 3.13.12-14, 3.14.3-6)
+    "email_ws_fix": "from email import _header_value_parser as p\nr=not p.WhiteSpaceTerminal('', 'fws').startswith_fws()",
+    "email_pop_empty": "from email import _header_value_parser as p\nl=[' ']\np._steal_trailing_WSP_if_exists(l)\nr=l==[]",
+    "email_last_word_ew": "import inspect\nfrom email import _header_value_parser as p\n"
+                          "r='last_word_is_ew' in inspect.signature(p._fold_as_ew).parameters",
+    "email_addr_fix": "from email.headerregistry import HeaderRegistry\nr=str(HeaderRegistry()('To', 'a@b.com junk'))=='a@b.com, <>'",
+    "email_ew_phrase": "from email import _header_value_parser as p\nr=str(p.get_phrase('=?utf-8?q?a?= =?utf-8?q?b?=')[0])=='ab'",
+    "email_verify_bytes": "import email.generator as g\nr=hasattr(g, 'NEWLINE_WITHOUT_FWSP_BYTES')",
 }
 
 

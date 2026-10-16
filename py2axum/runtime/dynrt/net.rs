@@ -131,6 +131,15 @@ fn not_addr(s: &str, what: &str) -> Exc {
     Exc::value_error(format!("{} does not appear to be an IPv4 or IPv6 {what}", ops::str_repr(s)))
 }
 
+/// `ipaddress.ip_address(str)`'s accepted forms: an IPv6 address may carry a `%scope` (non-empty, without `%`)
+pub fn py_ip_address(s: &str) -> Option<IpAddr> {
+    match s.split_once('%') {
+        Some((a, scope)) if !scope.is_empty() && !scope.contains('%') => a.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6),
+        Some(_) => None,
+        None => s.parse::<IpAddr>().ok(),
+    }
+}
+
 fn parse_addr(v: &V) -> R<IpAddr> {
     match v {
         V::Str(s) => s.parse::<IpAddr>().map_err(|_| not_addr(s, "address")),
@@ -258,7 +267,7 @@ fn sockaddr(a: &std::net::SocketAddr) -> V {
 }
 
 /// CPython's `OSError(errno, text)`: the subclass its errno selects, `[Errno n] text`
-fn os_error(e: &std::io::Error, text: &str) -> Exc {
+pub fn os_error(e: &std::io::Error, text: &str) -> Exc {
     let errno = e.raw_os_error().unwrap_or(0);
     let class: &'static Class = match errno {
         libc::ECONNREFUSED => &CONNECTION_REFUSED_ERROR,
@@ -440,7 +449,7 @@ pub struct Sock {
     local: V,
 }
 
-fn strerror(errno: i32) -> String {
+pub fn strerror(errno: i32) -> String {
     // strerror_r (XSI, libc's binding on Linux and macOS): `strerror` shares a static buffer between threads
     let mut buf = [0u8; 256];
     // SAFETY: the buffer and its length are passed together; on success it holds a NUL-terminated string

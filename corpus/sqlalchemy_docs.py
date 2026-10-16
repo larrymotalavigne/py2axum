@@ -470,7 +470,8 @@ def plan(unit: str, section: str, stmts: list[Stmt]) -> tuple[list[Example], lis
         # its other definitions (a plain class such as a composite's value object) are still in scope
         tainted = _orm_tainted(trees, kinds, rw, g["world"])
         for i in range(end):
-            if kinds[i] != "def":
+            if kinds[i] != "def" or _failed(stmts[i]):
+                # a definition Python cannot run (a fragment: `class X(Base): # ...` with no table) bound nothing
                 continue
             if i < g["world"]:
                 if all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in trees[i].body):

@@ -397,6 +397,29 @@ pub fn read_all(f: &File) -> R<(Vec<u8>, bool, String)> {
     Ok((buf, f.binary, f.path.clone()))
 }
 
+/// `for line in f`: the lines from the position, each with its line end; a text file with universal newlines
+/// (`\r\n` and `\r` read as `\n`), like CPython's default `newline=None`
+pub fn file_lines(f: &File) -> R<Vec<V>> {
+    let (buf, binary, path) = read_all(f)?;
+    if binary {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, b) in buf.iter().enumerate() {
+            if *b == b'\n' {
+                out.push(V::Bytes(Arc::from(&buf[start..=i])));
+                start = i + 1;
+            }
+        }
+        if start < buf.len() {
+            out.push(V::Bytes(Arc::from(&buf[start..])));
+        }
+        return Ok(out);
+    }
+    let text = String::from_utf8(buf).map_err(|_| Exc::type_error(format!("py2axum: {path} is not valid UTF-8 (decoding errors are not reproduced)")))?;
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    Ok(text.split_inclusive('\n').map(V::str).collect())
+}
+
 pub fn is_binary(f: &File) -> bool {
     f.binary
 }

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-RT = "crate::dynrt"
+RT = "dynrt"
 
 
 def _kwvec(kw: dict[str, str]) -> str:
@@ -102,11 +102,25 @@ def _noargs(name, code):
 
 def _bindparam(a, kw):
     """`bindparam(key, value=...)`: the value from the execution's parameters (or `value`); the type comes from
-    the column it meets (type_=, expanding=, required=, callable_=... are refused)"""
+    the column it meets (type_=ARRAY(String()) is read by the translator; expanding=, required=, callable_=...
+    are refused)"""
     if set(kw) - {"value"} or not 1 <= len(a) <= 2 or (len(a) == 2 and kw):
-        raise ValueError("bindparam(key, value=None): other arguments are not supported")
+        raise ValueError("bindparam(key, value=None, type_=ARRAY(String())): other arguments are not supported")
     v = a[1] if len(a) == 2 else kw.get("value")
     return f"{RT}::orm::bindparam(&{a[0]}, {f'Some(&{v})' if v else 'None'})"
+
+
+def _aliased(a, kw):
+    """`aliased(Model)`, `aliased(Model, name=...)`, `aliased(Model, select(Model)...subquery())`; `flat=` changes only
+    the aliases of a joined table inheritance's tables (refused there): accepted and ignored elsewhere"""
+    kw = {k: v for k, v in kw.items() if k != "flat"}
+    if len(a) == 1 and not kw:
+        return f"{RT}::orm::aliased(&{a[0]})"
+    if len(a) == 1 and set(kw) == {"name"}:
+        return f"{RT}::orm::aliased_named(&{a[0]}, &{kw['name']})"
+    if len(a) == 2 and not kw:
+        return f"{RT}::orm::aliased_sub(&{a[0]}, &{a[1]})"
+    raise ValueError("aliased(Model), aliased(Model, name=...), aliased(Model, subquery) and flat= only")
 
 
 def _raiseload(name, kw):
@@ -114,6 +128,13 @@ def _raiseload(name, kw):
     if set(kw) - {"raiseload"}:
         raise ValueError(f"{name}(): only the raiseload= keyword is supported")
     return kw.get("raiseload", "V::Bool(false)")
+
+
+def _op2(name, a, kw):
+    """`operator.eq(a, b)` & co: exactly two positional arguments"""
+    if len(a) != 2 or kw:
+        raise ValueError(f"operator.{name}() takes exactly two positional arguments")
+    return f"{RT}::ops::{name}(&{a[0]}, &{a[1]})"
 
 
 def _one_pos(name, tmpl):
@@ -154,10 +175,11 @@ def _one(name):
 
 # --- values (attribute or name used as a value) -------------------------------------------
 VALUES: dict[str, str] = {
+    "sys.maxsize": "V::Int(i64::MAX)",  # CPython's on 64-bit platforms
     "datetime.UTC": f"V::Tz({RT}::dt::Tz::Utc)",
     "datetime.timezone.utc": f"V::Tz({RT}::dt::Tz::Utc)",
     "sqlalchemy.null": "V::None",
-    **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean")},
+    **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean", "Numeric")},
     "os.environ": f"{RT}::libs::environ()",
     **{f"orjson.{k}": f"V::Int({v})" for k, v in (
         ("OPT_APPEND_NEWLINE", 1024), ("OPT_INDENT_2", 1), ("OPT_NAIVE_UTC", 2), ("OPT_NON_STR_KEYS", 4),
@@ -243,6 +265,11 @@ VALUES: dict[str, str] = {
         ("ascii_lowercase", "abcdefghijklmnopqrstuvwxyz"), ("ascii_uppercase", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
         ("digits", "0123456789"), ("hexdigits", "0123456789abcdefABCDEF"), ("octdigits", "01234567"))},
     **{f"hashlib.{n}": f'V::native({RT}::Native::HashCtor("{n}"))' for n in ("sha256", "sha1", "md5", "sha512")},
+    # dnspython 2.8 (dynrt/dnsres.rs)
+    "dns.name.root": f"{RT}::dnsres::root_name()",
+    "dns.name.empty": f"{RT}::dnsres::empty_name()",
+    # the modern email policies EmailMessage takes (dynrt/emailmsg.rs)
+    **{f"email.policy.{n}": f'V::native({RT}::Native::ExtType("email.policy.{n}"))' for n in ("default", "SMTP", "SMTPUTF8", "HTTP")},
 }
 
 # values above that are snapshots: writing into them would be lost, so it is refused
@@ -441,6 +468,21 @@ EXCEPTIONS: dict[str, str] = {
     "jinja2.exceptions.TemplateNotFound": "TEMPLATE_NOT_FOUND",
     "aiosmtplib.SMTPException": "SMTP_EXCEPTION",
     "aiosmtplib.errors.SMTPException": "SMTP_EXCEPTION",
+    # dnspython 2.8: each module's classes (dns.resolver.Timeout is LifetimeTimeout)
+    **{f"dns.{m}.{n}": c for m, names in (
+        ("exception", (("DNSException", "DNS_EXCEPTION"), ("FormError", "DNS_FORM_ERROR"), ("SyntaxError", "DNS_SYNTAX_ERROR"),
+                       ("Timeout", "DNS_TIMEOUT"))),
+        ("resolver", (("NXDOMAIN", "DNS_NXDOMAIN"), ("YXDOMAIN", "DNS_YXDOMAIN"), ("NoAnswer", "DNS_NO_ANSWER"),
+                      ("NoNameservers", "DNS_NO_NAMESERVERS"), ("NotAbsolute", "DNS_NOT_ABSOLUTE"), ("NoRootSOA", "DNS_NO_ROOT_SOA"),
+                      ("NoMetaqueries", "DNS_NO_METAQUERIES"), ("NoResolverConfiguration", "DNS_NO_RESOLVER_CONFIGURATION"),
+                      ("LifetimeTimeout", "DNS_LIFETIME_TIMEOUT"), ("Timeout", "DNS_LIFETIME_TIMEOUT"))),
+        ("name", (("EmptyLabel", "DNS_EMPTY_LABEL"), ("BadEscape", "DNS_BAD_ESCAPE"), ("LabelTooLong", "DNS_LABEL_TOO_LONG"),
+                  ("NameTooLong", "DNS_NAME_TOO_LONG"), ("BadPointer", "DNS_BAD_POINTER"), ("BadLabelType", "DNS_BAD_LABEL_TYPE"))),
+        ("rdatatype", (("UnknownRdatatype", "DNS_UNKNOWN_RDATATYPE"),)),
+        ("message", (("ShortHeader", "DNS_SHORT_HEADER"), ("TrailingJunk", "DNS_TRAILING_JUNK"), ("BadEDNS", "DNS_BAD_EDNS"))))
+       for n, c in names},
+    **{f"email.errors.{n}": c for n, c in (("MessageError", "EMAIL_MESSAGE_ERROR"), ("HeaderParseError", "HEADER_PARSE_ERROR"),
+                                            ("HeaderWriteError", "HEADER_WRITE_ERROR"))},
     "itsdangerous.BadData": "BAD_DATA",
     "itsdangerous.exc.BadData": "BAD_DATA",
     "itsdangerous.BadSignature": "BAD_SIGNATURE",
@@ -669,10 +711,37 @@ def _mime(cls):
     return build
 
 
-def _its_serializer(a, kw):
-    v = _bind("URLSafeTimedSerializer", a, kw, ["secret_key", "salt"], {"secret_key", "salt"})
-    salt = f"Some(&{v['salt']})" if "salt" in v else "None"
-    return f"{RT}::itsd::new(&{v['secret_key']}, {salt})"
+def _its_serializer(cls):
+    def build(a, kw):
+        v = _bind(cls, a, kw, ["secret_key", "salt"], {"secret_key", "salt"})
+        salt = f"Some(&{v['salt']})" if "salt" in v else "None"
+        return f"{RT}::itsd::new(&{v['secret_key']}, {salt}, {'true' if cls.endswith('TimedSerializer') else 'false'})"
+    return build
+
+
+# dns.resolver.resolve(): the keywords the runtime takes (source=, source_port= are refused)
+DNS_RESOLVE_KW = {"rdtype", "rdclass", "tcp", "raise_on_no_answer", "lifetime", "search"}
+
+
+def _dns_call(name, a, kw, most, allowed, code):
+    """A constructor or function of dnspython/email: its keywords and positional arguments checked here"""
+    for k in kw:
+        if k not in allowed:
+            raise ValueError(f"{name}({k}=) is not supported (only {', '.join(sorted(allowed))})")
+    if len(a) > most:
+        raise ValueError(f"{name}() takes at most {most} positional argument{'s' if most != 1 else ''} here")
+    return code
+
+
+def _mimetypes(name, params, kw_only=()):
+    """`mimetypes.guess_type(url, strict=True)` & co, on the database `mimetypes.init()` builds (dynrt/resp.rs)"""
+    def build(a, kw):
+        v = _bind(f"mimetypes.{name}", a, {k: x for k, x in kw.items() if k not in kw_only}, params, set(params))
+        if params[0] not in v:
+            raise ValueError(f"mimetypes.{name}() needs its {params[0]} argument")
+        v.update({k: x for k, x in kw.items() if k in kw_only})
+        return f"{RT}::resp::mimetypes(\"{name}\", &vec![{v[params[0]]}], &{_kwvec({k: v[k] for k in ('strict',) if k in v})})"
+    return build
 
 
 def _getenv(name, a, kw):
@@ -913,6 +982,12 @@ CALLS = {
                      ("standard_b64encode", ["s"]), ("standard_b64decode", ["s"]), ("urlsafe_b64encode", ["s"]),
                      ("urlsafe_b64decode", ["s"]), ("b16encode", ["s"]), ("b16decode", ["s", "casefold"]),
                      ("b32encode", ["s"]), ("b32decode", ["s", "casefold", "map01"]))},
+    # mimetypes (the module's functions; add_type, init, read and the tables are not: refused)
+    "mimetypes.guess_type": _mimetypes("guess_type", ["url", "strict"]),
+    "mimetypes.guess_file_type": lambda a, kw: (_since((3, 13), "mimetypes.guess_file_type()")
+                                                or _mimetypes("guess_file_type", ["path"], ("strict",))(a, kw)),
+    "mimetypes.guess_extension": _mimetypes("guess_extension", ["type", "strict"]),
+    "mimetypes.guess_all_extensions": _mimetypes("guess_all_extensions", ["type", "strict"]),
     # urllib.parse
     **{f"urllib.parse.{f}": (lambda f: lambda a, kw: _no_kw(f, kw, ("missing_as_none",))
                              or f"{RT}::stdlib::urllib(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
@@ -975,9 +1050,11 @@ CALLS = {
     "jwt.decode_complete": _pyjwt_decode("decode_complete", ["jwt", "key", "algorithms", "options", "verify",
                                                              "detached_payload", "audience", "issuer", "subject", "leeway"]),
     "jwt.get_unverified_header": lambda a, kw: f"{RT}::pyjwt::get_unverified_header(&{_bind('jwt.get_unverified_header', a, kw, ['jwt'], {'jwt'})['jwt']})",
-    # itsdangerous (URLSafeTimedSerializer with its default signer and serializer only)
-    "itsdangerous.URLSafeTimedSerializer": _its_serializer,
-    "itsdangerous.url_safe.URLSafeTimedSerializer": _its_serializer,
+    # itsdangerous (URLSafeTimedSerializer and URLSafeSerializer with their default signer and serializer only)
+    "itsdangerous.URLSafeTimedSerializer": _its_serializer("URLSafeTimedSerializer"),
+    "itsdangerous.url_safe.URLSafeTimedSerializer": _its_serializer("URLSafeTimedSerializer"),
+    "itsdangerous.URLSafeSerializer": _its_serializer("URLSafeSerializer"),
+    "itsdangerous.url_safe.URLSafeSerializer": _its_serializer("URLSafeSerializer"),
     # cryptography (Fernet only)
     "cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key": lambda a, kw: (
         f"{RT}::crypto::generate_private_key(&{_argv(a)}, &{_kwvec({k: v for k, v in _bind('generate_private_key', a, kw, ['public_exponent', 'key_size', 'backend'], {'public_exponent', 'key_size', 'backend'}).items() if k != 'backend' and k in kw})}).await"),
@@ -993,6 +1070,17 @@ CALLS = {
     **{f"email.mime.{m}.{c}": _mime(c)
        for m, c in (("multipart", "MIMEMultipart"), ("text", "MIMEText"), ("application", "MIMEApplication"), ("base", "MIMEBase"))},
     "email.encoders.encode_base64": lambda a, kw: f"{RT}::mail::encode_base64(&{a[0]})",
+    # dnspython 2.8's stub resolver (dynrt/dnsres.rs)
+    "dns.resolver.Resolver": lambda a, kw: _dns_call("Resolver", a, kw, 2, {"filename", "configure"},
+                                                     f"{RT}::dnsres::new(&{_argv(a)}, &{_kwvec(kw)})"),
+    "dns.resolver.resolve": lambda a, kw: _dns_call("resolve", a, kw, 9, DNS_RESOLVE_KW | {"qname"},
+                                                    f"{RT}::dnsres::resolve_default({_argv(a)}, {_kwvec(kw)}).await"),
+    "dns.resolver.get_default_resolver": _noargs("get_default_resolver", f"{RT}::dnsres::get_default_resolver()"),
+    "dns.resolver.reset_default_resolver": _noargs("reset_default_resolver", f"{RT}::dnsres::reset_default_resolver()"),
+    "dns.name.from_text": lambda a, kw: f"{RT}::dnsres::name_from_text(&{_argv(a)}, &{_kwvec(kw)})",
+    # email.message.EmailMessage under the modern policies (dynrt/emailmsg.rs, emailhdr.rs)
+    "email.message.EmailMessage": lambda a, kw: _dns_call("EmailMessage", a, kw, 0, {"policy"},
+                                                          f"{RT}::emailmsg::new(&{_argv(a)}, &{_kwvec(kw)})"),
     # positional-only in CPython: keywords are a TypeError there, refused here
     "unicodedata.normalize": lambda a, kw: f"{RT}::stdlib::unicodedata_normalize(self::UCD_UNASSIGNED, &{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("normalize(form, unistr): two positional arguments")),
     "unicodedata.combining": lambda a, kw: f"{RT}::stdlib::unicodedata_combining(self::UCD_UNASSIGNED, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("combining(chr): one positional argument")),
@@ -1058,6 +1146,9 @@ CALLS = {
     "csv.reader": lambda a, kw: f"{RT}::stdlib::reader(&{_argv(a)}, &{_kwvec(kw)})",
     "csv.DictReader": lambda a, kw: f"{RT}::stdlib::dict_reader(&{_argv(a)}, &{_kwvec(kw)})",
     "csv.Sniffer": lambda a, kw: f"Ok::<V, Exc>(V::native({RT}::Native::SnifferObj))",
+    # operator's comparisons (a SQLAlchemy Comparator's `operate(op, other)` gets them): `a OP b`, project methods
+    # and SQL expressions included
+    **{f"operator.{n}": (lambda n: lambda a, kw: _op2(n, a, kw))(n) for n in ("eq", "ne", "lt", "le", "gt", "ge")},
     # math, time, os.path, hmac
     **{f"math.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::math(\"{n}\", &{_argv(a)})")(n)
        for n in ("ceil", "floor", "trunc", "pow", "sqrt", "log", "log10", "exp", "fabs", "isclose", "isnan", "isinf",
@@ -1082,6 +1173,8 @@ CALLS = {
     # calendar, types
     "calendar.monthrange": lambda a, kw: f"{RT}::libs::monthrange(&{a[0]}, &{a[1]})",
     "types.SimpleNamespace": lambda a, kw: f"{RT}::libs::namespace(&{_argv(a)}, &{_kwvec(kw)})",
+    "operator.index": lambda a, kw: _no_kw("operator.index", kw, kw) or f"{RT}::libs::operator_index(&{_argv(a)})",
+    "threading.local": lambda a, kw: f"{RT}::libs::thread_local(&{_argv(a)}, &{_kwvec(kw)})",
     # FastAPI's SSE event (yielded by a generator endpoint with response_class=EventSourceResponse)
     "fastapi.sse.ServerSentEvent": lambda a, kw: f"{RT}::web::sse_event(&{_argv(a)}, &{_kwvec(kw)})",
     # pathlib, uuid
@@ -1163,9 +1256,7 @@ CALLS = {
     # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable
     "sqlalchemy.inspect": lambda a, kw: _sa_inspect(a, kw),
     "sqlalchemy.text": lambda a, kw: f"{RT}::orm::text(&{a[0]})",
-    "sqlalchemy.orm.aliased": lambda a, kw: (f"{RT}::orm::aliased(&{a[0]})" if len(a) == 1 and not kw
-                                             else f"{RT}::orm::aliased_named(&{a[0]}, &{kw['name']})" if len(a) == 1 and set(kw) == {"name"}
-                                             else (_ for _ in ()).throw(ValueError("aliased(Model) or aliased(Model, name=...) only"))),
+    "sqlalchemy.orm.aliased": lambda a, kw: _aliased(a, kw),
     "sqlalchemy.orm.with_parent": lambda a, kw: f"{RT}::orm::with_parent(&{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("with_parent(instance, Parent.relationship) only")),
     "sqlalchemy.tuple_": lambda a, kw: f"{RT}::orm::tuple_({_argv(a)})",
     "sqlalchemy.and_": lambda a, kw: f"{RT}::orm::and_or(\"AND\", {_argv(a)})",
@@ -1174,8 +1265,31 @@ CALLS = {
     "sqlalchemy.update": lambda a, kw: f"{RT}::orm::update(&{a[0]})",
     "sqlalchemy.insert": lambda a, kw: f"{RT}::orm::insert(&{a[0]}, false)",
     "sqlalchemy.dialects.postgresql.insert": lambda a, kw: f"{RT}::orm::insert(&{a[0]}, true)",
-    "sqlalchemy.case": lambda a, kw: f"{RT}::orm::case(&{_argv(a)}, &{_kwvec(kw)})",
     "sqlalchemy.literal": lambda a, kw: f"{RT}::orm::literal(&{a[0]})",
+    **{f"sqlalchemy.{n}": (lambda op: lambda a, kw: (
+        f"{RT}::orm::compound(\"{op}\", &{_argv(a)})" if not kw
+        else (_ for _ in ()).throw(ValueError("keyword arguments are not supported"))))(op)
+       for n, op in (("union_all", "UNION ALL"), ("union", "UNION"), ("intersect", "INTERSECT"),
+                     ("intersect_all", "INTERSECT ALL"), ("except_", "EXCEPT"), ("except_all", "EXCEPT ALL"))},
+    **{f"{m}.array": lambda a, kw: (f"{RT}::orm::pg_array(&{a[0]})" if len(a) == 1 and not kw
+                                    else (_ for _ in ()).throw(ValueError("array(items) only: type_= is not supported")))
+       for m in ("sqlalchemy.dialects.postgresql", "sqlalchemy.dialects.postgresql.array")},
+    **{f"{m}.{n}": (lambda n: lambda a, kw: f"{RT}::orm::any_all(\"{n}\", &{_one(n)(a, kw)})")(n)
+       for m in ("sqlalchemy", "sqlalchemy.sql.expression") for n in ("any_", "all_")},
+    # a type made without arguments (String() and String are the same type here; String(50) is not)
+    **{f"sqlalchemy.{t}": (lambda t: lambda a, kw: f'V::str("{t}")' if not a and not kw
+                           else (_ for _ in ()).throw(ValueError(f"{t}() is supported without arguments only")))(t)
+       for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean", "Numeric")},
+    # literal_column("TRUE"): its text as is (type_= not supported)
+    "sqlalchemy.literal_column": lambda a, kw: (
+        f"{RT}::orm::literal_column(&{a[0]})" if len(a) == 1 and not kw
+        else (_ for _ in ()).throw(ValueError("literal_column(text) only: type_= is not supported"))),
+    "sqlalchemy.sql.elements.literal_column": lambda a, kw: (
+        f"{RT}::orm::literal_column(&{a[0]})" if len(a) == 1 and not kw
+        else (_ for _ in ()).throw(ValueError("literal_column(text) only: type_= is not supported"))),
+    "sqlalchemy.sql.expression.literal_column": lambda a, kw: (
+        f"{RT}::orm::literal_column(&{a[0]})" if len(a) == 1 and not kw
+        else (_ for _ in ()).throw(ValueError("literal_column(text) only: type_= is not supported"))),
     # true() / false(): the literals `true` / `false` (PostgreSQL has a native boolean)
     "sqlalchemy.true": lambda a, kw: f"{RT}::orm::text(&V::str(\"true\"))" if not a and not kw else (_ for _ in ()).throw(ValueError("true() takes no arguments")),
     "sqlalchemy.false": lambda a, kw: f"{RT}::orm::text(&V::str(\"false\"))" if not a and not kw else (_ for _ in ()).throw(ValueError("false() takes no arguments")),
@@ -1188,7 +1302,9 @@ CALLS = {
         else (_ for _ in ()).throw(ValueError("selectin_polymorphic(Base, [Sub, ...]) only"))),
     "sqlalchemy.orm.with_polymorphic": lambda a, kw: (
         f"{RT}::orm::with_polymorphic(&{a[0]}, &{a[1]})" if len(a) == 2 and not kw
-        else (_ for _ in ()).throw(ValueError("with_polymorphic(Base, [Sub, ...] or \"*\") only: aliased=, flat=, "
+        else f"{RT}::orm::with_polymorphic_opts(&{a[0]}, &{a[1]}, &{kw.get('aliased', 'V::Bool(false)')}, "
+             f"&{kw.get('flat', 'V::Bool(false)')})" if len(a) == 2 and set(kw) <= {"aliased", "flat"}
+        else (_ for _ in ()).throw(ValueError("with_polymorphic(Base, [Sub, ...] or \"*\", aliased=, flat=) only: "
                                               "selectable= and polymorphic_on= are not supported"))),
     "sqlalchemy.orm.undefer": lambda a, kw: f"{RT}::orm::undefer(&{_one('undefer')(a, kw)})",
     "sqlalchemy.orm.undefer_group": lambda a, kw: f"{RT}::orm::undefer_group(&{_one('undefer_group')(a, kw)})",
@@ -1237,6 +1353,8 @@ DYN_ARGS = {
     "asyncio.Semaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.BoundedSemaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.Lock": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
+    # case(*whens, else_=...): the (condition, value) tuples of a list built at run time
+    "sqlalchemy.case": lambda a, kw: f"{RT}::orm::case(&{a}, &{kw})",
 }
 for _n in DYN_ARGS:
     CALLS.setdefault(_n, DYN_ARGS[_n])

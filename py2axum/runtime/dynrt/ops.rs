@@ -22,8 +22,42 @@ pub fn row_tuple(v: &V) -> Option<V> {
     }
 }
 
+/// An integral float as a Python int (int(), round(), math.floor/ceil/trunc): CPython's errors for NaN and
+/// infinities, an OverflowError beyond 64 bits (`as` would saturate in silence).
+pub fn float_to_int(x: f64) -> R {
+    if x.is_nan() {
+        return Err(Exc::value_error("cannot convert float NaN to integer"));
+    }
+    if x.is_infinite() {
+        return Err(Exc::msg(&OVERFLOW_ERROR, "cannot convert float infinity to integer"));
+    }
+    if !(-9.223_372_036_854_775_808e18..9.223_372_036_854_775_808e18).contains(&x) {
+        return Err(Exc::msg(&OVERFLOW_ERROR, "py2axum: integer beyond 64 bits"));
+    }
+    Ok(V::Int(x as i64))
+}
+
+/// A value that behaves as a tuple in sequence operations: a SQLAlchemy Row, a NamedTuple instance (its own
+/// repr, str and attributes aside).
+pub fn seq_tuple(v: &V) -> Option<V> {
+    match v {
+        V::Inst(i) if i.desc.x.ntuple => Some(V::Tuple(Arc::new(i.vals.read().clone()))),
+        _ => row_tuple(v),
+    }
+}
+
 pub fn truthy(v: &V) -> R<bool> {
-    if let Some(t) = row_tuple(v) {
+    if matches!(v, V::Native(n) if matches!(&**n, Native::NotImplemented)) {
+        // 3.14: a TypeError; before, True (CPython's DeprecationWarning is not printed: docs/reference/python.md)
+        if super::python() >= (3, 14) {
+            return Err(Exc::type_error("NotImplemented should not be used in a boolean context"));
+        }
+        return Ok(true);
+    }
+    if let Some(r) = super::proto::truthy(v) {
+        return r;
+    }
+    if let Some(t) = seq_tuple(v) {
         return truthy(&t);
     }
     Ok(match v {
@@ -51,7 +85,7 @@ pub fn truthy(v: &V) -> R<bool> {
         V::Sql(_) | V::Col(..) => {
             return Err(Exc::type_error("Boolean value of this clause is not defined"))
         }
-        V::Native(n) if matches!(&**n, Native::Deque(_)) => len(v)? > 0,
+        V::Native(n) if matches!(&**n, Native::Deque(_) | Native::EmailMsg(_) | Native::DnsAnswer(_)) => len(v)? > 0,
         _ => true,
     })
 }
@@ -131,8 +165,15 @@ fn dec_op(a: &V, b: &V, op: &str) -> Option<R> {
 }
 
 pub fn add(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "+", b) {
+        return r;
+    }
     if let Some(r) = counter_binop(a, "+", b) {
         return r;
+    }
+    // a NamedTuple concatenated: a plain tuple
+    if matches!(a, V::Inst(i) if i.desc.x.ntuple) || matches!(b, V::Inst(i) if i.desc.x.ntuple) {
+        return add(&seq_tuple(a).unwrap_or_else(|| a.clone()), &seq_tuple(b).unwrap_or_else(|| b.clone()));
     }
     if let Some(r) = super::tenacity::binop(a, "+", b) {
         return r;
@@ -172,6 +213,9 @@ pub fn add(a: &V, b: &V) -> R {
 }
 
 pub fn sub(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "-", b) {
+        return r;
+    }
     if let Some(r) = counter_binop(a, "-", b) {
         return r;
     }
@@ -213,7 +257,7 @@ pub fn sub(a: &V, b: &V) -> R {
 
 /// `seq * n` with a size from the request: OverflowError / MemoryError as CPython, never an allocation
 /// failure (which aborts the process)
-pub(crate) fn repeat_room(unit: usize, k: usize, overflow_msg: &str) -> R<()> {
+pub fn repeat_room(unit: usize, k: usize, overflow_msg: &str) -> R<()> {
     let total = unit.checked_mul(k).filter(|t| *t <= isize::MAX as usize).ok_or_else(|| Exc::msg(&OVERFLOW_ERROR, overflow_msg))?;
     if total > 1 << 20 {
         let mut probe: Vec<u8> = Vec::new();
@@ -223,8 +267,14 @@ pub(crate) fn repeat_room(unit: usize, k: usize, overflow_msg: &str) -> R<()> {
 }
 
 pub fn mul(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "*", b) {
+        return r;
+    }
     if let Some(r) = super::reldelta::binop(a, "*", b) {
         return r;
+    }
+    if matches!(a, V::Inst(i) if i.desc.x.ntuple) || matches!(b, V::Inst(i) if i.desc.x.ntuple) {
+        return mul(&seq_tuple(a).unwrap_or_else(|| a.clone()), &seq_tuple(b).unwrap_or_else(|| b.clone()));
     }
     if is_sql(a) || is_sql(b) {
         return orm::sql_binop(a, "*", b);
@@ -248,6 +298,11 @@ pub fn mul(a: &V, b: &V) -> R {
             let k = int_of(n).unwrap().max(0) as usize;
             repeat_room(src.len() * std::mem::size_of::<V>(), k, "")?;
             V::list(src.iter().cloned().cycle().take(src.len() * k).collect())
+        }
+        (V::Tuple(t), n) | (n, V::Tuple(t)) if int_of(n).is_some() => {
+            let k = int_of(n).unwrap().max(0) as usize;
+            repeat_room(t.len() * std::mem::size_of::<V>(), k, "")?;
+            V::tuple(t.iter().cloned().cycle().take(t.len() * k).collect())
         }
         (V::Delta(d), n) | (n, V::Delta(d)) if num(n).is_some() => {
             V::Delta(Duration::microseconds((dt::micros(d) as f64 * num(n).unwrap()).round() as i64))
@@ -290,6 +345,9 @@ fn is_float(a: &V, b: &V) -> bool {
 }
 
 pub fn truediv(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "/", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_div(a, b);
     }
@@ -326,6 +384,9 @@ pub fn truediv(a: &V, b: &V) -> R {
 }
 
 pub fn floordiv(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "//", b) {
+        return r;
+    }
     if let Some(r) = dec_op(a, b, "//") {
         return r;
     }
@@ -357,6 +418,9 @@ pub fn floordiv(a: &V, b: &V) -> R {
 }
 
 pub fn modulo(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "%", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_binop(a, "%", b);
     }
@@ -388,6 +452,9 @@ pub fn modulo(a: &V, b: &V) -> R {
 }
 
 pub fn neg(a: &V) -> R {
+    if let Some(r) = super::proto::unary(a, "__neg__") {
+        return r;
+    }
     Ok(match a {
         V::Decimal(d) => super::decimal::v(d.negate().fix()?),
         V::Bool(b) => V::Int(-(*b as i64)),
@@ -403,6 +470,9 @@ pub fn neg(a: &V) -> R {
 }
 
 pub fn pos(a: &V) -> R {
+    if let Some(r) = super::proto::unary(a, "__pos__") {
+        return r;
+    }
     Ok(match a {
         V::Bool(b) => V::Int(*b as i64),
         V::Int(_) | V::Float(_) | V::Delta(_) => a.clone(),
@@ -413,6 +483,9 @@ pub fn pos(a: &V) -> R {
 }
 
 pub fn bitor(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "|", b) {
+        return r;
+    }
     if let Some(r) = counter_binop(a, "|", b) {
         return r;
     }
@@ -452,6 +525,9 @@ fn unsupported(op: &str, a: &V, b: &V) -> Exc {
 /// `a ** b`: int ** non-negative int is an int (beyond 64 bits: OverflowError, py2axum has no big ints),
 /// a negative exponent or a float gives a float
 pub fn pow(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "**", b) {
+        return r;
+    }
     match (int_of(a), int_of(b)) {
         (Some(x), Some(y)) if y >= 0 => {
             let e = u32::try_from(y).map_err(|_| Exc::msg(&OVERFLOW_ERROR, "py2axum: integer power beyond 64 bits"))?;
@@ -477,6 +553,9 @@ pub fn pow(a: &V, b: &V) -> R {
 }
 
 pub fn bitxor(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "^", b) {
+        return r;
+    }
     // Counter ^ Counter (Python 3.15): the absolute differences of the counts, zeros dropped
     if let (V::Dict(x), V::Dict(y)) = (a, b) {
         if is_counter(x) && is_counter(y) && super::python() >= (3, 15) {
@@ -507,6 +586,9 @@ pub fn bitxor(a: &V, b: &V) -> R {
 }
 
 pub fn lshift(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "<<", b) {
+        return r;
+    }
     match (int_of(a), int_of(b)) {
         (Some(_), Some(y)) if y < 0 => Err(Exc::value_error("negative shift count")),
         (Some(x), Some(y)) => {
@@ -518,6 +600,9 @@ pub fn lshift(a: &V, b: &V) -> R {
 }
 
 pub fn rshift(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, ">>", b) {
+        return r;
+    }
     match (int_of(a), int_of(b)) {
         (Some(_), Some(y)) if y < 0 => Err(Exc::value_error("negative shift count")),
         (Some(x), Some(y)) => Ok(V::Int(if y >= 64 { if x < 0 { -1 } else { 0 } } else { x >> y })),
@@ -526,6 +611,9 @@ pub fn rshift(a: &V, b: &V) -> R {
 }
 
 pub fn bitand(a: &V, b: &V) -> R {
+    if let Some(r) = super::proto::binop(a, "&", b) {
+        return r;
+    }
     if let Some(r) = counter_binop(a, "&", b) {
         return r;
     }
@@ -550,6 +638,9 @@ pub fn bitand(a: &V, b: &V) -> R {
 }
 
 pub fn invert(a: &V) -> R {
+    if let Some(r) = super::proto::unary(a, "__invert__") {
+        return r;
+    }
     if is_sql(a) {
         return orm::sql_not(a);
     }
@@ -562,13 +653,21 @@ pub fn invert(a: &V) -> R {
 // ---------------------------------------------------------------- comparisons
 
 pub fn eq_bool(a: &V, b: &V) -> bool {
+    if let (V::Native(x), V::Native(y)) = (a, b) {
+        if let (Native::DnsName(p), Native::DnsName(q)) = (&**x, &**y) {
+            return p == q;
+        }
+        if let (Native::DnsRdata(p), Native::DnsRdata(q)) = (&**x, &**y) {
+            return p == q;
+        }
+    }
     if let Some(Ok(V::Bool(r))) = super::reldelta::binop(a, "==", b) {
         return r;
     }
-    if let Some(t) = row_tuple(a) {
+    if let Some(t) = seq_tuple(a) {
         return eq_bool(&t, b);
     }
-    if let Some(t) = row_tuple(b) {
+    if let Some(t) = seq_tuple(b) {
         return eq_bool(a, &t);
     }
     if matches!(a, V::Inst(_) | V::Obj(_)) || matches!(b, V::Inst(_) | V::Obj(_)) {
@@ -648,8 +747,36 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
     }
 }
 
+/// `a OP b` with a project comparison method, CPython's rich comparison: the left operand's method, else (an SQL
+/// expression on the left answers itself) the right operand's reflected one; its result as is (SQL from a
+/// SQLAlchemy Comparator or a hybrid value object). None: no project method takes part.
+fn richcmp(a: &V, op: &str, b: &V) -> Option<R> {
+    let inst = |v: &V| matches!(v, V::Inst(_) | V::Obj(_));
+    if !inst(a) && !inst(b) {
+        return None;
+    }
+    let (name, reflected) = match op {
+        "==" => ("__eq__", "__eq__"),
+        "!=" => ("__ne__", "__ne__"),
+        "<" => ("__lt__", "__gt__"),
+        "<=" => ("__le__", "__ge__"),
+        ">" => ("__gt__", "__lt__"),
+        _ => ("__ge__", "__le__"),
+    };
+    if let Some(f) = dunder(a, name) {
+        return Some(call_dunder(f, a, vec![b.clone()], name));
+    }
+    if is_sql(a) {
+        return None;
+    }
+    dunder(b, reflected).map(|f| call_dunder(f, b, vec![a.clone()], reflected))
+}
+
 pub fn eq(a: &V, b: &V) -> R {
     super::stack_guard()?;
+    if let Some(r) = richcmp(a, "==", b) {
+        return r;
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_cmp(a, "=", b);
     }
@@ -657,6 +784,11 @@ pub fn eq(a: &V, b: &V) -> R {
 }
 
 pub fn ne(a: &V, b: &V) -> R {
+    if dunder(a, "__ne__").is_some() || dunder(b, "__ne__").is_some() {
+        if let Some(r) = richcmp(a, "!=", b) {
+            return r;
+        }
+    }
     if is_sql(a) || is_sql(b) {
         return orm::sql_cmp(a, "!=", b);
     }
@@ -664,13 +796,24 @@ pub fn ne(a: &V, b: &V) -> R {
 }
 
 pub fn cmp(a: &V, b: &V) -> R<std::cmp::Ordering> {
-    if let Some(t) = row_tuple(a) {
+    if let Some(t) = seq_tuple(a) {
         return cmp(&t, b);
     }
-    if let Some(t) = row_tuple(b) {
+    if let Some(t) = seq_tuple(b) {
         return cmp(a, &t);
     }
     use std::cmp::Ordering::*;
+    // instances with `__lt__` (sorted(), min(), a sequence's order): `a < b`, then `b < a`, as list.sort compares
+    if let Some(r) = richcmp(a, "<", b) {
+        if truthy(&r?)? {
+            return Ok(Less);
+        }
+        let greater = match richcmp(b, "<", a) {
+            Some(r) => truthy(&r?)?,
+            None => false,
+        };
+        return Ok(if greater { Greater } else { Equal });
+    }
     if let V::Enum(e, i) = a {
         if e.kind != EnumKind::Plain {
             return cmp(&e.value(*i), b);
@@ -729,6 +872,9 @@ fn seq_cmp(x: &[V], y: &[V]) -> R<std::cmp::Ordering> {
 macro_rules! cmp_op {
     ($name:ident, $sql:expr, $pat:pat) => {
         pub fn $name(a: &V, b: &V) -> R {
+            if let Some(r) = richcmp(a, $sql, b) {
+                return r;
+            }
             if is_sql(a) || is_sql(b) {
                 return orm::sql_cmp(a, $sql, b);
             }
@@ -772,11 +918,19 @@ pub fn not_container(type_name: &str) -> String {
 }
 
 pub fn contains(container: &V, item: &V) -> R<bool> {
-    if let Some(t) = row_tuple(container) {
+    if let Some(r) = super::proto::contains(container, item) {
+        return r;
+    }
+    if let Some(t) = seq_tuple(container) {
         return contains(&t, item);
     }
     if let V::Enum(e, i) = container {
         return contains(&e.value(*i), item);
+    }
+    if let V::Native(n) = container {
+        if let Native::EmailMsg(m) = &**n {
+            return super::emailmsg::contains(m, item);
+        }
     }
     Ok(match container {
         V::Class(c) => match c.kind {
@@ -977,7 +1131,7 @@ pub fn str_(v: &V) -> R<String> {
     }
     // a Pydantic model's str is BaseModel.__str__ (fields separated by spaces), whatever its __repr__
     if let V::Inst(i) = v {
-        if !i.desc.open && !i.desc.dataclass {
+        if !i.desc.open && !i.desc.dataclass && !i.desc.x.ntuple {
             return dunder_text(v, &["__str__"]).unwrap_or_else(|| i.str_());
         }
     }
@@ -988,6 +1142,15 @@ pub fn str_(v: &V) -> R<String> {
         return Ok(d.to_string());
     }
     if let V::Native(n) = v {
+        if let Native::EmailMsg(m) = &**n {
+            return m.str_();
+        }
+        if let Native::DnsRdata(d) = &**n {
+            return Ok(d.to_text());
+        }
+        if let Native::DnsName(x) = &**n {
+            return Ok(x.to_text(false));
+        }
         if let Native::PydUrl(_, u) = &**n {
             return Ok(u.as_str().to_string());
         }
@@ -1040,7 +1203,16 @@ pub fn str_(v: &V) -> R<String> {
             Native::Complex(re, im) => super::complex::repr(*re, *im)?,
             _ => unreachable!(),
         },
-        V::Sql(_) | V::Col(..) => orm::sql_text(v)?,
+        // a column's text is SQLAlchemy's (`table.col`); a statement's or an expression's is SQLAlchemy's default
+        // compiler (`:param_1` placeholders, generic types, line breaks before FROM/WHERE...): refused, never
+        // approximated
+        V::Col(..) => orm::sql_text(v)?,
+        V::Sql(x) if matches!(&**x, orm::Sql::Col(..)) => orm::sql_text(v)?,
+        V::Sql(_) => {
+            return Err(Exc::type_error(
+                "py2axum: the SQL text of a statement or an expression (str(), f-string, format) is not supported",
+            ))
+        }
         V::Enum(e, i) => match e.kind {
             EnumKind::StrEnum | EnumKind::IntEnum => str_(&e.value(*i))?,
             _ => format!("{}.{}", e.name, e.member_name(*i)),
@@ -1055,6 +1227,17 @@ pub fn ellipsis() -> V {
     E.clone()
 }
 
+/// An object's address as a repr shows it (`<X object at 0x7f...>`). It differs from CPython's anyway, but a
+/// truncated repr (pydantic's `input_value`) cuts it where its width says: on 64-bit Linux CPython's have 12 hex
+/// digits, mimalloc's (placed from 2 TiB) 11, so they are padded to 12 there.
+pub fn addr(p: usize) -> String {
+    if cfg!(all(target_os = "linux", target_pointer_width = "64")) {
+        format!("{p:#014x}")
+    } else {
+        format!("{p:#x}")
+    }
+}
+
 pub fn repr(v: &V) -> R<String> {
     // the text of a type expression depends on the Python (3.14 writes `Union[int, str]` as `int | str`) and
     // on the modules of its classes: refused rather than approximated
@@ -1067,6 +1250,14 @@ pub fn repr(v: &V) -> R<String> {
     }
     if matches!(v, V::Native(n) if matches!(&**n, Native::Ellipsis)) {
         return Ok("Ellipsis".into());
+    }
+    if matches!(v, V::Native(n) if matches!(&**n, Native::NotImplemented)) {
+        return Ok("NotImplemented".into());
+    }
+    if let V::Native(n) = v {
+        if matches!(&**n, Native::Object) {
+            return Ok(format!("<object object at {}>", addr(Arc::as_ptr(n) as *const () as usize)));
+        }
     }
     if let Some(r) = dunder_text(v, &["__repr__"]) {
         return r;
@@ -1083,6 +1274,12 @@ pub fn repr(v: &V) -> R<String> {
         }
         if let Native::Deque(d) = &**n {
             return super::deque::repr(d);
+        }
+        if let Native::DnsRdata(d) = &**n {
+            return Ok(super::dnsres::rdata_repr(d));
+        }
+        if let Native::DnsName(x) = &**n {
+            return Ok(format!("<DNS name {}>", x.to_text(false)));
         }
         if let Native::IpAddr(a) = &**n {
             return Ok(super::net::addr_repr(a));
@@ -1159,7 +1356,7 @@ pub fn repr(v: &V) -> R<String> {
             _ => unreachable!(),
         },
         V::Native(n) if matches!(&**n, Native::AEvent(_)) => match &**n {
-            Native::AEvent(e) => format!("<asyncio.locks.Event object at {:#x} [{}]>", Arc::as_ptr(n) as usize,
+            Native::AEvent(e) => format!("<asyncio.locks.Event object at {} [{}]>", addr(Arc::as_ptr(n) as usize),
                                          if super::aio::event_is_set(e) { "set" } else { "unset" }),
             _ => unreachable!(),
         },
@@ -1179,9 +1376,18 @@ pub fn repr(v: &V) -> R<String> {
             _ => unreachable!(),
         },
         // CPython's default repr: the address differs from one process to the other anyway
-        V::Obj(o) => format!("<{} object at {:#x}>", o.desc.class_qualname, Arc::as_ptr(o) as usize),
-        V::Native(n) if matches!(&**n, Native::YamlMark(_)) => format!("<yaml.error.Mark object at {:#x}>", Arc::as_ptr(n) as *const () as usize),
+        V::Obj(o) => format!("<{} object at {}>", o.desc.class_qualname, addr(Arc::as_ptr(o) as usize)),
+        V::Native(n) if matches!(&**n, Native::RespObj(_) | Native::RespHeaders(_)) => match &**n {
+            Native::RespObj(r) => format!("<{} object at {}>", r.cls, addr(Arc::as_ptr(r) as usize)),
+            Native::RespHeaders(r) => super::resp::headers_repr(&r.headers.lock())?,
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::YamlMark(_)) => format!("<yaml.error.Mark object at {}>", addr(Arc::as_ptr(n) as *const () as usize)),
         V::Enum(e, i) => format!("<{}.{}: {}>", e.name, e.member_name(*i), repr(&e.value(*i))?),
+        V::Native(n) if matches!(&**n, Native::Builtin(..)) => {
+            let Native::Builtin(name, _) = &**n else { unreachable!() };
+            format!("<built-in function {name}>")
+        }
         other => format!("<{}>", other.type_name()),
     })
 }
@@ -1693,6 +1899,9 @@ fn slice_bounds(len: usize, start: &V, stop: &V, step: &V) -> R<(Vec<usize>,)> {
 
 /// `lst[a:b] = iterable` (`lst[a:b:c] = ...` needs as many items as the slice)
 pub fn setslice(v: &V, start: &V, stop: &V, step: &V, val: V) -> R<()> {
+    if let Some(e) = super::proto::slice_refused(v, "__setitem__") {
+        return Err(e);
+    }
     let V::List(l) = v else {
         return Err(Exc::type_error(format!("'{}' object does not support slice assignment", v.type_name())));
     };
@@ -1732,7 +1941,10 @@ pub fn setslice(v: &V, start: &V, stop: &V, step: &V, val: V) -> R<()> {
 }
 
 pub fn getslice(v: &V, start: &V, stop: &V, step: &V) -> R {
-    if let Some(t) = row_tuple(v) {
+    if let Some(e) = super::proto::slice_refused(v, "__getitem__") {
+        return Err(e);
+    }
+    if let Some(t) = seq_tuple(v) {
         return getslice(&t, start, stop, step);
     }
     Ok(match v {
@@ -1952,13 +2164,29 @@ fn default_value(factory: &str) -> V {
 }
 
 pub fn getitem(v: &V, k: &V) -> R {
-    if let Some(t) = row_tuple(v) {
+    if let Some(r) = super::proto::getitem(v, k) {
+        return r;
+    }
+    if let Some(t) = seq_tuple(v) {
         return getitem(&t, k);
     }
     if let V::Native(n) = v {
         match &**n {
             Native::SaColumns(t) => return super::satable::getitem(t, k),
             Native::Mime(m) => return super::mail::mime_getitem(m, k),
+            Native::EmailMsg(m) => return super::emailmsg::getitem(m, k),
+            Native::DnsAnswer(a) => {
+                let items = super::dnsres::answer_items(a);
+                if a.rrset.is_none() {
+                    return Err(Exc::new(&INDEX_ERROR, vec![]));
+                }
+                return match k {
+                    V::Int(i) if *i >= 0 && (*i as usize) < items.len() => Ok(items[*i as usize].clone()),
+                    V::Int(i) if *i >= 0 => Err(Exc::new(&STOP_ITERATION, vec![])),
+                    V::Int(_) => Err(Exc::value_error("Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.")),
+                    _ => Err(Exc::type_error("py2axum: Answer[...] takes an int index")),
+                };
+            }
             Native::Deque(d) => return super::deque::getitem(d, k),
             Native::RespHeaders(r) => return super::resp::headers_getitem(&r.headers, k),
             Native::CellHeaders(c) => return super::resp::headers_getitem(&c.headers, k),
@@ -2030,10 +2258,14 @@ pub fn getitem(v: &V, k: &V) -> R {
 }
 
 pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
+    if let Some(r) = super::proto::setitem(v, k, &val) {
+        return r;
+    }
     if let V::Native(n) = v {
         match &**n {
             Native::Deque(d) => return super::deque::setitem(d, k, val),
             Native::Mime(m) => return super::mail::mime_setitem(m, k, &val),
+            Native::EmailMsg(m) => return super::emailmsg::setitem(m, k, &val),
             Native::JinjaFilters(j) => return super::mail::add_filter(j, k, val),
             Native::RespHeaders(r) => return super::resp::headers_setitem(&r.headers, k, &val),
             Native::CellHeaders(c) => return super::resp::headers_setitem(&c.headers, k, &val),
@@ -2057,12 +2289,18 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
 }
 
 pub fn delitem(v: &V, k: &V) -> R<()> {
+    if let Some(r) = super::proto::delitem(v, k) {
+        return r;
+    }
     if let V::Native(n) = v {
         if let Native::RespHeaders(r) = &**n {
             return super::resp::headers_delitem(&r.headers, k);
         }
         if let Native::CellHeaders(c) = &**n {
             return super::resp::headers_delitem(&c.headers, k);
+        }
+        if let Native::EmailMsg(m) = &**n {
+            return super::emailmsg::delitem(m, k);
         }
     }
     match v {
@@ -2085,7 +2323,10 @@ pub fn delitem(v: &V, k: &V) -> R<()> {
 
 /// Materialised iteration (a snapshot, like `list(x)`).
 pub fn iter(v: &V) -> R<Vec<V>> {
-    if let Some(t) = row_tuple(v) {
+    if let Some(r) = super::proto::iter_all(v) {
+        return r;
+    }
+    if let Some(t) = seq_tuple(v) {
         return iter(&t);
     }
     Ok(match v {
@@ -2096,6 +2337,14 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         V::Str(s) => s.chars().map(|c| V::str(c.to_string())).collect(),
         V::Bytes(b) => b.iter().map(|x| V::Int(*x as i64)).collect(),
         V::Result(r) => r.lock().take_rows()?,
+        V::Native(n) if matches!(&**n, Native::EmailMsg(_)) => match &**n {
+            Native::EmailMsg(m) => super::emailmsg::keys(m),
+            _ => vec![],
+        },
+        V::Native(n) if matches!(&**n, Native::DnsAnswer(_)) => match &**n {
+            Native::DnsAnswer(a) => super::dnsres::answer_items(a),
+            _ => vec![],
+        },
         V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => super::deque::items(d),
             _ => vec![],
@@ -2109,11 +2358,21 @@ pub fn iter(v: &V) -> R<Vec<V>> {
             Native::BytesIO(b) => super::files::bytesio_lines(b),
             _ => vec![],
         },
+        V::Native(n) if matches!(&**n, Native::File(_)) => match &**n {
+            Native::File(f) => super::pathio::file_lines(f)?,
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::ValIter(_)) => match &**n {
+            Native::ValIter(it) => it.drain()?,
+            _ => unreachable!(),
+        },
         V::Native(n) if matches!(&**n, Native::CsvRows(..) | Native::StringIO(_) | Native::Iter(_)) => match &**n {
             Native::CsvRows(_, rows) => iter(rows)?,
             Native::Iter(q) => q.lock().drain(..).collect(),
             _ => super::stdlib::iter_lines(v).unwrap_or_default(),
         },
+        // a Pydantic model iterates over its fields; a plain class or a dataclass is not iterable
+        V::Inst(i) if i.desc.open || i.desc.dataclass => return Err(Exc::type_error(format!("'{}' object is not iterable", i.desc.name))),
         V::Inst(i) => i.iter_fields(),
         V::Native(n) if matches!(&**n, Native::CronGen(_)) => match &**n {
             Native::CronGen(g) => super::croniter::gen_iter(g)?,
@@ -2137,7 +2396,10 @@ pub fn iter(v: &V) -> R<Vec<V>> {
 }
 
 pub fn len(v: &V) -> R<usize> {
-    if let Some(t) = row_tuple(v) {
+    if let Some(r) = super::proto::len(v) {
+        return r;
+    }
+    if let Some(t) = seq_tuple(v) {
         return len(&t);
     }
     Ok(match v {
@@ -2158,6 +2420,14 @@ pub fn len(v: &V) -> R<usize> {
         },
         V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => d.items.lock().len(),
+            _ => 0,
+        },
+        V::Native(n) if matches!(&**n, Native::EmailMsg(_)) => match &**n {
+            Native::EmailMsg(m) => super::emailmsg::len(m),
+            _ => 0,
+        },
+        V::Native(n) if matches!(&**n, Native::DnsAnswer(_)) => match &**n {
+            Native::DnsAnswer(a) => a.rrset.as_ref().map(|s| s.len()).unwrap_or(0),
             _ => 0,
         },
         _ => return Err(Exc::type_error(format!("object of type '{}' has no len()", v.type_name()))),

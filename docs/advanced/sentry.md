@@ -79,6 +79,7 @@ has a single stack frame, its route handler (none outside a request), and `attac
 stack to messages; there are no child spans (database, middleware) in transactions, and no release-health
 sessions or client reports (the SDK's own counters). Every event and
 transaction carries the tag `py2axum.source`: the route handler's `file.py:line`, or the call site
-outside a request. The `Task exception was never retrieved` message does not show the task's repr.
+outside a request. The `Task exception was never retrieved` message shows the task's repr as the logs do
+([Python reference](../reference/python.md): without `coro=` for a coroutine other than a module-level `async def`).
 Events are sent from the Rust SDK's background thread; on SIGTERM the queue is flushed for
 `shutdown_timeout` (2 s by default), like the Python SDK's atexit hook.

@@ -416,3 +416,226 @@ def reset(db: str) -> None:
                     await ch.exchange_delete(x.format(tag))
 
     asyncio.run(run())
+
+
+def _itsx_cases() -> list:
+    """fixtures/libapp/itsx.py: itsdangerous.URLSafeSerializer (deterministic tokens: compared byte for byte)."""
+    values = [None, 1, -2.5, "é \x00", [], {}, {"id": 7, "u": "unsubscribe"}, ["a" * 200], {"k": list(range(60))},
+              {"z": 1, "a": [True, False, None]}]
+    steps = [("POST", "/itsx/dumps", {"value": v}) for v in values]
+    steps += [("POST", "/itsx/dumps", {"value": {"id": 3}, **o}) for o in (
+        {"salt": "desabonnement-marketing"}, {"salt": "none"}, {"keys": "rotated"}, {"call_salt": "other"},
+        {"salt": "s", "call_salt": "t"}, {"salt": "none", "call_salt": "t"})]
+    # tokens made by the reference itsdangerous 2.2.0 (secret "lib-secret")
+    good = "eyJpZCI6N30.VIS4fzdZEmy7OPxyd6u9r748Y30"
+    salted = "eyJpZCI6N30.PMoE2aSfhVv6iWQTraiclaGTA1c"
+    for tok in (good, salted, "WzEsMl0.x", "nodot", "", ".", "a.b.c", "eyJpZCI6N30.!!", good + "x", good.upper()):
+        steps += [("GET", f"/itsx/loads?token={tok}&{q}", None) for q in (
+            "", "salt=desabonnement-marketing", "keys=rotated", "keys=old", "salt=none", "how=ignored", "how=bytes",
+            "call_salt=desabonnement-marketing&how=positional", "call_salt=desabonnement-marketing&how=keyword",
+            "how=positional")]
+    steps += [("GET", f"/itsx/garbage/{n}", None) for n in ("b64", "zlib", "json", "utf8", "empty", "cut", "zlib_short")]
+    steps += [("GET", f"/itsx/tamper?what={w}", None) for w in ("sig", "nodot", "payload", "sig_b64", "empty", "dot")]
+    steps += [("GET", f"/itsx/mixed?direction={d}", None) for d in ("timed_to_plain", "plain_to_timed")]
+    steps += [("GET", f"/itsx/errors?what={w}", None) for w in ("set", "int_token", "too_many", "key_int")]
+    return steps
+
+
+STEPS += _itsx_cases()
+
+
+def _mimex_cases() -> list:
+    """fixtures/libapp/mimex.py: mimetypes on the built-in tables of the project's Python and the host's files."""
+    names = ["a.txt", "A.TXT", "photo.JPG", "photo.jpg", "x.tar.gz", "x.tgz", "x.TGZ", "x.tar.GZ", "x.svgz", "x.tar.bz2",
+             "x.tar.xz", "x.br", "x.Z", "x.gz", "x.pdf.gz", "noext", ".bashrc", "..gz", "dir.d/file", "dir.d/", "a.b.c.json",
+             "/abs/path/report.PDF", "C:\\docs\\a.pdf", "c:a.png", "a.png?x=1", "a.png#f", "song.mp3", "font.woff2",
+             "a.webp", "a.avif", "a.yaml", "a.docx", "a.7z", "a.rtf", "a.mid", "a.pict", "a.xul", "a.md", "a.heic", "é.PNG",
+             "a.İ", "a.\u212a", "", ".", "a.", "http://h/a.png", "HTTP://h/a.PDF?q=1#x", "https://h/dir/", "https://h",
+             "ftp://h/a.tar.gz;type=i", "http://h/a.pdf;v=1", "file:///tmp/a.css", "s3://bucket/key.json",
+             "x:a.png", "xy:a.png", "1x:a.png", " http://h/a.png", "\thttp://h/a.\npng", "data:,hello",
+             "data:image/png;base64,iVBOR", "data:text/plain;charset=utf-8,x", "data:image/svg+xml,<svg>", "data:foo,x",
+             "data:a=b/c,x", "data:image/png", "DATA:image/gif,x", "data:;base64,x", "data://h/x,y",
+             "http://[::1]/a.png", "http://[::1/a.png", "http://::1]/a.png", "http://[v1.x]/a.png", "http://[V1.x]/a.png",
+             "http://[v1]/a.png", "http://[vg.x]/a.png", "http://[1.2.3.4]/a.png", "http://[fe80::1%eth0]/a.png",
+             "http://[fe80::1%]/a.png", "http://[nope]/a.png", "http://u@[::1]:80/a.png", "http://x[::1]/a.png",
+             "http://[::1]x/a.png", "http://ℍ/a.png", "http://℀/a.png", "http://h／x/a.png", "http://﹖/a.png"]
+    steps = [("POST", "/mimex/guess", {"names": names}), ("POST", "/mimex/guess", {"names": names, "strict": False}),
+             ("POST", "/mimex/guess", {"names": names[:40], "as": "path"}),
+             ("POST", "/mimex/guess", {"names": names[:40], "as": "path", "strict": 0}),
+             ("POST", "/mimex/guess", {"names": names[:60], "as": "bytes"}),
+             ("POST", "/mimex/file", {"names": names[:45]}), ("POST", "/mimex/file", {"names": names[:45], "strict": False})]
+    types = ["text/plain", "TEXT/PLAIN", "image/jpeg", "image/jpg", "image/png", "application/pdf", "audio/midi",
+             "image/pict", "application/rtf", "text/xul", "application/octet-stream", "application/json", "text/html",
+             "audio/mpeg", "video/mp4", "application/zip", "application/x-tar", "image/svg+xml", "text/csv",
+             "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "font/woff2", "image/webp",
+             "application/yaml", "text/markdown", "nope/nope", "", "image/heic", "text/javascript", "application/xml"]
+    steps += [("POST", "/mimex/ext", {"types": types, **o}) for o in (
+        {}, {"strict": False}, {"all": True}, {"all": True, "strict": False}, {"strict": 1})]
+    steps += [("GET", f"/mimex/upload?{q}", None) for q in (
+        "filename=a.pdf", "filename=scan.JPEG", "filename=x", "content_type=image/png", "filename=a.pdf&content_type=text/csv",
+        "", "filename=a.unknownext", "content_type=application/x-unknown")]
+    steps += [("GET", f"/mimex/bad?what={w}", None) for w in ("int", "none_ext", "int_all")]
+    steps += [("GET", f"/mimex/file_response?name={n}", None) for n in ("a.pdf", "a.unknown", "x.tar.gz", "http://[x/a.png")]
+    return steps
+
+
+STEPS += _mimex_cases()
+
+
+def _email_cases() -> list:
+    """fixtures/libapp/emailx.py: EmailMessage under policy.default (and SMTP, SMTPUTF8, HTTP). A table of header values
+    (unstructured and address headers: blanks, non-ASCII, encoded words, specials, long words) and bodies (each
+    Content-Transfer-Encoding), then token soups from a fixed seed that reach the folder's corner cases (comments,
+    quoted strings, groups, obsolete local parts, domain literals, junk after an address). The folder changed in
+    security releases: every one was checked against this table (3.12.12 to 3.15.0)."""
+    import random
+
+    subjects = [
+        "", "hello", " hello", "hello ", "  two  spaces  ", "tab\tinside", "\tleading tab", "café", "é",
+        "Réunion de l'équipe demain à 10h", "日本語の件名", "emoji 🎉 party", "🎉", "a" * 70, "a" * 78, "a" * 100, "word " * 30,
+        "é" * 40, "mot é " * 20, "x" * 50 + " é" + " y" * 30, "=?utf-8?q?caf=C3=A9?=", "=?utf-8?b?w6k=?= plain",
+        "re: =?iso-8859-1?q?a?= =?iso-8859-1?q?b?=", "specials ()<>@,;:\\\".[]", "(comment) text", '"quoted" text', "a\\b",
+        "end with é", "é start", "mixed ascii and ünïcödé words that go on and on beyond the limit of seventy eight characters",
+        "a" * 92 + "é", " ".join(["é"] * 40), "Fwd: [ticket #1234] Ça marche — pas tout à fait…", "(no subject)", "x" * 200,
+        "ascii " * 10 + "é" + " ascii" * 10, "ü ü", "ü  ü", "a ü b", "ü\tü", " ü", "ü ", " nbsp", "zero​width",
+        "ascii-only-but-very-long-" * 5, "a=b?c_d", "=?", "?=",
+    ]
+    addresses = [
+        "", "a@b.com", "John Doe <john@example.com>", '"Doe, John" <john@example.com>', "Jöhn Doé <john@example.com>",
+        "a@b.com, c@d.com", "invalid", "<>", "x@", "@x", "a b@c.com", "group: a@b.com, c@d.com;", "jö@x.com", "a@exämple.com",
+        ", ".join(f"user{i}@example{i}.com" for i in range(8)), "a@b.com (Comment)", '"quoted local"@x.com', "a@b.com junk",
+        "Undisclosed recipients:;", "<a@b.com>", "Name <a@b.com", "a@[1.2.3.4]",
+        "Very Long Display Name That Goes On And On And On Forever <very.long.address@some-domain.example.com>",
+        "Élodie Müller-Lüdenscheidt et compagnie internationale <elodie@example.com>, José <jose@example.com>",
+        "a.b@c.com", "a..b@c.com", ".a@c.com", "a.@c.com", "a@b.com,", ",a@b.com", "a@b.com;c@d.com", 'a"b@c.com',
+        "(comment) a@b.com", "Name (comment) <a@b.com>", "=?utf-8?q?J=C3=B6hn?= <j@x.com>", '"Jöhn" <j@x.com>',
+        "noreply@mailer.example", "user+tag@sub.domain.co.uk", "Robert'); DROP TABLE <a@b.com>",
+    ]
+    bodies = [
+        "", "hello", "hello\n", "é", "line1\nline2", "line1\r\nline2\r\n", "a\rb", "x" * 77, "x" * 78, "x" * 79, "é" * 39,
+        "é" * 40, "é" * 100, "ascii\n" * 12 + "é", "é\n" * 12, "From me\n", ".\n", "a=b\n", "trailing  \n", "tab\there",
+        "\x00nul", "(no body available — message id 42)", "mixed é " * 30, "日本語", "🎉" * 30, "line\n" * 15, "x" * 1000,
+        "ascii line\n" + "é" * 200 + "\n", "=\n=" * 10, "  leading", "\n\n\n",
+    ]
+    run = lambda **c: ("POST", "/emailx/run", c)  # noqa: E731
+    steps = []
+    for s in subjects:
+        steps += [run(before=[["Subject", s]], body="x"), run(before=[["X-Custom-Header-With-A-Long-Name", s]])]
+    for a in addresses:
+        steps += [run(before=[["From", a], ["To", a]], body="x"), run(before=[["Cc", a]])]
+    for b in bodies:
+        steps.append(run(body=b))
+        for kw in ({"subtype": "html"}, {"cte": "7bit"}, {"cte": "8bit"}, {"cte": "base64"}, {"cte": "quoted-printable"},
+                   {"charset": "us-ascii"}, {"charset": "ascii"}):
+            steps.append(run(body=b, kw=kw))
+    rnd = random.Random(42)
+    for _ in range(300):
+        words = [rnd.choice(["a", "é", "word", "ünïcödé", "x" * rnd.randint(1, 30), "日本", "🎉", " ", "\t", "=?", "(", '"', "<", "@"])
+                 for _ in range(rnd.randint(1, 25))]
+        s = rnd.choice([" ", "", "  "]).join(words)
+        steps.append(run(before=[["Subject", s]], body=s))
+    for _ in range(150):
+        names = ["", "John", "Jöhn Doé", "A, B", "Ünïcödé Nämé Lönger Than Usual", "x" * rnd.randint(1, 60), "日本 語"]
+        locs = ["a", "john.doe", "jö", "x" * rnd.randint(1, 40), "a+b"]
+        doms = ["b.com", "exämple.com", "sub." * rnd.randint(1, 5) + "example.org"]
+        addrs = []
+        for _ in range(rnd.randint(1, 4)):
+            n, lp, d = rnd.choice(names), rnd.choice(locs), rnd.choice(doms)
+            addrs.append(f"{n} <{lp}@{d}>" if n else f"{lp}@{d}")
+        steps.append(run(before=[["To", ", ".join(addrs)]], body="b"))
+    steps += [
+        run(before=[["From", "a@b.com"], ["From", "c@d.com"]]), run(before=[["Subject", "a"], ["subject", "b"]]),
+        run(before=[["Subject", "line\nbreak"]]), run(before=[["Subject", "line\rbreak"]]), run(before=[["Subject", "end\n"]]),
+        run(before=[["Subject", "a\x0bb"]]), run(before=[["X-Two", "a"], ["X-Two", "b"]], body="z"),
+        run(body="z", after=[["Subject", "after content"]]), run(body="é", kw={"cte": "7bit"}),
+        run(body="x" * 100, kw={"cte": "7bit"}), run(body="x" * 100, kw={"cte": "8bit"}),
+        run(before=[["subject", "lower name"], ["FROM", "a@b.com"], ["x-lower", "v"]], body="z"), run(), run(before=[["To", "a@b.com"]]),
+        run(before=[["To", ["a@b.com", "Bé <c@d.com>"]], ["Cc", None], ["Subject", None]], body="z"),
+    ]
+    # token soups (seeded): every address-list path, several policies, str() and bytes() of the message
+    atoms = ["a", "john", "doe", "é", "ü", "日本", "🎉", "x" * 30, "y" * 75, "=?utf-8?q?=C3=A9?=", "=?utf-8?b?w6k=?=",
+             "=?iso-8859-1?q?caf=E9?=", "=?us-ascii?q?plain?=", "=?utf-8?q?bad", "=?x?y?z?=", "=?utf-8?Q?a_b?=", "word",
+             "Réunion", "naïve", "élève", " ", "a.b", "a..b", ".", "..", "'", "!", "#", "%"]
+    seps = [" ", "  ", "\t", " \t ", "", ",", ", ", ";", ":", "@", "<", ">", "(", ")", '"', "\\", "[", "]", "( c )",
+            "(nested (c))", "(é)", '"q s"', '"é"', '"a\\"b"', " (c) "]
+    pols = [None, None, None, "SMTP", "HTTP", "SMTPUTF8"]
+    rnd = random.Random(7)
+    for _ in range(1200):
+        s = "".join(rnd.choice(atoms) if rnd.random() < 0.6 else rnd.choice(seps) for _ in range(rnd.randint(1, 18)))
+        name = rnd.choice(["Subject", "To", "From", "Cc", "Reply-To", "X-Thing", "Resent-To", "Comments"])
+        c = {"before": [[name, s]], "body": rnd.choice(["b", "é", "x" * 90, "line\r\nline"]), "str": rnd.random() < 0.3}
+        p = rnd.choice(pols)
+        if p:
+            c["policy"] = p
+        steps.append(run(**c))
+    for _ in range(500):
+        disp = "".join(rnd.choice(atoms) if rnd.random() < 0.6 else rnd.choice(seps) for _ in range(rnd.randint(0, 6)))
+        local = rnd.choice(["a", "a.b", '"x y"', "a..b", ".a", "a.", "jö", "x" * 50, "a(c).b", "a . b", '""', '"a'])
+        dom = rnd.choice(["b.com", "exämple.org", "[1.2.3.4]", "[1.2", "b. com", "sub(c).b.com", "", "b.com.", "-b-.com", "x" * 60 + ".com"])
+        addr = f"{disp} <{local}@{dom}>" if rnd.random() < 0.6 else f"{local}@{dom}"
+        if rnd.random() < 0.3:
+            addr += rnd.choice([" junk", ", b@c.com", ";", " (c)", ",,", ", ,x@y.z", " <x@y.z>"])
+        if rnd.random() < 0.2:
+            addr = f"Group {disp}: {addr};"
+        c = {"before": [[rnd.choice(["To", "From", "Cc", "Sender"]), addr]], "body": "b", "str": rnd.random() < 0.3}
+        p = rnd.choice(pols)
+        if p:
+            c["policy"] = p
+        steps.append(run(**c))
+    steps.append(("GET", "/emailx/api", None))
+    steps += [("GET", f"/emailx/policies?policy={p}&how={h}", None) for p in ("default", "SMTP", "SMTPUTF8", "HTTP")
+              for h in ("bytes", "string", "str", "as_smtp", "utf8")]
+    return steps
+
+
+STEPS += _email_cases()
+
+
+def _dns_cases() -> list:
+    """fixtures/libapp/dnsx.py: dnspython against tests/dns_stub.py (DNS_STUB_PORT, started by
+    scripts_start_libapp.sh): every behaviour of the stub over UDP and TCP, timeouts and lifetimes (their durations
+    masked), failover, names, rdata types, resolv.conf files, the default resolver, a mail service's verification."""
+    from urllib.parse import quote
+
+    t = "p2a.test"
+    resolve = lambda **c: ("POST", "/dnsx/resolve", c)  # noqa: E731
+    steps = []
+    for q, rdtype in [("mx", "MX"), ("mx", "TXT"), ("txt", "TXT"), ("txt", "MX"), ("cname", "TXT"), ("cname", "MX"),
+                      ("cname", "CNAME"), ("dangling", "TXT"), ("loop", "TXT"), ("nodata", "MX"), ("nx", "MX"),
+                      ("nxanswer", "TXT"), ("servfail", "MX"), ("refused", "MX"), ("formerr", "MX"), ("notimp", "MX"),
+                      ("yx", "MX"), ("rcode12", "MX"), ("tc", "TXT"), ("tcfail", "TXT"), ("badid", "TXT"), ("case", "MX"),
+                      ("a", "A"), ("a", "AAAA"), ("ns", "NS"), ("edns", "TXT"), ("extra", "TXT"), ("escape", "MX"),
+                      ("_dmarc", "TXT"), ("default._domainkey", "TXT"), ("other.zone", "MX")]:
+        name = f"{q}.{t}" if q != "other.zone" else "example.invalid"
+        steps += [resolve(qname=name, rdtype=rdtype), resolve(qname=name + ".", rdtype=rdtype.lower(), kw={"tcp": True})]
+    steps += [
+        resolve(qname=f"nodata.{t}", rdtype="MX", kw={"raise_on_no_answer": False}),
+        resolve(qname=f"cname.{t}", rdtype="MX", kw={"raise_on_no_answer": False}),
+        resolve(qname=f"a.{t}"), resolve(qname=f"edns.{t}", rdtype="TXT", edns=True),
+        resolve(qname=f"servfail.{t}", rdtype="MX", retry_servfail=True, lifetime=0.5),
+        resolve(qname=f"timeout.{t}", rdtype="MX", timeout=0.2, lifetime=0.5),
+        resolve(qname=f"slow.{t}", rdtype="TXT", timeout=0.25, lifetime=0.4),
+        resolve(qname=f"junk.{t}", rdtype="TXT", timeout=0.2, lifetime=0.3),
+        resolve(qname=f"mx.{t}", rdtype="MX", port="dead", timeout=0.2, lifetime=0.3),
+        resolve(qname=f"mx.{t}", rdtype="MX", nameservers=["127.0.0.1", "127.0.0.1"]),
+        resolve(qname=f"mx.{t}", rdtype="MX", nameservers=["::1", "127.0.0.1"], ports={"::1": "dead", "127.0.0.1": "stub"}, timeout=0.2),
+        resolve(qname=f"servfail.{t}", rdtype="MX", nameservers=["::1", "127.0.0.1"], ports={"::1": "dead", "127.0.0.1": "stub"},
+                timeout=0.2, lifetime=0.6),
+        resolve(qname=f"mx.{t}", rdtype="MX", nameservers=[]), resolve(qname=f"mx.{t}", rdtype="MX", kw={"lifetime": 0.0}),
+        resolve(qname="mx", rdtype="MX", kw={"search": True}),
+    ]
+    steps += [("GET", f"/dnsx/rdtypes?qname=mx.{t}&rdtype={r}", None)
+              for r in ("MX", "mx", "TXT", "ANY", "AXFR", "OPT", "FOO", "TYPE15", "TYPE99999", "SOA", "SRV", "TYPE16", "CNAME")]
+    for n in ("a..b", ".a", "a.", "", ".", "@", "a\\.b.c", "a\\065b", "a\\0", "a\\999x", "a\\", "x" * 64, ".".join(["x" * 60] * 5),
+              "UPPER.Case", "w\\(e\\)ird\\;", "sp ace", "tab\tx", "a.b.c.", "\\046"):
+        steps += [("GET", f"/dnsx/names?text={quote(n)}", None), ("GET", f"/dnsx/names?text={quote(n)}&relative=true", None),
+                  ("GET", f"/dnsx/badnames?text={quote(n)}", None)]
+    steps += [("GET", f"/dnsx/conf/{c}", None) for c in ("full.conf", "domain.conf", "nons.conf", "edns.conf", "badname.conf", "absent.conf")]
+    steps += [("GET", "/dnsx/system", None), ("GET", "/dnsx/unconfigured", None), ("GET", "/dnsx/classes", None)]
+    steps += [("GET", f"/dnsx/module?qname={q}.{t}&rdtype={r}", None) for q, r in (("mx", "MX"), ("txt", "TXT"), ("nodata", "MX"), ("nx", "TXT"))]
+    steps += [("GET", f"/dnsx/module?qname=nodata.{t}&rdtype=MX&raise_on_no_answer=false", None)]
+    steps += [("GET", f"/dnsx/verify?domain={d}", None) for d in (t, f"nx.{t}", f"servfail.{t}")]
+    return steps
+
+
+STEPS += _dns_cases()

@@ -30,7 +30,7 @@ The `Dockerfile` takes build arguments, so it can often be used as is:
 ```bash
 docker build -f Dockerfile \
   --build-arg APP_DIR=. --build-arg PACKAGE=api \
-  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.8.0 \
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.9.0 \
   --build-arg PY2AXUM_FLAGS="--python-side auto" -t myapp .
 ```
 
@@ -45,8 +45,9 @@ docker build -f Dockerfile \
 - Copy your `uv.lock` (or requirements file) with the application: library behaviours follow its versions.
 - The build runs `py2axum check` before generating, so the build log lists every route's verdict.
 
-The release profile uses fat LTO and one codegen unit: the runtime's crates are precompiled in the image, but
-the final link optimises the whole program and takes a few minutes. The generated crate ships with the
+The release profile uses thin LTO and one codegen unit: the runtime (its own library crate) and its dependencies
+are precompiled in the image, and the final link optimises them with your code
+([build profile](performance.md#build-profile)). The generated crate ships with the
 `Cargo.lock` py2axum is tested with (`cargo build --locked`). Without Docker, the same steps are
 `py2axum check`, `py2axum … -o crate` and `cargo build --release` ([first application](../getting-started/first-app.md)).
 

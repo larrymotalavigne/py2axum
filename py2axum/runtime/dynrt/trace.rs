@@ -282,9 +282,23 @@ pub fn task_group_error(e: &Exc) -> Exc {
     g
 }
 
+/// An exception escaping Starlette's StreamingResponse while it streams: before Starlette 1.3 the body runs
+/// in an anyio TaskGroup (with the disconnect listener) and Starlette re-raises the single exception out of
+/// its `ExceptionGroup`, which becomes its `__context__`; from 1.3 (`create_collapsing_task_group`) it
+/// comes out alone.
+pub fn streaming_error(e: &Exc) -> Exc {
+    if super::web::starlette() < (1, 3) {
+        let g = task_group_error(e);
+        e.0.attrs.lock().insert("__context__".into(), V::Exc(g));
+    }
+    e.clone()
+}
+
 /// an exception group as `traceback` prints it: its own traceback and line behind `  | `, then each
-/// sub-exception boxed under its number
-fn group(g: &Exc, subs: &[Exc], out: &mut String) {
+/// sub-exception boxed under its number (the exceptions already printed are shared with the group's: a
+/// sub-exception whose `__context__` is the group itself, as Starlette re-raises it, is not followed back)
+fn group(g: &Exc, subs: &[Exc], out: &mut String, seen: &mut Vec<*const ExcObj>) {
+    seen.push(Arc::as_ptr(&g.0));
     out.push_str("  + Exception Group Traceback (most recent call last):\n");
     for l in format_frames(g).lines() {
         out.push_str(&format!("  | {l}\n"));
@@ -295,7 +309,9 @@ fn group(g: &Exc, subs: &[Exc], out: &mut String) {
     for (i, x) in subs.iter().enumerate() {
         let head = if i == 0 { "  +-+" } else { "    +" };
         out.push_str(&format!("{head}---------------- {} ----------------\n", i + 1));
-        for l in format_exc(x).lines() {
+        let mut sub = String::new();
+        chain(x, &mut sub, seen);
+        for l in sub.lines() {
             out.push_str(&format!("    | {l}\n"));
         }
     }
@@ -308,7 +324,7 @@ fn chain(e: &Exc, out: &mut String, seen: &mut Vec<*const ExcObj>) {
             Some(V::Tuple(t)) => t.iter().filter_map(|v| if let V::Exc(x) = v { Some(x.clone()) } else { None }).collect(),
             _ => vec![],
         };
-        return group(e, &subs, out);
+        return group(e, &subs, out, seen);
     }
     seen.push(Arc::as_ptr(&e.0));
     let attrs = e.0.attrs.lock();

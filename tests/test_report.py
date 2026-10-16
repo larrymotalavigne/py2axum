@@ -39,7 +39,7 @@ FILES = {
             label: Mapped[str] = mapped_column(String(50))
     ''',
     "proj/schemas.py": '''
-        from pydantic import BaseModel, ConfigDict, Field, Json
+        from pydantic import BaseModel, ConfigDict, Field, ImportString
 
         class ItemOut(BaseModel):
             model_config = ConfigDict(from_attributes=True)
@@ -47,7 +47,7 @@ FILES = {
             label: str = Field(..., min_length=1)
 
         class Stamped(BaseModel):
-            at: Json
+            at: ImportString
     ''',
     "proj/deps.py": '''
         import boto3
@@ -121,15 +121,15 @@ def test_report(tmp_path, capsys):
     # imports: absolute, relative, __init__ re-export, factory app, router prefixes
     assert routes["/api/items/{item_id}"]["status"] == "traduite"
     assert routes["/users/count"]["status"] == "traduite"
-    # dyn backend: the Json field blocks the schema, the unmapped lib blocks the dependency; one
+    # dyn backend: the ImportString field blocks the schema, the unmapped lib blocks the dependency; one
     # blocker per route (compilation of a route's closure stops at its first error)
-    assert set(routes["/api/items/stamp/now"]["blockers"]) == {"type Json"}
+    assert set(routes["/api/items/stamp/now"]["blockers"]) == {"type …"}
     assert set(routes["/api/items/me/info"]["blockers"]) == {"lib boto3"}
     # the second route using the same refused dependency is blocked too (no stale dependency cache)
     assert set(routes["/api/items/me/again"]["blockers"]) == {"lib boto3"}
     assert len(routes["/api/items/me/stamp"]["blockers"]) == 1
     alone = {c["construction"]: c["débloquées_seule"] for c in data["constructions"]}
-    assert alone == {"type Json": 2, "lib boto3": 2}
+    assert alone == {"type …": 2, "lib boto3": 2}
     assert data["glouton"][-1]["cumul"] == 6
     assert data["résumé"] == {"total": 6, "traduites": 2, "bloquées": 4}
 
@@ -147,7 +147,7 @@ def test_required_field_with_ellipsis(tmp_path):
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert re.search(r'name: "label",\s*alias: None,\s*ser: None,\s*paths: &\[\],\s*td: &TD_\d+,\s*'
-                     r'default: crate::dynrt::pyd::Dflt::Required,', gen)
+                     r'default: dynrt::pyd::Dflt::Required,', gen)
 
 
 def test_python_side_auto(tmp_path, capsys):
@@ -174,7 +174,7 @@ def test_python_side_auto_global_error(tmp_path, capsys):
     main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(telemetry=True)"))
     assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "main.py" in err and "FastAPI(telemetry=...) is not supported" in err
+    assert "main.py" in err and "FastAPI(telemetry=...)" in err  # its message depends on the FastAPI version
     assert "only moves routes" in err
 
 

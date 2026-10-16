@@ -14,6 +14,17 @@ relative (`from ..db import SessionDep`) and resolved statically. Like every exa
 
 ## What is native
 
+- Custom route classes (FastAPI's "Custom Request and APIRoute class"): `APIRouter(route_class=R)` and
+  `app.router.route_class = R` (for the app's routes declared after it in the same module), where `R` subclasses
+  `APIRoute` and overrides only `get_route_handler()`: `super().get_route_handler()` is the route's own handler,
+  called with the request and returning the Response object (`status_code`, mutable `headers`, its class in
+  `type()` and `repr()`), its exceptions raised as they are (`RequestValidationError`, `HTTPException`). The
+  handler is made once per route, at its first request (FastAPI: when the route is created). A project subclass
+  of `Request` built as `GzipRequest(request.scope, request.receive)` wraps the request: its attributes and
+  methods fall back to it, `super().body()` reads the raw body, and its own `body()` is what the route parses
+  when it has a body or form parameter (an error there: FastAPI's 400 `There was an error parsing the body`); the
+  endpoint's `request` parameter is that instance. Refused: reading `self` (the APIRoute) in `get_route_handler`,
+  other overridden methods, `route_class` set twice, an app route in another module than the assignment.
 - `FastAPI()` apps, `APIRouter(prefix=, tags=, dependencies=)`, `include_router`, routers split across
   modules, apps built by a factory function (`create_app()`), including endpoints defined inside it; a
   local of the factory assigned once is evaluated once. `if` statements around registrations are evaluated
@@ -61,6 +72,21 @@ Routes added by a `configure(app)` function are described in [Middleware](middle
   is shadowed by it in Python but would be served by the binary), or registrations of the app in another
   module or function than the mount (their order depends on imports or calls). WebSocket handshakes under
   the mount are not relayed (see [WebSockets](websockets.md)).
+
+### Routers of libraries
+
+- `app.include_router(router)` where `router` comes from a library (imported from it, or returned by one of its
+  functions: `app.include_router(lib.make_router(...), prefix="/x")`) is not translated: py2axum reads only the
+  project, so the library's routes are unknown. Included among the app's last registrations, its routes stay on
+  the Python side (`--python-side mount`, implied by `--python-side auto`), like a final mount: with
+  `PY2AXUM_PYTHON_URL` set, a request that no translated route fully matches (path and method) is relayed to the
+  Python application, under the literal `prefix=` of the call, or every such request without one (the Python
+  application then answers the 404s and 405s itself, the library's routes included: a POST on a translated GET
+  route reaches the library's POST route of the same path, as in Starlette). Refused with `file:line`
+  (P2A0315): a registration after it (a route, an `include_router` of the project, a function given the app
+  that registers routes, even through another function: Starlette would try the library's routes first), a
+  conditional include (under `if`, `try`, a loop, `with`), a prefix that is not a literal string, an include on
+  a router instead of the app, and registrations of the app in another module or function.
 - `FastAPI(root_path="/api/v1")` (a literal; `root_path_in_servers=` only changes the OpenAPI schema): the scope's
   `root_path`, stripped from the path before routing when the path starts with it (Starlette's
   `get_route_path`, so `/app` and `/api/v1/app` both match), part of `request.base_url`. Refused together with
@@ -69,6 +95,7 @@ Routes added by a `configure(app)` function are described in [Middleware](middle
 ## What stays in Python
 
 - Mounted applications (above), left to Python with `--python-side mount`.
+- Routers of libraries (above), left to Python with `--python-side mount`.
 - Raw ASGI routes: a class as endpoint (`HTTPEndpoint`) is refused.
 
 ## Differences

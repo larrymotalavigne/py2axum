@@ -20,6 +20,14 @@ hashes and signed JWTs, also native. Like every example on this site, it is comp
   `WWW-Authenticate: Bearer`), `HTTPBasic` (`realm=` a literal; `HTTPBasicCredentials`; a payload that is not
   base64 of ASCII `user:password` is a 401 even with `auto_error=False`, as in FastAPI),
   `OAuth2PasswordRequestForm`.
+- A project subclass of one of them that overrides `make_not_authenticated_error(self)` (the exception raised
+  instead of the 401: `HTTPBearer403` of FastAPI's documentation) or, for `HTTPBearer` and `HTTPBasic`,
+  `make_authenticate_headers(self)` (the 401's headers; OAuth2's error does not call it, so an override has no
+  effect, as in FastAPI). The overrides must not read `self`.
+- OAuth2 scopes: `Security(dependency, scopes=[...])` (a literal list) and a `SecurityScopes` parameter, which
+  receives the scopes of the dependency chain down to it, without repeats, in order. A dependency that uses
+  scopes (its own, a `SecurityScopes` parameter, a security scheme, here or below) is cached per set of scopes,
+  as FastAPI's cache key holds them.
 - Behind them, see the rows of [Libraries](../reference/libraries.md): PyJWT and python-jose (HMAC
   algorithms), bcrypt and pyotp, itsdangerous, cryptography's `Fernet`.
 

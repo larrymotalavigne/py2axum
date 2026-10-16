@@ -123,6 +123,7 @@ nav:
       - How it works: advanced/how-it-works.md
       - Graceful shutdown: advanced/shutdown.md
       - Database migrations: advanced/migrations.md
+      - Libraries from source: advanced/libraries.md
       - Logging: advanced/logging.md
       - Large list responses: advanced/streaming.md
       - Sentry: advanced/sentry.md

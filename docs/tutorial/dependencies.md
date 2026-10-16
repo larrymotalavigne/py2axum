@@ -35,6 +35,12 @@ request is over. Like every example on this site, it is compiled and compared wi
   response is sent (for a streamed response, at the end of the stream). The cache key includes the scope.
 - An instance of a project class with `__call__` as a dependency (`checker = Checker("bar")`,
   `Depends(checker)`): its parameters are those of `__call__`, sync or async.
+- A dependency built by a factory, `Depends(make_dep(Query([], alias="id"), int))`: FastAPI reads the signature of
+  the function the factory returns, whose defaults and annotations hold the factory's arguments. The factory may
+  only define functions and return one of them (undecorated); its arguments are constants, builtin types and
+  FastAPI markers of constants, naming the same objects where the call is and where the factory is; inside, a
+  marker is only read as a parameter default or through its `.default`, and no factory parameter is reassigned.
+  Anything else is refused at its line.
 - `app.dependency_overrides[dep] = other` written at module level (a project function overridden by a project
   function): `other` is solved and called wherever `dep` is depended on, with its own parameters.
 - The session dependency: `async with maker() as s: yield s` with optional `await s.commit()`,

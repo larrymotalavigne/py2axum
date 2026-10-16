@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from py_vapid import Vapid02
 
-from fixtures.dynapp.libs import AUTH, RECEIVER_PRIV, VAPID_PUB
+from fixtures.integapp.libs import AUTH, RECEIVER_PRIV, VAPID_PUB
 
 app = FastAPI()
 

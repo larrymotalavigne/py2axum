@@ -1,5 +1,5 @@
-//! `itsdangerous.URLSafeTimedSerializer` (itsdangerous 2.2.0): `dumps(obj, salt)` /
-//! `loads(s, max_age, return_timestamp, salt)` with the default signer (django-concat key derivation,
+//! `itsdangerous.URLSafeTimedSerializer` and `URLSafeSerializer` (itsdangerous 2.2.0): `dumps(obj, salt)` /
+//! `loads(s, max_age, return_timestamp, salt)` (`loads(s, salt)` untimed) with the default signer (django-concat key derivation,
 //! HMAC-SHA1), compact JSON payload, zlib when shorter, and the library's exceptions (with their `payload`
 //! and `date_signed` attributes) and messages in its order of checks.
 use std::io::{Read, Write};
@@ -17,6 +17,14 @@ pub struct Serializer {
     pub keys: Vec<Vec<u8>>,
     /// the serializer's salt (None: the Signer default)
     pub salt: Option<Vec<u8>>,
+    /// URLSafeTimedSerializer (TimestampSigner) or URLSafeSerializer (Signer)
+    pub timed: bool,
+}
+
+impl Serializer {
+    pub fn class_name(&self) -> &'static str {
+        if self.timed { "URLSafeTimedSerializer" } else { "URLSafeSerializer" }
+    }
 }
 
 fn want_bytes(v: &V, what: &str) -> R<Vec<u8>> {
@@ -27,8 +35,8 @@ fn want_bytes(v: &V, what: &str) -> R<Vec<u8>> {
     }
 }
 
-/// `URLSafeTimedSerializer(secret_key, salt=b"itsdangerous")`
-pub fn new(secret_key: &V, salt: Option<&V>) -> R {
+/// `URLSafeTimedSerializer(secret_key, salt=b"itsdangerous")` (`timed`) or `URLSafeSerializer(...)`
+pub fn new(secret_key: &V, salt: Option<&V>, timed: bool) -> R {
     let keys = match secret_key {
         V::Str(_) | V::Bytes(_) => vec![want_bytes(secret_key, "secret_key")?],
         other => ops::iter(other)?.iter().map(|k| want_bytes(k, "secret_key")).collect::<R<Vec<_>>>()?,
@@ -38,7 +46,7 @@ pub fn new(secret_key: &V, salt: Option<&V>) -> R {
         Some(V::None) => None,
         Some(s) => Some(want_bytes(s, "salt")?),
     };
-    Ok(V::native(Native::Serializer(Serializer { keys, salt })))
+    Ok(V::native(Native::Serializer(Serializer { keys, salt, timed })))
 }
 
 fn b64(data: &[u8]) -> Vec<u8> {
@@ -106,9 +114,9 @@ fn salt_kw(kwargs: &[(String, V)]) -> R<Option<Vec<u8>>> {
     }
 }
 
-fn check_kwargs(name: &str, kwargs: &[(String, V)], allowed: &[&str]) -> R<()> {
+fn check_kwargs(s: &Serializer, name: &str, kwargs: &[(String, V)], allowed: &[&str]) -> R<()> {
     match kwargs.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
-        Some((k, _)) => Err(Exc::type_error(format!("py2axum: URLSafeTimedSerializer.{name}({k}=) is not supported"))),
+        Some((k, _)) => Err(Exc::type_error(format!("py2axum: {}.{name}({k}=) is not supported", s.class_name()))),
         None => Ok(()),
     }
 }
@@ -116,13 +124,35 @@ fn check_kwargs(name: &str, kwargs: &[(String, V)], allowed: &[&str]) -> R<()> {
 pub fn method(s: &Serializer, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     match name {
         "dumps" => {
-            check_kwargs(name, kwargs, &["salt"])?;
-            let obj = args.first().ok_or_else(|| Exc::type_error("dumps() missing 1 required positional argument: 'obj'"))?;
+            check_kwargs(s, name, kwargs, &["salt"])?;
+            if args.len() > 2 {
+                return Err(Exc::type_error(format!("Serializer.dumps() takes from 2 to 3 positional arguments but {} were given", args.len() + 1)));
+            }
+            let obj = args.first().ok_or_else(|| Exc::type_error("Serializer.dumps() missing 1 required positional argument: 'obj'"))?;
             let salt = if let Some(v) = args.get(1) { if matches!(v, V::None) { None } else { Some(want_bytes(v, "salt")?) } } else { salt_kw(kwargs)? };
             dumps(s, obj, &salt)
         }
+        // Serializer.loads(s, salt=None, **kwargs): the other keywords are accepted and ignored
+        "loads" if !s.timed => {
+            if args.len() > 2 {
+                return Err(Exc::type_error(format!("Serializer.loads() takes from 2 to 3 positional arguments but {} were given", args.len() + 1)));
+            }
+            if args.len() == 2 && kwargs.iter().any(|(k, _)| k == "salt") {
+                return Err(Exc::type_error("Serializer.loads() got multiple values for argument 'salt'"));
+            }
+            let token = match args.first().or_else(|| kwargs.iter().find(|(k, _)| k == "s").map(|(_, v)| v)) {
+                Some(t) => t,
+                None => return Err(Exc::type_error("Serializer.loads() missing 1 required positional argument: 's'")),
+            };
+            let salt = match args.get(1) {
+                Some(V::None) => None,
+                Some(v) => Some(want_bytes(v, "salt")?),
+                None => salt_kw(kwargs)?,
+            };
+            loads_untimed(s, token, &salt)
+        }
         "loads" => {
-            check_kwargs(name, kwargs, &["max_age", "return_timestamp", "salt"])?;
+            check_kwargs(s, name, kwargs, &["max_age", "return_timestamp", "salt"])?;
             // TimedSerializer.loads(s, max_age=None, return_timestamp=False, salt=None)
             let params = ["s", "max_age", "return_timestamp", "salt"];
             if args.len() > params.len() {
@@ -140,7 +170,7 @@ pub fn method(s: &Serializer, name: &str, args: &[V], kwargs: &[(String, V)]) ->
             let (payload, ts) = loads(s, token, &arg(1), &salt)?;
             if ops::truthy(&arg(2))? { Ok(V::tuple(vec![payload, ts])) } else { Ok(payload) }
         }
-        _ => Err(Exc::attr_error(format!("'URLSafeTimedSerializer' object has no attribute '{name}'"))),
+        _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", s.class_name()))),
     }
 }
 
@@ -160,12 +190,14 @@ fn dumps(s: &Serializer, obj: &V, salt: &Option<Vec<u8>>) -> R {
     } else {
         payload.extend(b64(&json));
     }
-    // TimestampSigner.sign: value.timestamp.signature
-    let ts = (now() as u64).to_be_bytes();
-    let ts = &ts[ts.iter().position(|b| *b != 0).unwrap_or(ts.len())..];
+    // TimestampSigner.sign: value.timestamp.signature (Signer.sign: value.signature)
     let mut value = payload;
-    value.push(b'.');
-    value.extend(b64(ts));
+    if s.timed {
+        let ts = (now() as u64).to_be_bytes();
+        let ts = &ts[ts.iter().position(|b| *b != 0).unwrap_or(ts.len())..];
+        value.push(b'.');
+        value.extend(b64(ts));
+    }
     let key = derive_key(signer_salt(s, salt), s.keys.last().expect("a secret key"));
     let sig = b64(&signature(&key, &value));
     value.push(b'.');
@@ -173,12 +205,9 @@ fn dumps(s: &Serializer, obj: &V, salt: &Option<Vec<u8>>) -> R {
     Ok(V::str(String::from_utf8(value).expect("ascii")))
 }
 
-/// `TimedSerializer.loads`: the payload and the signing instant (`return_timestamp=True`'s pair)
-fn loads(s: &Serializer, token: &V, max_age: &V, salt: &Option<Vec<u8>>) -> R<(V, V)> {
-    let signed = want_bytes(token, "s")?;
-    let salt = signer_salt(s, salt);
-    // Signer.unsign: BadSignature("No b'.' found in value") has no payload, a bad signature the value
-    let sig_error: Option<(String, Option<Vec<u8>>)> = match signed.iter().rposition(|c| *c == b'.') {
+/// `Signer.unsign`'s check: None when a key signed `value`, else BadSignature's message and payload
+fn check_sig(s: &Serializer, signed: &[u8], salt: &[u8]) -> Option<(String, Option<Vec<u8>>)> {
+    match signed.iter().rposition(|c| *c == b'.') {
         None => Some(("No b'.' found in value".into(), None)),
         Some(i) => {
             let (value, sig) = (&signed[..i], &signed[i + 1..]);
@@ -188,9 +217,41 @@ fn loads(s: &Serializer, token: &V, max_age: &V, salt: &Option<Vec<u8>>) -> R<(V
                     bool::from(subtle::ConstantTimeEq::ct_eq(expected.as_slice(), sig.as_slice()))
                 })
             });
-            if ok { None } else { Some((format!("Signature {} does not match", ops::repr(&V::Bytes(sig.into()))?), Some(value.to_vec()))) }
+            if ok {
+                None
+            } else {
+                let repr = ops::repr(&V::Bytes(sig.to_vec().into())).unwrap_or_default();
+                Some((format!("Signature {repr} does not match"), Some(value.to_vec())))
+            }
         }
-    };
+    }
+}
+
+/// `Serializer.loads` with the default Signer (no fallback signers)
+/// `want_bytes(s)` of `loads`: a str or bytes; a number reaches `b"." not in s` (Signer.unsign)
+fn token_bytes(token: &V) -> R<Vec<u8>> {
+    match token {
+        V::Int(_) | V::Float(_) | V::Bool(_) | V::None => {
+            Err(Exc::type_error(ops::not_container(token.type_name())))
+        }
+        _ => want_bytes(token, "s"),
+    }
+}
+
+fn loads_untimed(s: &Serializer, token: &V, salt: &Option<Vec<u8>>) -> R {
+    let signed = token_bytes(token)?;
+    if let Some((msg, payload)) = check_sig(s, &signed, signer_salt(s, salt)) {
+        return Err(bad_sig(&BAD_SIGNATURE, msg, payload.as_deref(), None));
+    }
+    load_payload(&signed[..signed.iter().rposition(|c| *c == b'.').unwrap()])
+}
+
+/// `TimedSerializer.loads`: the payload and the signing instant (`return_timestamp=True`'s pair)
+fn loads(s: &Serializer, token: &V, max_age: &V, salt: &Option<Vec<u8>>) -> R<(V, V)> {
+    let signed = token_bytes(token)?;
+    let salt = signer_salt(s, salt);
+    // Signer.unsign: BadSignature("No b'.' found in value") has no payload, a bad signature the value
+    let sig_error = check_sig(s, &signed, salt);
     // TimestampSigner.unsign: `result = e.payload or b""`
     let result: Vec<u8> = match &sig_error {
         None => signed[..signed.iter().rposition(|c| *c == b'.').unwrap()].to_vec(),
@@ -235,7 +296,11 @@ fn loads(s: &Serializer, token: &V, max_age: &V, salt: &Option<Vec<u8>>) -> R<(V
     }
     // TimedSerializer.loads always asks the signer for the timestamp (return_timestamp=True)
     let stamp = date_of(date(ts).ok_or_else(out_of_range)?);
-    // URLSafeSerializerMixin.load_payload
+    Ok((load_payload(value)?, stamp))
+}
+
+/// `URLSafeSerializerMixin.load_payload`, then the json serializer's
+fn load_payload(value: &[u8]) -> R {
     let (compressed, b) = match value.strip_prefix(b".") {
         Some(rest) => (true, rest),
         None => (false, value),
@@ -250,5 +315,5 @@ fn loads(s: &Serializer, token: &V, max_age: &V, salt: &Option<Vec<u8>>) -> R<(V
     }
     let unserializing = || bad(&BAD_PAYLOAD, "Could not load the payload because an exception occurred on unserializing the data.");
     let text = String::from_utf8(json).map_err(|_| unserializing())?;
-    Ok((pyd::loads(&text).map_err(|_| unserializing())?, stamp))
+    pyd::loads(&text).map_err(|_| unserializing())
 }

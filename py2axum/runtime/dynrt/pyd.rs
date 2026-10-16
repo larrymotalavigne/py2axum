@@ -134,6 +134,144 @@ pub enum TD {
     Bytes(Option<usize>, Option<usize>, BytesMode),
     /// `Field(min_length=, max_length=)` on a list, set, tuple or dict: (container, min, max)
     Len(&'static TD, Option<usize>, Option<usize>),
+    /// `Iterable[T]`: any iterable, its items validated one by one when iterated (`ValidatorIterator`)
+    Iter(&'static TD),
+    /// `pydantic.Json` / `Json[T]`: a str or bytes parsed by jiter (inf and nan allowed), then validated as T
+    Json(Option<&'static TD>),
+    /// a datetime or date with `Field(gt=, ge=, lt=, le=)` and/or `AwareDatetime` / `NaiveDatetime`
+    DtC(&'static TD, DtC),
+}
+
+/// a datetime or date constant of a constraint: (year, month, day, hour, minute, second, microsecond, UTC offset
+/// in seconds; a date: the time fields are 0 and `date` is true)
+#[derive(Clone, Copy)]
+pub struct DtLit {
+    pub ymd: (i32, u32, u32),
+    pub hms: (u32, u32, u32, u32),
+    pub offset: Option<i32>,
+    pub date: bool,
+}
+
+/// pydantic-core's datetime/date constraints, checked after the type in this order: le, lt, ge, gt, then the
+/// timezone (`Some(true)`: aware, `Some(false)`: naive)
+#[derive(Clone, Copy)]
+pub struct DtC {
+    pub le: Option<DtLit>,
+    pub lt: Option<DtLit>,
+    pub ge: Option<DtLit>,
+    pub gt: Option<DtLit>,
+    pub tz: Option<bool>,
+}
+
+impl DtLit {
+    fn wall(&self) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(self.ymd.0, self.ymd.1, self.ymd.2).unwrap()
+            .and_hms_micro_opt(self.hms.0, self.hms.1, self.hms.2, self.hms.3).unwrap()
+    }
+    /// speedate's Display (pydantic-core puts it in the error message and ctx)
+    fn text(&self) -> String {
+        if self.date {
+            return dt::date_iso(&self.wall().date());
+        }
+        let d = DateTime { wall: self.wall(), tz: self.offset.map(dt::Tz::Fixed), fold: 0 };
+        d.pydantic()
+    }
+}
+
+/// speedate's order: two aware values by their instants, otherwise (one naive at least) by their wall times
+fn dt_cmp(v: &V, c: &DtLit) -> std::cmp::Ordering {
+    match v {
+        V::Date(d) => d.cmp(&c.wall().date()),
+        V::DateTime(d) => match (d.offset(), c.offset) {
+            (Some(_), Some(o)) => d.utc().cmp(&(c.wall() - chrono::Duration::seconds(o as i64))),
+            _ => d.wall.cmp(&c.wall()),
+        },
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn dt_checks(v: V, c: &DtC, loc: &[V], input: &V, e: &mut Errs) -> Option<V> {
+    use std::cmp::Ordering::*;
+    let checks: [(&Option<DtLit>, &'static str, &'static str, &'static str, fn(std::cmp::Ordering) -> bool); 4] = [
+        (&c.le, "le", "less_than_equal", "less than or equal to", |o| o != Greater),
+        (&c.lt, "lt", "less_than", "less than", |o| o == Less),
+        (&c.ge, "ge", "greater_than_equal", "greater than or equal to", |o| o != Less),
+        (&c.gt, "gt", "greater_than", "greater than", |o| o == Greater),
+    ];
+    for (lit, key, kind, words, ok) in checks {
+        if let Some(lit) = lit {
+            if !ok(dt_cmp(&v, lit)) {
+                let t = lit.text();
+                e.push(kind, loc, format!("Input should be {words} {t}"), input, Some(vec![(key, V::str(&t))]));
+                return None;
+            }
+        }
+    }
+    if let (Some(aware), V::DateTime(d)) = (c.tz, &v) {
+        if aware && d.tz.is_none() {
+            e.push("timezone_aware", loc, "Input should have timezone info", input, None);
+            return None;
+        }
+        if !aware && d.tz.is_some() {
+            e.push("timezone_naive", loc, "Input should not have timezone info", input, None);
+            return None;
+        }
+    }
+    Some(v)
+}
+
+/// pydantic-core's `ValidatorIterator`: the input's items (taken at validation, like `iter(input)`), each validated
+/// against the item type when it is reached (`next`, a loop, a JSON dump), with the strictness of its model
+pub struct ValIter {
+    items: Mutex<std::collections::VecDeque<V>>,
+    index: Mutex<usize>,
+    td: &'static TD,
+    strict: bool,
+}
+
+impl ValIter {
+    /// the next item, validated (a ValidationError titled `ValidatorIterator`, loc = its index); None at the end
+    pub fn next(&self) -> R<Option<V>> {
+        let Some(item) = self.items.lock().pop_front() else { return Ok(None) };
+        let i = {
+            let mut ix = self.index.lock();
+            *ix += 1;
+            *ix - 1
+        };
+        let (mut steps, mut slots) = (Vec::new(), Vec::new());
+        let loc = [V::Int(i as i64)];
+        let got = val(&item, self.td, &loc, &mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: self.strict });
+        let mut errs = Vec::new();
+        for st in steps {
+            match st {
+                Step::Err(d) => errs.push(d),
+                Step::Raise(x) => return Err(x),
+                _ => {}
+            }
+        }
+        match got {
+            Some(v) if errs.is_empty() => Ok(Some(v)),
+            _ => Err(Exc::validation_titled(&VALIDATION_ERROR, errs, "ValidatorIterator")),
+        }
+    }
+
+    /// every remaining item, validated (iteration stops at the first invalid one, which is raised)
+    pub fn drain(&self) -> R<Vec<V>> {
+        let mut out = Vec::new();
+        while let Some(v) = self.next()? {
+            out.push(v);
+        }
+        Ok(out)
+    }
+}
+
+/// `to_json`'s wrapping of an error raised while serializing (`Error serializing to JSON: ValidationError: ...`):
+/// the items of an `Iterable` field validated by `model_dump_json` or a response
+pub fn ser_json_error(x: Exc) -> Exc {
+    if x.0.errors.is_some() && x.0.attrs.lock().get("title").is_some_and(|t| matches!(t, V::Str(s) if &**s == "ValidatorIterator")) {
+        return Exc::msg(&PYDANTIC_SERIALIZATION_ERROR, format!("Error serializing to JSON: ValidationError: {}", x.message()));
+    }
+    x
 }
 
 /// a union discriminated by a field of its models: the tag read from the input picks the member
@@ -172,7 +310,7 @@ impl TD {
     /// the container under its length constraints (`Len`), else itself
     pub fn bare(&self) -> &TD {
         match self {
-            TD::Len(t, _, _) => t.bare(),
+            TD::Len(t, _, _) | TD::DtC(t, _) => t.bare(),
             t => t,
         }
     }
@@ -463,6 +601,14 @@ pub struct SchemaX {
     pub root: bool,
     /// a plain class's `__new__(cls, ...)`: called before `__init__`, which runs only on an instance of the class
     pub new_: Option<MethodFn>,
+    /// `@dataclass(eq=False)`: no generated `__eq__` (identity, or the base class's)
+    pub eq_id: bool,
+    /// `class P(NamedTuple)`: built like a dataclass, a tuple everywhere else (`ops::seq_tuple`)
+    pub ntuple: bool,
+    /// the `@classmethod`s: read on the class, bound to it (the other methods are plain functions)
+    pub classmethods: &'static [&'static str],
+    /// the `@staticmethod`s: read on the class, functions that take no receiver
+    pub statics: &'static [&'static str],
 }
 
 /// a serializer function: plain (its result replaces the value) or wrap (it gets a `handler` that dumps the
@@ -482,7 +628,7 @@ pub struct Ser {
 }
 
 impl SchemaX {
-    pub const NONE: SchemaX = SchemaX { ser_by_alias: false, exclude: &[], norepr: &[], frozen: &[], exclude_if: &[], field_ser: &[], model_ser: None, root: false, new_: None };
+    pub const NONE: SchemaX = SchemaX { ser_by_alias: false, exclude: &[], norepr: &[], frozen: &[], exclude_if: &[], field_ser: &[], model_ser: None, root: false, new_: None, eq_id: false, ntuple: false, classmethods: &[], statics: &[] };
 }
 
 impl FieldDesc {
@@ -536,6 +682,10 @@ fn path_loc(path: &[PK]) -> Vec<V> {
 impl SchemaDesc {
     pub fn is_private(&self, name: &str) -> bool {
         self.private.iter().any(|(n, _)| *n == name)
+    }
+    /// a model's `model_post_init`, or a private attribute whose default is computed: a step after validation
+    pub fn has_post_init(&self) -> bool {
+        !self.dataclass && (self.post_init.is_some() || self.private.iter().any(|(_, d)| matches!(d, Dflt::Dyn(_))))
     }
     /// the private attributes' defaults (a fresh value per instance)
     pub fn private_defaults(&self, extra: &mut IndexMap<String, V>) {
@@ -659,6 +809,9 @@ enum Step {
     ModelStart { slot: usize },
     /// its fields are validated: run the model validators unless an error occurred since ModelStart
     ModelAfter { slot: usize, desc: &'static SchemaDesc, input: V, loc: Vec<V> },
+    /// its fields are validated: unless an error occurred since ModelStart, the private attributes' computed
+    /// defaults, then `model_post_init(self, None)` (pydantic-core's `post_init`, before the after validators)
+    PostInit { slot: usize, desc: &'static SchemaDesc, input: V, loc: Vec<V> },
 }
 
 // How well the input matched (pydantic-core's `Exactness`): smart unions keep the best member.
@@ -804,6 +957,8 @@ pub struct Inst {
     pub vals: Slots<Vec<V>>,
     pub set: Mutex<Vec<bool>>,
     pub extra: Slots<IndexMap<String, V>>,
+    /// built by `model_construct()`: its values were never validated (`dump` checks each against its field)
+    pub raw: bool,
 }
 
 /// An instance's attributes. An instance shared by every request (a middleware's `self.app`, a service
@@ -836,7 +991,7 @@ pub async fn validate(cx: &super::Cx, input: &V, td: &'static TD, loc: &[V], err
 fn td_has_before(td: &TD) -> bool {
     match td {
         TD::Schema(d) => d.has_before,
-        TD::List(Some(t)) | TD::Set(Some(t)) | TD::Tuple(Some(t)) | TD::Optional(t) | TD::Len(t, _, _) | TD::Strict(t, _) | TD::StrictTop(t) => td_has_before(t),
+        TD::List(Some(t)) | TD::Set(Some(t)) | TD::Tuple(Some(t)) | TD::Optional(t) | TD::Len(t, _, _) | TD::DtC(t, _) | TD::Strict(t, _) | TD::StrictTop(t) => td_has_before(t),
         TD::Dict(Some((_, v))) => td_has_before(v),
         TD::TupleFix(ts) => ts.iter().any(|t| td_has_before(t)),
         TD::Enum(d, _) => d.missing.is_some(),
@@ -901,7 +1056,7 @@ fn prepare<'a>(cx: &'a super::Cx, input: V, td: &'static TD) -> super::BoxFut<'a
         Ok(match (td, &input) {
             (TD::Optional(_), V::None) => input,
             (TD::Optional(t), _) | (TD::Strict(t, _), _) | (TD::StrictTop(t), _) => prepare(cx, input, t).await?,
-            (TD::Len(t, _, _), _) => prepare(cx, input, t).await?,
+            (TD::Len(t, _, _) | TD::DtC(t, _), _) => prepare(cx, input, t).await?,
             (TD::List(Some(t)) | TD::Tuple(Some(t)) | TD::Set(Some(t)), V::List(_) | V::Tuple(_)) if td_has_before(t) => {
                 // the items of a list or tuple input (what a set or tuple validates too)
                 let items = match &input {
@@ -1089,7 +1244,7 @@ pub fn validate_sync(input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDe
 }
 
 /// A validator's ValueError/AssertionError as an error detail; other exceptions propagate.
-fn validator_error(x: Exc, loc: Vec<V>, input: V) -> R<ErrDetail> {
+pub fn validator_error(x: Exc, loc: Vec<V>, input: V) -> R<ErrDetail> {
     if let Some(d) = custom_error(&x, &loc, &input) {
         return Ok(d);
     }
@@ -1135,7 +1290,7 @@ pub async fn assign_validated(cx: &super::Cx, inst: &Arc<Inst>, name: &str, v: V
             };
             let data = V::dict_from(data)?;
             args.push(if vd.info == 1 {
-                V::Inst(Arc::new(Inst {
+                V::Inst(Arc::new(Inst { raw: false,
                     desc: &VALINFO,
                     vals: Slots::new(vec![data, V::str(fname)]),
                     set: Mutex::new(vec![true, true]),
@@ -1170,6 +1325,31 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
             Step::Raise(x) => return Err(x),
             Step::ModelStart { slot } => {
                 starts.insert(slot, errs.len());
+            }
+            Step::PostInit { slot, desc, input, loc } => {
+                let Some(inst) = &slots[slot] else { continue };
+                if errs.len() > starts.get(&slot).copied().unwrap_or(0) {
+                    continue;
+                }
+                for (n, d) in desc.private {
+                    if let Dflt::Dyn(f) = d {
+                        let v = f(cx, V::None, vec![]).await?;
+                        inst.extra.lock().insert(n.to_string(), v);
+                    }
+                }
+                if let Some(f) = desc.post_init {
+                    if let Err(x) = f(cx, V::Inst(inst.clone()), vec![V::None]).await {
+                        let (kind, word) = if x.isinstance(&ASSERTION_ERROR) {
+                            ("assertion_error", "Assertion failed")
+                        } else if x.isinstance(&VALUE_ERROR) {
+                            ("value_error", "Value error")
+                        } else {
+                            return Err(x);
+                        };
+                        let msg = format!("{word}, {}", x.message());
+                        errs.push(ErrDetail { kind, loc: loc.clone(), msg, input: input.clone(), ctx: Some(vec![("error", V::Exc(x))]), custom: false });
+                    }
+                }
             }
             Step::ModelAfter { slot, desc, input, loc } => {
                 let Some(inst) = &slots[slot] else { continue };
@@ -1234,7 +1414,7 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
                         }
                         let data = V::dict_from(data)?;
                         args.push(if vd.info == 1 {
-                            V::Inst(Arc::new(Inst {
+                            V::Inst(Arc::new(Inst { raw: false,
                                 desc: &VALINFO,
                                 // `context`: FastAPI and model validation pass none
                                 vals: Slots::new(vec![data, V::str(name), V::None]),
@@ -1843,6 +2023,10 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 None
             }
         },
+        TD::DtC(inner, c) => {
+            let v = val(input, inner, loc, e)?;
+            dt_checks(v, c, loc, input, e)
+        }
         TD::Len(inner, mn, mx) => {
             let ft = match inner {
                 TD::List(_) => "List",
@@ -1954,6 +2138,59 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
                 (Coll::Seq, V::List(l)) if matches!(input, V::Tuple(_)) => V::tuple(l.lock().clone()),
                 (_, v) => v,
             })
+        }
+        TD::Json(inner) => {
+            let bytes: Vec<u8> = match input {
+                V::Str(s) => s.as_bytes().to_vec(),
+                V::Bytes(b) => b.to_vec(),
+                _ => {
+                    e.push("json_type", loc, "JSON input should be string, bytes or bytearray", input, None);
+                    return None;
+                }
+            };
+            if let Err(err) = jiter::JsonValue::parse(&bytes, true) {
+                let msg = err.description(&bytes);
+                e.push("json_invalid", loc, format!("Invalid JSON: {msg}"), input, Some(vec![("error", V::str(&msg))]));
+                return None;
+            }
+            // jiter accepted it: the value as the runtime's JSON reader builds it (same grammar, inf and nan included)
+            let parsed = match super::pyjson::loads(&String::from_utf8_lossy(&bytes)) {
+                Ok(v) => v,
+                Err(x) => {
+                    e.raise(x);
+                    return None;
+                }
+            };
+            match inner {
+                Some(t) => val(&parsed, t, loc, e),
+                None => Some(parsed),
+            }
+        }
+        TD::Iter(item) => {
+            // `iter(input)`: a str gives its characters, bytes their ints, a dict its keys, a model its fields
+            // a ValidatorIterator revalidated (a response model of the same class): pydantic wraps it lazily, its
+            // items checked once more when reached; kept as it is (the same item type gives the same results)
+            if let V::Native(n) = input {
+                if matches!(&**n, Native::ValIter(_)) {
+                    return Some(input.clone());
+                }
+            }
+            let items = match input {
+                V::Int(_) | V::Float(_) | V::Bool(_) | V::None => None,
+                _ => ops::iter(input).ok(),
+            };
+            match items {
+                Some(items) => Some(V::native(Native::ValIter(Arc::new(ValIter {
+                    items: Mutex::new(items.into()),
+                    index: Mutex::new(0),
+                    td: item,
+                    strict: e.strict,
+                })))),
+                None => {
+                    e.push("iterable_type", loc, "Input should be iterable", input, None);
+                    None
+                }
+            }
         }
         TD::TupleFix(types) => {
             if !matches!(input, V::Tuple(_)) {
@@ -2306,10 +2543,12 @@ fn label(td: &TD) -> String {
         TD::Set(t) => format!("set[{}]", t.map(label).unwrap_or_else(|| "any".into())),
         TD::Tuple(t) => format!("tuple[{}, ...]", t.map(label).unwrap_or_else(|| "any".into())),
         TD::Optional(t) => format!("nullable[{}]", label(t)),
-        TD::Len(t, _, _) => label(t),
+        TD::Len(t, _, _) | TD::DtC(t, _) => label(t),
         TD::Strict(t, _) | TD::StrictTop(t) => label(t),
         TD::Subclass(name, _) => format!("is-subclass[{name}]"),
         TD::Coll(t, _) => label(t),
+        TD::Iter(t) => format!("generator[{}]", label(t)),
+        TD::Json(t) => format!("json[{}]", t.map(label).unwrap_or_else(|| "any".into())),
         TD::TupleFix(ts) => format!("tuple[{}]", ts.iter().map(|t| label(t)).collect::<Vec<_>>().join(",")),
         TD::Tagged(t) => format!("tagged-union[{}]", t.tags.iter().map(|(_, c)| label(c)).collect::<Vec<_>>().join(",")),
         TD::Union(cs) | TD::UnionLtr(cs) => format!("union[{}]", cs.iter().map(|c| label(c)).collect::<Vec<_>>().join(",")),
@@ -2665,11 +2904,12 @@ fn schema_val(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> 
 fn schema_val_in(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> Option<V> {
     if desc.x.root && !matches!(input, V::Inst(i) if std::ptr::eq(i.desc, desc)) {
         let v = val(input, desc.fields[0].td, loc, e)?;
-        return Some(V::Inst(Arc::new(Inst { desc, vals: Slots::new(vec![v]), set: Mutex::new(vec![true]), extra: Slots::new(IndexMap::new()) })));
+        return Some(V::Inst(Arc::new(Inst { raw: false, desc, vals: Slots::new(vec![v]), set: Mutex::new(vec![true]), extra: Slots::new(IndexMap::new()) })));
     }
     if let V::Inst(i) = input {
-        if std::ptr::eq(i.desc, desc) {
-            return Some(input.clone()); // exact, no fields count: wins a union at once
+        if std::ptr::eq(i.desc, desc) || (desc.dataclass && std::ptr::eq(i.desc.class, desc.class)) {
+            // exact, no fields count: wins a union at once (a dataclass instance: not revalidated, like pydantic)
+            return Some(input.clone());
         }
     }
     if desc.init.is_some() && !desc.open && matches!(input, V::Dict(d) if !is_from_attrs(d)) && !SKIP_INIT.with(|s| s.replace(0) == desc as *const _ as usize) {
@@ -2696,20 +2936,26 @@ fn schema_val_in(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) 
             Src::Map(&dict_snapshot)
         }
         V::Obj(_) | V::Inst(_) => Src::Attrs(input),
+        _ if desc.dataclass => {
+            e.push("dataclass_type", loc, format!("Input should be a dictionary or an instance of {}", desc.name), input,
+                   Some(vec![("class_name", V::str(desc.name))]));
+            return None;
+        }
         _ => {
             e.push("model_attributes_type", loc, "Input should be a valid dictionary or object to extract fields from", input, None);
             return None;
         }
     };
     let start = e.n;
-    // a slot only for the instances that have validators or computed defaults
-    let slot = if !desc.validators.is_empty() || !desc.model_after.is_empty() || desc.fields.iter().any(|f| matches!(f.default, Dflt::Dyn(_) | Dflt::Data(_))) {
+    // a slot only for the instances that have validators, computed defaults or a post-init step
+    let post = desc.has_post_init();
+    let slot = if !desc.validators.is_empty() || !desc.model_after.is_empty() || post || desc.fields.iter().any(|f| matches!(f.default, Dflt::Dyn(_) | Dflt::Data(_))) {
         e.slots.push(None);
         Some(e.slots.len() - 1)
     } else {
         None
     };
-    if let (Some(slot), false) = (slot, desc.model_after.is_empty()) {
+    if let (Some(slot), true) = (slot, !desc.model_after.is_empty() || post) {
         e.steps.push(Step::ModelStart { slot });
     }
     let mut vals = Vec::with_capacity(desc.fields.len());
@@ -2890,13 +3136,16 @@ fn schema_val_in(input: &V, desc: &'static SchemaDesc, loc: &[V], e: &mut Errs) 
     if e.n > start {
         return None;
     }
+    if let (Some(slot), true) = (slot, post) {
+        e.steps.push(Step::PostInit { slot, desc, input: input.clone(), loc: loc.to_vec() });
+    }
     if let (Some(slot), false) = (slot, desc.model_after.is_empty()) {
         e.steps.push(Step::ModelAfter { slot, desc, input: input.clone(), loc: loc.to_vec() });
     }
     e.fields_set = Some(set.iter().filter(|x| **x).count());
     let mut extra = extra;
     desc.private_defaults(&mut extra);
-    let inst = Arc::new(Inst { desc, vals: Slots::new(vals), set: Mutex::new(set), extra: Slots::new(extra) });
+    let inst = Arc::new(Inst { raw: false, desc, vals: Slots::new(vals), set: Mutex::new(set), extra: Slots::new(extra) });
     if let Some(slot) = slot {
         e.slots[slot] = Some(inst.clone());
     }
@@ -2962,7 +3211,7 @@ impl Drop for Pf<'_> {
 fn prefetch<'a>(pf: &'a Pf<'a>, td: &'static TD, v: &'a V) -> Fut<'a> {
     Box::pin(async move {
         match (td, v) {
-            (TD::Optional(t) | TD::Len(t, _, _) | TD::Strict(t, _) | TD::StrictTop(t), _) => prefetch(pf, t, v).await,
+            (TD::Optional(t) | TD::Len(t, _, _) | TD::DtC(t, _) | TD::Strict(t, _) | TD::StrictTop(t), _) => prefetch(pf, t, v).await,
             (TD::Union(ts), _) => {
                 for t in ts.iter() {
                     prefetch(pf, t, v).await?;
@@ -2984,6 +3233,17 @@ fn prefetch<'a>(pf: &'a Pf<'a>, td: &'static TD, v: &'a V) -> Fut<'a> {
             _ => Ok(()),
         }
     })
+}
+
+/// `prefetch` does something under this type (it reaches a model: what an ORM object validates into)
+fn prefetches(td: &'static TD) -> bool {
+    match td {
+        TD::Optional(t) | TD::Len(t, _, _) | TD::DtC(t, _) | TD::Strict(t, _) | TD::StrictTop(t) => prefetches(t),
+        TD::Union(ts) => ts.iter().any(|t| prefetches(t)),
+        TD::List(Some(t)) | TD::Set(Some(t)) | TD::Tuple(Some(t)) => prefetches(t),
+        TD::Schema(_) => true,
+        _ => false,
+    }
 }
 
 fn prefetch_schema<'a>(pf: &'a Pf<'a>, s: &'static SchemaDesc, v: &'a V) -> Fut<'a> {
@@ -3015,8 +3275,15 @@ fn prefetch_schema<'a>(pf: &'a Pf<'a>, s: &'static SchemaDesc, v: &'a V) -> Fut<
                     }
                     continue;
                 }
-                match o.get_attr(key).await {
-                    Ok(x) => prefetch(pf, f.td, &x).await?,
+                // what reads without IO is read here (every column of every row of a list goes through this); only
+                // a load (synchronous session) needs `get_attr`
+                let got = match o.get_attr_sync(key) {
+                    Err(e) if super::orm::is_greenlet_error(&e) => o.get_attr(key).await,
+                    r => r,
+                };
+                match got {
+                    Ok(x) if prefetches(f.td) => prefetch(pf, f.td, &x).await?,
+                    Ok(_) => {}
                     Err(e) if super::orm::is_greenlet_error(&e) => {}
                     Err(e) => return Err(e),
                 }
@@ -3118,7 +3385,7 @@ pub async fn init_in_place(cx: &super::Cx, me: &V, input: V) -> R {
 /// `SomeDataclass(*args, **kwargs)`: the generated `__init__` (no validation, CPython's TypeErrors).
 pub async fn dataclass_new(cx: &super::Cx, desc: &'static SchemaDesc, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     let n = desc.fields.len();
-    let init = format!("{}.__init__()", desc.name);
+    let init = format!("{}.{}()", desc.name, if desc.x.ntuple { "__new__" } else { "__init__" });
     if args.len() > n {
         let required = desc.fields.iter().filter(|f| matches!(f.default, Dflt::Required)).count();
         let takes = if required == n { format!("{}", n + 1) } else { format!("from {} to {}", required + 1, n + 1) };
@@ -3159,7 +3426,7 @@ pub async fn dataclass_new(cx: &super::Cx, desc: &'static SchemaDesc, args: Vec<
             (None, Dflt::Required) => unreachable!(),
         });
     }
-    let inst = V::Inst(Arc::new(Inst { desc, vals: Slots::new(out), set: Mutex::new(vec![true; n]), extra: Slots::new(IndexMap::new()) }));
+    let inst = V::Inst(Arc::new(Inst { raw: false, desc, vals: Slots::new(out), set: Mutex::new(vec![true; n]), extra: Slots::new(IndexMap::new()) }));
     if let Some(f) = desc.post_init {
         f(cx, inst.clone(), vec![]).await?;
     }
@@ -3171,6 +3438,16 @@ impl Inst {
         self.desc.field_index(name).map(|i| self.vals.read()[i].clone()).or_else(|| self.extra.read().get(name).cloned())
     }
     pub fn set_field(&self, name: &str, v: V) -> R<()> {
+        if self.desc.x.ntuple {
+            // a tuple: its fields are read-only descriptors, it has no __dict__
+            return Err(Exc::attr_error(if self.desc.field_index(name).is_some() {
+                "can't set attribute".to_string()
+            } else if super::python() >= (3, 13) {
+                format!("'{}' object has no attribute '{name}' and no __dict__ for setting new attributes", self.desc.name)
+            } else {
+                format!("'{}' object has no attribute '{name}'", self.desc.name)
+            }));
+        }
         if self.desc.frozen && self.desc.dataclass {
             return Err(Exc::msg(&FROZEN_INSTANCE_ERROR, format!("cannot assign to field '{name}'")));
         }
@@ -3210,7 +3487,7 @@ impl Inst {
     }
     pub fn equals(&self, other: &Inst) -> bool {
         // object.__eq__ (a plain class) is identity, decided by the caller (Arc::ptr_eq)
-        !self.desc.open && std::ptr::eq(self.desc, other.desc) && {
+        !self.desc.open && !self.desc.x.eq_id && std::ptr::eq(self.desc, other.desc) && {
             let (a, b) = (self.vals.lock().clone(), other.vals.lock().clone());
             a.iter().zip(b.iter()).all(|(x, y)| ops::eq_bool(x, y))
         }
@@ -3239,7 +3516,7 @@ impl Inst {
                 return Ok(format!("namespace({})", parts.join(", ")));
             }
             // CPython: <module.Class object at 0x...> (the address differs anyway)
-            return Ok(format!("<{} object at {:#x}>", self.desc.class.qualname, self as *const Self as usize));
+            return Ok(format!("<{} object at {}>", self.desc.class.qualname, ops::addr(self as *const Self as usize)));
         }
         Ok(format!("{}({})", self.desc.name, self.repr_parts()?.join(", ")))
     }
@@ -3256,7 +3533,7 @@ impl Inst {
             .collect::<R<Vec<_>>>()?;
         let mut parts = parts;
         if !self.desc.computed.is_empty() {
-            let me = Arc::new(Inst {
+            let me = Arc::new(Inst { raw: false,
                 desc: self.desc,
                 vals: Slots::new(vals.clone()),
                 set: Mutex::new(self.set.lock().clone()),
@@ -3281,7 +3558,7 @@ fn float_ser(v: &V, td: &TD) -> Option<V> {
     }
     match (td, v) {
         (TD::Float(_), V::Int(i)) => Some(V::Float(*i as f64)),
-        (TD::Optional(t) | TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _), _) => float_ser(v, t),
+        (TD::Optional(t) | TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _) | TD::DtC(t, _), _) => float_ser(v, t),
         (TD::TupleFix(ts), V::Tuple(items)) => {
             let conv: Vec<Option<V>> = items.iter().zip(ts.iter()).map(|(x, t)| float_ser(x, t)).collect();
             if conv.iter().all(|c| c.is_none()) {
@@ -3305,7 +3582,7 @@ fn float_ser(v: &V, td: &TD) -> Option<V> {
 fn has_float(td: &TD) -> bool {
     match td {
         TD::Float(_) => true,
-        TD::Optional(t) | TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _) | TD::List(Some(t)) => has_float(t),
+        TD::Optional(t) | TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _) | TD::DtC(t, _) | TD::List(Some(t)) => has_float(t),
         TD::TupleFix(ts) => ts.iter().any(|t| has_float(t)),
         _ => false,
     }
@@ -3342,6 +3619,8 @@ pub struct DumpOpts {
     pub skip_model_ser: bool,
     /// the `ser_json_bytes` of the model being dumped (each model its own)
     pub bytes: BytesMode,
+    /// inside a model's fields: pydantic-core's serializer, which has no JSON form for a plain object
+    pub in_model: bool,
 }
 
 /// `val_json_bytes` / `ser_json_bytes` of a model config: how bytes travel as a JSON string.
@@ -3509,7 +3788,7 @@ fn ser_info(o: &DumpOpts, field: Option<&str>) -> V {
         V::Bool(o.exclude_none),
         V::Bool(o.exclude_unset),
     ];
-    V::Inst(Arc::new(Inst { desc: &SERINFO, set: Mutex::new(vec![true; vals.len()]), vals: Slots::new(vals), extra: Slots::new(IndexMap::new()) }))
+    V::Inst(Arc::new(Inst { raw: false, desc: &SERINFO, set: Mutex::new(vec![true; vals.len()]), vals: Slots::new(vals), extra: Slots::new(IndexMap::new()) }))
 }
 
 /// the `handler` of a wrap serializer: the usual dump with the same options
@@ -3551,10 +3830,17 @@ fn ser_applies(s: &Ser, v: &V, o: &DumpOpts) -> bool {
 
 pub fn dump(v: &V, o: DumpOpts) -> R {
     super::stack_guard()?;
-    if let Some(t) = ops::row_tuple(v) {
+    // a Row, a NamedTuple: pydantic-core dumps them as plain tuples (lists in JSON)
+    if let Some(t) = ops::seq_tuple(v) {
         return dump(&t, o);
     }
     Ok(match v {
+        // a plain project object in a model's field (an after validator's result, `arbitrary_types_allowed`): no JSON
+        // form in pydantic-core (FastAPI's jsonable_encoder takes `vars()` of one it is given directly)
+        V::Inst(inst) if inst.desc.open && o.json && o.in_model => {
+            return Err(Exc::msg(&PYDANTIC_SERIALIZATION_ERROR,
+                                format!("Unable to serialize unknown type: <class '{}'>", inst.desc.class.qualname)));
+        }
         V::Inst(inst) => {
             if let Some(ms) = &inst.desc.x.model_ser {
                 if !o.skip_model_ser && ser_applies(ms, v, &o) {
@@ -3568,8 +3854,16 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
             }
             let vals = inst.vals.lock().clone();
             let set = inst.set.lock().clone();
+            if inst.raw {
+                if let Some((f, v)) = inst.desc.fields.iter().zip(&vals).find(|(f, v)| !fits(v, f.td)) {
+                    return Err(Exc::type_error(format!(
+                        "py2axum: {}.{} holds a {} given to model_construct(): pydantic would serialize it with a warning (not supported)",
+                        inst.desc.name, f.name, v.type_name()
+                    )));
+                }
+            }
             let mut items = Vec::new();
-            let o = DumpOpts { bytes: inst.desc.ser_bytes, ..o };
+            let o = DumpOpts { bytes: inst.desc.ser_bytes, in_model: !inst.desc.open, ..o };
             for (i, f) in inst.desc.fields.iter().enumerate() {
                 if (o.exclude_unset && !set[i]) || inst.desc.x.exclude.contains(&f.name) {
                     continue;
@@ -3643,6 +3937,12 @@ pub fn dump(v: &V, o: DumpOpts) -> R {
         },
         // pydantic-core dumps a Fraction as its str() in both modes
         V::Native(n) if matches!(&**n, Native::Fraction(_)) => V::str(ops::str_(v)?),
+        // an Iterable field: its items validated as the dump reaches them (python mode keeps pydantic-core's
+        // SerializationIterator, not reproduced)
+        V::Native(n) if matches!(&**n, Native::ValIter(_)) => match &**n {
+            Native::ValIter(it) if o.json => V::list(it.drain()?.iter().map(|x| dump(x, o)).collect::<R<Vec<_>>>()?),
+            _ => return Err(Exc::type_error("py2axum: model_dump() in python mode of an Iterable field (pydantic's SerializationIterator) is not supported: use mode=\"json\"")),
+        },
         V::Native(n) if o.json && matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => V::list(d.items.lock().iter().map(|x| dump(x, o)).collect::<R<Vec<_>>>()?),
             _ => unreachable!(),
@@ -3678,7 +3978,7 @@ pub fn json_key(k: &V) -> R<String> {
 /// FastAPI's `jsonable_encoder` (no response_model): datetimes via `isoformat()`.
 pub fn jsonable(v: &V) -> R {
     super::stack_guard()?;
-    if let Some(t) = ops::row_tuple(v) {
+    if let Some(t) = ops::seq_tuple(v) {
         return jsonable(&t);
     }
     Ok(match v {
@@ -3810,7 +4110,8 @@ fn write(out: &mut String, v: &V, st: &JsonStyle, default_str: bool) -> R<()> {
             out.push_str(&ops::float_repr(*f))
         }
         V::Str(s) => write_str(out, s, st),
-        V::List(_) | V::Tuple(_) => {
+        V::List(_) | V::Tuple(_) | V::Inst(_) if !matches!(v, V::Inst(i) if !i.desc.x.ntuple) => {
+            // a NamedTuple too (a tuple subclass: an array, its notes naming its class)
             out.push('[');
             for (i, x) in ops::iter(v)?.iter().enumerate() {
                 if i > 0 {
@@ -3892,7 +4193,7 @@ pub fn tz_utc() -> V {
 /// an instance before its state (`cls.__new__(cls)`, unpickling): fields None, none set
 pub fn object_new_blank(desc: &'static SchemaDesc) -> V {
     let n = desc.fields.len();
-    V::Inst(Arc::new(Inst { desc, vals: Slots::new(vec![V::None; n]), set: Mutex::new(vec![false; n]), extra: Slots::new(IndexMap::new()) }))
+    V::Inst(Arc::new(Inst { raw: false, desc, vals: Slots::new(vec![V::None; n]), set: Mutex::new(vec![false; n]), extra: Slots::new(IndexMap::new()) }))
 }
 
 /// `object.__new__(cls)`: a bare instance of a plain class held as a value
@@ -3906,8 +4207,131 @@ pub fn object_new_of(cls: &V) -> R {
     }
 }
 
+/// `Model.model_construct(_fields_set=None, **values)` (pydantic 2.12-2.14, `BaseModel.model_construct`): no
+/// validation; each field takes its alias, then its validation aliases, then its name, else its default (a
+/// `default_factory` taking data gets the fields taken so far); the keys left are the extras with
+/// `extra="allow"` (ignored otherwise) and set the private attributes they name. A required field left out
+/// (pydantic leaves it out of `__dict__`), a `_fields_set` that is not a set of field names, and a RootModel are
+/// refused at run time.
+pub async fn model_construct(cx: &super::Cx, desc: &'static SchemaDesc, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if desc.open || desc.dataclass {
+        return Err(Exc::attr_error(format!("type object '{}' has no attribute 'model_construct'", desc.name)));
+    }
+    if desc.x.root {
+        return Err(Exc::type_error(format!("py2axum: {}.model_construct() of a RootModel is not supported", desc.name)));
+    }
+    if args.len() > 1 {
+        return Err(Exc::type_error(format!("BaseModel.model_construct() takes from 1 to 2 positional arguments but {} were given", args.len() + 1)));
+    }
+    let mut fields_set = args.into_iter().next();
+    let mut values: IndexMap<Key, (V, V)> = IndexMap::new();
+    for (k, v) in kwargs {
+        if k == "_fields_set" {
+            if fields_set.is_some() {
+                return Err(Exc::type_error("BaseModel.model_construct() got multiple values for argument '_fields_set'"));
+            }
+            fields_set = Some(v);
+            continue;
+        }
+        values.insert(Key::Str(Arc::from(k.as_str())), (V::str(&k), v));
+    }
+    let n = desc.fields.len();
+    let mut vals: Vec<Option<V>> = Vec::with_capacity(n);
+    let mut set = vec![false; n];
+    let key = |s: &str| Key::Str(Arc::from(s));
+    for (fi, f) in desc.fields.iter().enumerate() {
+        let mut got = f.alias.and_then(|a| values.shift_remove(&key(a))).map(|(_, v)| v);
+        if got.is_none() {
+            for p in f.paths {
+                // a plain key of AliasChoices is taken out of the values, an AliasPath is only read
+                if let [PK::S(k)] = p {
+                    if let Some((_, v)) = values.shift_remove(&key(k)) {
+                        got = Some(v);
+                        break;
+                    }
+                } else if let Some(v) = path_lookup(&values, p) {
+                    got = Some(v);
+                    break;
+                }
+            }
+        }
+        if got.is_none() {
+            got = values.shift_remove(&key(f.name)).map(|(_, v)| v);
+        }
+        if got.is_some() {
+            set[fi] = true;
+            vals.push(got);
+            continue;
+        }
+        vals.push(match &f.default {
+            Dflt::Required => None,
+            Dflt::Value(d) | Dflt::Factory(d) => Some(d()),
+            Dflt::Dyn(d) => Some(d(cx, V::None, vec![]).await?),
+            Dflt::Data(d) => {
+                let taken = desc.fields[..fi].iter().zip(&vals).filter_map(|(fd, v)| v.clone().map(|v| (V::str(fd.name), v))).collect();
+                Some(d(cx, V::None, vec![V::dict_from(taken)?]).await?)
+            }
+        });
+    }
+    if let Some(i) = vals.iter().position(|v| v.is_none()) {
+        return Err(Exc::type_error(format!(
+            "py2axum: {}.model_construct() without the required field '{}' is not supported (pydantic leaves it unset)",
+            desc.name, desc.fields[i].name
+        )));
+    }
+    if let Some(fs) = fields_set.filter(|v| !v.is_none()) {
+        let V::Set(names) = &fs else {
+            return Err(Exc::type_error(format!("py2axum: model_construct(_fields_set=) must be a set, not {}", fs.type_name())));
+        };
+        set = vec![false; n];
+        for x in names.lock().values() {
+            let name = ops::str_(x)?;
+            match desc.field_index(&name) {
+                Some(i) => set[i] = true,
+                None => return Err(Exc::type_error(format!("py2axum: model_construct(_fields_set=) with {name:?}, which is not a field of {}", desc.name))),
+            }
+        }
+    }
+    let mut extra = IndexMap::new();
+    desc.private_defaults(&mut extra);
+    for (_, (k, v)) in values {
+        let k = ops::str_(&k)?;
+        if desc.is_private(&k) || desc.extra == Extra::Allow {
+            extra.insert(k, v);
+        }
+    }
+    let vals = vals.into_iter().map(Option::unwrap).collect();
+    Ok(V::Inst(Arc::new(Inst { desc, vals: Slots::new(vals), set: Mutex::new(set), extra: Slots::new(extra), raw: true })))
+}
+
+/// a value of an instance built by `model_construct()` that its field serializes as `dump` does (by its own
+/// type), with no warning from pydantic's serializer: the same Python type (an int in a float field too)
+fn fits(v: &V, td: &TD) -> bool {
+    match (td, v) {
+        (TD::Any, _) => true,
+        (TD::NoneT, V::None) => true,
+        (TD::Optional(t), _) => v.is_none() || fits(v, t),
+        (TD::Strict(t, _) | TD::StrictTop(t) | TD::Len(t, _, _) | TD::DtC(t, _), _) => fits(v, t),
+        (TD::Union(ts) | TD::UnionLtr(ts), _) => ts.iter().any(|t| fits(v, t)),
+        (TD::Bool, V::Bool(_)) => true,
+        (TD::Int(_), V::Int(_)) => true,
+        (TD::Float(_), V::Int(_) | V::Float(_)) => true,
+        (TD::Str(_) | TD::Email(_), V::Str(_)) => true,
+        (TD::DateTime, V::DateTime(_)) | (TD::Date, V::Date(_)) | (TD::Time, V::Time(_)) | (TD::Delta, V::Delta(_)) => true,
+        (TD::Decimal(_), V::Decimal(_)) => true,
+        (TD::Uuid, V::Native(n)) => matches!(&**n, Native::Uuid(_)),
+        (TD::Enum(d, _), V::Enum(e, _)) => std::ptr::eq(*d, *e),
+        (TD::Schema(d), V::Inst(i)) => std::ptr::eq(*d, i.desc),
+        (TD::List(t), V::List(l)) => t.is_none_or(|t| l.lock().iter().all(|x| fits(x, t))),
+        (TD::Set(t), V::Set(s)) => t.is_none_or(|t| s.lock().values().all(|x| fits(x, t))),
+        (TD::Tuple(t), V::Tuple(xs)) => t.is_none_or(|t| xs.iter().all(|x| fits(x, t))),
+        (TD::Dict(kv), V::Dict(d)) => kv.is_none_or(|(kt, vt)| d.lock().values().all(|(k, x)| fits(k, kt) && fits(x, vt))),
+        _ => false,
+    }
+}
+
 pub fn object_new(desc: &'static SchemaDesc) -> V {
-    V::Inst(Arc::new(Inst { desc, vals: Slots::new(vec![]), set: Mutex::new(vec![]), extra: Slots::new(IndexMap::new()) }))
+    V::Inst(Arc::new(Inst { raw: false, desc, vals: Slots::new(vec![]), set: Mutex::new(vec![]), extra: Slots::new(IndexMap::new()) }))
 }
 
 

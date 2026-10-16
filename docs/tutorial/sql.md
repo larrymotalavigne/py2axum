@@ -61,7 +61,8 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   compared column by column (`==`, `!=`, `<`... ANDed, `== None` as all NULL). One difference: setting one of
   its columns directly rebuilds the object at the next read (SQLAlchemy keeps the stale one until a flush),
   a SQL column name other than the attribute (`extra_data = Column("metadata", JSON)`: SQL uses the column
-  name, rows and `session.get` the attribute key, `Model.attr.name` is the column's name), `T.with_variant(V, "postgresql")` (V; other dialects' variants
+  name, rows and `session.get` the attribute key, `Model.attr.name` is the column's name), the type given as `mapped_column(..., type_=T)` (not
+  with a positional type too), `T.with_variant(V, "postgresql")` (V; other dialects' variants
   are ignored), `col.op("...")(value)` (the value typed like the column, as SQLAlchemy does), a column type returned by a project function
   (`def _enum(cls, name): return Enum(cls, name=name, ...)`, inlined; its arguments must be literals or names),
   project `TypeDecorator`s
@@ -72,8 +73,15 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `__init__` (the class's own constructor, run on the new object, positional arguments included),
   plain, `@property`, `@staticmethod` and `@classmethod` (`cls(...)` builds an instance), and
   `sqlalchemy.ext.hybrid`'s `@hybrid_property` / `@hybrid_method` (Python on an instance, SQL on the class),
-  with `@x.expression` / `@x.setter` (or `@x.inplace.expression` / `@x.inplace.setter`, over `@classmethod`
-  or not; the other hybrid modifiers are refused); other decorators (`@validates`...) are refused.
+  with `@x.expression` / `@x.setter` / `@x.comparator` (or `@x.inplace.expression` / `.setter` / `.comparator`,
+  over `@classmethod` or not; the other hybrid modifiers are refused); other decorators (`@validates`...) are
+  refused. A hybrid's setter also runs for a keyword of the default constructor (`Vertex(start=Point(3, 4))`).
+- `sqlalchemy.ext.hybrid.Comparator`, translated from Python source of py2axum's own written like SQLAlchemy's
+  class: subclasses (a custom comparator returned by `@x.comparator`, or a hybrid value object, a plain class or a
+  `@dataclass(eq=False)`) get `__init__(expression)`, `__clause_element__()` and the comparison operators
+  (`==`, `!=`, `<`, `<=`, `>`, `>=`, reflected ones included) sent to `operate(op, other)` with `operator.eq` & co.;
+  an object with `__clause_element__()` is coerced to SQL wherever SQL is expected (`select()`, `where()`,
+  `order_by()`, function arguments, the other side of a comparison), also on an `aliased()` class's hybrid.
 - Session: identity map (weak, like SQLAlchemy), autoflush, implicit transaction, `get` (scalar, tuple,
   list or dict identities), `add`/`add_all` (a detached object is persistent in the session again; another instance with its key raises `InvalidRequestError`), `delete`/`flush`/`commit`, `rollback` (the objects a flush of the transaction deleted are persistent again, expired), `refresh`, `close` (the objects
   are detached, then the transaction is rolled back; the session stays usable), `obj in session`,
@@ -97,7 +105,10 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `order_by=` (target columns, `.desc()`, or a string SQLAlchemy evaluates such as `"[Child.a, Child.b.desc()]"`),
   self-referential relationships (adjacency list: one-to-many by default, many-to-one with `remote_side=` naming
   the referenced column; a row made its own parent raises `CircularDependencyError` at flush, as without
-  `post_update`).
+  `post_update`), `primaryjoin=` equating a foreign key with the column it references (`widget_id ==
+  Entry.widget_id`, `Entry.entry_id == favorite_entry_id`; strings, lambdas and other conditions are refused),
+  `post_update=True` on a many-to-one relationship (its foreign key NULL in the INSERT then set by an UPDATE after
+  the INSERTs, set to NULL by an UPDATE before the DELETEs: two tables referencing each other).
 - Inheritance (`__mapper_args__` with `polymorphic_on` on the base and `polymorphic_identity` on each class): a row
   is built as the class of its discriminator (every mapped subclass is known, even one the code never names), the
   discriminator is set when an object is created, and a subclass's own columns are read on access after a query on
@@ -113,8 +124,13 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   criteria, the subclass tables LEFT OUTER JOINed, also through `A.rel.of_type(poly)` in a join or a
   `selectinload()`); `__mapper_args__ = {"polymorphic_load": "selectin" | "inline"}`; options on a subclass's
   relationship next to a query on its base (`selectinload(Sub.rel)`). `A.rel.of_type(Sub)` joins along a
-  relationship to a subclass. Refused: concrete inheritance, `with_polymorphic(aliased=, flat=, selectable=)`, an
-  alias of a joined subclass, a bulk update of columns of two tables.
+  relationship to a subclass. `with_polymorphic(Base, [...], aliased=True, flat=...)`: an alias of the base whose
+  subclass tables are LEFT OUTER JOINed under aliases of their own (`flat=` only changes the SQL text: aliased
+  tables or a subquery, the same rows), two of them joined to each other, `poly.Sub.col` under the alias, the
+  subclass columns of its objects loaded with the query (a column the base maps too is the base table's, as in
+  SQLAlchemy). Refused: concrete inheritance, `with_polymorphic(selectable=, polymorphic_on=)`, aliased on a
+  joined subclass (not the base), a relationship through `poly.Sub`, an alias of a joined subclass, a bulk update
+  of columns of two tables.
 - Write-only collections (`WriteOnlyMapped[...]` or `lazy="write_only"`, one-to-many or many-to-many, with
   `passive_deletes=True`): never loaded; members given to a new object's constructor, `add()`/`add_all()`/`remove()`
   applied at the next flush (foreign key set or cleared, orphans deleted, association rows written), and
@@ -124,7 +140,9 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
 - Core tables: a module-level `Table(name, metadata, Column(name, ...), ...)` (constraints and indexes are the
   DDL's business; `TypedColumns` and other `Table()` options are refused) is a value: `t.c.col`, `t.c["a", "b"]`,
   `t.name`, `select(t)` (its columns, rows of values), `insert(t)`, `update(t)`, `delete(t)`, `t.select()`,
-  `t.alias()` (`a.c.col`), in joins like a mapped class. `bindparam("name", value=None)` takes its value from the
+  `t.alias()` (`a.c.col`), in joins like a mapped class, and `t.join(right, onclause=None, isouter=, full=)` /
+  `t.outerjoin(...)` (chained, the ON clause from the foreign key when omitted), a Join given to `select_from()`
+  (it supersedes the FROM entries of its tables, as in SQLAlchemy). `bindparam("name", value=None)` takes its value from the
   execution's parameters (`StatementError` "A value is required for bind parameter" without one); a list of
   dicts runs an `insert()`/`update()`/`delete()` once per dict (executemany): the keys of the first dict are the
   statement's (a later dict lacking one raises before anything runs, its other keys are ignored), keys that are
@@ -144,7 +162,9 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `any()`/`has()`, `with_parent(obj, Parent.rel)`), `filter_by()` on columns, composites and hybrid properties
   (an unknown name raises SQLAlchemy's `InvalidRequestError`), a named alias as the key of its entity in a row
   (`row.u1`), `join(A.rel.of_type(alias))`, `join(A.rel.and_(criteria))`
-  (also from an alias, `alias.rel.of_type(...)`), `add_columns(...)`, `aliased(Model, name="x")`,
+  (also from an alias, `alias.rel.of_type(...)`), `add_columns(...)`, `aliased(Model, name="x")`, `aliased(Model, flat=True)`
+  (a plain table: the same alias), `aliased(Model, select(Model)....subquery())` or `aliased(Model, cte)` (the entity read
+  from the subquery, which must select that entity alone, or a union of such selects),
   `execution_options(populate_existing=, autoflush=, yield_per=)` on a SELECT (also given to
   `session.execute(stmt, execution_options={...})`),
   ORM bulk INSERT (`session.execute(insert(Model), [dicts])`, `scalars(insert(Model).returning(Model), [dicts])`:
@@ -156,8 +176,20 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `aliased`, subqueries, `exists` (`exists(select)`, `select.exists()`,
   and `exists().where(...)`, whose FROM is the tables of its criteria less those of the enclosing statement:
   SQLAlchemy's auto-correlation), `in_` (lists, selects, `tuple_`),
-  `like/ilike/startswith/contains`, `regexp_match` (`~`, `~*` with `flags="i"`; other flags raise), `is_/is_not`, `is_distinct_from`, `case`, `literal`, `cast`, `extract`,
-  `func.*` (with `FILTER`), `group_by/having/order_by/limit/offset/distinct(on)` (an expression built once and
+  `like/ilike/startswith/contains`, `icontains/istartswith/iendswith` (`lower(col) LIKE ...` as SQLAlchemy 2),
+  `regexp_match` (`~`, `~*` with `flags="i"`; other flags raise), `is_/is_not`, `is_distinct_from`,
+  `case` (also `case(*whens)` from a list or generator built at run time; no WHEN is built, then refused by
+  PostgreSQL, as with SQLAlchemy), `literal`, `literal_column`, `cast` (also to `Numeric`), `extract`,
+  `func.*` (with `FILTER`), window functions (`.over(partition_by=, order_by=)`, a clause or a list/tuple of
+  them; frames `rows=`/`range_=`/`groups=` are refused at translation), CTEs (`select(...).cte("name")` or anonymous,
+  read in the FROM list, a join, a subquery or another CTE: every CTE goes to the WITH clause of the outermost
+  statement, the ones it reads first; `recursive=` and `nesting=` are refused), LATERAL subqueries
+  (`.lateral()`, correlated to the FROM list of their statement, joined `ON` `true()` or `literal_column("TRUE")`),
+  `correlate(*entities)` (those enclosing tables taken out of the FROM list, even when a single FROM is left) and
+  `correlate(None)`, `union_all()`/`union()`/`intersect[_all]()`/`except_[_all]()` (functions or methods) made a
+  subquery, a CTE or executed (members with their own ORDER BY / LIMIT, and an ORDER BY / LIMIT of the compound,
+  are refused), `postgresql.array([...])` with `any_()`/`all_()`, `bindparam(key, type_=ARRAY(String()))`,
+  `group_by/having/order_by/limit/offset/distinct(on)` (an expression built once and
   used in the columns and in `GROUP BY` shares its bound parameters, like SQLAlchemy's bind objects; two
   identical expressions built apart do not, and PostgreSQL rejects the grouping, as it does for SQLAlchemy),
   `with_for_update`,
@@ -167,7 +199,7 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `excluded`, `returning`), `text()` with `:named` parameters (and `text(...).bindparams(name=value)`, also inside
   a `where()`; a list of dicts runs it once per dict, executemany: no rows, `rowcount` summed),
   `+` with a string as `||` like SQLAlchemy, `Result.scalars/all/first/one/scalar/unique/
-  mappings`, rows with attribute access (`row.total`, `_mapping`, `_asdict()`).
+  mappings/fetchone`, rows with attribute access (`row.total`, `_mapping`, `_asdict()`).
 - Table and column names quoted like SQLAlchemy's PostgreSQL dialect (`"user"`, `"order"."end"`); a label used
   as an operand is its expression (`x.label("n") > 3`), `select(...).label("n")` a labeled scalar subquery.
 - SQL typing like SQLAlchemy: arithmetic and `FILTER` keep the column type, `func.round`/`avg` untyped
@@ -227,6 +259,10 @@ run Alembic (or `create_all`, above) before it serves.
   `type`; a type supports `isinstance(col.type, JSON)` against any SQLAlchemy type class, `str()` and `repr()`
   (computed by SQLAlchemy at translation time, which needs it installed next to py2axum). Any other attribute
   raises a `TypeError` naming what is supported.
+- `Model.__table__` as a Core table, when the code uses it as one (`t.join(...)`, `t.c.col`, given to `select()`,
+  `select_from()`, `join()`...): what a module-level `Table()` supports (above), its columns by their column name,
+  rows of values. Decided per value at translation: one value (`t = Model.__table__`) both used as a Core table and
+  iterated for introspection, or given to other code, is refused; so is the table of an inheriting class.
 
 ## What stays in Python
 
@@ -243,6 +279,11 @@ run Alembic (or `create_all`, above) before it serves.
 
 ## Differences
 
+- The SQL text of a statement or an expression (`str(select(...))`, `str(col == 1)`, an f-string or `format()` of
+  one, `print(stmt)`) raises `TypeError` ("py2axum: the SQL text of a statement or an expression ... is not
+  supported"): SQLAlchemy writes it with its default compiler (`:param_1` placeholders, generic types, line breaks
+  before `FROM`/`WHERE`), the binary compiles for PostgreSQL only. The text of a column (`str(User.name)`, which
+  is `user_account.name`) is supported. The value is known only at run time, hence a run-time refusal.
 - **Known difference:** the binary issues one UPDATE per modified object; when several stale rows of the
   same table are flushed together, SQLAlchemy's `StaleDataError` message counts the whole batch
   ("expected to update 2 row(s)"), the binary's the first object ("1 row(s)").
@@ -258,6 +299,13 @@ run Alembic (or `create_all`, above) before it serves.
   SQL is not SQLAlchemy's text; for a lazy one-to-many load SQLAlchemy's parameters even name a memory
   address). `e.orig` (also `e.__cause__`) is there, with its own message; `e.statement` and `e.params` are not
   (AttributeError).
+- **Known difference:** the class-level attribute of a hybrid with a custom comparator (`@x.comparator`) is the
+  comparator object itself, where SQLAlchemy returns a proxy to it: `isinstance(Model.x, Comparator)` is true
+  (SQLAlchemy: false) and its `hash()` follows the comparator class (unhashable when it defines `__eq__` only).
+  Comparisons, `select()`, `filter_by()` and attribute reads behave alike.
+- **Known difference:** a `Comparator` subclass (a custom comparator, a hybrid value object) has the comparison
+  operators only: SQLAlchemy's other `ColumnOperators` (`like()`, `in_()`, `+`, ...) raise `AttributeError` or
+  `TypeError` on it in the binary.
 - **Known difference:** in `create_all`, a cycle of foreign keys partly created already is closed by
   `ALTER TABLE` where SQLAlchemy, which only sorts the tables it creates, may inline the constraint: same
   resulting schema.

@@ -1,0 +1,62 @@
+# py2axum's runtime, a library crate the generated crate depends on (copied next to it as `dynrt/`). Its
+# dependencies are also the generated crate's (one list: py2axum/dyn.py reads this section), with the same
+# versions and features, so the two resolve to the same crates in the shipped Cargo.lock.
+[package]
+name = "dynrt"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "mod.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
+futures-util = "0.3"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "json", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+form_urlencoded = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+indexmap = "2"
+# pydantic-core's JSON parser: Json fields' errors ("Invalid JSON: expected ident at line 1 column 2")
+jiter = { version = "=0.16.0", default-features = false, features = ["num-bigint"] }
+parking_lot = "0.12"
+regex = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+rand = "0.8"
+base64 = "0.22"
+subtle = "2"
+hmac = "0.12"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+aes = "0.8"
+multer = "3"
+fancy-regex = "0.14"
+minijinja = { version = "2", features = ["loader"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls", "rustls-native-certs", "ring"] }
+cbc = { version = "0.1", features = ["alloc"] }
+bcrypt = "0.17"
+argon2 = "0.5"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+url = "2"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+libc = "0.2"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+rsa = { version = "0.9", features = ["sha2"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "deflate", "stream"] }
+sentry = { version = "0.46", default-features = false, features = ["reqwest", "rustls"] }
+unicode-normalization = "0.1"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "aio"] }
+lapin = "4"
+ammonia = "4.1"
+zmij = "1"

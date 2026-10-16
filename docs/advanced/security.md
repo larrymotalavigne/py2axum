@@ -260,7 +260,7 @@ The generated application code contains no `unsafe`.
 
 ## Tests
 
-- `fixtures/dynapp/sec.py` with its cases in `tests/scenarios/dynapp.py` (conformance against FastAPI, normal and
+- `fixtures/langapp/sec.py` with its cases in `tests/scenarios/langapp.py` (conformance against FastAPI, normal and
   forced-streaming passes): request values used as labels, subquery names, `index_elements` and `order_by`
   strings, values in every comparison and in `text()`, with the table checked intact after each; symlinks under
   `resolve()`; CR/LF in a response header; the body of a 500 (an exception message with a password, an

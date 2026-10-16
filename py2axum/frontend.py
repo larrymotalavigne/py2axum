@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .ir import Gzip, TranspileError
-from .modules import ModuleIndex, Sym, is_ext
+from .modules import Ext, ModuleIndex, Sym, is_ext
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 DECLARATIVE = ("sqlalchemy.orm.DeclarativeBase", "sqlalchemy.orm.DeclarativeBaseNoMeta")
@@ -47,6 +47,7 @@ class Router:
     prefix: str = ""
     deps: ast.AST | None = None  # dependencies=[...] node
     unsupported: list[ast.keyword] = field(default_factory=list)
+    route_class: ast.AST | None = None  # route_class=R: an APIRoute subclass of the project
 
 
 @dataclass
@@ -179,9 +180,17 @@ class Frontend:
         # @dataclass classes (plain ones: options are checked by the dyn backend)
         self.dataclass_syms = {
             s: n for s, n in classes.items() if s not in models and s not in schemas and any(
-                is_ext(self.index.resolve_expr(s.module, d.func if isinstance(d, ast.Call) else d), "dataclasses.dataclass")
+                is_ext(self.index.resolve_expr(s.module, d.func if isinstance(d, ast.Call) else d), "dataclasses.dataclass",
+                       "pydantic.dataclasses.dataclass")
                 for d in n.decorator_list)
         }
+        # `class P(NamedTuple)`: compiled like a dataclass, its instances tuples (the dyn backend checks the rest)
+        self.namedtuple_syms = {
+            s: n for s, n in classes.items() if s not in models and s not in schemas and s not in self.dataclass_syms
+            and any(is_ext(self.index.resolve_expr(s.module, b), "typing.NamedTuple", "typing_extensions.NamedTuple")
+                    for b in n.bases)
+        }
+        self.dataclass_syms.update(self.namedtuple_syms)
         self.model_syms = {s: classes[s] for s in classes if s in models}
         self.schema_syms = {s: classes[s] for s in classes if s in schemas}
         self._declarative = bases
@@ -299,11 +308,30 @@ class Frontend:
                                 r.unsupported.append(kw)
                         elif kw.arg == "dependencies":
                             r.deps = kw
+                        elif kw.arg == "route_class":
+                            r.route_class = kw.value
                         elif kw.arg in {"tags", "responses", "deprecated", "include_in_schema"}:
                             pass
                         else:
                             r.unsupported.append(kw)
                     self.routers[r.sym] = r
+
+    def _library_router(self, module: str, arg: ast.expr, scope) -> str | None:
+        """`include_router(x)` where `x` comes from a library (a name imported from it, or what one of its
+        functions returns): the library's package, else None. fastapi/starlette themselves do not count."""
+        node = arg.func if isinstance(arg, ast.Call) else arg
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            return None
+        t = self.index.resolve_expr(module, node, scope)
+        if isinstance(t, Sym):
+            # `graphql_app = GraphQLRouter(schema)`: a module variable holding what a library call returns
+            d = self.index.definition(t)
+            if isinstance(d, (ast.Assign, ast.AnnAssign)) and isinstance(d.value, ast.Call):
+                return self._library_router(t.module, d.value, None)
+            return None
+        if not isinstance(t, Ext) or t.package in {"fastapi", "starlette", "builtins"}:
+            return None
+        return t.package
 
     def _dyn_prefix(self, value: ast.expr, file: str, module: str) -> str:
         for i, (v, _, _) in enumerate(self.dyn_prefixes):
@@ -328,6 +356,15 @@ class Frontend:
                     continue
                 scope = _enclosing_fn(node, parents)
                 child = self.index.resolve_expr(m.name, node.args[0], scope)
+                lib = self._library_router(m.name, node.args[0], scope)
+                if lib is not None:
+                    # dyn.prepare leaves it to Python when it is among the app's last registrations
+                    where = "the app" if self._is_app(m.name, node.func.value) else f"`{ast.unparse(node.func.value)}`"
+                    self._global(TranspileError(
+                        f"include_router: `{ast.unparse(node.args[0])}` is a router of the library `{lib}` (included in "
+                        f"{where}): its routes are not translated",
+                        node, file))
+                    continue
                 if not isinstance(child, Sym) or child not in self.routers:
                     self._global(TranspileError(
                         f"include_router: cannot resolve `{ast.unparse(node.args[0])}` to an APIRouter",

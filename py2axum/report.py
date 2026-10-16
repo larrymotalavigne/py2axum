@@ -74,6 +74,9 @@ def collect_dyn(package: Path, root: Path | None, python_side, auto: bool = Fals
     dyn.prepare(fe, set(python_side))
     with tempfile.TemporaryDirectory() as tmp:
         proj = dyn.generate_project(fe, Path(tmp), str(package), "check", collect=True)
+    from .libsrc import stats
+
+    fe.libstats = stats(proj)
     return fe, [(info, ([err] if err else []) + dyn.closure_errors(proj, info["id"]))
                 for info, err in getattr(proj, "route_infos", [])]
 

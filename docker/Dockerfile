@@ -5,7 +5,7 @@
 #   docker run --rm -v "$PWD:/app" ghcr.io/larrymotalavigne/py2axum build app --python-side auto
 #
 # or serves as the first stage of a multi-stage build (examples/docker/Dockerfile). Built from the repository root:
-#   docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.8.0 -t py2axum .   # a published version
+#   docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.9.0 -t py2axum .   # a published version
 #   docker build -f docker/Dockerfile --build-arg PY2AXUM=/src -t py2axum .              # this checkout
 # Debian bookworm (glibc 2.36): the binaries it produces run on bookworm, trixie, Ubuntu 24.04 and
 # gcr.io/distroless/cc-debian12.
@@ -44,8 +44,9 @@ RUN --mount=type=bind,target=/src,rw pip install --no-cache-dir "$PY2AXUM" && py
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/py2axum-entrypoint
 COPY --chmod=755 docker/py2axum-build /usr/local/bin/py2axum-build
 
-# Compile a one-route application once: every crate of the runtime lands in CARGO_TARGET_DIR, an application's build
-# compiles only its own crate. The application's own artefacts and the extracted sources are dropped (cargo
+# Compile a one-route application once: the runtime's library crate (dynrt) and its dependencies land in
+# CARGO_TARGET_DIR, an application's build compiles only its own crate (the runtime, copied with its files' times,
+# stays fresh wherever the application's crate is generated). The application's own artefacts and the extracted sources are dropped (cargo
 # re-extracts from the downloaded .crate files when needed, offline). Any user may build (`docker run --user`).
 RUN --mount=type=bind,source=docker/warm,target=/warm \
     useradd --uid 1000 --create-home py2axum \
