@@ -114,7 +114,7 @@ jobs:
           python -c "from tests.scenarios import ormapp; ormapp.reset('$DATABASE_URL')"
           ./scripts_start_ormapp.sh
           python tests/conformance.py http://127.0.0.1:8560 http://127.0.0.1:8570 --scenario ormapp
-      - name: queryapp (reporting queries: window functions, CTEs, LATERAL, unions; dependency factories)
+      - name: "queryapp (reporting queries: window functions, CTEs, LATERAL, unions; dependency factories)"
         env:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
           BIN: generated/dynapp_axum/target/release/queryapp_axum
