@@ -60,6 +60,11 @@ pub fn truthy(v: &V) -> R<bool> {
     if let Some(t) = seq_tuple(v) {
         return truthy(&t);
     }
+    if let V::Native(n) = v {
+        if let Native::CtCache(c) = &**n {
+            return Ok(super::ctools::len(c)? > 0);
+        }
+    }
     Ok(match v {
         V::Unbound => return Err(Exc::msg(&UNBOUND_LOCAL_ERROR, "local variable referenced before assignment")),
         V::None => false,
@@ -234,7 +239,8 @@ pub fn sub(a: &V, b: &V) -> R {
             if x.tz.is_some() != y.tz.is_some() {
                 return Err(Exc::type_error("can't subtract offset-naive and offset-aware datetimes"));
             }
-            V::Delta(x.utc() - y.utc())
+            // the same tzinfo object: the wall times (CPython ignores the offsets and the folds)
+            if x.tz == y.tz { V::Delta(x.wall - y.wall) } else { V::Delta(x.utc() - y.utc()) }
         }
         (V::Date(x), V::Date(y)) => V::Delta(*x - *y),
         // date.__sub__: `self + timedelta(-other.days)`
@@ -664,6 +670,16 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
     if let Some(Ok(V::Bool(r))) = super::reldelta::binop(a, "==", b) {
         return r;
     }
+    // a cachetools cache: Mapping.__eq__ (either side)
+    for (x, y) in [(a, b), (b, a)] {
+        if let V::Native(n) = x {
+            if let Native::CtCache(c) = &**n {
+                if let Ok(Some(r)) = super::ctools::eq(c, y) {
+                    return r;
+                }
+            }
+        }
+    }
     if let Some(t) = seq_tuple(a) {
         return eq_bool(&t, b);
     }
@@ -727,14 +743,17 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
         (V::DateTime(x), V::DateTime(y)) => {
             if x.tz.is_some() != y.tz.is_some() {
                 false
+            } else if x.tz == y.tz {
+                x.wall == y.wall
             } else {
-                x.utc() == y.utc()
+                // PEP 495: between zones, a value whose offset depends on its fold equals nothing
+                !(fold_dependent(x) || fold_dependent(y)) && x.utc() == y.utc()
             }
         }
         (V::Date(x), V::Date(y)) => x == y,
         (V::Time(x), V::Time(y)) => x == y,
         (V::Delta(x), V::Delta(y)) => x == y,
-        (V::Tz(x), V::Tz(y)) => x == y,
+        (V::Tz(x), V::Tz(y)) => x.py_eq(y),
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y) || x.equals(y),
@@ -842,7 +861,7 @@ pub fn cmp(a: &V, b: &V) -> R<std::cmp::Ordering> {
             if x.tz.is_some() != y.tz.is_some() {
                 return Err(Exc::type_error("can't compare offset-naive and offset-aware datetimes"));
             }
-            x.utc().cmp(&y.utc())
+            if x.tz == y.tz { x.wall.cmp(&y.wall) } else { x.utc().cmp(&y.utc()) }
         }
         (V::Date(x), V::Date(y)) => x.cmp(y),
         (V::Time(x), V::Time(y)) => x.cmp(y),
@@ -900,6 +919,8 @@ pub fn is(a: &V, b: &V) -> bool {
         // `e.orig is e.__cause__`, `exc is caught`
         (V::Exc(x), V::Exc(y)) => Arc::ptr_eq(&x.0, &y.0),
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),
+        // tzinfos: one object per value (timezone.utc, ZoneInfo's cache, pytz's and dateutil's instances)
+        (V::Tz(x), V::Tz(y)) => x == y,
         // enum members are singletons: `shelf is Shelf.done`
         (V::Enum(x, i), V::Enum(y, j)) => std::ptr::eq(*x, *y) && i == j,
         // a builtin type is one object: `type(x) is str`
@@ -930,6 +951,9 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
     if let V::Native(n) = container {
         if let Native::EmailMsg(m) = &**n {
             return super::emailmsg::contains(m, item);
+        }
+        if let Native::CtCache(c) = &**n {
+            return super::ctools::contains(c, item);
         }
     }
     Ok(match container {
@@ -1194,7 +1218,7 @@ pub fn str_(v: &V) -> R<String> {
         V::Time(t) => dt::time_iso(t),
         V::Delta(d) => dt::delta_str(d),
         V::Exc(e) => e.message(),
-        V::Tz(t) => t.name(),
+        V::Tz(t) => t.py_str(),
         V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Secret(_) | Native::Fraction(_) | Native::Complex(..)) => match &**n {
             Native::Path(p) => p.clone(),
             Native::Uuid(u) => super::pathio::uuid_str(*u),
@@ -1257,6 +1281,18 @@ pub fn repr(v: &V) -> R<String> {
     if let V::Native(n) = v {
         if matches!(&**n, Native::Object) {
             return Ok(format!("<object object at {}>", addr(Arc::as_ptr(n) as *const () as usize)));
+        }
+    }
+    if let V::Native(n) = v {
+        if let Native::CtCache(c) = &**n {
+            return super::ctools::repr(c);
+        }
+    }
+    // a named tuple of a library (`psutil.virtual_memory()`, cachetools' CacheInfo): `Name(field=value, ...)`
+    if let V::Native(n) = v {
+        if let Native::Record(name, f) = &**n {
+            let parts = f.iter().map(|(k, x)| Ok(format!("{k}={}", repr(x)?))).collect::<R<Vec<_>>>()?;
+            return Ok(format!("{name}({})", parts.join(", ")));
         }
     }
     if let Some(r) = dunder_text(v, &["__repr__"]) {
@@ -1349,7 +1385,11 @@ pub fn repr(v: &V) -> R<String> {
         V::Time(t) => dt::time_repr(t),
         V::Delta(d) => dt::delta_repr(d),
         V::Tz(t) => dt::tz_repr(t),
-        V::Class(c) => format!("<class '{}'>", c.qualname),
+        // a library's exception class carries its module (`<class 'decimal.DivisionImpossible'>`)
+        V::Class(c) => match (matches!(c.kind, ClassKind::Exception), super::sentry::exc_module(c)) {
+            (true, Some(m)) if m != "builtins" => format!("<class '{m}.{}'>", c.qualname),
+            _ => format!("<class '{}'>", c.qualname),
+        },
         V::Native(n) if matches!(&**n, Native::AmqpQueue(_) | Native::AmqpExchange(_) | Native::AmqpFrame(..) | Native::AmqpIter(_)) => super::rmq::repr(n)?,
         V::Native(n) if matches!(&**n, Native::AFuture(_)) => match &**n {
             Native::AFuture(f) => super::aio::future_repr(f)?,
@@ -1364,6 +1404,7 @@ pub fn repr(v: &V) -> R<String> {
             Native::Type(t) | Native::ExtType(t) => format!("<class '{t}'>"),
             _ => unreachable!(),
         },
+        V::Exc(e) if super::duparse::parser_error_repr(e).is_some() => super::duparse::parser_error_repr(e).unwrap(),
         V::Exc(e) => format!("{}({})", e.0.class.name, e.args().iter().map(repr).collect::<R<Vec<_>>>()?.join(", ")),
         V::Inst(i) => i.repr()?,
         V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Upload(_) | Native::Secret(_) | Native::Fraction(_) | Native::Complex(..)) => match &**n {
@@ -1460,10 +1501,10 @@ pub fn format_spec(v: &V, spec: &str) -> R<String> {
     }
     // datetime.__format__ / date.__format__: strftime(spec)
     match v {
-        V::DateTime(d) => return Ok(super::libs::strftime(&d.wall, d.offset(), d.tz.map(|t| t.name()), spec)),
-        V::Date(d) => return Ok(super::libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, spec)),
+        V::DateTime(d) => return Ok(super::libs::strftime(&d.wall, d.offset(), d.tz.and_then(|t| t.tzname(&d.wall, d.fold).ok().flatten()), spec)?),
+        V::Date(d) => return Ok(super::libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, spec)?),
         // time.__format__: strftime on 1900-01-01
-        V::Time(t) => return Ok(super::libs::strftime(&chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_time(*t), None, None, spec)),
+        V::Time(t) => return Ok(super::libs::strftime(&chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_time(*t), None, None, spec)?),
         _ => {}
     }
     if let V::Enum(e, i) = v {
@@ -2172,6 +2213,7 @@ pub fn getitem(v: &V, k: &V) -> R {
     }
     if let V::Native(n) = v {
         match &**n {
+            Native::CtCache(c) => return super::ctools::getitem(c, k),
             Native::SaColumns(t) => return super::satable::getitem(t, k),
             Native::Mime(m) => return super::mail::mime_getitem(m, k),
             Native::EmailMsg(m) => return super::emailmsg::getitem(m, k),
@@ -2263,6 +2305,7 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
     }
     if let V::Native(n) = v {
         match &**n {
+            Native::CtCache(c) => return super::ctools::setitem(c, k, val),
             Native::Deque(d) => return super::deque::setitem(d, k, val),
             Native::Mime(m) => return super::mail::mime_setitem(m, k, &val),
             Native::EmailMsg(m) => return super::emailmsg::setitem(m, k, &val),
@@ -2293,6 +2336,9 @@ pub fn delitem(v: &V, k: &V) -> R<()> {
         return r;
     }
     if let V::Native(n) = v {
+        if let Native::CtCache(c) = &**n {
+            return super::ctools::delitem(c, k);
+        }
         if let Native::RespHeaders(r) = &**n {
             return super::resp::headers_delitem(&r.headers, k);
         }
@@ -2328,6 +2374,11 @@ pub fn iter(v: &V) -> R<Vec<V>> {
     }
     if let Some(t) = seq_tuple(v) {
         return iter(&t);
+    }
+    if let V::Native(n) = v {
+        if let Native::CtCache(c) = &**n {
+            return Ok(super::ctools::iter(c));
+        }
     }
     Ok(match v {
         V::List(l) => l.lock().clone(),
@@ -2401,6 +2452,11 @@ pub fn len(v: &V) -> R<usize> {
     }
     if let Some(t) = seq_tuple(v) {
         return len(&t);
+    }
+    if let V::Native(n) = v {
+        if let Native::CtCache(c) = &**n {
+            return super::ctools::len(c);
+        }
     }
     Ok(match v {
         V::List(l) => l.lock().len(),
@@ -2532,6 +2588,14 @@ fn td_days(t: &Duration) -> i64 {
     match t.num_microseconds() {
         Some(us) => us.div_euclid(86_400_000_000),
         None => t.num_days() - i64::from(*t < Duration::days(t.num_days())),
+    }
+}
+
+/// an aware datetime whose UTC offset changes with its fold (CPython's `pep495_eq_exception`)
+fn fold_dependent(d: &DateTime) -> bool {
+    match d.tz {
+        Some(t) => t.offset_for_wall(&d.wall, 0) != t.offset_for_wall(&d.wall, 1),
+        None => false,
     }
 }
 

@@ -347,6 +347,10 @@ STEPS += [    ("POST", "/libs/urls", {"site": ""}),  # pydantic-core: "input is 
     ("GET", "/libs/status/99", None),
     ("GET", "/libs/status/65736", None),  # not 200 once truncated to 16 bits
 ]
+STEPS += [  # tests/smtp_sink.py --tls: a self-signed certificate for mail.other.invalid, dialled as 127.0.0.1
+    ("POST", "/small/mail-tls?validate=false", None),  # neither the chain nor the host name is checked: sent
+    ("POST", "/small/mail-tls?validate=true", None),  # refused
+]
 
 
 def _reset_broker() -> None:

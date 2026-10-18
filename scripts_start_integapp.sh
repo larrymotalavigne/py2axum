@@ -12,6 +12,10 @@ export DYNAPP_NONE_INT=none DYNAPP_NONE_STR=none DYNAPP_NONE_LIST=none DYNAPP_NO
   DYNAPP_NONE_REQ=none DYNAPP_NONE_DICT='{"a": 1}' \
   DYNAPP_RAW='not json' DYNAPP_JSON='[1, 2]'
 for port in $REF_PORT $CAND_PORT; do pid=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -n "$pid" ] && kill $pid; done; sleep 1
+# SMTP server in implicit TLS with a self-signed certificate for another name (/small/mail-tls)
+TLS_SMTP=${INTEG_TLS_SMTP_PORT:-8026}
+lsof -tiTCP:$TLS_SMTP -sTCP:LISTEN >/dev/null || { nohup python tests/smtp_sink.py $TLS_SMTP - --tls > "$LOG/tls-sink.log" 2>&1 & sleep 1; }
+export INTEG_TLS_SMTP_PORT=$TLS_SMTP
 lsof -tiTCP:8299 -sTCP:LISTEN >/dev/null || {
 # web push sink (tests/push_sink.py): pywebpush blocks the server that calls it, so its own process
 nohup uvicorn tests.push_sink:app --port 8299 --log-level warning > "$LOG/push-sink.log" 2>&1 & }

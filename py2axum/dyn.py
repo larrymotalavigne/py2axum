@@ -446,6 +446,22 @@ class Project:
             self._async_names = names
         return self._async_names
 
+    def cachedmethod_names(self) -> set[str]:
+        """Methods of a project class decorated with `@cachedmethod` (by name: their `cache_*` attributes are
+        refused)."""
+        if self.__dict__.get("_cm_names") is None:
+            names = set()
+            for m in list(self.ix.modules.values()):
+                for n in ast.walk(m.tree):
+                    if isinstance(n, ast.ClassDef):
+                        for st in n.body:
+                            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                                    (dotted(d.func if isinstance(d, ast.Call) else d) or "").split(".")[-1] == "cachedmethod"
+                                    for d in st.decorator_list):
+                                names.add(st.name)
+            self._cm_names = names
+        return self._cm_names
+
     def project_attrs(self) -> set[str]:
         """Names a project object may carry: methods and class attributes of every class, attributes
         assigned anywhere (`obj.cb = f`), columns and fields included."""
@@ -3193,6 +3209,8 @@ class Project:
                         raise self.err(f"class {sym.name}: method {st.name} is not supported", st, module)
                     last = [((dotted(d.func) if isinstance(d, ast.Call) else dotted(d)) or "").split(".")[-1] for d in st.decorator_list]
                     for d, ln in zip(st.decorator_list, last):
+                        if ln == "cachedmethod" and cachedmethod_deco(self, Sym(module, f"{node.name}.{st.name}"), st) is not None:
+                            continue  # applied by its method wrapper (method_wrapper)
                         if ln not in {"property", "classmethod", "staticmethod", "abstractmethod"}:
                             raise self.err(f"{sym.name}.{st.name}: decorator @{ast.unparse(d)} is not supported", d, module)
                     if "abstractmethod" in last:
@@ -4669,6 +4687,11 @@ class Project:
             fc = FnCompiler(self, sym.module, None, name)
             prev, self.cur = self.cur, ("decorated", sym)
             try:
+                for d in node.decorator_list:
+                    ref = fc.static_ref(d.func if isinstance(d, ast.Call) else d)
+                    if isinstance(ref, Ext) and ref.dotted.startswith("cachetools.") and isinstance(node, ast.AsyncFunctionDef):
+                        raise fc.err(f"@{ref.dotted.removeprefix('cachetools.')} on an async function is not supported (cachetools "
+                                     "caches the coroutine object, which a second await refuses)", d)
                 decos = [mcp_tool_decorator(self, fc, sym, node, d) or fc.expr(d) for d in node.decorator_list]
                 val = raw_fn_value(self, sym)
                 # decorators introspect the function (typing.get_type_hints): its annotations as type values
@@ -6101,9 +6124,14 @@ class FnCompiler:
                 raise  # keep the location of the offending declaration (model/schema file)
             raise self.err(e.msg, node) from None
 
+    def deco_resolver(self, sym: Sym):
+        """static_ref in the module defining `sym` (its decorators' names)."""
+        fc = FnCompiler(self.p, sym.module, None, "deco")
+        return fc.static_ref
+
     def fn_value(self, sym: Sym, d, node) -> str:
         try:
-            vdecos = value_decorators(d)
+            vdecos = value_decorators(d, self.deco_resolver(sym))
         except TranspileError as e:
             raise self.err(e.msg, e.node or d) from None
         if "." not in sym.name and vdecos:
@@ -6244,6 +6272,9 @@ class FnCompiler:
         if (isinstance(node.value, ast.Name) and node.value.id in BUILTIN_TYPES - {"object"} and node.value.id not in self.locals
                 and self.p.resolve(self.module, node.value) is None and method_descriptor(node.value.id, node.attr)):
             return self.method_descriptor_value(node.value.id, node.attr)
+        if (node.attr in CT_WRAPPER_ATTRS and isinstance(node.value, ast.Attribute)
+                and node.value.attr in self.p.cachedmethod_names()):
+            raise self.err(f"`.{node.value.attr}.{node.attr}` of a @cachedmethod is not supported (only its calls)", node)
         obj = self.expr(node.value)
         self.check_attr(node)
         return self.q(f"{RT}::methods::getattr(cx, &{obj}, {rs(node.attr)}).await")
@@ -6455,6 +6486,8 @@ class FnCompiler:
                 elif v.conversion == ord("a"):
                     raise self.err("!a conversion is not supported", v)
                 if v.format_spec is not None:
+                    if all(isinstance(x, ast.Constant) for x in v.format_spec.values):
+                        self.check_strftime("".join(x.value for x in v.format_spec.values), v.format_spec, "an f-string format spec")
                     spec = self.expr(v.format_spec)
                     parts.append(f"{s}.push_str(&{self.q(f'{RT}::ops::format_spec(&{val}, &{RT}::ops::str_(&{spec})?)')});")
                 else:
@@ -7114,6 +7147,9 @@ class FnCompiler:
         """A method resolved at run time that no runtime type implements (and no project class defines)
         is a certain 500 on that path: refused here, so that --report counts it."""
         name = node.func.attr
+        if (name in CT_WRAPPER_ATTRS and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr in self.p.cachedmethod_names()):
+            raise self.err(f"`.{node.func.value.attr}.{name}` of a @cachedmethod is not supported (only its calls)", node)
         if name in self.p.project_attrs() or name == "__wrapped__":
             return
         recv = node.func.value
@@ -7122,9 +7158,16 @@ class FnCompiler:
         if name == "columns":
             # `text(...).columns(...)` (a TextualSelect): no runtime value has a columns() method
             raise self.err("method .columns() (text().columns(), a TextualSelect) is not supported", node)
+        if name in {"form", "stream"}:
+            # Starlette's `await request.form()` / `request.stream()`: no runtime value has them (the names are
+            # in the runtime's catalog for other reasons), each would raise AttributeError at run time
+            raise self.err(f"`request.{name}()` is not supported: declare Form()/File() parameters, or read "
+                           "`await request.body()`", node)
         if name not in runtime_names():
             raise self.err(f"method .{name}() is not implemented by the runtime for any type "
                            "(it would raise AttributeError at run time)", node)
+        if name == "strftime" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            self.check_strftime(node.args[0].value, node.args[0], "strftime()")
         allowed = METHOD_KWARGS.get(name)
         if allowed is not None:
             for k in node.keywords:
@@ -7135,6 +7178,25 @@ class FnCompiler:
                                  or any(k.arg is None for k in node.keywords)):
             raise self.err(f".{name}() takes at most {most} positional argument{'s' if most != 1 else ''} here "
                            "(no * or ** unpacking)", node)
+
+    def check_strftime(self, fmt: str, node: ast.AST, where: str) -> None:
+        """A literal strftime format (or a date's f-string spec) may only use the directives `dynrt::libs::strftime`
+        renders as CPython does on both glibc and macOS (`STRFTIME_DIRECTIVES`): flags, widths, E/O modifiers, %s
+        (the local time zone) and letters the C library does not know render differently on each platform."""
+        i = 0
+        while i < len(fmt):
+            if fmt[i] != "%" or i + 1 == len(fmt):
+                i += 1
+                continue
+            d = fmt[i + 1]
+            if d == ":" and fmt[i + 2:i + 3] == "z":
+                i += 3
+                continue
+            if d not in STRFTIME_DIRECTIVES:
+                raise self.err(f"strftime directive %{fmt[i + 1:i + 3] if d in STRFTIME_PREFIXES else d} in {where} is not "
+                               f"supported (glibc and macOS render it differently{', it reads the local time zone' if d == 's' else ''}); "
+                               f"supported: %{' %'.join(STRFTIME_DIRECTIVES)} and %:z", node)
+            i += 2
 
     def check_model_construct(self, sym: Sym, node: ast.Call) -> None:
         """`Model.model_construct(...)` (dynrt `pyd::model_construct`): what pydantic does differently from the
@@ -7232,9 +7294,17 @@ class FnCompiler:
         # not awaited: a coroutine object (arguments evaluated now, the body run when awaited or as a task)
         lazy = isinstance(d, ast.AsyncFunctionDef) and not awaited and not has_yield(d)
         try:
-            vdecos = value_decorators(d)
+            vdecos = value_decorators(d, self.deco_resolver(sym))
         except TranspileError as e:
             raise self.err(e.msg, e.node or d) from None
+        cm = cachedmethod_deco(self.p, sym, d)
+        if cm is not None:
+            if not prefix:
+                raise self.err(f"the @cachedmethod {sym.name} called through its class is not supported", node)
+            if not awaited and isinstance(d, ast.AsyncFunctionDef):
+                raise self.err(f"the @cachedmethod {sym.name} not awaited is not supported", node)
+            args, kwargs = self.dyn_args(node)
+            return self.q(f"{method_wrapper(self.p, sym)}(cx, {prefix[0]}.clone(), {RT}::pack({args}, {kwargs})).await")
         if vdecos:
             if "." in sym.name:
                 raise self.err(f"decorator @{ast.unparse(vdecos[0])} on method {sym.name} is not supported", vdecos[0])
@@ -7445,6 +7515,50 @@ class FnCompiler:
                 return f"V::str({rs(ver)})"
         return self.q(f"Err(Exc::new(&{RT}::v::PACKAGE_NOT_FOUND, vec![V::str({rs(name)})]))")
 
+    def ct_markers(self, name: str, node: ast.Call) -> ast.Call:
+        """cachetools' timer=, getsizeof= and key= arguments: the library functions the runtime reproduces passed as
+        markers (time.monotonic, time.time, len, keys.hashkey); anything else refused here, condition= too."""
+        node = ast.Call(func=node.func, args=list(node.args), keywords=[ast.keyword(arg=k.arg, value=k.value) for k in node.keywords])
+        ast.copy_location(node, node.func)
+        for pos, kwname, kind in libmap.CT_MARKED[name]:
+            if pos < len(node.args):
+                expr, put = node.args[pos], (lambda v, pos=pos: node.args.__setitem__(pos, v))
+            else:
+                k = next((k for k in node.keywords if k.arg == kwname), None)
+                if k is None:
+                    continue
+                expr, put = k.value, (lambda v, k=k: setattr(k, "value", v))
+            if isinstance(expr, ast.Constant) and expr.value is None:
+                continue
+            if kind == "info":
+                if isinstance(expr, ast.Constant) and expr.value is False:
+                    continue
+                raise self.err(f"{name}(info=...) is not supported (the per-instance hit counters are not reproduced)", expr)
+            if kind == "typed":
+                if isinstance(expr, ast.Constant) and expr.value is False:
+                    continue
+                raise self.err(f"{name}(typed=...) is not supported (keys.typedkey is not reproduced)", expr)
+            ref = self.static_ref(expr)
+            marker = None
+            if kind == "timer" and ref in (Ext("time.monotonic"), Ext("time.time")):
+                marker = "\x00timer:" + ref.dotted.split(".")[-1]
+            elif kind == "getsizeof" and ref == ("builtin", "len"):
+                marker = "\x00getsizeof:len"
+            elif kind == "key" and ref == Ext("cachetools.keys.hashkey"):
+                marker = "\x00key:hashkey"
+            elif kind == "key" and ref == Ext("cachetools.keys.methodkey") and name == "cachetools.cachedmethod":
+                marker = "\x00key:methodkey"
+            elif kind == "key":
+                if isinstance(ref, Ext) and ref.dotted != "cachetools.keys.methodkey":
+                    raise self.err(f"{name}(key=...) is not supported with {ref.dotted} (keys.hashkey, keys.methodkey or a "
+                                   "function of the project)", expr)
+                continue
+            if marker is None:
+                what = {"timer": "time.monotonic or time.time", "getsizeof": "len", "condition": "no condition"}[kind]
+                raise self.err(f"{name}({kwname}=...) is not supported ({what} only)", expr)
+            put(ast.copy_location(ast.Constant(value=marker), expr))
+        return node
+
     def lib_fn_value(self, name: str, node) -> str:
         """A library function used as a value (`run_in_executor(None, threading.get_ident)`): a function object
         calling its translation with 0 to 3 positional arguments."""
@@ -7582,6 +7696,13 @@ class FnCompiler:
                 libmap.croniter_static(name, node)
             except ValueError as e:
                 raise self.err(f"{name}(): {e}", node) from None
+        if name.startswith("dateutil.parser"):
+            try:
+                libmap.du_parse_static(name, node)
+            except ValueError as e:
+                raise self.err(f"{name}(): {e}", node) from None
+        if name in libmap.CT_MARKED:
+            node = self.ct_markers(name, node)
         for k in node.keywords:
             if k.arg in libmap.REFUSED_KWARGS.get(name, ()):
                 raise self.err(f"{name}({k.arg}=) is not supported", node)
@@ -7824,7 +7945,9 @@ class FnCompiler:
         elif isinstance(ref, Ext):
             short = {"datetime.datetime": "datetime", "datetime.date": "date", "datetime.timedelta": "timedelta",
                      "datetime.time": "time", "uuid.UUID": "UUID", "enum.Enum": "Enum", "pathlib.Path": "Path",
-                     "decimal.Decimal": "Decimal"}.get(ref.dotted)
+                     "decimal.Decimal": "Decimal", "datetime.tzinfo": "tzinfo", "zoneinfo.ZoneInfo": "ZoneInfo",
+                     "datetime.timezone": "timezone",
+                     **TZ_CLASSES}.get(ref.dotted)
             if short:
                 return f"{RT}::methods::isinstance_builtin(&{v}, {rs(short)})"
             if ref.dotted in libmap.EXCEPTIONS:
@@ -9463,7 +9586,18 @@ def composite_desc(c: dict) -> str:
             f"ctor: {c['ctor']} as {RT}::v::ClsAttr, none_on_null: {str(c['none']).lower()} }}")
 
 
-PLAIN_DECORATORS = {"lru_cache", "cache", "staticmethod", "classmethod", "property"}
+PLAIN_DECORATORS = {"lru_cache", "cache", "staticmethod", "classmethod", "property", "cachedmethod"}
+
+# the attributes cachetools sets on a cached function (a @cachedmethod's are refused)
+CT_WRAPPER_ATTRS = {"cache_clear", "cache_info", "cache_parameters", "cache", "cache_key", "cache_lock", "cache_condition"}
+
+# the tzinfo classes of pytz and dateutil.tz an isinstance() test names (methods::isinstance_builtin)
+TZ_CLASSES = {
+    **{f"pytz{m}.{c}": f"pytz.{c}" for m in ("", ".tzinfo") for c in ("BaseTzInfo", "DstTzInfo", "StaticTzInfo")},
+    **{f"dateutil.tz{m}.{c}": c for m in ("", ".tz") for c in ("tzutc", "tzoffset", "tzlocal", "tzfile", "tzstr", "tzrange")},
+    "dateutil.tz._common.tzrangebase": "tzrange",
+    **{f"cachetools.{c}": f"cachetools.{c}" for c in ("Cache", "FIFOCache", "LRUCache", "TTLCache")},
+}
 
 
 def async_method_names(p: "Project", methods) -> list[str]:
@@ -9678,11 +9812,19 @@ def hash_kind(info) -> str:
     return "Value" if info.__dict__.get("frozen") else "Unhashable"
 
 
-def value_decorators(d) -> list:
+def value_decorators(d, resolve=None) -> list:
     """Decorators of a project `def` applied as values (anything but lru_cache & co); mixing both kinds
-    is refused."""
+    is refused. `resolve` (expression -> static reference, in the def's module) tells functools' lru_cache/cache from a
+    library's own (cachetools.func.lru_cache is a value decorator)."""
     decos = [d for d in d.decorator_list]
     last = [((dotted(x.func) if isinstance(x, ast.Call) else dotted(x)) or "").split(".")[-1] for x in decos]
+    if resolve is not None:
+        for i, x in enumerate(decos):
+            ref = resolve(x.func if isinstance(x, ast.Call) else x)
+            if last[i] in ("lru_cache", "cache") and isinstance(ref, Ext) and not ref.dotted.startswith("functools."):
+                last[i] = ref.dotted
+            if ref == Ext("cachetools.cachedmethod"):
+                last[i] = "cachedmethod"
     plain = [x for x, n in zip(decos, last) if n in PLAIN_DECORATORS]
     other = [x for x, n in zip(decos, last) if n not in PLAIN_DECORATORS]
     if plain and other:
@@ -9792,6 +9934,55 @@ def method_wrapper(p: Project, sym: Sym) -> str:
         return name
     rust = p.function(sym)
     name = f"mw_{rust}"
+    cm = cachedmethod_deco(p, sym, p.fn_node(sym))
+    if cm is not None and name not in p.__dict__.setdefault("_wrappers", set()):
+        # @cachedmethod: the decorator's configuration built once (class creation), then the cache around the method
+        p._wrappers.add(name)
+        raw = raw_method_wrapper(p, sym, f"mwr_{rust}")
+        g = f"gcm_{rust}"
+        fc = FnCompiler(p, sym.module, None, g)
+        code = fc.expr(cm)
+        body = "\n".join("        " + l for l in fc.lines)
+        p.items.append(
+            f"static G_{g}: {RT}::Global = {RT}::Global::new();\n"
+            f"async fn {g}(cx: &Cx) -> R {{\n    G_{g}.get(cx, |cx| Box::pin(async move {{\n{body}\n        Ok({code})\n    }})).await\n}}\n"
+            f"fn {name}<'a>(cx: &'a Cx, slf: V, args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{\n"
+            f"    let __d = {g}(cx).await?;\n    {RT}::ctools::method_call(cx, &__d, slf, args, {raw}).await\n}}) }}")
+        return name
+    if cm is not None:
+        return name
+    return raw_method_wrapper(p, sym, name)
+
+
+def cachedmethod_deco(p: Project, sym: Sym, node) -> ast.AST | None:
+    """The `@cachedmethod(...)` decorator expression of a method (None: it has none); refused on a module function,
+    an async method, beside another decorator, with info= or a lock taking no instance."""
+    found = None
+    fc = None
+    for d in node.decorator_list:
+        target = d.func if isinstance(d, ast.Call) else d
+        if (dotted(target) or "").split(".")[-1] != "cachedmethod":
+            continue
+        fc = fc or FnCompiler(p, sym.module, None, "deco")
+        if fc.static_ref(target) == Ext("cachetools.cachedmethod"):
+            found = d
+    if found is None:
+        return None
+    if "." not in sym.name:
+        raise fc.err(f"@cachedmethod on the function {sym.name} (not a method) is not supported", found)
+    if isinstance(node, ast.AsyncFunctionDef):
+        raise fc.err("@cachedmethod on an async method is not supported (cachetools caches the coroutine object, "
+                             "which a second await refuses)", found)
+    if len(node.decorator_list) > 1:
+        raise fc.err("@cachedmethod combined with another decorator is not supported", found)
+    if not isinstance(found, ast.Call):
+        raise fc.err("@cachedmethod without arguments is not supported (cachedmethod(cache) takes the cache)", found)
+    return found
+
+
+def raw_method_wrapper(p: Project, sym: Sym, name: str) -> str:
+    """method_wrapper's code for the method itself (under `name`)."""
+    rust = p.function(sym)
     if name not in p.__dict__.setdefault("_wrappers", set()):
         p._wrappers.add(name)
         node = p.fn_node(sym)
@@ -12019,6 +12210,10 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
 
 
 # keyword arguments the runtime implements for these methods (others raise TypeError at run time)
+# the strftime directives dynrt::libs::strftime renders (%:z aside); keep in step with it
+STRFTIME_DIRECTIVES = "aAbBcCdDeFfgGhHIjklmMnpPrRStTuUVwWxXyYzZ%"
+STRFTIME_PREFIXES = "-_0^#EO:123456789"
+
 METHOD_KWARGS = {
     "model_dump": {"mode", "exclude_none", "exclude_unset", "exclude_defaults", "by_alias", "exclude", "include", "context"},
     "model_dump_json": {"exclude_none", "exclude_unset", "exclude_defaults", "by_alias", "exclude", "include", "context"},
@@ -12055,7 +12250,7 @@ METHOD_KWARGS = {
     # window functions (dynrt/orm.rs): frames (rows=, range_=, groups=) not rendered
     "over": {"partition_by", "order_by"},
     # recursive= and nesting= not rendered
-    "cte": {"name"}, "lateral": {"name"}, "correlate": set(),
+    "cte": {"name"}, "lateral": {"name"}, "correlate": set(), "correlate_except": set(),
 }
 # positional arguments the runtime implements for these methods (same union)
 METHOD_MAX_ARGS = {"loads": 4, "dumps": 2, "encode": 2, "decode": 2, "read_text": 2, "write_text": 4, "write_bytes": 1,

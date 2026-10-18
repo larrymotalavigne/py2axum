@@ -43,7 +43,6 @@ ALTERNATIVES = {
     "structlog": "logging (native)",
     "pendulum": "datetime and dateutil.relativedelta (native)",
     "arrow": "datetime and dateutil.relativedelta (native)",
-    "pytz": "zoneinfo (native)",
     "jwcrypto": "PyJWT or python-jose with an HMAC algorithm (native)",
     "authlib": "PyJWT or python-jose with an HMAC algorithm (native)",
     "smtplib": "aiosmtplib (native)",

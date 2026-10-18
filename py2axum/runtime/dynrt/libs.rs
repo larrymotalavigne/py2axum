@@ -319,7 +319,12 @@ pub fn datetime_new(args: &[V], kwargs: &[(String, V)]) -> R {
     for (i, a) in args.iter().enumerate() {
         vals[i] = Some(a.clone());
     }
+    let mut fold = 0u8;
     for (k, v) in kwargs {
+        if k == "fold" {
+            fold = super::methods::fold_arg(v)?;
+            continue;
+        }
         let i = names.iter().position(|n| n == k).ok_or_else(|| Exc::type_error(format!("'{k}' is an invalid keyword argument")))?;
         vals[i] = Some(v.clone());
     }
@@ -337,7 +342,7 @@ pub fn datetime_new(args: &[V], kwargs: &[(String, V)]) -> R {
         Some(v) => tz_of(v)?,
         None => None,
     };
-    Ok(V::DateTime(DateTime { wall: NaiveDateTime::new(date, time), tz, fold: 0 }))
+    Ok(V::DateTime(DateTime { wall: NaiveDateTime::new(date, time), tz, fold }))
 }
 
 pub fn date_new(args: &[V], kwargs: &[(String, V)]) -> R {
@@ -488,48 +493,104 @@ pub fn fromisoformat_date(s: &V) -> R {
     dt::parse_date(&t).map(V::Date).map_err(|_| iso_range_error(&t).unwrap_or_else(|| Exc::value_error(format!("Invalid isoformat string: {}", ops::str_repr(&t)))))
 }
 
-/// `strftime` with the common directives.
-pub fn strftime(wall: &NaiveDateTime, offset: Option<i32>, tzname: Option<String>, fmt: &str) -> String {
+/// `strftime` as CPython renders it: %f, %z, %:z and %Z by CPython itself, every other directive by the C library
+/// in the C locale (CPython never sets LC_TIME). Measured on glibc (Debian trixie 3.13.5, 3.12.15–3.15.0) and macOS
+/// (3.12.13–3.15.0): the outputs below are identical everywhere except where noted. Anything else (flags, widths, E/O
+/// modifiers, %s that reads the local zone, letters the C library does not know) is refused at generation for a literal
+/// format (`dyn.STRFTIME_DIRECTIVES`) and raises here for a computed one: glibc and macOS render them differently.
+pub fn strftime(wall: &NaiveDateTime, offset: Option<i32>, tzname: Option<String>, fmt: &str) -> R<String> {
+    strftime_with(wall, offset, tzname, fmt, true)
+}
+
+/// logging's `formatTime` (`time.strftime`): an unsupported directive is copied as is (glibc's rendering of a letter it
+/// does not know), as before; its formats are not checked at generation
+pub fn strftime_lenient(wall: &NaiveDateTime, offset: Option<i32>, tzname: Option<String>, fmt: &str) -> String {
+    strftime_with(wall, offset, tzname, fmt, false).unwrap_or_default()
+}
+
+fn strftime_with(wall: &NaiveDateTime, offset: Option<i32>, tzname: Option<String>, fmt: &str, strict: bool) -> R<String> {
     let mut out = String::new();
     let mut it = fmt.chars().peekable();
     const DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
     const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    // glibc writes a year below 1000 (%Y, %G, %C, %F) without padding (`1`), macOS pads it (`0001`); from 3.14
+    // CPython pads them itself on every platform, but not the year inside %c
+    let linux = cfg!(target_os = "linux");
+    let pad = !linux || super::python() >= (3, 14);
+    let year = |y: i32, padded: bool| if padded { format!("{y:04}") } else { y.to_string() };
+    let wday = wall.weekday().num_days_from_monday() as usize;
+    let h12 = if wall.hour() % 12 == 0 { 12 } else { wall.hour() % 12 };
+    let ampm = if wall.hour() < 12 { "AM" } else { "PM" };
     while let Some(c) = it.next() {
         if c != '%' {
             out.push(c);
             continue;
         }
         match it.next() {
-            Some('Y') => out += &format!("{:04}", wall.year()),
+            Some('Y') => out += &year(wall.year(), pad),
+            Some('G') => out += &year(wall.iso_week().year(), pad),
+            Some('C') => out += &if pad { format!("{:02}", wall.year() / 100) } else { (wall.year() / 100).to_string() },
+            Some('F') => out += &format!("{}-{:02}-{:02}", year(wall.year(), pad), wall.month(), wall.day()),
+            Some('c') => out += &format!("{} {} {:>2} {:02}:{:02}:{:02} {}", &DAYS[wday][..3], &MONTHS[wall.month0() as usize][..3],
+                                         wall.day(), wall.hour(), wall.minute(), wall.second(), year(wall.year(), !linux)),
             Some('y') => out += &format!("{:02}", wall.year() % 100),
+            Some('g') => out += &format!("{:02}", wall.iso_week().year() % 100),
             Some('m') => out += &format!("{:02}", wall.month()),
             Some('d') => out += &format!("{:02}", wall.day()),
+            Some('e') => out += &format!("{:>2}", wall.day()),
             Some('H') => out += &format!("{:02}", wall.hour()),
-            Some('I') => out += &format!("{:02}", if wall.hour() % 12 == 0 { 12 } else { wall.hour() % 12 }),
-            Some('p') => out += if wall.hour() < 12 { "AM" } else { "PM" },
+            Some('k') => out += &format!("{:>2}", wall.hour()),
+            Some('I') => out += &format!("{h12:02}"),
+            Some('l') => out += &format!("{h12:>2}"),
+            Some('p') => out += ampm,
+            // glibc's lower-case am/pm; macOS does not know %P and writes the letter alone
+            Some('P') if linux => out += &ampm.to_lowercase(),
+            Some('P') => out.push('P'),
             Some('M') => out += &format!("{:02}", wall.minute()),
             Some('S') => out += &format!("{:02}", wall.second()),
             Some('f') => out += &format!("{:06}", wall.nanosecond() / 1000),
             Some('j') => out += &format!("{:03}", wall.ordinal()),
-            Some('A') => out += DAYS[wall.weekday().num_days_from_monday() as usize],
-            Some('a') => out += &DAYS[wall.weekday().num_days_from_monday() as usize][..3],
+            Some('A') => out += DAYS[wday],
+            Some('a') => out += &DAYS[wday][..3],
             Some('B') => out += MONTHS[wall.month0() as usize],
-            Some('b') => out += &MONTHS[wall.month0() as usize][..3],
+            Some('b') | Some('h') => out += &MONTHS[wall.month0() as usize][..3],
+            Some('u') => out += &(wday + 1).to_string(),
+            Some('w') => out += &((wday + 1) % 7).to_string(),
+            Some('U') => out += &format!("{:02}", (wall.ordinal0() as usize + 7 - (wday + 1) % 7) / 7),
+            Some('W') => out += &format!("{:02}", (wall.ordinal0() as usize + 7 - wday) / 7),
+            Some('V') => out += &format!("{:02}", wall.iso_week().week()),
+            Some('D') | Some('x') => out += &format!("{:02}/{:02}/{:02}", wall.month(), wall.day(), wall.year() % 100),
+            Some('T') | Some('X') => out += &format!("{:02}:{:02}:{:02}", wall.hour(), wall.minute(), wall.second()),
+            Some('R') => out += &format!("{:02}:{:02}", wall.hour(), wall.minute()),
+            Some('r') => out += &format!("{h12:02}:{:02}:{:02} {ampm}", wall.minute(), wall.second()),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
             Some('z') => {
                 if let Some(o) = offset {
                     out += &dt::fmt_offset(o, false).replace(':', "");
                 }
             }
+            Some(':') if it.peek() == Some(&'z') => {
+                it.next();
+                if let Some(o) = offset {
+                    out += &dt::fmt_offset(o, false);
+                }
+            }
             Some('Z') => out += &tzname.clone().unwrap_or_default(),
             Some('%') => out.push('%'),
-            Some(other) => {
+            // a lone % at the end is kept by both C libraries
+            None => out.push('%'),
+            Some(other) if !strict => {
                 out.push('%');
                 out.push(other);
             }
-            None => out.push('%'),
+            Some(other) => {
+                return Err(Exc::value_error(format!("strftime directive '%{other}' is not supported by py2axum (glibc and \
+                                                     macOS render it differently, or it reads the local time zone)")))
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- os

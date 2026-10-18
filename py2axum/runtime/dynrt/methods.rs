@@ -177,6 +177,24 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => return super::satable::attr(n, name),
             Native::RelDelta(r) => return super::reldelta::attr(r, name).ok_or_else(|| no_attr(v, name)),
             Native::Cron(c) => return super::croniter::attr(c, name),
+            Native::CtCache(c) => {
+                if let Some(r) = super::ctools::attr(c, name) {
+                    return r;
+                }
+                const M: [&str; 13] = ["get", "pop", "setdefault", "popitem", "clear", "expire", "getsizeof", "keys", "values", "items",
+                                       "update", "__getitem__", "__contains__"];
+                return match M.iter().find(|m| **m == name && (**m != "expire" || c.kind == super::ctools::Kind::Ttl)) {
+                    Some(m) => Ok(V::native(Native::MethodOf(v.clone(), m))),
+                    None => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", c.name))),
+                };
+            }
+            Native::IsoParser(_) => {
+                const M: [&str; 4] = ["isoparse", "parse_isodate", "parse_isotime", "parse_tzstr"];
+                return match M.iter().find(|m| **m == name) {
+                    Some(m) => Ok(V::native(Native::MethodOf(v.clone(), m))),
+                    None => Err(Exc::attr_error(format!("'isoparser' object has no attribute '{name}'"))),
+                };
+            }
             Native::DnsResolver(r) => return super::dnsres::resolver_attr(r, name),
             Native::DnsAnswer(a) => return super::dnsres::answer_attr(a, name),
             Native::DnsRdata(d) => return super::dnsres::rdata_attr(d, name),
@@ -402,10 +420,18 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 _ => return Err(no_attr(v, name)),
             })
         }
-        V::Tz(t) => match name {
-            "key" => Ok(V::str(t.name())),
-            _ => Err(no_attr(v, name)),
-        },
+        V::Tz(t) => {
+            if let Some(r) = tz_attr(t, name) {
+                return r;
+            }
+            match name {
+                "key" if matches!(t, Tz::Zone(_)) => Ok(V::str(t.name())),
+                _ => match TZ_METHODS.iter().find(|m| **m == name) {
+                    Some(m) if tz_has_method(t, m) => Ok(V::native(Native::MethodOf(v.clone(), m))),
+                    _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", tz_cpython_type(t)))),
+                },
+            }
+        }
         V::Result(r) => orm::result_attr(r, name),
         V::Col(m, i) => match name {
             "key" => Ok(V::str(m.cols[*i].name)),
@@ -956,6 +982,18 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let f = getattr(cx, recv, name).await?;
             call_value(cx, &f, args, kwargs).await
         }
+        V::Native(n) if matches!(&**n, Native::CtCache(_)) => {
+            let Native::CtCache(c) = &**n else { unreachable!() };
+            match name {
+                "__getitem__" if args.len() == 1 => super::ctools::getitem(c, &args[0]),
+                "__contains__" if args.len() == 1 => super::ctools::contains(c, &args[0]).map(V::Bool),
+                _ => super::ctools::method(c, name, &args, &kwargs),
+            }
+        }
+        V::Native(n) if matches!(&**n, Native::IsoParser(_)) => {
+            let Native::IsoParser(sep) = &**n else { unreachable!() };
+            super::duparse::isoparser_method(*sep, name, &args, &kwargs)
+        }
         V::Native(n) if matches!(&**n, Native::YamlMark(_)) => {
             let Native::YamlMark(m) = &**n else { unreachable!() };
             super::pyyaml::mark_method(m, name, &args, &kwargs)
@@ -1165,6 +1203,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             _ => Err(no_attr(recv, name)),
         },
         V::DateTime(d) => datetime_method(d, name, &args, &kwargs),
+        V::Tz(t) => tz_method(t, name, &args, &kwargs),
         V::Date(d) => date_method(d, name, &args, &kwargs),
         V::Time(t) => time_method(t, name, &args, &kwargs),
         V::Delta(d) => match name {
@@ -1341,8 +1380,12 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 if let Some((k, _)) = kwargs.first() {
                     return Err(Exc::type_error(format!("py2axum: model_validate_json({k}=) is not supported")));
                 }
-                let obj = pyd::loads(&ops::str_(args.first().unwrap_or(&V::None))?)?;
-                pyd::construct(cx, s, obj).await
+                // str, bytes (`await request.body()`) or anything else (json_type), parsed by jiter
+                let [data] = &args[..] else {
+                    // more than one is refused by the transpiler
+                    return Err(Exc::type_error("BaseModel.model_validate_json() missing 1 required positional argument: 'json_data'"));
+                };
+                pyd::construct_json(cx, s, data).await
             }
             (ClassKind::Model(m), _) if m.class_methods.contains(&name) => match find_method(m.methods, name) {
                 Some((_, f)) => f(cx, recv.clone(), super::pack(args, kwargs)).await,
@@ -1458,7 +1501,8 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::Request(r) => match name {
                 "is_disconnected" => Ok(V::Bool(r.disconnected.load(std::sync::atomic::Ordering::Relaxed))),
                 "body" => Ok(V::Bytes(Arc::from(&r.body_bytes()[..]))),
-                "json" => pyd::loads(&String::from_utf8_lossy(&r.body_bytes())),
+                // Starlette: `json.loads(await self.body())` (bytes: json.detect_encoding, UnicodeDecodeError)
+                "json" => super::libs::json_loads(&V::Bytes(Arc::from(&r.body_bytes()[..]))),
                 _ => Err(no_attr(recv, name)),
             },
             Native::Queue(q) => match name {
@@ -1601,6 +1645,12 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
                 return Err(Exc::type_error("py2axum: keyword arguments to a tenacity decorator are not supported"));
             }
             return super::tenacity::decorate(t, &args);
+        }
+        if let Native::CtDecorator(c) = &**n {
+            if !kwargs.is_empty() {
+                return Err(Exc::type_error("decorator() got an unexpected keyword argument"));
+            }
+            return super::ctools::decorate(c, &args);
         }
         // `async_sessionmaker(...)()`: a new session on the process pool
         if let Native::Maker(expire, autoflush, sync) = &**n {
@@ -2343,8 +2393,16 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
                 Some(v) => libs::tz_of(v)?.unwrap_or_else(local),
                 None => local(),
             };
-            V::DateTime(d.astimezone(tz))
+            V::DateTime(super::dutz::astimezone(d, tz)?)
         }
+        "tzname" => match d.tz {
+            Some(t) => t.tzname(&d.wall, d.fold)?.map(V::str).unwrap_or(V::None),
+            None => V::None,
+        },
+        "dst" => match dt::dst_of(d)? {
+            Some(s) => V::Delta(Duration::seconds(s)),
+            None => V::None,
+        },
         "replace" => {
             let w = d.wall;
             let mut tz = d.tz;
@@ -2358,12 +2416,7 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
                         continue;
                     }
                     "fold" => {
-                        fold = match v {
-                            V::Int(i @ (0 | 1)) => *i as u8,
-                            V::Bool(b) => *b as u8,
-                            V::Int(_) => return Err(Exc::value_error("fold must be either 0 or 1")),
-                            o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
-                        };
+                        fold = fold_arg(v)?;
                         continue;
                     }
                     _ => return Err(Exc::type_error(format!("'{k}' is an invalid keyword argument for replace()"))),
@@ -2382,12 +2435,95 @@ fn datetime_method(d: &DateTime, name: &str, args: &[V], kwargs: &[(String, V)])
         "weekday" => V::Int(d.wall.weekday().num_days_from_monday() as i64),
         "isoweekday" => V::Int(d.wall.weekday().number_from_monday() as i64),
         "toordinal" => V::Int(d.wall.date().num_days_from_ce() as i64),
-        "strftime" => V::str(libs::strftime(&d.wall, d.offset(), d.tz.map(|t| t.name()), &strs(&args[0])?)),
+        "strftime" => V::str(libs::strftime(&d.wall, d.offset(), d.tz.and_then(|t| t.tzname(&d.wall, d.fold).ok().flatten()), &strs(&args[0])?)?),
         _ => return Err(Exc::attr_error(format!("'datetime.datetime' object has no attribute '{name}'"))),
     })
 }
 
 use chrono::TimeZone;
+
+/// a `fold=` argument (datetime(), replace()): 0 or 1, CPython's messages (3.14 adds the value)
+pub fn fold_arg(v: &V) -> R<u8> {
+    Ok(match v {
+        V::Int(i @ (0 | 1)) => *i as u8,
+        V::Bool(b) => *b as u8,
+        V::Int(i) if super::python() >= (3, 14) => return Err(Exc::value_error(format!("fold must be either 0 or 1, not {i}"))),
+        V::Int(_) => return Err(Exc::value_error("fold must be either 0 or 1")),
+        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+    })
+}
+
+/// the methods a tzinfo object has (pytz's localize/normalize, dateutil's is_ambiguous)
+const TZ_METHODS: [&str; 7] = ["utcoffset", "dst", "tzname", "fromutc", "localize", "normalize", "is_ambiguous"];
+
+fn tz_has_method(t: &Tz, m: &str) -> bool {
+    match m {
+        "localize" | "normalize" => matches!(t, Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_)),
+        "is_ambiguous" => matches!(t, Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_)),
+        _ => true,
+    }
+}
+
+/// CPython's name of a tzinfo's type in messages (`'datetime.timezone' object ...`)
+pub fn tz_cpython_type(t: &Tz) -> &'static str {
+    match t {
+        Tz::Utc | Tz::Fixed(_) => "datetime.timezone",
+        Tz::Zone(_) => "zoneinfo.ZoneInfo",
+        _ => t.type_name(),
+    }
+}
+
+/// a library tzinfo's own attributes (pytz's `zone`...)
+fn tz_attr(t: &Tz, name: &str) -> Option<R> {
+    match t {
+        Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::attr(t, name),
+        Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_) => super::dutz::attr(t, name),
+        _ => None,
+    }
+}
+
+/// a method of a tzinfo: pytz's and dateutil's (their modules), the standard library's `utcoffset(dt)`, `dst(dt)`,
+/// `tzname(dt)`, `fromutc(dt)`
+fn tz_method(t: &Tz, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    let lib = match t {
+        Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::method(t, name, args, kwargs),
+        Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_) => super::dutz::method(t, name, args, kwargs),
+        _ => None,
+    };
+    if let Some(r) = lib {
+        return r;
+    }
+    let cls = tz_cpython_type(t);
+    let short = cls.rsplit('.').next().unwrap_or(cls);
+    let one = || -> R<V> {
+        match (args, kwargs) {
+            ([d], []) => Ok(d.clone()),
+            _ => Err(Exc::type_error(format!("{short}.{name}() takes exactly one argument ({} given)", args.len() + kwargs.len()))),
+        }
+    };
+    match name {
+        "utcoffset" | "dst" | "tzname" => {
+            let d = one()?;
+            let (wall, fold) = match &d {
+                V::DateTime(x) => (x.wall, x.fold),
+                V::None if matches!(t, Tz::Zone(_)) => return Ok(V::None),
+                V::None => (chrono::NaiveDateTime::default(), 0),
+                o => return Err(Exc::type_error(format!("{name}() argument must be a datetime instance or None, not {}", o.type_name()))),
+            };
+            Ok(match name {
+                "utcoffset" => V::Delta(Duration::seconds(t.offset_for_wall(&wall, fold) as i64)),
+                "dst" => t.dst(&wall, fold)?.map(|s| V::Delta(Duration::seconds(s))).unwrap_or(V::None),
+                _ => t.tzname(&wall, fold)?.map(V::str).unwrap_or(V::None),
+            })
+        }
+        "fromutc" => match one()? {
+            V::DateTime(x) if x.tz == Some(*t) => Ok(V::DateTime(dt::from_utc_checked(x.wall, *t)?)),
+            V::DateTime(_) => Err(Exc::value_error("fromutc: dt.tzinfo is not self")),
+            o => Err(Exc::type_error(format!("fromutc: argument must be a datetime, not {}", o.type_name()))),
+        },
+        _ => Err(Exc::attr_error(format!("'{cls}' object has no attribute '{name}'"))),
+    }
+}
 
 /// `date(year, month, day)` with CPython's checks and messages (reworded in 3.14: the value and the bounds)
 pub fn ymd(y: i64, m: i64, d: i64) -> R<chrono::NaiveDate> {
@@ -2430,7 +2566,7 @@ fn time_method(t: &chrono::NaiveTime, name: &str, args: &[V], kwargs: &[(String,
         "isoformat" => Err(Exc::type_error("py2axum: time.isoformat() with arguments (timespec=) is not supported")),
         // CPython formats a time as on 1900-01-01
         "strftime" if args.len() == 1 => Ok(V::str(libs::strftime(&chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap().and_time(*t),
-                                                                   None, None, &strs(&args[0])?))),
+                                                                   None, None, &strs(&args[0])?)?)),
         _ => Err(Exc::attr_error(format!("'datetime.time' object has no attribute '{name}'"))),
     }
 }
@@ -2441,7 +2577,7 @@ fn date_method(d: &chrono::NaiveDate, name: &str, args: &[V], kwargs: &[(String,
         "weekday" => V::Int(d.weekday().num_days_from_monday() as i64),
         "isoweekday" => V::Int(d.weekday().number_from_monday() as i64),
         "toordinal" => V::Int(d.num_days_from_ce() as i64),
-        "strftime" => V::str(libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, &strs(&args[0])?)),
+        "strftime" => V::str(libs::strftime(&d.and_hms_opt(0, 0, 0).unwrap(), None, None, &strs(&args[0])?)?),
         "replace" => {
             let mut f = [d.year() as i64, d.month() as i64, d.day() as i64];
             for (k, v) in kwargs {
@@ -3447,6 +3583,21 @@ pub fn isinstance_builtin(v: &V, ty: &str) -> bool {
         "NoneType" => v.is_none(),
         "complex" => matches!(v, V::Native(n) if matches!(&**n, Native::Complex(..))),
         // bytearray, memoryview: the runtime never makes one (dyn.TYPE_ONLY)
+        "tzinfo" => matches!(v, V::Tz(_)),
+        "timezone" => matches!(v, V::Tz(Tz::Utc | Tz::Fixed(_))),
+        "ZoneInfo" => matches!(v, V::Tz(Tz::Zone(_))),
+        "pytz.BaseTzInfo" => matches!(v, V::Tz(Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_))),
+        "pytz.DstTzInfo" | "pytz.StaticTzInfo" => match v {
+            V::Tz(t @ Tz::Py(..)) => (super::pytzrt::tz_repr(t).starts_with("<Dst")) == (ty == "pytz.DstTzInfo"),
+            _ => false,
+        },
+        "tzutc" | "tzoffset" | "tzlocal" | "tzfile" | "tzstr" => matches!(v, V::Tz(t) if t.type_name() == ty),
+        "tzrange" => matches!(v, V::Tz(t) if t.type_name() == "tzstr"),
+        "cachetools.Cache" => matches!(v, V::Native(n) if matches!(&**n, Native::CtCache(_))),
+        "cachetools.FIFOCache" | "cachetools.LRUCache" | "cachetools.TTLCache" => match v {
+            V::Native(n) => matches!(&**n, Native::CtCache(c) if format!("cachetools.{}", c.name) == ty || (ty == "cachetools.TTLCache" && c.name == "_UnboundTTLCache")),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -3556,7 +3707,7 @@ pub fn set_str_classes(c: &'static StrClasses) {
     let _ = STR_CLASSES.set(c);
 }
 
-fn str_class(c: char, table: fn(&StrClasses) -> &'static [(u32, u32)], fallback: fn(char) -> bool) -> bool {
+pub fn str_class(c: char, table: fn(&StrClasses) -> &'static [(u32, u32)], fallback: fn(char) -> bool) -> bool {
     match STR_CLASSES.get() {
         Some(t) => {
             let ranges = table(t);

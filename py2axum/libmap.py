@@ -177,6 +177,13 @@ def _one(name):
 VALUES: dict[str, str] = {
     "sys.maxsize": "V::Int(i64::MAX)",  # CPython's on 64-bit platforms
     "datetime.UTC": f"V::Tz({RT}::dt::Tz::Utc)",
+    # pytz 2026.5 (dynrt/pytzrt.rs)
+    "pytz.utc": f"V::Tz({RT}::dt::Tz::PyUtc)",
+    "pytz.UTC": f"V::Tz({RT}::dt::Tz::PyUtc)",
+    **{f"pytz.{n}": f"{RT}::pytzrt::{n}()" for n in ("all_timezones", "all_timezones_set", "common_timezones", "common_timezones_set")},
+    **{f"pytz.{n}": f'V::str("{v}")' for n, v in (("VERSION", "2026.5"), ("__version__", "2026.5"), ("OLSON_VERSION", "2026e"))},
+    # python-dateutil 2.9 (dynrt/dutz.rs)
+    **{f"{m}.UTC": f"V::Tz({RT}::dt::Tz::DuUtc)" for m in ("dateutil.tz", "dateutil.tz.tz")},
     "datetime.timezone.utc": f"V::Tz({RT}::dt::Tz::Utc)",
     "sqlalchemy.null": "V::None",
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean", "Numeric")},
@@ -281,7 +288,9 @@ HOOKS = {
     "httpx.AsyncClient.request": f'{RT}::http::set_hook("httpx", {{val}})',
 }
 # library values that are run-time objects: their methods are called on the value
-OBJECT_VALUES = {"prometheus_client.REGISTRY", "aiohttp.ClientSession._request", "httpx.AsyncClient.request"}
+OBJECT_VALUES = {"prometheus_client.REGISTRY", "aiohttp.ClientSession._request", "httpx.AsyncClient.request",
+                 # tzinfo singletons (`pytz.utc.zone`, `tz.UTC.utcoffset(None)`)
+                 "pytz.utc", "pytz.UTC", "dateutil.tz.UTC", "dateutil.tz.tz.UTC"}
 
 # --- exception classes usable in `except` / `isinstance` / `raise` -------------------------
 EXCEPTIONS: dict[str, str] = {
@@ -495,6 +504,11 @@ EXCEPTIONS: dict[str, str] = {
     "itsdangerous.exc.BadHeader": "BAD_HEADER",
     "itsdangerous.BadPayload": "BAD_PAYLOAD",
     "itsdangerous.exc.BadPayload": "BAD_PAYLOAD",
+    **{f"{m}.{n}": c for m in ("pytz", "pytz.exceptions") for n, c in (
+        ("UnknownTimeZoneError", "PYTZ_UNKNOWN_TIME_ZONE_ERROR"), ("InvalidTimeError", "PYTZ_INVALID_TIME_ERROR"),
+        ("AmbiguousTimeError", "PYTZ_AMBIGUOUS_TIME_ERROR"), ("NonExistentTimeError", "PYTZ_NON_EXISTENT_TIME_ERROR"))},
+    "pytz.exceptions.Error": "PYTZ_ERROR",
+    **{f"dateutil.parser{m}.ParserError": "DU_PARSER_ERROR" for m in ("", "._parser")},
     **{f"{m}.{n}": c for m in ("croniter", "croniter.croniter") for n, c in (
         ("CroniterError", "CRONITER_ERROR"), ("CroniterBadCronError", "CRONITER_BAD_CRON_ERROR"),
         ("CroniterBadDateError", "CRONITER_BAD_DATE_ERROR"), ("CroniterBadTypeRangeError", "CRONITER_BAD_TYPE_RANGE_ERROR"),
@@ -826,6 +840,28 @@ def _relativedelta(a, kw):
     return f"{RT}::reldelta::new(&{_argv(a)}, &{_kwvec(kw)})"
 
 
+# cachetools: the arguments that must be one of the supported library functions (position, keyword, kind)
+CT_MARKED = {
+    **{f"cachetools.{n}": ((1, "getsizeof", "getsizeof"),) for n in ("Cache", "FIFOCache", "LRUCache")},
+    "cachetools.TTLCache": ((2, "timer", "timer"), (3, "getsizeof", "getsizeof")),
+    "cachetools.func.ttl_cache": ((2, "timer", "timer"), (3, "typed", "typed")),
+    **{f"cachetools.func.{n}": ((1, "typed", "typed"),) for n in ("lru_cache", "fifo_cache")},
+    "cachetools.cached": ((1, "key", "key"), (3, "condition", "condition")),
+    "cachetools.cachedmethod": ((1, "key", "key"), (3, "condition", "condition"), (4, "info", "info")),
+}
+
+
+def du_parse_static(name, node):
+    """dateutil.parser.parse(timestr, parserinfo=None, **kwargs): the default parserinfo only (a custom one is a
+    class of the project the runtime's parser does not read)."""
+    import ast
+    if not name.endswith(".parse"):
+        return
+    pi = node.args[1] if len(node.args) > 1 else next((k.value for k in node.keywords if k.arg == "parserinfo"), None)
+    if pi is not None and not (isinstance(pi, ast.Constant) and pi.value is None):
+        raise ValueError("a parserinfo is not supported (the default parserinfo only)")
+
+
 # croniter 6.2 (dynrt/croniter.rs): the class (`from croniter import croniter`, or its module path), its
 # classmethods, croniter_range; parameters as in croniter.py (checked statically by croniter_static)
 _CRON_CLASSES = ("croniter.croniter", "croniter.croniter.croniter")
@@ -897,6 +933,30 @@ CALLS = {
        for m in _CRON_MODULES for k in ("croniter_range", "datetime_to_timestamp")},
     # python-dateutil 2.9 (dynrt/reldelta.rs)
     "dateutil.relativedelta.relativedelta": _relativedelta,
+    # cachetools 7.2 (dynrt/ctools.rs); the timer, getsizeof and key arguments checked by dyn.FnCompiler.ct_markers
+    **{f"cachetools.{n}": (lambda n: lambda a, kw: f'{RT}::ctools::cache_new("{n}", &{_argv(a)}, &{_kwvec(kw)})')(n)
+       for n in ("Cache", "FIFOCache", "LRUCache")},
+    "cachetools.TTLCache": lambda a, kw: f"{RT}::ctools::ttl_new(&{_argv(a)}, &{_kwvec(kw)})",
+    "cachetools.cached": lambda a, kw: f"{RT}::ctools::cached(&{_argv(a)}, &{_kwvec(kw)})",
+    "cachetools.cachedmethod": lambda a, kw: f"{RT}::ctools::cachedmethod(&{_argv(a)}, &{_kwvec(kw)})",
+    "cachetools.keys.hashkey": lambda a, kw: f"{RT}::ctools::hashkey_fn(&{_argv(a)}, &{_kwvec(kw)})",
+    "cachetools.keys.methodkey": lambda a, kw: f"{RT}::ctools::methodkey_fn(&{_argv(a)}, &{_kwvec(kw)})",
+    **{f"cachetools.func.{n}": (lambda n: lambda a, kw: f'{RT}::ctools::func_cache("{n}", &{_argv(a)}, &{_kwvec(kw)})')(n)
+       for n in ("lru_cache", "fifo_cache", "ttl_cache")},
+    # dateutil.parser (dynrt/duparse.rs)
+    **{f"dateutil.parser{m}.isoparse": (lambda a, kw: f"{RT}::duparse::isoparse(&{_argv(a)}, &{_kwvec(kw)})") for m in ("", ".isoparser")},
+    **{f"dateutil.parser{m}.isoparser": (lambda a, kw: f"{RT}::duparse::isoparser_new(&{_argv(a)}, &{_kwvec(kw)})") for m in ("", ".isoparser")},
+    # dateutil.tz (dynrt/dutz.rs)
+    **{f"{m}.{n}": (lambda f: lambda a, kw: f"{RT}::dutz::{f}(&{_argv(a)}, &{_kwvec(kw)})")(f)
+       for m in ("dateutil.tz", "dateutil.tz.tz") for n, f in (
+           ("tzoffset", "tzoffset"), ("gettz", "gettz"), ("tzstr", "tzstr"), ("enfold", "enfold"),
+           ("datetime_exists", "datetime_exists"), ("datetime_ambiguous", "datetime_ambiguous"),
+           ("resolve_imaginary", "resolve_imaginary"))},
+    **{f"{m}.tzutc": _noargs("tzutc", f"Ok::<V, Exc>(V::Tz({RT}::dt::Tz::DuUtc))") for m in ("dateutil.tz", "dateutil.tz.tz")},
+    **{f"{m}.tzlocal": _noargs("tzlocal", f"Ok::<V, Exc>({RT}::dutz::tzlocal())") for m in ("dateutil.tz", "dateutil.tz.tz")},
+    # pytz 2026.5 (dynrt/pytzrt.rs)
+    "pytz.timezone": lambda a, kw: f"{RT}::pytzrt::timezone(&{_argv(a)}, &{_kwvec(kw)})",
+    "pytz.FixedOffset": lambda a, kw: f"{RT}::pytzrt::fixed_offset(&{_argv(a)}, &{_kwvec(kw)})",
     # xmltodict 1.0 (dynrt/xmld.rs): default options, namespaces; dict_constructor= has no effect (dicts)
     "xmltodict.parse": lambda a, kw: (_bind("xmltodict.parse", a, kw, ["xml_input"], {"xml_input", "process_namespaces", "namespaces", "dict_constructor"})
                                        and f"{RT}::xmld::parse(&{_argv(a)}, &{_kwvec(kw)})"),
@@ -1353,6 +1413,8 @@ DYN_ARGS = {
     "asyncio.Semaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.BoundedSemaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.Lock": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
+    # dateutil.parser.parse(s, **options) (dynrt/duparse.rs)
+    **{f"dateutil.parser{m}.parse": (lambda a, kw: f"{RT}::duparse::parse(cx, {a}, {kw}).await") for m in ("", "._parser")},
     # case(*whens, else_=...): the (condition, value) tuples of a list built at run time
     "sqlalchemy.case": lambda a, kw: f"{RT}::orm::case(&{a}, &{kw})",
 }

@@ -13,9 +13,13 @@ pub mod crypto;
 pub mod decimal;
 pub mod deque;
 pub mod dt;
+pub mod dutz;
+pub mod duparse;
+pub mod pytzrt;
 pub mod http;
 pub mod ical;
 pub mod croniter;
+pub mod ctools;
 pub mod htmlent;
 pub mod ini;
 pub mod email;
@@ -761,7 +765,15 @@ pub fn bind_params(qual: &str, lead: usize, args: Vec<V>, kwargs: Vec<(String, V
             Some(i) if slots[i].is_some() => return Err(Exc::type_error(format!("{qual} got multiple values for argument '{k}'"))),
             Some(i) => slots[i] = Some(v),
             None if kwarg.is_some() => rest.push((V::str(&k), v)),
-            None => return Err(Exc::type_error(format!("{qual} got an unexpected keyword argument '{k}'"))),
+            None => {
+                // CPython 3.13+: the closest parameter name (`_Py_CalculateSuggestions`)
+                let names: Vec<&str> = params.iter().filter(|p| p.1 == P_POS || p.1 == P_KWONLY).map(|p| p.0).collect();
+                let hint = match suggestion(&k, &names) {
+                    Some(s) if python() >= (3, 13) => format!(". Did you mean '{s}'?"),
+                    _ => String::new(),
+                };
+                return Err(Exc::type_error(format!("{qual} got an unexpected keyword argument '{k}'{hint}")));
+            }
         }
     }
     if let Some(i) = kwarg {
@@ -775,6 +787,85 @@ pub fn bind_params(qual: &str, lead: usize, args: Vec<V>, kwargs: Vec<(String, V
         }
     }
     Ok(slots)
+}
+
+/// CPython's `levenshtein_distance` (Python/suggestions.c): case flips cost 1, other edits 2
+fn levenshtein(a: &[u8], b: &[u8], max_cost: usize) -> usize {
+    const MOVE: usize = 2;
+    let (mut a, mut b) = (a, b);
+    while !a.is_empty() && !b.is_empty() && a[0] == b[0] {
+        a = &a[1..];
+        b = &b[1..];
+    }
+    while !a.is_empty() && !b.is_empty() && a[a.len() - 1] == b[b.len() - 1] {
+        a = &a[..a.len() - 1];
+        b = &b[..b.len() - 1];
+    }
+    if a.is_empty() || b.is_empty() {
+        return (a.len() + b.len()) * MOVE;
+    }
+    if a.len() > 40 || b.len() > 40 {
+        return max_cost + 1;
+    }
+    if b.len() < a.len() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    if (b.len() - a.len()) * MOVE > max_cost {
+        return max_cost + 1;
+    }
+    let cost = |x: u8, y: u8| {
+        if x & 31 != y & 31 {
+            return MOVE;
+        }
+        if x == y {
+            return 0;
+        }
+        if x.to_ascii_lowercase() == y.to_ascii_lowercase() { 1 } else { MOVE }
+    };
+    let mut buf: Vec<usize> = (0..a.len()).map(|i| (i + 1) * MOVE).collect();
+    let mut result = 0;
+    for (bi, &code) in b.iter().enumerate() {
+        let mut distance = bi * MOVE;
+        result = distance;
+        let mut minimum = usize::MAX;
+        for (i, &c) in a.iter().enumerate() {
+            let substitute = distance + cost(code, c);
+            distance = buf[i];
+            let insert_delete = result.min(distance) + MOVE;
+            result = insert_delete.min(substitute);
+            buf[i] = result;
+            minimum = minimum.min(result);
+        }
+        if minimum > max_cost {
+            return max_cost + 1;
+        }
+    }
+    result
+}
+
+/// CPython's `_Py_CalculateSuggestions`: the closest of `dir` to `name`, if close enough
+pub fn suggestion<'a>(name: &str, dir: &[&'a str]) -> Option<&'a str> {
+    if dir.len() >= 750 {
+        return None;
+    }
+    let mut best: Option<(&str, usize)> = None;
+    for item in dir {
+        if *item == name {
+            continue;
+        }
+        let mut max = (name.len() + item.len() + 3) * 2 / 6;
+        if let Some((_, d)) = best {
+            max = max.min(d.saturating_sub(1));
+        }
+        let d = levenshtein(name.as_bytes(), item.as_bytes(), max);
+        if d > max {
+            continue;
+        }
+        if best.map(|(_, b)| d < b).unwrap_or(true) {
+            best = Some((item, d));
+        }
+    }
+    best.map(|(s, _)| s)
 }
 
 /// `type(obj)` for a classmethod called through an instance.

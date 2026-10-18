@@ -1,5 +1,5 @@
 """Scenario of fixtures/libapp: orjson, PyYAML, croniter, Unidecode, aio-pika, ecs-logging and a plain class's
-__new__ (moved out of fixtures/dynapp, whose crate grew past the CI build containers' memory). No database; RabbitMQ
+__new__ (then pytz, dateutil's parser and tz, cachetools: 0.9) (moved out of fixtures/dynapp, whose crate grew past the CI build containers' memory). No database; RabbitMQ
 at BROKER_DSN. Compare the logs too (--logs): ecs-logging's output is what fixtures/libapp/ecslogs.py checks."""
 import os
 
@@ -639,3 +639,230 @@ def _dns_cases() -> list:
 
 
 STEPS += _dns_cases()
+
+
+def _pytz_cases() -> list:
+    """fixtures/libapp/pytzx.py: every pytz zone's localize/fromutc over transitions, methods, lookups, errors."""
+    import pytz
+    WALLS = ["0001-01-01T00:30:00", "1850-06-01T12:00:00", "1900-01-01T00:00:00", "1911-03-11T00:00:00", "1945-07-01T12:00:00",
+             "1970-01-01T00:00:00", "2000-03-26T02:30:00", "2026-03-08T02:30:00", "2026-03-29T02:30:00", "2026-03-29T01:59:59.999999",
+             "2026-10-25T02:30:00", "2026-11-01T01:30:00", "2026-04-05T02:30:00", "2026-10-04T02:30:00", "2037-06-01T12:00:00",
+             "2037-10-25T02:30:00", "2040-07-01T12:00:00", "9999-12-31T23:00:00"]
+    INSTANTS = ["0001-01-01T00:00:00", "1850-06-01T12:00:00", "1901-12-13T20:45:52", "1901-12-13T20:45:51", "1970-01-01T00:00:00",
+                "2026-03-29T00:59:59", "2026-03-29T01:00:00", "2026-10-25T00:59:59.5", "2026-10-25T01:00:00", "2037-10-25T01:00:00",
+                "2040-07-01T12:00:00", "9999-12-31T12:00:00"]
+    steps = []
+    for z in pytz.all_timezones:
+        steps.append(("POST", "/pytzx/localize", {"zone": z, "walls": WALLS}))
+        steps.append(("POST", "/pytzx/fromutc", {"zone": z, "instants": INSTANTS}))
+    for z in ["Europe/Paris", "America/New_York", "Australia/Sydney", "Asia/Kolkata", "EST", "UTC", "utc", "fixed:330", "fixed:-90",
+              "Europe/Dublin", "Africa/Casablanca", "Pacific/Chatham", "America/Sao_Paulo", "Antarctica/Troll"]:
+        steps.append(("POST", "/pytzx/methods", {"zone": z, "walls": WALLS}))
+        steps.append(("POST", "/pytzx/localize", {"zone": z, "walls": WALLS, "add": 24, "flags": [False, True, None, 0, 1, 2, "", "x"]}))
+    for n in ["Europe/Paris", "europe/paris", "EUROPE/PARIS", "UTC", "utc", "uTc", "Etc/UTC", "GMT", "Etc/GMT+5", "Etc/GMT_plus_5",
+              "Etc/GMT_minus_14", "US/Eastern", "EST", "EST5EDT", "Zulu", "", "Nope", "Europe/Paris ", " UTC", "Europe//Paris",
+              "../etc/passwd", "Asia/Calcutta", "America/Argentina/Buenos_Aires", "ROK", "Factory", "localtime", "posixrules",
+              "zone.tab", "UCT", "Universal"]:
+        steps.append(("POST", "/pytzx/zone", {"name": n}))
+        steps.append(("POST", "/pytzx/zone", {"name": n, "bytes": True}))
+    for v in [None, 3, 3.5, ["Europe/Paris"]]:
+        steps.append(("POST", "/pytzx/zone", {"name": v}))
+    for w in ["aware", "aware_utc", "naive_normalize", "naive_normalize_utc", "foreign_normalize", "zoneinfo_normalize",
+              "fromutc_other", "fromutc_sibling", "fromutc_utc_other", "fromutc_utc_naive", "nonexistent", "ambiguous", "unknown",
+              "unknown_plus", "unknown_type", "unknown_none", "nonascii", "bytes_nonascii", "fixed_big", "fixed_neg_big", "fixed_str",
+              "localize_date", "localize_kw", "localize_bad_kw", "localize_missing", "normalize_is_dst", "utc_utcoffset_is_dst",
+              "min", "max", "max_utc", "min_utc", "is_dst_two", "is_dst_one", "is_dst_str", "attr"]:
+        steps.append(("GET", f"/pytzx/errors/{w}", None))
+    for m in [0, 1, -1, 60, -60, 330, -330, 1439, -1439, 1440, -1440, 90, 545]:
+        steps.append(("GET", f"/pytzx/fixed?minutes={m}", None))
+    steps += [("GET", "/pytzx/lists", None), ("GET", "/pytzx/compare", None)]
+    steps += [("GET", f"/pytzx/model?zone={z}", None) for z in ("Europe/Paris", "UTC", "America/St_Johns", "Asia/Kathmandu", "EST")]
+    sfw = ["0001-01-01T00:00:00", "0005-03-01T07:05:09.000123", "0099-12-31T23:59:59", "0999-12-31T23:59:59", "1000-01-01T00:00:00",
+           "1899-12-31T12:00:00", "2021-01-03T13:00:00", "2024-12-30T12:00:00", "2026-10-17T00:30:00", "2026-03-29T03:15:00", "9999-12-31T23:59:59.999999"]
+    sff = ["%Y %G %C %F %y %g", "%c", "%x %X %D %T %R %r", "%a %A %b %B %h %m %d %e %j", "%H %I %k %l %M %S %f %p %P",
+           "%u %w %U %W %V", "%z %:z %Z", "%n%t%%", "100%", "%%Y", "plain"]
+    for z in (None, "Europe/Paris", "utc", "fixed:330", "fixed:-90", "America/St_Johns"):
+        steps.append(("POST", "/pytzx/strftime", {"zone": z, "walls": sfw, "formats": sff}))
+    for lib in ("pytz", "dateutil"):
+        for zone, start in (("Europe/Paris", "2026-03-28T22:00:00"), ("Europe/Paris", "2026-10-24T23:00:00"),
+                            ("America/New_York", "2026-03-07T23:00:00"), ("America/New_York", "2026-10-31T23:00:00"),
+                            ("Australia/Lord_Howe", "2026-04-04T23:00:00"), ("UTC", "2026-01-01T00:00:00")):
+            for expr in ("*/30 * * * *", "0 2 * * *", "30 2 * * *", "0 * * * *", "15 1,2,3 * * *"):
+                for prev in (False, True):
+                    steps.append(("POST", "/pytzx/cron", {"lib": lib, "zone": zone, "start": start, "expr": expr, "prev": prev, "n": 8}))
+    return steps
+
+
+STEPS += _pytz_cases()
+
+
+def _dutz_cases() -> list:
+    """fixtures/libapp/dutzx.py: gettz over the system's zone names (and pytz's), tzinfos over walls and instants, tzstr."""
+    import os
+    import pytz
+    WALLS = ["0001-01-01T00:30:00", "1850-06-01T12:00:00", "1901-12-13T20:45:52", "1945-07-01T12:00:00", "1970-01-01T00:00:00",
+             "2000-03-26T02:30:00", "2026-03-08T02:30:00", "2026-03-29T02:30:00", "2026-03-29T01:59:59.999999", "2026-10-25T02:30:00",
+             "2026-10-25T01:59:59", "2026-11-01T01:30:00", "2026-04-05T02:30:00", "2026-10-04T02:30:00", "2037-10-25T02:30:00",
+             "2038-01-19T03:14:08", "2040-07-01T12:00:00", "9999-12-31T23:00:00"]
+    INSTANTS = ["0001-01-01T00:00:00", "1850-06-01T12:00:00", "1901-12-13T20:45:52", "1970-01-01T00:00:00", "2026-03-29T00:59:59",
+                "2026-03-29T01:00:00", "2026-10-25T00:59:59.5", "2026-10-25T01:00:00", "2026-11-01T05:30:00", "2026-11-01T06:30:00",
+                "2037-10-25T01:00:00", "2040-07-01T12:00:00", "9999-12-31T12:00:00"]
+    names = sorted((set(pytz.all_timezones) | set(os.listdir("/usr/share/zoneinfo"))) - {"iso3166.tab"})
+    steps = []
+    for i in range(0, len(names), 20):
+        steps.append(("POST", "/dutzx/gettz", {"names": names[i:i + 20], "walls": WALLS[5:12]}))
+    steps.append(("POST", "/dutzx/gettz", {"names": ["UTC", "GMT", "utc", "Z", "", ":", ":UTC", "EST5EDT", "UTC+3", "GMT-2", "EST5EDT,M3.2.0,M11.1.0",
+                                                      "CET-1CEST,M3.5.0,M10.5.0/3", "Nope", "nope1", "US/Eastern", "America/New York",
+                                                      "Europe/Paris/", "../zoneinfo/Europe/Paris", "/usr/share/zoneinfo/Asia/Tokyo",
+                                                      "/nonexistent", "CET", "CEST", "XYZ", "+03", "<+03>-3", "Etc/GMT+5", "posixrules",
+                                                      "localtime", "zone.tab", "tzdata.zi", "leapseconds"], "walls": WALLS}))
+    TZS = ["Europe/Paris", "America/New_York", "Australia/Sydney", "Asia/Kolkata", "Africa/Casablanca", "Europe/Dublin",
+           "Pacific/Chatham", "America/Sao_Paulo", "Antarctica/Troll", "EST", "UTC", "utc", "UTC", "local", "off:None/3600",
+           "off:BRST/-10800", "off:X/0", "str:EST5EDT", "str:CET-1CEST,M3.5.0,M10.5.0/3", "str:UTC+3", "str:AEST-10AEDT,M10.1.0,M4.1.0/3",
+           "str:EST5EDT4,95/2,300/2", "str:IST-5:30", "str:EST+5EDT,4,1,0,7200,10,-1,0,7200,3600", "stdlib", "US/Eastern",
+           "Europe/London", "America/St_Johns", "Asia/Tehran", "Pacific/Apia", "America/Godthab", "Europe/Moscow"]
+    for t in TZS:
+        steps.append(("POST", "/dutzx/walls", {"tz": t, "walls": WALLS}))
+        steps.append(("POST", "/dutzx/instants", {"tz": t, "instants": INSTANTS}))
+    steps.append(("GET", "/dutzx/objects", None))
+    steps.append(("POST", "/dutzx/tzstr", {"strs": ["EST5EDT", "EST5", "EST", "UTC", "UTC0", "UTC+3", "GMT-3", "GMT+3", "EST5EDT,M3.2.0,M11.1.0",
+        "EST5EDT,M3.2.0/2,M11.1.0/2", "CET-1CEST,M3.5.0,M10.5.0/3", "AEST-10AEDT,M10.1.0,M4.1.0/3", "NZST-12NZDT,M9.5.0,M4.1.0/3",
+        "EST5EDT4,95/2,300/2", "EST5EDT4,J95/2,J300/2", "IST-5:30", "IST-0530", "EST+5EDT,4,1,0,7200,10,-1,0,7200,3600",
+        "EST+5EDT,4,1,0,7200,10,-1,0,7200", "<+03>-3", "", "5", "EST5EDT,M3.2.0,M11.1.0,X", "EST5EDT;M3.2.0;M11.1.0",
+        "EST 5 EDT", "ABCDEFGHIJ5", "EST5EDT,M3.5.0/26,M10.5.0/25", "EST5EDT,M3.5.0/1:30:30,M10.5.0/0130", "EST5EDT,0,365",
+        "EST5EDT,J60,J300", "EST5EDT,J1,J365"]}))
+    steps.append(("POST", "/dutzx/tzstr", {"strs": ["UTC+3", "GMT-3", "EST5EDT"], "posix": True}))
+    for w in ["fromutc_other", "fromutc_naive", "fromutc_date", "utc_fromutc_other", "offset_fromutc", "exists_naive", "ambiguous_naive",
+              "gettz_bytes", "gettz_abs", "gettz_abs_missing", "gettz_abs_bad", "gettz_colon", "gettz_space", "gettz_none", "tzstr_bad",
+              "tzoffset_kw", "enfold_bad", "enfold_zero", "unhashable", "missing", "max", "min"]:
+        steps.append(("GET", f"/dutzx/errors/{w}", None))
+    steps.append(("GET", "/dutzx/compare", None))
+    return steps
+
+
+STEPS += _dutz_cases()
+
+
+def _duparse_cases() -> list:
+    """fixtures/libapp/duparsex.py: parse() over picked and generated strings with each option set, isoparse."""
+    import random
+    HAND = ["2026-10-16", "2026-10-16T10:20:30", "2026-10-16 10:20:30.123456", "2026-10-16T10:20:30Z", "2026-10-16T10:20:30+02:00",
+            "2026-10-16T10:20:30-0530", "Thu Sep 25 10:36:28 BRST 2003", "Thu Sep 25 10:36:28 2003", "Thu Sep 25 10:36:28", "Thu Sep 10:36:28",
+            "Thu 10:36:28", "Sep 10:36:28", "10:36:28", "10:36", "Sep 2003", "Sep", "2003", "10h36m28.5s", "10h36m28s", "10h36m", "10h",
+            "10 h 36", "10 h 36.5", "36 m 5", "36 m 5 s", "36 m 05", "36 m 05 s", "10h am", "10h pm", "10am", "10pm", "10:00 am", "10:00 pm",
+            "10:00am", "10:00pm", "10:00a.m", "10:00p.m", "10:00a.m.", "10:00p.m.", "October", "31-Dec-00", "0:01:02", "12h 01m02s am",
+            "0:01:02 on July 4, 1976", "0:01:02 on July 4, 1976", "July 4, 1976 12:01:02 am", "Mon Jan  2 04:24:27 1995",
+            "04.04.95 00:22", "Jan 1 1999 11:23:34.578", "950404 122212", "3rd of May 2001", "5th of March 2001", "1st of May 2003",
+            "0099-01-01T00:00:00", "0031-01-01T00:00:00", "20080227T21:26:01.123456789", "13NOV2017", "0003-03-04", "December.0031.30",
+            "090107", "2015 09 25", "2015-15-May", "02/03/2015", "03/02/2015", "2003/09/25", "25/09/2003", "1999/12/31 23:59:59",
+            "Tue, 31 Dec 2002 23:59:59 GMT", "Wed, 01 Jan 2003 00:00:00 +0000", "Mon, 15 Aug 2005 15:52:01 +0000 (GMT)",
+            "2003-09-25T10:49:41.5-03:00", "2003-09-25T10:49:41-03:00", "2003-09-25T10:49:41", "2003-09-25T10:49", "2003-09-25T10",
+            "2003-09-25", "20030925T104941.5-0300", "20030925T104941-0300", "20030925T104941", "20030925T1049", "20030925T10",
+            "20030925", "2003-09-25 10:49:41,502", "199709020908", "19970902090807", "09-25-2003", "25-09-2003", "10-09-2003",
+            "10-09-03", "2003.09.25", "09.25.2003", "25.09.2003", "10.09.2003", "10.09.03", "2003/09/25", "09/25/2003", "25/09/2003",
+            "10/09/2003", "10/09/03", "2003 09 25", "09 25 2003", "25 09 2003", "10 09 2003", "10 09 03", "25 09 03", "03 25 Sep",
+            "25 03 Sep", "  July   4 ,  1976   12:01:02   am  ", "Wed, July 10, '96", "1996.07.10 AD at 15:08:56 PDT", "1996.July.10 AD 12:08 PM",
+            "Tuesday, April 12, 1952 AD 3:30:42pm PST", "November 5, 1994, 8:15:30 am EST", "1994-11-05T08:15:30-05:00",
+            "1994-11-05T08:15:30Z", "July 4, 1976", "7 4 1976", "4 jul 1976", "4 Jul 1976", "7-4-76", "19760704", "0:01:02 on July 4, 1976",
+            "July 4, 1976 12:01:02 am", "Mon Jan  2 04:24:27 1995", "04.04.95 00:22", "Jan 1 1999 11:23:34.578", "950404 122212",
+            "3rd of May 2001", "5th of March 2001", "1st of May 2003", "01h02m03", "01h02", "01h02s", "01m02", "01m02h", "2004 10 Apr 11h30m",
+            "Apr 2003", "Feb 29 2003", "Feb 29 2004", "31 Feb", "Feb 30", "2026-02-30", "2026-13-01", "2026-00-01", "13/13/2026",
+            "10:61", "25:00", "24:00", "10:00:61", "", " ", "abc", "not a date", "2026 abc", "abc 2026", "1234567", "123", "12345",
+            "123456789", "12345678901", "1234567890123", "123456789012345", "99999999999999999999", "2020 99999999999999999999 h",
+            "12:99999999999", "5 99999999999999999999999999999.5 h", "1111111111111111111111111111111.5 m", "10:00 +9999",
+            "10:00 +25:00", "10:00 +0099", "10:00 -0530", "10:00 +05:30 (IST)", "10:00 +0530 (IST)", "10:00 UTC+3", "10:00 UTC-3", "10:00 GMT+3",
+            "10:00 z", "10:00 Z", "10:00 UTC", "10:00 GMT", "10:00 CEST", "10:00 CET", "10:00 EST", "10:00 BRST", "10:00 XYZ", "10:00 PDT",
+            "10:00 ABCDE", "10:00 ABCDEF", "10:00 abc", "10:00 Utc", "nan", "inf", "Infinity", "NaN 10:00", "١٢:٣٠", "²", "10:00 ²",
+            "12.5", "12,5", "12,50", "1,234,567", "12.5.2026", "2026.", "Monday", "Mon", "monday 10:00", "Mon 2026-10-16", "Sunday Oct 2026",
+            "Oct 2026 Sunday", "Jan-01", "Jan-01-2026", "Jan/01/2026", "01-Jan", "01-Jan-2026", "01/Jan/2026", "of Jan", "Jan of 2026",
+            "Jan of 26", "Jan of x", "the 3rd", "10 am pm", "13 pm", "0 am", "12 am", "12 pm", "am", "pm 10", "10 a", "10 p", "noon",
+            "midnight", "today", "tomorrow", "2026-10-16T10:20:30.1234567", "2026-10-16T10:20:30.", "10:20:30.12.34", "10:20.5", "10.5h",
+            "10.25 h", "10.5 m", "1.5.2026", "T10:00", "2026T", "2026-W42", "2026-W42-5", "2026-289", "\x00 2026 \x00", "2026\t10\t16",
+            "2026\n10\n16", "2026 10 16", "2026　10　16", "Ⅻ", "１２:３０", "2026-10-16 10:00 Europe/Paris",
+            "10:00:00.000000001", "10:00:00.9999999", "0:00", "00:00:00", "23:59:59.999999", "12:00:00 am", "12:00:00 pm"]
+    TOKENS = ["2026", "10", "16", "25", "3", "99", "0", "32", "13", "1999", "05", "Oct", "October", "Sept", "MAY", "Mon", "friday", "12:30",
+              "12:30:45.123456", "+0200", "-05:00", "+3", "Z", "UTC", "EST", "BRST", "PM", "am", "a.m.", "of", "the", "at", "on", "and",
+              "T", "-", "/", ".", " ", ",", ";", "'", "1st", "3rd", "th", "h", "m", "s", "min", "hours", "1.5", "12,5", "(", ")", "x", "ad",
+              "٣", "²", "nan", " "]
+    rnd = random.Random(16)
+    GEN = []
+    for _ in range(3000):
+        n = rnd.randint(1, 7)
+        sep = rnd.choice(["", " ", " ", "-", "/", ":", "."])
+        GEN.append(sep.join(rnd.choice(TOKENS) for _ in range(n)))
+    KWS = [{}, {"dayfirst": True}, {"yearfirst": True}, {"dayfirst": True, "yearfirst": True}, {"fuzzy": True},
+           {"fuzzy_with_tokens": True}, {"ignoretz": True}, {"tzdict": True}, {"tzfn": True}, {"aware_default": True}]
+    steps = []
+    for kw in KWS:
+        cases = [{"s": s, "kw": kw} for s in HAND]
+        for i in range(0, len(cases), 100):
+            steps.append(("POST", "/duparsex/parse", {"cases": cases[i:i + 100]}))
+    for kw in KWS[:6] + [{"tzdict": True}]:
+        cases = [{"s": s, "kw": kw} for s in GEN]
+        for i in range(0, len(cases), 150):
+            steps.append(("POST", "/duparsex/parse", {"cases": cases[i:i + 150]}))
+    steps.append(("POST", "/duparsex/parse", {"cases": [{"s": s, "bytes": True} for s in HAND[:40]]}))
+    ISO = ["2026", "2026-10", "202610", "2026-10-16", "20261016", "2026-W42", "2026W42", "2026-W42-5", "2026W425", "2026-W53", "2026-W54",
+           "2026-W00", "2026-W42-8", "2026-289", "2026289", "2024-366", "2026-366", "2026-000", "2026-10-16T10", "2026-10-16T10:20",
+           "2026-10-16T1020", "2026-10-16T10:20:30", "2026-10-16T102030", "2026-10-16T10:20:30.123", "2026-10-16T10:20:30,123456789",
+           "2026-10-16T10:20:30.", "2026-10-16T10:20:30Z", "2026-10-16T10:20:30z", "2026-10-16T10:20:30+02", "2026-10-16T10:20:30+0200",
+           "2026-10-16T10:20:30+02:00", "2026-10-16T10:20:30-00:00", "2026-10-16T10:20:30+00", "2026-10-16T10:20:30+2", "2026-10-16T10:20:30+24:00",
+           "2026-10-16T10:20:30+02:60", "2026-10-16T24:00", "2026-10-16T24:00:00", "2026-10-16T24:00:01", "9999-12-31T24:00", "2026-10-16 10:20",
+           "2026-10-16X10:20", "2026-10-16T10:20:3", "2026-10-16T10:2030", "2026-10-1610:20", "2026-1016", "202610-16", "2026-13-01",
+           "2026-02-30", "abcd", "", "20", "2026-", "2026-1", "+2026", " 2026", "2026_10", "20 26", "2026-10-16T", "Z", "z", "+02", "-0530",
+           "+05:30", "-00:00", "+00:00", "+0", "+2400", "02", "10:20", "1020", "10:20:30.5", "24:00", "24:00:00.000001", "2026-10-16T10:20:30.123456789012",
+           "2026-W01-1", "2027-W01-1", "0001-W01-1", "9999-W52-7", "0001-001", "café", "2026-10-16Té"]
+    steps.append(("POST", "/duparsex/iso", {"strs": ISO}))
+    steps.append(("POST", "/duparsex/iso", {"strs": ISO, "sep": " "}))
+    steps.append(("POST", "/duparsex/iso", {"strs": ISO, "sep": "T"}))
+    for w in ["int", "none", "badkw", "badkw_far", "tzinfos_bad", "iso_sep", "iso_sep_digit", "iso_int", "nodefault", "weekday_today",
+              "kwargs", "err_attrs", "err_cause"]:
+        steps.append(("GET", f"/duparsex/errors/{w}", None))
+    return steps
+
+
+STEPS += _duparse_cases()
+
+
+def _ctools_cases() -> list:
+    """fixtures/libapp/ctoolsx.py: scripts of operations on each cache kind, the decorated functions and methods."""
+    import random
+    steps = []
+    OPS = ["set", "get", "getm", "get1", "del", "in", "pop", "popd", "setdefault", "popitem", "len", "bool", "update", "update_kw", "eq", "clear"]
+    KEYS = ["a", "b", "c", "d", 1, 2, 2.0, True, None, "e"]
+    VALS = ["x", "yy", "zzz", "", [1, 2], {"k": 1}, 7]
+    rnd = random.Random(7)
+    for kind in ("Cache", "FIFOCache", "LRUCache", "TTLCache", "TTLWall"):
+        for sized in (False, True):
+            for maxsize in (0, 1, 3, 5):
+                for ttl in ((3600, 0, -1) if kind.startswith("TTL") else (3600,)):
+                    if kind == "TTLWall" and sized:
+                        continue
+                    for _seed in range(3):
+                        ops = []
+                        for _ in range(40):
+                            op = rnd.choice(OPS[:-1] if rnd.random() > 0.03 else OPS)
+                            ops.append([op, rnd.choice(KEYS), rnd.choice(VALS)])
+                        if kind.startswith("TTL"):
+                            ops.append(["expire", None, None])
+                        steps.append(("POST", "/ctoolsx/script", {"kind": kind, "maxsize": maxsize, "ttl": ttl, "sized": sized, "ops": ops}))
+    for w in ["negative", "too_large", "kw", "missing", "popitem_empty", "popitem_empty_lru", "popitem_empty_ttl", "float_max", "unhashable", "zero"]:
+        steps.append(("GET", f"/ctoolsx/errors/{w}", None))
+    CALLS = [["square", [2], {}], ["square", [2], {}], ["square", [2], {"scale": 2}], ["square", [3], {}], ["square", [4], {}], ["square", [5], {}],
+             ["square", [2], {}], ["lru", [1], {}], ["lru", [2], {}], ["lru", [1], {}], ["lru", [3], {}], ["lru", [2], {}], ["lru", "clear", {}],
+             ["lru", [1], {}], ["custom", [1], {"b": 5}], ["custom", [1], {"b": 7}], ["locked", [1], {}], ["locked", [1], {}], ["uncached", [1], {}],
+             ["uncached", [1], {}], ["expiring", [1], {}], ["expiring", [1], {}], ["sized", ["ab"], {}], ["sized", ["ab"], {}], ["sized", ["abcd"], {}],
+             ["sized", ["abcd"], {}], ["sized", ["x"], {}], ["func_lru", [1], {}], ["func_lru", [1], {}], ["func_lru", [2], {}], ["func_lru", [3], {}],
+             ["func_lru", [1], {}], ["func_lru_bare", [1], {}], ["func_lru_bare", [1], {}], ["func_ttl", [1], {}], ["func_ttl", [1], {}],
+             ["func_fifo", [2], {}], ["func_fifo", [2], {}], ["func_fifo", "clear", {}], ["func_fifo", [2], {}], ["square", [[1]], {}],
+             ["square", [], {}], ["lru", [{"a": 1}], {}]]
+    steps.append(("POST", "/ctoolsx/decorated", {"calls": CALLS}))
+    steps.append(("POST", "/ctoolsx/decorated", {"calls": CALLS}))
+    MCALLS = [["a", "find", [1]], ["a", "find", [1]], ["b", "find", [1]], ["a", "find", [2]], ["a", "find", [3]], ["a", "find", [1]],
+              ["a", "label", [1]], ["b", "label", [1]], ["a", "label", [1]], ["a", "locked", [5]], ["a", "locked", [5]], ["a", "find", [[1]]],
+              ["a", "label", [[1]]], ["a", "find", []], ["b", "locked", [1]]]
+    steps += [("POST", "/ctoolsx/methods", {"calls": MCALLS, "size": n}) for n in (0, 1, 2, 5)]
+    return steps
+
+
+STEPS += _ctools_cases()

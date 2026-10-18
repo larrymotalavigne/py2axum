@@ -42,7 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, mounted, sqlmore, wsock
+from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, mounted, reqbody, sqlmore, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -70,6 +70,7 @@ app.include_router(ddl.router)
 app.include_router(inherit.router)
 app.include_router(enumcols.router)
 app.include_router(composite.router)
+app.include_router(reqbody.router)
 app.include_router(expire.router)
 app.include_router(aio.router)
 app.include_router(life.router)

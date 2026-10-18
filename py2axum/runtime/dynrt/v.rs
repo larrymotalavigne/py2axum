@@ -97,6 +97,11 @@ pub enum Native {
     Deque(Arc<super::deque::Deque>),
     /// `string.Template(text)`
     Template(String),
+    /// `dateutil.parser.isoparser(sep)`
+    IsoParser(Option<u8>),
+    /// a cachetools cache (`TTLCache(...)`...) and a `cached(...)` decorator not applied yet (see `ctools`)
+    CtCache(Arc<super::ctools::CtCache>),
+    CtDecorator(Arc<super::ctools::Cfg>),
     /// `ipaddress.ip_address(...)`
     IpAddr(std::net::IpAddr),
     /// `ipaddress.ip_network(...)`: network address, prefix length
@@ -357,8 +362,7 @@ impl V {
             V::Date(_) => "date",
             V::Time(_) => "time",
             V::Delta(_) => "timedelta",
-            V::Tz(super::dt::Tz::Zone(_)) => "ZoneInfo",
-            V::Tz(_) => "timezone",
+            V::Tz(t) => t.type_name(),
             V::Class(c) => c.name,
             V::Inst(i) => i.desc.name,
             V::Obj(o) => o.desc.name,
@@ -467,6 +471,9 @@ impl V {
                 Native::ICal(c) => super::ical::type_name(c),
                 Native::YamlMark(_) => "Mark",
                 Native::Cron(_) => super::croniter::type_name(),
+                Native::IsoParser(_) => "isoparser",
+                Native::CtCache(c) => c.name,
+                Native::CtDecorator(_) => "function",
                 Native::CronGen(_) => "generator",
                 Native::Type(_) => "type",
                 Native::FieldInfo => "FieldInfo",
@@ -565,8 +572,9 @@ impl Key {
             let msg = e.message();
             if super::python() >= (3, 14) && std::ptr::eq(e.0.class, &TYPE_ERROR) && msg.starts_with("unhashable type: ") {
                 let qual = match v {
-                    V::Inst(o) => o.desc.class.qualname,
-                    _ => v.type_name(),
+                    V::Inst(o) => o.desc.class.qualname.to_string(),
+                    V::Tz(t) => super::dutz::tz_qualname(t),
+                    _ => v.type_name().to_string(),
                 };
                 Exc::type_error(format!("cannot use '{qual}' as a {role} ({msg})"))
             } else {
@@ -624,6 +632,8 @@ impl Key {
                 _ => Key::Ptr(Arc::as_ptr(n) as *const () as usize),
             },
             V::Col(m, i) => Key::Ptr((*m as *const orm::ModelDesc as usize) ^ (*i << 1)),
+            // dateutil's tzinfos set `__hash__ = None`
+            V::Tz(t) if !t.unhashable() => Key::Str(Arc::from(format!("\u{0}tz:{t:?}"))),
             other => return Err(Exc::type_error(format!("unhashable type: '{}'", other.type_name()))),
         })
     }
@@ -939,6 +949,16 @@ builtin_exc!(EXPIRED_SIGNATURE_ERROR, "ExpiredSignatureError", [JWT_ERROR]);
 builtin_exc!(JWK_ERROR, "JWKError", [JOSE_ERROR]);
 // PyJWT (jwt.exceptions)
 builtin_exc!(PYJWT_ERROR, "PyJWTError", [EXCEPTION]);
+// dateutil.parser.ParserError (dynrt/duparse.rs)
+builtin_exc!(DU_PARSER_ERROR, "ParserError", [VALUE_ERROR]);
+// calendar.IllegalMonthError (monthrange: dateutil's parser and tzstr)
+builtin_exc!(CALENDAR_ILLEGAL_MONTH, "IllegalMonthError", [VALUE_ERROR, INDEX_ERROR]);
+// pytz (dynrt/pytzrt.rs)
+builtin_exc!(PYTZ_ERROR, "Error", [EXCEPTION]);
+builtin_exc!(PYTZ_UNKNOWN_TIME_ZONE_ERROR, "UnknownTimeZoneError", [KEY_ERROR, PYTZ_ERROR]);
+builtin_exc!(PYTZ_INVALID_TIME_ERROR, "InvalidTimeError", [PYTZ_ERROR]);
+builtin_exc!(PYTZ_AMBIGUOUS_TIME_ERROR, "AmbiguousTimeError", [PYTZ_INVALID_TIME_ERROR]);
+builtin_exc!(PYTZ_NON_EXISTENT_TIME_ERROR, "NonExistentTimeError", [PYTZ_INVALID_TIME_ERROR]);
 // croniter 6.2 (dynrt/croniter.rs)
 builtin_exc!(CRONITER_ERROR, "CroniterError", [VALUE_ERROR]);
 builtin_exc!(CRONITER_BAD_TYPE_RANGE_ERROR, "CroniterBadTypeRangeError", [TYPE_ERROR]);
@@ -1179,6 +1199,22 @@ impl Exc {
         if std::ptr::eq(self.0.class, &PACKAGE_NOT_FOUND) && args.len() == 1 {
             // PackageNotFoundError.__str__
             return format!("No package metadata was found for {}", super::ops::str_(&args[0]).unwrap_or_default());
+        }
+        if let Some(m) = super::duparse::parser_error_str(self) {
+            return m;
+        }
+        if std::ptr::eq(self.0.class, &CALENDAR_ILLEGAL_MONTH) && args.len() == 1 {
+            return format!("bad month number {}; must be 1-12", super::ops::repr(&args[0]).unwrap_or_default());
+        }
+        // UnicodeDecodeError(encoding, object, start, end, reason).__str__
+        if std::ptr::eq(self.0.class, &UNICODE_DECODE_ERROR) && args.len() == 5 {
+            if let (V::Str(enc), V::Bytes(b), V::Int(st), V::Int(en), V::Str(why)) = (&args[0], &args[1], &args[2], &args[3], &args[4]) {
+                return if *en == st + 1 && (*st as usize) < b.len() {
+                    format!("'{enc}' codec can't decode byte 0x{:02x} in position {st}: {why}", b[*st as usize])
+                } else {
+                    format!("'{enc}' codec can't decode bytes in position {st}-{}: {why}", en - 1)
+                };
+            }
         }
         match args.len() {
             0 => String::new(),

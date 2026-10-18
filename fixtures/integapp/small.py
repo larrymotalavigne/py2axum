@@ -1,8 +1,11 @@
 """Constructions of the small ATOM apps (coproscan, ao-radar, fr-opendata-mcp, transcript):
 response_class= wrapping a returned value, uuid.UUID (Pydantic, parameters, Uuid columns)."""
+import os
 import uuid
 from datetime import datetime
+from email.mime.text import MIMEText
 
+import aiosmtplib
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
@@ -242,3 +245,17 @@ async def sniff(blob: Blob):
             errs.append(str(e))
     return {"image": data.startswith(MAGIC), "jpeg_end": data.endswith((b"\xff\xd9", b"\x00")),
             "empty": data.startswith(()), "plain": data.startswith(b"\x89"), "errs": errs}
+
+
+@router.post("/mail-tls")
+async def mail_tls(validate: bool = True):
+    """aiosmtplib towards tests/smtp_sink.py --tls (implicit TLS, self-signed certificate for another name than the one
+    dialled): validate_certs=False checks neither the chain nor the host name; True refuses."""
+    msg = MIMEText("hello")
+    msg["From"], msg["To"], msg["Subject"] = "a@example.com", "b@example.com", "tls"
+    port = int(os.getenv("INTEG_TLS_SMTP_PORT", "8026"))
+    try:
+        await aiosmtplib.send(msg, hostname="127.0.0.1", port=port, use_tls=True, timeout=5, validate_certs=validate)
+        return {"sent": True}
+    except aiosmtplib.SMTPException:  # the binary raises SMTPException itself, not aiosmtplib's SMTPConnectError
+        return {"sent": False}

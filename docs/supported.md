@@ -101,6 +101,48 @@ while decoding a JSON array from a unicode string`), a bound on untrusted input
   from one process to the other for strings).
 - `encoding=` accepts UTF-8, UTF-16, UTF-32 (with or without `-le`/`-be`), ASCII and Latin-1 (`TypeError` for
   another codec); a text file read by `safe_load` is decoded as UTF-8 with universal newlines.
+## pytz
+
+pytz 2026.5 is ported with its own zones ([Libraries](reference/libraries.md)); what the binary does not reproduce:
+
+- `all_timezones` and `common_timezones` are a `list`, their `_set`s a `set` (pytz's `LazyList` and `LazySet`
+  subclasses of them): the same contents and order.
+- `FixedOffset(minutes)` with a fraction of a second (`FixedOffset(0.01)`) raises a py2axum `TypeError`; pickling a
+  pytz tzinfo too.
+
+## python-dateutil
+
+The parser and `dateutil.tz` are ported from dateutil 2.9 ([Libraries](reference/libraries.md)); what the binary does
+not reproduce:
+
+- Library warnings are not printed (`UnknownTimezoneWarning` of a time zone name the parser does not understand,
+  `DeprecatedTzFormatWarning` of tzstr's old format), as for every library.
+- A UTC offset of a day or more cannot be a datetime's: dateutil builds the tzinfo and each later `utcoffset()`
+  raises `ValueError`; the binary raises that `ValueError` when the offset is made (`parse("10:00 +9999")`), and a
+  py2axum `TypeError` for `tzoffset(name, offset)` and `tzstr()`/`gettz()` of such a string (`gettz("iso3166.tab")`
+  of a file name holding digits). A `tzstr` whose DST rule has a month outside 1..12 or a negative day (dateutil
+  raises on each use) raises a py2axum `TypeError` when built. `tzoffset` names are a `str` or None.
+- `gettz` and `tzstr` keep each instance for the process's lifetime (dateutil: while referenced, eight more in an
+  LRU cache): each distinct zone file and TZ string a process reads stays in memory.
+- `tzlocal()` reads the local zone (`time.timezone`, `altzone`, `tzname`) once, as CPython's `time` module does at
+  import (a `time.tzset()` is not followed).
+- `parse()` of a stream (`StringIO`) raises a py2axum `TypeError`; `isoparser().parse_isotime()` of a time with an
+  offset too (the binary's `time` values are naive).
+- `datetime.dst()` of a `zoneinfo.ZoneInfo` value is the tz database's saving: CPython infers it from the
+  transitions, which differs during double summer times (1940s).
+
+## cachetools
+
+cachetools 7.2 is ported from its source ([Libraries](reference/libraries.md)); what the binary does not reproduce:
+
+- `keys()`, `values()` and `items()` of a cache are lists (cachetools: `MutableMapping`'s views), iterating a cache
+  takes its keys first (a cache changed during the loop is not seen), and a `hashkey` key is a `tuple` (type
+  `_HashedTuple`, with the same `repr` and hash).
+- `cachetools.func`'s caches serialize the concurrent calls of one key with a `threading.Condition` (the second
+  caller waits and reads the first one's result): in the binary both may run the function.
+- A `lock=` is not acquired: cachetools holds it around the cache's reads and writes only, which the binary does
+  without interleaving them (`cache.setdefault()` is used when one is given, as cachetools does).
+
 ## croniter
 
 croniter 6.2 is ported line by line ([Libraries](reference/libraries.md)); what the binary does not reproduce:
@@ -116,8 +158,9 @@ croniter 6.2 is ported line by line ([Libraries](reference/libraries.md)); what 
   `CroniterBadCronError` carries the formatted traceback of the `ValueError`, the binary its message only.
 - The `CroniterUnsupportedSyntaxError` message prints each nth set with its numbers first, then `'l'`; Python's
   order of a set mixing both depends on the string hash seed (`PYTHONHASHSEED`).
-- Time zones: `datetime.timezone` and `zoneinfo.ZoneInfo` (pytz and dateutil zones are not translated); the
-  zone rules are the runtime's tz database, Python's those of the system or of the `tzdata` package.
+- Time zones: `datetime.timezone` and `zoneinfo.ZoneInfo` (the zone rules are the runtime's tz database, Python's
+  those of the system or of the `tzdata` package), pytz zones (`localize`, pytz's own data) and dateutil zones (the
+  system's files, as dateutil reads them).
 - A start time that `gmtime` cannot represent raises the platform's `OSError` (`[Errno 75]` on Linux).
 - `croniter_range(_croniter=)`, `croniter.expand(from_timestamp=)` and `is_valid(encoding=)` other than UTF-8
   are refused at compile time; a start time other than a `datetime`, an `int` or a `float`, and `croniter_range`

@@ -240,7 +240,7 @@ impl ValIter {
         };
         let (mut steps, mut slots) = (Vec::new(), Vec::new());
         let loc = [V::Int(i as i64)];
-        let got = val(&item, self.td, &loc, &mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: self.strict });
+        let got = val(&item, self.td, &loc, &mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: self.strict, json: false });
         let mut errs = Vec::new();
         for st in steps {
             match st {
@@ -831,6 +831,9 @@ struct Errs<'a> {
     fields_set: Option<usize>,
     /// strict mode (`strict=True` of the model config or of a field): only the exact input types
     strict: bool,
+    /// JSON mode (`model_validate_json`, `TypeAdapter.validate_json`, a `Json[T]` field): the input parsed by
+    /// jiter, validated with pydantic-core's JSON-input rules (its own type errors and exactness)
+    json: bool,
 }
 
 impl Errs<'_> {
@@ -850,7 +853,7 @@ impl Errs<'_> {
         self.exact = self.exact.min(x);
     }
     fn sub<'b>(&'b mut self, steps: &'b mut Vec<Step>) -> Errs<'b> {
-        Errs { steps, slots: self.slots, n: 0, exact: EXACT, fields_set: None, strict: self.strict }
+        Errs { steps, slots: self.slots, n: 0, exact: EXACT, fields_set: None, strict: self.strict, json: self.json }
     }
 }
 
@@ -982,10 +985,15 @@ impl<T> Slots<T> {
 /// included. Errors are appended to `errs`; the value is returned only if there were none.
 /// Exceptions other than ValueError/AssertionError raised by a validator propagate.
 pub async fn validate(cx: &super::Cx, input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDetail>) -> R<Option<V>> {
+    validate_mode(cx, input, td, loc, false, errs).await
+}
+
+/// `validate` in python mode (false) or JSON mode (true: an input parsed from JSON)
+async fn validate_mode(cx: &super::Cx, input: &V, td: &'static TD, loc: &[V], json: bool, errs: &mut Vec<ErrDetail>) -> R<Option<V>> {
     let input = if td_has_before(td) { prepare(cx, input.clone(), td).await? } else { input.clone() };
     let pf = Pf { cx, keys: Default::default() };
     prefetch(&pf, td, &input).await?;
-    run(cx, errs, |e| val(&input, td, loc, e)).await
+    run_mode(cx, errs, json, |e| val(&input, td, loc, e)).await
 }
 
 fn td_has_before(td: &TD) -> bool {
@@ -1216,9 +1224,14 @@ fn is_from_attrs(d: &Arc<DictCell>) -> bool {
 }
 
 async fn run(cx: &super::Cx, errs: &mut Vec<ErrDetail>, check: impl FnOnce(&mut Errs) -> Option<V>) -> R<Option<V>> {
+    run_mode(cx, errs, false, check).await
+}
+
+/// `run` in python mode (false) or JSON mode (true)
+async fn run_mode(cx: &super::Cx, errs: &mut Vec<ErrDetail>, json: bool, check: impl FnOnce(&mut Errs) -> Option<V>) -> R<Option<V>> {
     let (mut steps, mut slots) = (Vec::new(), Vec::new());
     take_fatal();
-    let got = check(&mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: false });
+    let got = check(&mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: false, json });
     if let Some(x) = take_fatal() {
         return Err(x);
     }
@@ -1230,7 +1243,7 @@ async fn run(cx: &super::Cx, errs: &mut Vec<ErrDetail>, check: impl FnOnce(&mut 
 /// Type checks only (`validate_assignment`, where the transpiler refuses validators).
 pub fn validate_sync(input: &V, td: &'static TD, loc: &[V], errs: &mut Vec<ErrDetail>) -> Option<V> {
     let (mut steps, mut slots) = (Vec::new(), Vec::new());
-    let got = val(input, td, loc, &mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: false });
+    let got = val(input, td, loc, &mut Errs { steps: &mut steps, slots: &mut slots, n: 0, exact: EXACT, fields_set: None, strict: false, json: false });
     for st in steps {
         match st {
             Step::Err(d) => errs.push(d),
@@ -1480,6 +1493,132 @@ async fn settle(cx: &super::Cx, steps: Vec<Step>, slots: Vec<Option<Arc<Inst>>>,
 }
 
 fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
+    if !e.json {
+        return val_in(input, td, loc, e);
+    }
+    if let Some(out) = json_val(input, td, loc, e) {
+        return out;
+    }
+    // JSON mode: a string is an exact input for the types parsed from strings (`date | str` keeps the date),
+    // measured on pydantic 2.13
+    let parsed_from_str = matches!(input, V::Str(_))
+        && matches!(td, TD::Date | TD::DateTime | TD::Time | TD::Delta | TD::Uuid | TD::UuidV(_) | TD::Bytes(..) | TD::Decimal(_));
+    let before = e.exact;
+    let out = val_in(input, td, loc, e);
+    if parsed_from_str && out.is_some() {
+        e.exact = before;
+    }
+    out
+}
+
+/// A construct whose JSON-mode behaviour is not reproduced: refused when reached (a 500, never a wrong value)
+fn json_refuse(e: &mut Errs, what: &str) -> Option<Option<V>> {
+    FATAL.with(|f| {
+        f.borrow_mut().get_or_insert(Exc::runtime(format!("py2axum: JSON-mode validation (model_validate_json, validate_json, Json[T]) of {what} is not supported")));
+    });
+    e.n += 1;
+    Some(None)
+}
+
+/// pydantic-core's JSON-mode type errors where they differ from python mode (pydantic 2.13 and 2.14, measured
+/// input by input): arrays and objects named as JSON names them; constructs measured to differ otherwise are
+/// refused. None: validated as in python mode.
+fn json_val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<Option<V>> {
+    if e.strict {
+        return json_refuse(e, "a strict field");
+    }
+    match td {
+        TD::Strict(_, true) | TD::StrictTop(_) => json_refuse(e, "a strict field"),
+        TD::Complex => json_refuse(e, "a complex field"),
+        TD::Iter(_) => json_refuse(e, "an Iterable field"),
+        TD::Coll(_, Coll::Frozen) if !matches!(input, V::List(_)) => {
+            e.push("frozen_set_type", loc, "Input should be a valid array", input, None);
+            Some(None)
+        }
+        TD::Coll(_, Coll::Frozen) => None,
+        TD::Coll(..) => json_refuse(e, "a deque, Counter, OrderedDict or Sequence field"),
+        TD::List(_) | TD::Set(_) | TD::Tuple(_) | TD::TupleFix(_) if !matches!(input, V::List(_)) => {
+            let kind = match td {
+                TD::List(_) => "list_type",
+                TD::Set(_) => "set_type",
+                _ => "tuple_type",
+            };
+            e.push(kind, loc, "Input should be a valid array", input, None);
+            Some(None)
+        }
+        TD::Dict(_) if !matches!(input, V::Dict(_)) => {
+            e.push("dict_type", loc, "Input should be an object", input, None);
+            Some(None)
+        }
+        TD::Tagged(t) if t.func.is_some() => json_refuse(e, "a union discriminated by a function"),
+        TD::Tagged(t) if t.custom.is_none() && !matches!(input, V::Dict(_)) => {
+            e.push("dict_type", loc, "Input should be an object", input, None);
+            Some(None)
+        }
+        TD::Schema(d) => json_schema(input, d, loc, e),
+        _ => None,
+    }
+}
+
+/// a model (or dataclass) in JSON mode: an object only; None: validated as in python mode
+fn json_schema(input: &V, d: &'static SchemaDesc, loc: &[V], e: &mut Errs) -> Option<Option<V>> {
+    if d.validators.iter().any(|v| v.wrap.is_some()) {
+        return json_refuse(e, "a model with a wrap validator");
+    }
+    if d.x.root || matches!(input, V::Dict(_)) {
+        return None;
+    }
+    let kind = if d.dataclass { "dataclass_type" } else { "model_type" };
+    e.push(kind, loc, "Input should be an object", input, Some(vec![("class_name", V::str(d.name))]));
+    Some(None)
+}
+
+pub enum JsonIn {
+    /// `json_type` / `json_invalid`: (type, msg, ctx), at the location of the input
+    Invalid(&'static str, String, Option<Vec<(&'static str, V)>>),
+    /// what the runtime cannot hold (an integer beyond 64 bits)
+    Raise(Exc),
+}
+
+/// The input of a JSON-mode validation (str, bytes or bytearray) parsed as pydantic-core does: jiter decides
+/// what is valid (inf and nan allowed, invalid UTF-8 and lone surrogates refused) and how errors read.
+pub fn json_input(input: &V) -> Result<V, JsonIn> {
+    let bytes: &[u8] = match input {
+        V::Str(s) => s.as_bytes(),
+        V::Bytes(b) => b,
+        _ => return Err(JsonIn::Invalid("json_type", "JSON input should be string, bytes or bytearray".into(), None)),
+    };
+    if let Err(err) = jiter::JsonValue::parse(bytes, true) {
+        let msg = err.description(bytes);
+        return Err(JsonIn::Invalid("json_invalid", format!("Invalid JSON: {msg}"), Some(vec![("error", V::str(&msg))])));
+    }
+    // jiter accepted it, UTF-8 included: the value as the runtime's JSON reader builds it (same grammar)
+    let text = std::str::from_utf8(bytes).map_err(|_| JsonIn::Raise(Exc::runtime("py2axum: JSON accepted by jiter is not UTF-8")))?;
+    super::pyjson::loads(text).map_err(JsonIn::Raise)
+}
+
+/// `Model.model_validate_json(data)`: `data` parsed by jiter, then validated in JSON mode
+pub async fn construct_json(cx: &super::Cx, desc: &'static SchemaDesc, data: &V) -> R {
+    let input = match json_input(data) {
+        Ok(v) => v,
+        Err(JsonIn::Invalid(kind, msg, ctx)) => {
+            let d = ErrDetail { kind, loc: vec![], msg, input: data.clone(), ctx, custom: false };
+            return Err(Exc::validation_titled(&VALIDATION_ERROR, vec![d], desc.name));
+        }
+        Err(JsonIn::Raise(x)) => return Err(x),
+    };
+    let mut errs = Vec::new();
+    let input = if desc.has_before { prepare_schema(cx, input, desc).await? } else { input };
+    let pf = Pf { cx, keys: Default::default() };
+    prefetch_schema(&pf, desc, &input).await?;
+    // the model itself checked as a field of that model would be (json_val)
+    match run_mode(cx, &mut errs, true, |e| json_schema(&input, desc, &[], e).unwrap_or_else(|| schema_val(&input, desc, &[], e))).await? {
+        Some(v) => Ok(v),
+        None => Err(Exc::validation_titled(&VALIDATION_ERROR, errs, desc.name)),
+    }
+}
+
+fn val_in(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
     if let V::Native(n) = input {
         if let Native::ValErr(kind, msg, raw, exc) = &**n {
             if let Some(d) = match exc { V::Exc(x) => custom_error(x, loc, raw), _ => None } {
@@ -1979,21 +2118,23 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
             if !matches!(input, V::Delta(_)) {
                 e.floor(LAX);
             }
+            // JSON mode says "duration" and refuses a bool
+            let word = if e.json { "duration" } else { "timedelta" };
             let parsed = match input {
                 V::Delta(d) => return Some(V::Delta(*d)),
                 V::Str(s) => dt::parse_duration(s),
-                V::Bool(b) => Ok(chrono::TimeDelta::seconds(*b as i64)),
+                V::Bool(b) if !e.json => Ok(chrono::TimeDelta::seconds(*b as i64)),
                 V::Int(i) => dt::duration_from_seconds(*i as f64).and_then(|_| Ok(chrono::TimeDelta::seconds(*i))),
                 V::Float(f) => dt::duration_from_seconds(*f),
                 _ => {
-                    e.push("time_delta_type", loc, "Input should be a valid timedelta", input, None);
+                    e.push("time_delta_type", loc, format!("Input should be a valid {word}"), input, None);
                     return None;
                 }
             };
             match parsed {
                 Ok(d) => Some(V::Delta(d)),
                 Err(err) => {
-                    e.push("time_delta_parsing", loc, format!("Input should be a valid timedelta, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
+                    e.push("time_delta_parsing", loc, format!("Input should be a valid {word}, {}", err.text()), input, Some(vec![("error", V::str(err.text()))]));
                     None
                 }
             }
@@ -2140,27 +2281,18 @@ fn val(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
             })
         }
         TD::Json(inner) => {
-            let bytes: Vec<u8> = match input {
-                V::Str(s) => s.as_bytes().to_vec(),
-                V::Bytes(b) => b.to_vec(),
-                _ => {
-                    e.push("json_type", loc, "JSON input should be string, bytes or bytearray", input, None);
+            let parsed = match json_input(input) {
+                Ok(v) => v,
+                Err(JsonIn::Invalid(kind, msg, ctx)) => {
+                    e.push(kind, loc, msg, input, ctx);
                     return None;
                 }
-            };
-            if let Err(err) = jiter::JsonValue::parse(&bytes, true) {
-                let msg = err.description(&bytes);
-                e.push("json_invalid", loc, format!("Invalid JSON: {msg}"), input, Some(vec![("error", V::str(&msg))]));
-                return None;
-            }
-            // jiter accepted it: the value as the runtime's JSON reader builds it (same grammar, inf and nan included)
-            let parsed = match super::pyjson::loads(&String::from_utf8_lossy(&bytes)) {
-                Ok(v) => v,
-                Err(x) => {
+                Err(JsonIn::Raise(x)) => {
                     e.raise(x);
                     return None;
                 }
             };
+            // the inner type in the mode of the validation holding it (measured: python mode keeps "valid list")
             match inner {
                 Some(t) => val(&parsed, t, loc, e),
                 None => Some(parsed),
@@ -2763,6 +2895,8 @@ fn decimal_val(input: &V, c: &DecC, loc: &[V], e: &mut Errs) -> Option<V> {
         V::Decimal(d) => (**d).clone(),
         V::Int(i) => Dec::from_i64(*i),
         V::Float(f) if !f.is_finite() => return finite(e),
+        // JSON mode: the float as Rust writes it (`1.0` -> Decimal('1'), `1e2` -> Decimal('100'))
+        V::Float(f) if e.json => Dec::parse(&format!("{f}")).ok()?,
         V::Float(f) => Dec::parse(&ops::float_repr(*f)).ok()?,
         V::Str(s) => {
             let t = s.trim().to_ascii_lowercase();
@@ -4355,17 +4489,21 @@ pub async fn adapter_method(cx: &super::Cx, td: &'static TD, name: &str, args: V
     };
     match name {
         "validate_python" | "validate_json" => {
-            let input = if name == "validate_json" {
-                let text = match obj {
-                    V::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
-                    other => ops::str_(other)?,
-                };
-                loads(&text)?
+            let json = name == "validate_json";
+            let input = if json {
+                match json_input(obj) {
+                    Ok(v) => v,
+                    Err(JsonIn::Invalid(kind, msg, ctx)) => {
+                        let d = ErrDetail { kind, loc: vec![], msg, input: obj.clone(), ctx, custom: false };
+                        return Err(Exc::validation(&VALIDATION_ERROR, vec![d]));
+                    }
+                    Err(JsonIn::Raise(x)) => return Err(x),
+                }
             } else {
                 obj.clone()
             };
             let mut errs = Vec::new();
-            match validate(cx, &input, td, &[], &mut errs).await? {
+            match validate_mode(cx, &input, td, &[], json, &mut errs).await? {
                 Some(v) if errs.is_empty() => Ok(v),
                 _ => Err(Exc::validation(&VALIDATION_ERROR, errs)),
             }

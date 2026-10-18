@@ -5,6 +5,76 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-10-18
+
+Patch release: an ammonia security update, fixes for differences seen in production (request bodies validated from
+JSON bytes, SMTP over TLS with `validate_certs=False`, `has()`/`any()` after a join, datetimes and `strftime`), and
+pytz, python-dateutil and cachetools translated natively.
+
+### Security
+
+- `ammonia` 4.2.4 in the shipped lock file and as the runtime's minimum (was 4.2.3): RUSTSEC-2026-0373,
+  CSS `url()` matched case-sensitively when sanitizing (`nh3.clean`).
+
+### Added
+
+- pytz 2026.5 native (`dynrt/pytzrt.rs`, pytz's own zones dumped by tools/gen_pytz.py): `timezone()`, `utc`,
+  `FixedOffset()`, the zone lists, `localize`/`normalize`/`fromutc`/`utcoffset`/`dst`/`tzname` with pytz's instances
+  (`is` holds), croniter over pytz zones (its `localize` branch). fixtures/libapp/pytzx.py: every zone over its
+  transitions.
+- python-dateutil 2.9: `dateutil.parser.parse()` with its options, `ParserError`, `isoparse()`/`isoparser`
+  (`dynrt/duparse.rs`), and `dateutil.tz` (`dynrt/dutz.rs`): `tzutc`, `tzoffset`, `tzlocal`, `gettz` (system zone
+  files as dateutil reads them, dateutil's tarball, `tzstr`), `tzstr`, `enfold`, `datetime_exists`,
+  `datetime_ambiguous`, `resolve_imaginary`. fixtures/libapp/duparsex.py, dutzx.py (3,000 generated strings for the
+  parser). The python-dateutil range is checked when its parser or tz is imported; the binary reads `TZ` (`gettz()`).
+- cachetools 7.2 (`dynrt/ctools.rs`): `Cache`, `FIFOCache`, `LRUCache`, `TTLCache`, `@cached`, `@cachedmethod`,
+  `cachetools.func.lru_cache`/`fifo_cache`/`ttl_cache`, `keys.hashkey`/`methodkey`. fixtures/libapp/ctoolsx.py.
+- Error codes P2A0210 (cachetools decorator not supported) and P2A0119 (strftime directive not supported).
+
+### Fixed
+
+- `Model.model_validate_json(await request.body())` always failed: the bytes went through `str()` (`"b'{...}'"`),
+  so the JSON was refused at its first character (a route swallowing the error silently dropped every request).
+  `model_validate_json` and `TypeAdapter.validate_json` now take str or bytes parsed by jiter (`json_invalid` and
+  `json_type` validation errors, as pydantic) and validate in pydantic's JSON mode: its own type errors (`Input
+  should be a valid array`, `Input should be an object`, `valid duration`), a JSON string as an exact input for
+  date, datetime, time, timedelta, UUID, bytes and Decimal in a smart union, Decimal from a JSON float as pydantic
+  writes it (`1.0` -> `Decimal('1')`). Strict fields, complex, Iterable, deque/Counter/OrderedDict/Sequence, unions
+  discriminated by a function and models with wrap validators are refused in JSON mode when reached (never a wrong
+  value). fixtures/dynapp/reqbody.py.
+- `await request.json()` decodes the body as `json.loads(bytes)` does (UTF-8 BOM, UTF-16/32, `UnicodeDecodeError`):
+  invalid UTF-8 was replaced by U+FFFD.
+- `await request.form()` and `request.stream()` are refused at generation (file:line): they raised AttributeError
+  at run time.
+- `aiosmtplib.send(validate_certs=False)` now accepts a certificate issued for another host name, as aiosmtplib does
+  (it checks neither the chain nor the name); the binary skipped the chain only, so a relay dialled by an internal name
+  (e.g. `internal-mailserver` against a certificate for `mail.example.fr`) failed with "certificate not valid for name".
+  `validate_certs=True` still refuses. Covered by `/small/mail-tls` (integapp) against `tests/smtp_sink.py --tls`.
+- `Model.rel.has()` / `.any()` in a statement that joins the relationship's target
+  (`select(A).join(A.b).where(A.b.has(...))`): the EXISTS kept its target in its FROM list like SQLAlchemy's
+  `correlate_except(target)`; since 0.7.0 it auto-correlated it away and raised InvalidRequestError (500, Python 200).
+  `correlate_except()` on `select()`, `exists()` and `scalar_subquery()`, and `correlate()` on `exists()`, are native.
+- Datetimes: two values under the same tzinfo subtract and compare by their wall times (CPython), and between zones
+  a value whose offset depends on its fold equals nothing (PEP 495); `astimezone()` of the same tzinfo returns the
+  value; `dt.tzname()` and `dt.dst()`; `%Z` writes the zone's abbreviation (it wrote a ZoneInfo's key);
+  `datetime(..., fold=)`; 3.14's `fold must be either 0 or 1, not N`; `timezone`/`ZoneInfo` values are hashable,
+  `is` holds between tzinfos; `isinstance(x, timezone)`, `isinstance(x, tzinfo)`.
+- A keyword argument a function does not take names the closest parameter on Python 3.13+ (`Did you mean 'dt'?`).
+- `UnicodeDecodeError(encoding, object, start, end, reason)`'s `str()`; `<class 'decimal.DivisionImpossible'>` and
+  the other library exception classes' `repr` with their module; a library named tuple's `repr`
+  (`CacheInfo(hits=0, ...)`).
+- A decorator named `lru_cache` or `cache` from another library than functools (cachetools.func) was compiled as
+  functools' own.
+- `strftime("%Y")` of a year below 1000 on Linux before Python 3.14 writes it unpadded (`1`), as glibc does through
+  CPython; macOS and 3.14+ pad it (`0001`). Likewise `%G`, `%C` and `%F`; `%c` keeps glibc's unpadded year on every
+  version.
+- `strftime` copied the directives it did not know into the output (`%c`, `%e`, `%u`, `%V`, `%:z`...): every
+  directive whose output is the same on glibc and macOS is rendered as CPython does, and `%P` as each C library does;
+  flags (`%-d`), widths, `%E`/`%O`, `%s` (the local time zone) and unknown letters are refused at generation for a
+  literal format (P2A0119) and raise ValueError for a computed one.
+- `dateutil.parser.parse()` of a field beyond a C int raises 3.13's `Python int too large to convert to C int`
+  (`datetime.replace` through Argument Clinic since 3.13.0; it was written for 3.14 only).
+
 ## [0.9.0] — 2026-10-16
 
 The runtime becomes a library crate of its own, compiled once and shared by every generated crate (link-time

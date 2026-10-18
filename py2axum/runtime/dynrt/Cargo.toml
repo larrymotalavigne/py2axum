@@ -58,5 +58,5 @@ sentry = { version = "0.46", default-features = false, features = ["reqwest", "r
 unicode-normalization = "0.1"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "aio"] }
 lapin = "4"
-ammonia = "4.1"
+ammonia = "4.2.4"
 zmij = "1"

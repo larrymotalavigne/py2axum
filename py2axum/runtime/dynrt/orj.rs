@@ -707,8 +707,7 @@ fn tp_name(v: &V) -> String {
         V::Date(_) => "datetime.date".into(),
         V::Time(_) => "datetime.time".into(),
         V::Delta(_) => "datetime.timedelta".into(),
-        V::Tz(super::dt::Tz::Zone(_)) => "zoneinfo.ZoneInfo".into(),
-        V::Tz(_) => "datetime.timezone".into(),
+        V::Tz(t) => super::methods::tz_cpython_type(t).into(),
         V::Exc(e) => e.0.class.name.into(),
         V::Native(n) => match &**n {
             Native::Deque(_) => "collections.deque".into(),

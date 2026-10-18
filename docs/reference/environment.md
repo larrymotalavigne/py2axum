@@ -27,6 +27,7 @@ These variables and their defaults are a stable interface ([Versioning and depre
 | `PY2AXUM_STREAM_CHUNK` | `65536` | block size (bytes) of [large list responses](../advanced/streaming.md) streamed from the session |
 | `PY2AXUM_STREAM_MIN_ROWS` | `1000` | a literal `LIMIT` at or below it keeps a list response buffered ([Large list responses](../advanced/streaming.md)) |
 | `SENTRY_DSN`, `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE` | | read as the Python SDK reads them ([Sentry](../advanced/sentry.md)) |
+| `TZ` | | the local time zone, as dateutil's `tz.gettz()` (no name) reads it ([Libraries](libraries.md)) |
 | `PROMETHEUS_MULTIPROC_DIR` | | `prometheus_client`'s multiprocess mode, with the same files as CPython ([Prometheus metrics](../advanced/metrics.md#multiprocess-mode)) |
 | `PROMETHEUS_DISABLE_CREATED_SERIES` | | as in `prometheus_client` ([Prometheus metrics](../advanced/metrics.md)) |
 

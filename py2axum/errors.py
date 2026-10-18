@@ -479,6 +479,13 @@ CLASSES: list[ErrorClass] = [
       "Starlette, a synchronous consumer (`list()`, `for`, `next()`, a comprehension) cannot drive it lazily.",
       "Build the list in the function and return it, or write an `async def` generator iterated with `async for`.",
       "reference/python.md", "générateur synchrone", "synchronous generator"),
+    E("P2A0119", "strftime directive not supported",
+      r"strftime directive (%\S+) in",
+      "CPython hands most strftime directives to the C library: flags (`%-d`), widths, `%E`/`%O` modifiers and letters "
+      "the C library does not know come out differently on glibc and macOS, and `%s` reads the local time zone. The "
+      "runtime renders the directives whose output is the same on both (see Python semantics).",
+      "Use the supported directives, or format the fields yourself (`f\"{d.day}\"`, `str(int(d.timestamp()))`).",
+      "reference/python.md", "directive strftime \\1", "strftime directive \\1"),
     E("P2A0107", "Loop with else", r"with/else|for/else|while/else",
       "`else` clauses of loops are not compiled.",
       "Use a flag variable or a helper function that returns.",
@@ -511,10 +518,19 @@ CLASSES: list[ErrorClass] = [
 
     # ------------------------------------------------------------------ catch-alls by keyword (last)
     E("P2A0209", "Option not supported", (r"\w\((\w+)=(\.\.\.)?\) is not supported", r"option \w+= is not supported",
-                                          r"unsupported option (\w+)= in", r"options? (are|is) not supported"),
+                                          r"unsupported option (\w+)= in", r"options? (are|is) not supported",
+                                          r"a (parserinfo) is not supported"),
       "The function or class is supported, but not with this option: its effect is not reproduced.",
       "Drop the option, or use one of the supported options listed in the message. " + PY_SIDE,
       "supported.md", "option \\1=", "option \\1="),
+    E("P2A0210", "cachetools decorator not supported",
+      (r"@cachedmethod", r"on an async function is not supported \(cachetools"),
+      "cachetools' `cached` and `cachedmethod` are compiled on synchronous functions and methods of the project: an "
+      "async function would cache its coroutine object (awaited once only), and a cached method's own attributes "
+      "(`cache_clear()`, `cache_info()`) are not reproduced.",
+      "Decorate a synchronous function or method, call a @cachedmethod through its instance, and clear its cache "
+      "through the cache object (`self.cache.clear()`). " + PY_SIDE,
+      "reference/libraries.md", "décorateur cachetools", "cachetools decorator"),
     E("P2A0999", "Not supported", r"",
       "The construct is outside the supported subset.",
       "Rewrite it with a supported construct (see the supported subset). " + PY_SIDE,

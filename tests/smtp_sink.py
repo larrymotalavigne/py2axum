@@ -1,13 +1,19 @@
 """A local SMTP sink: accepts every message (no TLS, no AUTH) and appends its envelope to a log file, so a
 conformance pass can send e-mail without anything leaving the machine; with a mail directory, each message is
 also kept whole (`<dir>/<n>.eml`), for a scenario that follows a link sent by e-mail (`last_mail`).
-Usage: python tests/smtp_sink.py <port> [log file] [mail directory]"""
+Usage: python tests/smtp_sink.py <port> [log file] [mail directory] [--tls]
+
+--tls: implicit TLS (port 465 style) with a throw-away self-signed certificate for a name that is not the one dialled
+(`mail.other.invalid`): a sender that checks the chain or the host name must refuse it (aiosmtplib `validate_certs`).
+"""
 import email
 import email.policy
 import itertools
 import os
 import re
 import socketserver
+import ssl
+import tempfile
 import sys
 import threading
 import time
@@ -56,8 +62,10 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-LOG = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
-MAILDIR = sys.argv[3] if len(sys.argv) > 3 else None
+ARGS = [a for a in sys.argv[1:] if a != "--tls"]
+TLS = "--tls" in sys.argv
+LOG = ARGS[1] if len(ARGS) > 1 and ARGS[1] != "-" else None
+MAILDIR = ARGS[2] if len(ARGS) > 2 else None
 LOCK, COUNTER = threading.Lock(), itertools.count()
 
 
@@ -87,5 +95,51 @@ def last_mail(maildir: str, to: str, pattern: str, nth: int, timeout: float = 10
     return m.group(1) if m.groups() else m.group(0)
 
 
+def self_signed_context() -> ssl.SSLContext:
+    """A server context with a self-signed certificate for `mail.other.invalid` (valid for a day)."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mail.other.invalid")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=5))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("mail.other.invalid")]), critical=False)
+            .sign(key, hashes.SHA256()))
+    with tempfile.TemporaryDirectory() as d:
+        pem, keyf = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+        with open(pem, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(keyf, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(pem, keyf)
+    return ctx
+
+
+class TlsServer(Server):
+    def get_request(self):
+        sock, addr = super().get_request()
+        sock.settimeout(10)
+        try:
+            return self.context.wrap_socket(sock, server_side=True), addr
+        except OSError:  # a sender that refuses the certificate hangs up during the handshake
+            sock.close()
+            raise
+
+
 if __name__ == "__main__":
-    Server(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+    if TLS:
+        srv = TlsServer(("127.0.0.1", int(ARGS[0])), Handler, bind_and_activate=False)
+        srv.allow_reuse_address = True
+        srv.context = self_signed_context()
+        srv.server_bind()
+        srv.server_activate()
+        srv.serve_forever()
+    Server(("127.0.0.1", int(ARGS[0])), Handler).serve_forever()

@@ -822,13 +822,20 @@ fn utcoffset(tz: &Tz, w: &Ndt, fold: u8) -> i32 {
                 z.offset_from_utc_datetime(&probe).fix().local_minus_utc()
             }
         },
+        // pytz / dateutil tzinfos: their own utcoffset()
+        _ => tz.offset_for_wall(w, fold),
     }
 }
 
 fn exists(tz: &Tz, w: &Ndt) -> bool {
     match tz {
         Tz::Zone(z) => !matches!(z.offset_from_local_datetime(w), chrono::LocalResult::None),
-        _ => true,
+        Tz::Utc | Tz::Fixed(_) => true,
+        // the round trip through UTC gives the wall time back (dateutil's datetime_exists)
+        _ => {
+            let off = tz.offset_for_wall(w, 0) as i64;
+            super::dt::from_utc_checked(*w - Duration::seconds(off), *tz).map(|d| d.wall == *w).unwrap_or(true)
+        }
     }
 }
 
@@ -858,8 +865,8 @@ fn from_utc(utc: Ndt, tz: Tz) -> R<DateTime> {
     match tz {
         Tz::Utc => Ok(DateTime { wall: utc, tz: Some(tz), fold: 0 }),
         Tz::Fixed(s) => Ok(DateTime { wall: add_us(utc, s as i64 * 1_000_000)?, tz: Some(tz), fold: 0 }),
-        Tz::Zone(_) => {
-            let d = DateTime::from_utc(utc, tz);
+        _ => {
+            let d = super::dt::from_utc_checked(utc, tz)?;
             chk(d.wall)?;
             Ok(d)
         }
@@ -1269,7 +1276,8 @@ impl St {
                 (aware, ex) = add_tzinfo(un, now, tz, is_prev)?;
             }
         }
-        let delta = utcoffset(&tz, &aware.wall, aware.fold) - utcoffset(&tz, &now.wall, now.fold);
+        // `_timezone_delta(now, aware_time)`: each value's own tzinfo (a pytz localization has its own)
+        let delta = utcoffset(&aware.tz.unwrap_or(tz), &aware.wall, aware.fold) - utcoffset(&tz, &now.wall, now.fold);
         if delta == 0 {
             return Ok(aware);
         }
@@ -1416,6 +1424,40 @@ fn is_successor(date: &DateTime, prev: &DateTime, is_prev: bool) -> bool {
 
 /// `_add_tzinfo` (zoneinfo / timezone tzinfos: PEP 495 folds)
 fn add_tzinfo(date: Ndt, prev: &DateTime, tz: Tz, is_prev: bool) -> R<(DateTime, bool)> {
+    // a pytz tzinfo: `localize(date, is_dst=None)`, a minute later while it does not exist, the successor of the two
+    // localizations of an ambiguous time
+    if matches!(tz, Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_)) {
+        let pz = super::pytzrt::localize_naive;
+        return match pz(&tz, date, &V::None) {
+            Ok(r) => Ok((r, true)),
+            Err(e) if e.isinstance(&PYTZ_NON_EXISTENT_TIME_ERROR) => {
+                let mut d = date;
+                loop {
+                    d = add_us(d, 60_000_000)?;
+                    match pz(&tz, d, &V::None) {
+                        Ok(r) => return Ok((r, false)),
+                        Err(e) if e.isinstance(&PYTZ_NON_EXISTENT_TIME_ERROR) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Err(e) if e.isinstance(&PYTZ_AMBIGUOUS_TIME_ERROR) => {
+                let closer = pz(&tz, date, &V::Bool(!is_prev))?;
+                let farther = pz(&tz, date, &V::Bool(is_prev))?;
+                if (utc_us(&closer) > utc_us(&farther)) != is_prev {
+                    return Err(assertion());
+                }
+                if is_successor(&closer, prev, is_prev) {
+                    Ok((closer, true))
+                } else if is_successor(&farther, prev, is_prev) {
+                    Ok((farther, true))
+                } else {
+                    Err(assertion())
+                }
+            }
+            Err(e) => Err(e),
+        };
+    }
     let mut result = DateTime { wall: date, tz: Some(tz), fold: is_prev as u8 };
     if !exists(&tz, &result.wall) {
         while !exists(&tz, &result.wall) {

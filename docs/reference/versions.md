@@ -27,6 +27,9 @@ conformance suites run on. CI runs the test suite and the full conformance of th
 | croniter | 6.2.4 | 6.2.4 | `>=6.2.4,<6.3` |
 | itsdangerous | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
 | dnspython | 2.8.0 | 2.8.0 | `>=2.8.0,<2.9` |
+| pytz | 2026.5 | 2026.5 | `>=2026.5,<2026.6` |
+| python-dateutil | 2.9.0 | 2.9.0.post0 | `>=2.9.0,<2.10` |
+| cachetools | 7.2.2 | 7.2.2 | `>=7.2.2,<7.3` |
 | Python | 3.12 | 3.15 | `>=3.12,<3.16` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;

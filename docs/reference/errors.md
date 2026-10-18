@@ -33,6 +33,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0116](#p2a0116) | Decorator |
 | [P2A0117](#p2a0117) | Python 3.14 or 3.15 construct not supported |
 | [P2A0118](#p2a0118) | Synchronous generator consumed synchronously |
+| [P2A0119](#p2a0119) | strftime directive not supported |
 | [P2A0201](#p2a0201) | Library call not supported |
 | [P2A0202](#p2a0202) | Library value not supported |
 | [P2A0203](#p2a0203) | Method not implemented by the runtime |
@@ -42,6 +43,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0207](#p2a0207) | MCP server construct not supported |
 | [P2A0208](#p2a0208) | Logging construct not supported |
 | [P2A0209](#p2a0209) | Option not supported |
+| [P2A0210](#p2a0210) | cachetools decorator not supported |
 | [P2A0301](#p2a0301) | Application method or decorator |
 | [P2A0302](#p2a0302) | Middleware not supported |
 | [P2A0303](#p2a0303) | Lifespan or startup event |
@@ -268,6 +270,16 @@ The runtime runs a generator function as an async generator: a streamed response
 
 See [Python semantics](../reference/python.md).
 
+### P2A0119
+
+**strftime directive not supported**
+
+CPython hands most strftime directives to the C library: flags (`%-d`), widths, `%E`/`%O` modifiers and letters the C library does not know come out differently on glibc and macOS, and `%s` reads the local time zone. The runtime renders the directives whose output is the same on both (see Python semantics).
+
+**What to do:** Use the supported directives, or format the fields yourself (`f"{d.day}"`, `str(int(d.timestamp()))`).
+
+See [Python semantics](../reference/python.md).
+
 ## Libraries
 
 ### P2A0201
@@ -359,6 +371,16 @@ The function or class is supported, but not with this option: its effect is not 
 **What to do:** Drop the option, or use one of the supported options listed in the message. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
 
 See [Supported subset](../supported.md).
+
+### P2A0210
+
+**cachetools decorator not supported**
+
+cachetools' `cached` and `cachedmethod` are compiled on synchronous functions and methods of the project: an async function would cache its coroutine object (awaited once only), and a cached method's own attributes (`cache_clear()`, `cache_info()`) are not reproduced.
+
+**What to do:** Decorate a synchronous function or method, call a @cachedmethod through its instance, and clear its cache through the cache object (`self.cache.clear()`). If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+
+See [Libraries](../reference/libraries.md).
 
 ## FastAPI and Starlette
 

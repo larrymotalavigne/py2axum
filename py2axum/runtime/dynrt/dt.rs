@@ -5,6 +5,9 @@
 //! session TimeZone (psycopg returns them in it), values built in Python keep their own tzinfo:
 //! this is what makes `+02:00` and `Z` come out exactly where FastAPI prints them.
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike};
+use chrono_tz::OffsetName;
+
+use super::v::{Exc, R, OVERFLOW_ERROR};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tz {
@@ -14,6 +17,21 @@ pub enum Tz {
     Fixed(i32),
     /// zoneinfo.ZoneInfo
     Zone(chrono_tz::Tz),
+    /// `pytz.utc` (dynrt/pytzrt.rs)
+    PyUtc,
+    /// a pytz zone (its index in pytzrt's table) with one of its transition infos: info 0 is the zone
+    /// `pytz.timezone()` returns, the others its localized instances
+    Py(u16, u16),
+    /// `pytz.FixedOffset(minutes)`, in seconds
+    PyFixed(i32),
+    /// `dateutil.tz.tzutc()` / `tz.UTC` (dynrt/dutz.rs)
+    DuUtc,
+    /// `dateutil.tz.tzoffset(name, offset)`: seconds, the name's code (`dutz::name_code`)
+    DuOffset(i32, u32),
+    /// `dateutil.tz.tzlocal()`: the instance's number (instances compare equal, `is` tells them apart)
+    DuLocal(u32),
+    /// a `dateutil.tz.tzfile` or `tzstr`: its index in dutz's registry
+    Du(u32),
 }
 
 impl Tz {
@@ -31,13 +49,67 @@ impl Tz {
                     z.offset_from_utc_datetime(&(*wall - Duration::hours(3))).fix().local_minus_utc()
                 }
             },
+            Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::info(self).0,
+            _ => super::dutz::offset(self, wall, fold),
         }
+    }
+    /// `tzinfo.dst(dt)` in seconds (None: timezone's)
+    pub fn dst(&self, wall: &NaiveDateTime, fold: u8) -> R<Option<i64>> {
+        Ok(match self {
+            Tz::Utc | Tz::Fixed(_) => None,
+            Tz::Zone(z) => {
+                let utc = *wall - Duration::seconds(self.offset_for_wall(wall, fold) as i64);
+                Some(chrono_tz::OffsetComponents::dst_offset(&z.offset_from_utc_datetime(&utc)).num_seconds())
+            }
+            Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => Some(super::pytzrt::info(self).1 as i64),
+            _ => Some(super::dutz::dst(self, wall, fold)?),
+        })
+    }
+    /// `tzinfo.tzname(dt)`
+    pub fn tzname(&self, wall: &NaiveDateTime, fold: u8) -> R<Option<String>> {
+        Ok(match self {
+            Tz::Utc | Tz::Fixed(_) => Some(self.name()),
+            Tz::Zone(z) => {
+                let utc = *wall - Duration::seconds(self.offset_for_wall(wall, fold) as i64);
+                z.offset_from_utc_datetime(&utc).abbreviation().map(String::from)
+            }
+            Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::info(self).2.map(String::from),
+            _ => super::dutz::tzname(self, wall, fold)?,
+        })
+    }
+    /// `str(tz)`
+    pub fn py_str(&self) -> String {
+        match self {
+            Tz::Utc | Tz::Fixed(_) | Tz::Zone(_) => self.name(),
+            Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::tz_str(self),
+            _ => super::dutz::tz_repr(self),
+        }
+    }
+    /// `type(tz).__name__`
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Tz::Utc | Tz::Fixed(_) => "timezone",
+            Tz::Zone(_) => "ZoneInfo",
+            _ => super::pytzrt::tz_type(self),
+        }
+    }
+    /// `a == b` (dateutil's `__eq__`; identity otherwise, timezone's offsets)
+    pub fn py_eq(&self, o: &Tz) -> bool {
+        match (self, o) {
+            (Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_), _) | (_, Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_)) => super::dutz::py_eq(self, o),
+            _ => self == o,
+        }
+    }
+    /// a library's tzinfo, whose instances are not hashable (dateutil's `__hash__ = None`)
+    pub fn unhashable(&self) -> bool {
+        matches!(self, Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_))
     }
     pub fn name(&self) -> String {
         match self {
             Tz::Utc => "UTC".into(),
             Tz::Fixed(s) => format!("UTC{}", fmt_offset(*s, true)),
             Tz::Zone(z) => z.name().into(),
+            _ => self.py_str(),
         }
     }
     pub fn zone(name: &str) -> Option<Tz> {
@@ -71,6 +143,10 @@ impl DateTime {
         match tz {
             Tz::Utc => DateTime::aware(utc, tz),
             Tz::Fixed(s) => DateTime::aware(utc + Duration::seconds(s as i64), tz),
+            Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::from_utc(utc, tz),
+            Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_) => {
+                super::dutz::fromutc(&tz, &utc, 0).unwrap_or(DateTime::aware(utc, tz))
+            }
             Tz::Zone(z) => {
                 let local = z.from_utc_datetime(&utc);
                 let wall = local.naive_local();
@@ -117,6 +193,10 @@ impl DateTime {
         self.wall.date()
     }
     pub fn astimezone(&self, tz: Tz) -> Self {
+        // CPython: the same tzinfo object returns the value itself
+        if self.tz == Some(tz) {
+            return *self;
+        }
         DateTime::from_utc(self.utc(), tz)
     }
 
@@ -891,5 +971,27 @@ pub fn tz_repr(t: &Tz) -> String {
         Tz::Utc => "datetime.timezone.utc".into(),
         Tz::Fixed(s) => format!("datetime.timezone({})", delta_repr(&Duration::seconds(*s as i64))),
         Tz::Zone(z) => format!("zoneinfo.ZoneInfo(key='{}')", z.name()),
+        Tz::PyUtc | Tz::Py(..) | Tz::PyFixed(_) => super::pytzrt::tz_repr(t),
+        _ => super::dutz::tz_repr(t),
+    }
+}
+
+/// `tz.fromutc(utc.replace(tzinfo=tz))` with CPython's OverflowError past the datetime range
+pub fn from_utc_checked(utc: NaiveDateTime, tz: Tz) -> R<DateTime> {
+    let d = match tz {
+        Tz::DuUtc | Tz::DuOffset(..) | Tz::DuLocal(_) | Tz::Du(_) => super::dutz::fromutc(&tz, &utc, 0)?,
+        _ => DateTime::from_utc(utc, tz),
+    };
+    if !(1..=9999).contains(&d.wall.year()) {
+        return Err(Exc::msg(&OVERFLOW_ERROR, "date value out of range"));
+    }
+    Ok(d)
+}
+
+/// `dt.dst()` (seconds; None for a naive value or timezone's)
+pub fn dst_of(d: &DateTime) -> R<Option<i64>> {
+    match &d.tz {
+        Some(t) => t.dst(&d.wall, d.fold),
+        None => Ok(None),
     }
 }

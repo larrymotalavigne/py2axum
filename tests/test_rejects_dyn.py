@@ -394,6 +394,13 @@ def test_column_type_factory_other_module(tmp_path, capsys):
         ("    return {'a': (1 << 70) - 1}", "integer expression out of 64-bit range"),
         ("    return {'a': 2**62 * 4}", "integer expression out of 64-bit range"),
         ("    return {'a': [10**x for x in (3, 6, 100)]}", "integer expression out of 64-bit range (with x = 100)"),
+        # strftime directives glibc and macOS render differently (or %s, the local zone): refused, never copied
+        ("    import datetime\n    return {'a': datetime.date(2026, 1, 2).strftime('%-d/%m')}", "strftime directive %-d in strftime()"),
+        ("    import datetime\n    return {'a': datetime.datetime(2026, 1, 2).strftime('%s')}", "strftime directive %s in strftime()"),
+        ("    import datetime\n    return {'a': datetime.datetime(2026, 1, 2).strftime('%Ey')}", "strftime directive %Ey in"),
+        ("    import datetime\n    return {'a': datetime.datetime(2026, 1, 2).strftime('%q')}", "strftime directive %q in"),
+        ("    import datetime\n    return {'a': f'{datetime.date(2026, 1, 2):%v}'}", "strftime directive %v in an f-string format spec"),
+        ("    import datetime\n    return {'a': datetime.time(1, 2).strftime('%:M')}", "strftime directive %:M in"),
     ],
 )
 def test_python_semantics_rejected(tmp_path, capsys, body, message):
@@ -2959,6 +2966,25 @@ def test_nonlocal_outside_enclosing_function_rejected(tmp_path, capsys):
 
 
 
+@pytest.mark.parametrize("call", ["await request.form()", "[c async for c in request.stream()]"])
+def test_request_form_and_stream_rejected(tmp_path, capsys, call):
+    """Starlette's `request.form()` / `request.stream()` have no runtime counterpart: an AttributeError at run
+    time otherwise (the names are in the runtime's catalog for other values)."""
+    err = _reject(tmp_path, capsys, f'''
+        from fastapi import FastAPI, Request
+
+        app = FastAPI()
+
+
+        @app.post("/f")
+        async def f(request: Request):
+            got = {call}
+            return {{"n": len(got)}}
+    ''')
+    name = "form" if "form" in call else "stream"
+    assert f"`request.{name}()` is not supported" in err and "main.py:9" in err
+
+
 def test_typeddict_response_model_rejected(tmp_path, capsys):
     """Calling a TypedDict builds a dict; as a response model Pydantic would validate it: refused."""
     err = _reject(tmp_path, capsys, '''
@@ -3978,3 +4004,128 @@ def test_module_function_attribute_rebound_rejected(tmp_path, capsys):
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "assigning `conf.f` (an attribute of module proj.conf) is not supported" in err, err
+
+
+DATELIB_MAIN = """
+import time
+import threading
+from datetime import datetime
+
+import cachetools
+from cachetools import LRUCache, TLRUCache, TTLCache, cached, cachedmethod, keys
+from cachetools.func import lru_cache
+from dateutil import parser, tz
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/x")
+def x():
+    return {body}
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    # dateutil: a custom parserinfo, the parser class
+    ('parser.parse("2026", parserinfo=parser.parserinfo(dayfirst=True))', "dateutil.parser.parse(): a parserinfo is not supported"),
+    ('parser.parse("2026", parser.parserinfo())', "dateutil.parser.parse(): a parserinfo is not supported"),
+    ('parser.parser().parse("2026")', "library call `dateutil.parser.parser()` is not supported"),
+    ('tz.tzrange("EST", -18000)', "library call `dateutil.tz.tzrange()` is not supported"),
+    # cachetools: timers, sizes, keys and conditions the runtime does not reproduce; caches it does not have
+    ('TTLCache(10, 60, timer=lambda: 0)', "cachetools.TTLCache(timer=...) is not supported (time.monotonic or time.time only)"),
+    ('LRUCache(10, getsizeof=lambda v: 2)', "cachetools.LRUCache(getsizeof=...) is not supported (len only)"),
+    ('cached(LRUCache(2), key=keys.typedkey)', "cachetools.cached(key=...) is not supported with cachetools.keys.typedkey"),
+    ('cached(LRUCache(2), condition=threading.Condition())', "cachetools.cached(condition=...) is not supported"),
+    ('TLRUCache(10, lambda k, v, t: t + 1)', "library call `cachetools.TLRUCache()` is not supported"),
+    ('cachetools.RRCache(10)', "library call `cachetools.RRCache()` is not supported"),
+    ('cachetools.LFUCache(10)', "library call `cachetools.LFUCache()` is not supported"),
+    ('lru_cache(maxsize=3, typed=True)', "cachetools.func.lru_cache(typed=...) is not supported"),
+])
+def test_datelibs_outside_subset_rejected(tmp_path, capsys, body, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(DATELIB_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:17" in err, err
+
+
+def test_cachetools_decorators_outside_subset_rejected(tmp_path, capsys):
+    """@cached on an async def (the coroutine object would be cached), @cachedmethod with info=, its cache_clear(),
+    on a function, through its class"""
+    cases = [
+        ('''
+        @cached(cache=TTLCache(maxsize=4, ttl=60))
+        async def f(x):
+            return x
+
+
+        @app.get("/x")
+        async def x():
+            return await f(1)
+        ''', "@cached on an async function is not supported", 6),
+        ('''
+        class Repo:
+            def __init__(self):
+                self.c = LRUCache(4)
+
+            @cachedmethod(lambda self: self.c, info=True)
+            def find(self, x):
+                return x
+
+
+        @app.get("/x")
+        def x():
+            return Repo().find(1)
+        ''', "cachetools.cachedmethod(info=...) is not supported", 10),
+        ('''
+        class Repo:
+            def __init__(self):
+                self.c = LRUCache(4)
+
+            @cachedmethod(lambda self: self.c)
+            def find(self, x):
+                return x
+
+
+        @app.get("/x")
+        def x():
+            r = Repo()
+            r.find.cache_clear()
+            return r.find(1)
+        ''', "`.find.cache_clear` of a @cachedmethod is not supported (only its calls)", 18),
+        ('''
+        @cachedmethod(lambda self: self.c)
+        def find(self, x):
+            return x
+
+
+        @app.get("/x")
+        def x():
+            return find(None, 1)
+        ''', "@cachedmethod on the function find (not a method) is not supported", 6),
+        ('''
+        class Repo:
+            def __init__(self):
+                self.c = LRUCache(4)
+
+            @cachedmethod(lambda self: self.c)
+            async def find(self, x):
+                return x
+
+
+        @app.get("/x")
+        async def x():
+            return await Repo().find(1)
+        ''', "@cachedmethod on an async method is not supported", 10),
+    ]
+    for i, (src, msg, line) in enumerate(cases):
+        d = tmp_path / f"c{i}"
+        d.mkdir()
+        head = "from cachetools import LRUCache, TTLCache, cached, cachedmethod\nfrom fastapi import FastAPI\n\napp = FastAPI()\n"
+        err = _reject(d, capsys, head + textwrap.dedent(src))
+        assert msg in err, err
+        assert f"main.py:{line}" in err, err

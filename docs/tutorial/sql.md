@@ -186,7 +186,9 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   statement, the ones it reads first; `recursive=` and `nesting=` are refused), LATERAL subqueries
   (`.lateral()`, correlated to the FROM list of their statement, joined `ON` `true()` or `literal_column("TRUE")`),
   `correlate(*entities)` (those enclosing tables taken out of the FROM list, even when a single FROM is left) and
-  `correlate(None)`, `union_all()`/`union()`/`intersect[_all]()`/`except_[_all]()` (functions or methods) made a
+  `correlate(None)`, `correlate_except(*entities)` (every other enclosing table taken out; `.has()`/`.any()` correlate
+  except their target, which stays in the EXISTS when the statement joins it) and
+  `correlate_except(None)`, `union_all()`/`union()`/`intersect[_all]()`/`except_[_all]()` (functions or methods) made a
   subquery, a CTE or executed (members with their own ORDER BY / LIMIT, and an ORDER BY / LIMIT of the compound,
   are refused), `postgresql.array([...])` with `any_()`/`all_()`, `bindparam(key, type_=ARRAY(String()))`,
   `group_by/having/order_by/limit/offset/distinct(on)` (an expression built once and

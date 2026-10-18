@@ -1409,6 +1409,9 @@ pub struct Select {
     pub compound: Vec<(&'static str, Select)>,
     /// `correlate(...)`: None = auto-correlation, else the only tables correlated away (empty: `correlate(None)`)
     pub correlate: Option<Vec<&'static ModelDesc>>,
+    /// `correlate_except(...)`: None = not called, else the enclosing tables never correlated away (empty:
+    /// `correlate_except(None)`, all of them correlated); `Model.rel.has()/any()` correlate except their target
+    pub correlate_except: Option<Vec<&'static ModelDesc>>,
     /// the joins (indexes into `joins`) that are FULL OUTER JOINs
     pub full_joins: Vec<usize>,
     /// `join(sq, on)`: (rendered before `joins[pos]`, the subquery, ON, outer)
@@ -2673,9 +2676,16 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         return Ok(sql(Sql::TableJoin(left.clone(), segs)));
     }
     if let Sql::Exists(sel) = &base {
+        if matches!(name, "correlate" | "correlate_except") {
+            // `exists().where(...).correlate(t)`: the correlation of its SELECT
+            let r = sql_method(&sql(Sql::Select(sel.clone())), name, args, kwargs)?;
+            let V::Sql(x) = &r else { unreachable!() };
+            let Sql::Select(s) = &**x else { unreachable!() };
+            return Ok(sql(Sql::Exists(s.clone())));
+        }
         // `exists().where(...)`: the criteria go to its SELECT
         if !matches!(name, "where" | "filter") {
-            return Err(Exc::attr_error(format!("py2axum: Exists.{name}() is not supported (where only)")));
+            return Err(Exc::attr_error(format!("py2axum: Exists.{name}() is not supported (where, correlate and correlate_except only)")));
         }
         let mut s = (**sel).clone();
         for a in &args {
@@ -2683,7 +2693,7 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
         return Ok(sql(Sql::Exists(Box::new(s))));
     }
-    if let (Sql::Scalar(sel), "correlate") = (&base, name) {
+    if let (Sql::Scalar(sel), "correlate" | "correlate_except") = (&base, name) {
         // `select(...).scalar_subquery().correlate(t)`: the correlation of its SELECT
         let r = sql_method(&sql(Sql::Select(sel.clone())), name, args, kwargs)?;
         let V::Sql(x) = &r else { unreachable!() };
@@ -3128,6 +3138,23 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
                             list.push(model_of(a)?);
                         }
                         s.correlate.get_or_insert_with(Vec::new).extend(list);
+                    }
+                }
+            }
+            // `correlate_except(A, ...)`: every enclosing table but these is correlated away (even with a single
+            // FROM); `correlate_except(None)`: all of them
+            "correlate_except" => {
+                match args.as_slice() {
+                    [] | [V::None] | [V::Bool(false)] => s.correlate_except = Some(Vec::new()),
+                    [V::None | V::Bool(false), ..] => {
+                        return Err(Exc::msg(&ARGUMENT_ERROR, "additional FROM objects not accepted when passing None/False to correlate_except()"));
+                    }
+                    _ => {
+                        let mut list = Vec::new();
+                        for a in &args {
+                            list.push(model_of(a)?);
+                        }
+                        s.correlate_except.get_or_insert_with(Vec::new).extend(list);
                     }
                 }
             }
@@ -4335,9 +4362,15 @@ fn render_select_body(r: &mut Rend, s: &Select) -> R<()> {
         }
     }
     // (SQLAlchemy's _get_display_froms: only a statement with more than one FROM correlates implicitly; an explicit
-    // correlate() takes away its enclosing tables, however many FROMs are left)
-    if let Some(list) = &s.correlate {
-        from.retain(|m| !(list.iter().any(|c| covers(c, m)) && r.outer.iter().any(|o| covers(o, m))));
+    // correlate() takes away its enclosing tables, correlate_except() the enclosing tables it does not name, however
+    // many FROMs are left)
+    if s.correlate.is_some() || s.correlate_except.is_some() {
+        if let Some(list) = &s.correlate {
+            from.retain(|m| !(list.iter().any(|c| covers(c, m)) && r.outer.iter().any(|o| covers(o, m))));
+        }
+        if let Some(list) = &s.correlate_except {
+            from.retain(|m| !(r.outer.iter().any(|o| covers(o, m)) && !list.iter().any(|c| covers(c, m))));
+        }
     } else if !r.outer.is_empty() && from.len() + s.from_subs.len() + s.from_aliases.len() > 1 {
         from.retain(|m| !r.outer.iter().any(|o| covers(o, m)));
         if from.is_empty() && s.from_subs.is_empty() && s.from_aliases.is_empty() {
@@ -7774,7 +7807,10 @@ fn rel_exists(m: &'static ModelDesc, ri: usize, name: &str, args: &[V], kwargs: 
             wheres.push((*x).clone());
         }
     }
-    let sel = Select { cols: vec![SelCol::Expr(Sql::Text("1".into()))], from, wheres, ..Default::default() };
+    // (SQLAlchemy's _criterion_exists: correlate_except(target[, secondary]), so that a target joined in the enclosing
+    // statement stays in the EXISTS)
+    let correlate_except = Some(from.clone());
+    let sel = Select { cols: vec![SelCol::Expr(Sql::Text("1".into()))], from, wheres, correlate_except, ..Default::default() };
     Ok(sql(Sql::Exists(Box::new(sel))))
 }
 

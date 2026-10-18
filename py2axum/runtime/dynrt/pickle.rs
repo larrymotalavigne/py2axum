@@ -362,6 +362,7 @@ impl W {
             Tz::Utc => self.reduce("datetime", "timezone", &[V::Delta(chrono::TimeDelta::zero())]),
             Tz::Fixed(s) => self.reduce("datetime", "timezone", &[V::Delta(chrono::TimeDelta::seconds(*s as i64))]),
             Tz::Zone(z) => self.reduce("zoneinfo", "ZoneInfo._unpickle", &[V::str(z.name()), V::Int(1)]),
+            t => Err(Exc::type_error(format!("py2axum: pickling a {} tzinfo is not supported", t.type_name()))),
         }
     }
 }

@@ -5,7 +5,7 @@ refused at compile time with `file:line`. With `--translate-libs`, a few pure-Py
 from the source of the project's Python (see [Libraries translated from source](../advanced/libraries.md#the-standard-library)).
 
 `datetime` (with time zones, `zoneinfo`, Pydantic and `isoformat` formats, `strptime` without `%f`/`%Z`,
-`combine`, `fromtimestamp`), `decimal` (`_pydecimal` rules: 28 digits, ROUND_HALF_EVEN, exact
+`combine`, `fromtimestamp`; `strftime` and date f-string specs with the directives that render the same on glibc and macOS, `%a %A %b %B %c %C %d %D %e %f %F %g %G %h %H %I %j %k %l %m %M %n %p %P %r %R %S %t %T %u %U %V %w %W %x %X %y %Y %z %:z %Z %%`, in the C locale, with each platform's padding of a year below 1000 (glibc before 3.14: none, and never in `%c`); flags, widths, `%E`/`%O`, `%s` and unknown letters are refused, P2A0119, or raise ValueError for a computed format), `decimal` (`_pydecimal` rules: 28 digits, ROUND_HALF_EVEN, exact
 add/mul then rounding, CPython's division, `quantize`, `round`, formatting; mixing with float refused),
 `uuid`, `json`, `re` (fancy-regex with Python syntax translated; consecutive empty matches follow Rust, not
 Python 3.7+; `pos`/`endpos` of a compiled pattern's methods refused), `csv` (simplified `Sniffer`; `DictReader(restval=, restkey=)`; a positional dialect refused), `io.StringIO/BytesIO`, `pathlib`/`open()` (UTF-8, POSIX; `for line in f` gives the lines, a text file with universal newlines; `Path.read_text/write_text(encoding=, errors=)` with the codecs below),

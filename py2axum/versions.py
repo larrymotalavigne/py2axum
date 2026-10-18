@@ -40,6 +40,11 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "croniter": ("6.2.4", "6.2.4", "6.3"),
     "dnspython": ("2.8.0", "2.8.0", "2.9"),  # dynrt/dnsres.rs: the stub resolver (Resolver, resolve), its retries and messages
     "itsdangerous": ("2.2.0", "2.2.0", "2.3"),  # dynrt/itsd.rs: URLSafe(Timed)Serializer, tokens byte for byte  # dynrt/croniter.rs ports 6.2.4's croniter.py (6.0 differs: no W, no strict)
+    "pytz": ("2026.5", "2026.5", "2026.6"),  # dynrt/pytzrt.rs: its zones (tools/gen_pytz.py), one tz database release per version
+    # dynrt/duparse.rs, dutz.rs (parser, tz; relativedelta is checked only with them): 2.8.2 has the same code but an
+    # older zoneinfo tarball
+    "python-dateutil": ("2.9.0", "2.9.0.post0", "2.10"),
+    "cachetools": ("7.2.2", "7.2.2", "7.3"),  # dynrt/ctools.rs (7.2.1 reads the TTL timer later, 7.0 had no size checks)
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
@@ -50,7 +55,8 @@ _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlal
               "httpx": ("httpx",), "aiohttp": ("aiohttp",), "mcp": ("mcp",), "icalendar": ("icalendar",),
               "orjson": ("orjson",), "unidecode": ("unidecode",), "ecs_logging": ("ecs-logging",),
               "yaml": ("pyyaml",), "croniter": ("croniter",),
-              "itsdangerous": ("itsdangerous",), "dns": ("dnspython",)}
+              "itsdangerous": ("itsdangerous",), "dns": ("dnspython",), "pytz": ("pytz",), "cachetools": ("cachetools",),
+              "dateutil.parser": ("python-dateutil",), "dateutil.tz": ("python-dateutil",)}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
 _FEATURES = [("WebSocket routes (Starlette 1.7's WebSocketDisconnected semantics)", r"\.websocket\(", "starlette", "1.7.0")]
@@ -216,6 +222,9 @@ def used(package: Path) -> tuple[set[str], list[tuple[str, str, str]]]:
     out = {"fastapi", "starlette", "pydantic", "pydantic-core"}
     feats = set()
     imp = re.compile(r"^[ \t]*(?:from[ \t]+(\w+)|import[ \t]+(\w+))", re.M)
+    # dateutil: checked when its parser or tz is imported (relativedelta alone reads no version-dependent data)
+    du = re.compile(r"^[ \t]*(?:from[ \t]+dateutil(?:\.(?:parser|tz)\b|[ \t]+import[ \t]+[^\n]*\b(?:parser|tz)\b)|"
+                    r"import[ \t]+dateutil\.(?:parser|tz)\b)", re.M)
     for f in Path(package).rglob("*.py"):
         try:
             text = f.read_text(errors="replace")
@@ -223,6 +232,8 @@ def used(package: Path) -> tuple[set[str], list[tuple[str, str, str]]]:
             continue
         for m in imp.finditer(text):
             out.update(_BY_IMPORT.get(m.group(1) or m.group(2), ()))
+        if du.search(text):
+            out.update(_BY_IMPORT["dateutil.tz"])
         feats.update(i for i, (_, rx, _, _) in enumerate(_FEATURES) if re.search(rx, text))
     return out, [(_FEATURES[i][0], _FEATURES[i][2], _FEATURES[i][3]) for i in sorted(feats)]
 

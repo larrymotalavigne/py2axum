@@ -520,6 +520,20 @@ STEPS: list = [
     ("GET", "/lazy/attr/missing", None),
     ("GET", "/lazy/use", None),
     # the session's connection (fixtures/dynapp/sqlmore.py)
+    # EXISTS / scalar subqueries correlated in a statement that joins their tables (sqlmore.py)
+    ("GET", "/sqlm/correlate/join_has", None),
+    ("GET", "/sqlm/correlate/join_has_kw_crit", None),
+    ("GET", "/sqlm/correlate/join_has_other", None),
+    ("GET", "/sqlm/correlate/join_any", None),
+    ("GET", "/sqlm/correlate/nested", None),
+    ("GET", "/sqlm/correlate/nested_plain", None),
+    ("GET", "/sqlm/correlate/exists_auto", None),
+    ("GET", "/sqlm/correlate/exists_correlate", None),
+    ("GET", "/sqlm/correlate/exists_except", None),
+    ("GET", "/sqlm/correlate/exists_except_none", None),
+    ("GET", "/sqlm/correlate/scalar_auto", None),
+    ("GET", "/sqlm/correlate/scalar_except", None),
+    ("GET", "/sqlm/correlate/scalar_except_after", None),
     ("GET", "/sqlm/ready", None),
     ("GET", "/sqlm/closed/none", None),
     ("GET", "/sqlm/closed/commit", None),
@@ -811,3 +825,57 @@ STEPS += [("POST", "/greenlet/run", None), ("POST", "/greenlet/dbapi", None)]
 
 # session.expire(obj) / expire(obj, [names]) (fixtures/dynapp/expire.py); last: its rolled back rows use sequence values
 STEPS += [("POST", "/expire/run", None), ("POST", "/expire/run", None)]
+
+# the raw request body and pydantic's JSON mode on it (fixtures/dynapp/reqbody.py)
+_TEXT = {"content-type": "text/plain;charset=UTF-8"}
+_JSON = {"content-type": "application/json"}
+_track = b'{"event":"pricing_toggle","properties":{"env":"prod","n":1.5},"session_id":"s1"}'
+STEPS += [
+    # sendBeacon (text/plain), HttpClient (application/json), no content-type, empty, invalid, too long
+    ("POST", "/reqbody/track", _track, _TEXT),
+    ("POST", "/reqbody/track", _track.replace(b"pricing", b"signup"), _JSON),
+    ("POST", "/reqbody/track", b'{"event":"bare"}', {}),
+    ("POST", "/reqbody/track", b"", _TEXT),
+    ("POST", "/reqbody/track", b"not json", _TEXT),
+    ("POST", "/reqbody/track", b'{"event":"' + b"x" * 65 + b'"}', _JSON),
+    ("GET", "/reqbody/tracked", None),
+]
+for _body, _h in ((b"", {}), (b'{"a": 1}', _JSON), ("é€".encode(), _TEXT), (b"\xff\xfe\x00", {}),
+                  (b"x" * (3 * 1024 * 1024), {"content-type": "application/octet-stream"})):
+    STEPS.append(("POST", "/reqbody/raw", _body, _h))
+for _body in (b'{"a": [1, 2.5, "\\u00e9"]}', b"", b"nope", b"\xef\xbb\xbf[1]", '"é"'.encode("utf-16"), b'"\xff"',
+              b"[NaN, Infinity]", b'{"a": 1, "a": 2}'):
+    STEPS.append(("POST", "/reqbody/json", _body, _JSON))
+STEPS += [
+    ("POST", "/reqbody/after-param", {"name": "a", "n": 2}),
+    ("POST", "/reqbody/after-param", b'{"name": 5}', _JSON),
+    ("POST", "/reqbody/after-dep", b"same bytes", _TEXT),
+    ("POST", "/reqbody/after-dep", None),
+    ("POST", "/reqbody/mvj-none", None),
+    ("POST", "/reqbody/mvj/none", None),
+]
+_RICH_OK = (b'{"ints":[1,2],"pair":[1,"a"],"tags":[3,3],"frozen":[1],"mapping":{"a":1},"inner":{"x":1},'
+            b'"inners":[{"x":2}],"point":{"y":3},"delay":"PT1S","amount":1.0,"day":"2020-01-01",'
+            b'"when":"2020-01-01T00:00:00","raw":"x","ident":"12345678-1234-5678-1234-567812345678",'
+            b'"price":"1.5","flag":true}')
+for _kind in ("bytes", "str"):
+    for _body in (_RICH_OK, b"", b"nope", b"[]", b"5", b"null", b'{"ints":5}', b'{"pair":5}', b'{"tags":{}}',
+                  b'{"frozen":"x"}', b'{"mapping":[]}', b'{"inner":5}', b'{"inners":[5]}', b'{"point":5}',
+                  b'{"delay":true}', b'{"delay":"x"}', b'{"delay":null}', b'{"delay":1e400}', b'{"amount":1e2}',
+                  b'{"amount":-0.0}', b'{"amount":12345678901234567890.5}', b'{"amount":"x"}', b'{"day":"x"}',
+                  b'{"raw":"\\ud800"}', b'{"raw":"\xff"}', b'{"flag":"maybe"}', b'{"ints":[1,"a"],"pair":[1]}',
+                  b'{"ints":[1]', b'{"ints": [1]} x', b"[1, 2,]"):
+        STEPS.append(("POST", f"/reqbody/mvj/{_kind}", _body, _JSON))
+for _body in (b'{"event":"a"}', b"", b'{"event":1}', b'{"properties":5}'):
+    STEPS.append(("POST", "/reqbody/mvj/track", _body, _TEXT))
+for _body in (b"[1,2]", b"5", b"", b"[1,true]", b"{}"):
+    STEPS.append(("POST", "/reqbody/mvj/adapter", _body, _JSON))
+for _body in (b"[1,2]", b"5", b"{}", b"nope", b'[1,"x"]'):
+    STEPS.append(("POST", "/reqbody/mvj/jsonfield", _body, _JSON))
+# a Json[T] field inside model_validate_json: its inner type in JSON mode too
+for _body in (b'{"j":"5"}', b'{"j":"[1]"}', b'{"j":5}'):
+    STEPS.append(("POST", "/reqbody/mvj/jsonmode", _body, _JSON))
+# the same inputs in python mode (model_validate of the parsed JSON; a nested model given a non-dict is left out:
+# the runtime answers model_attributes_type, FastAPI's from_attributes=True rule, where pydantic says model_type)
+for _body in (b'{"point":5}', b'{"mapping":[]}', b'{"delay":true}', b'{"amount":1.0}'):
+    STEPS.append(("POST", "/reqbody/mvj/python", _body, _JSON))

@@ -785,9 +785,9 @@ impl Formatter {
     fn format_time(&self, created: f64, msecs: f64, datefmt: Option<&str>) -> String {
         let (wall, off, zone) = localtime(created);
         match datefmt {
-            Some(f) => super::libs::strftime(&wall, Some(off), Some(zone), f),
+            Some(f) => super::libs::strftime_lenient(&wall, Some(off), Some(zone), f),
             None => {
-                let s = super::libs::strftime(&wall, Some(off), Some(zone), &self.default_time_format.read());
+                let s = super::libs::strftime_lenient(&wall, Some(off), Some(zone), &self.default_time_format.read());
                 match &*self.default_msec_format.read() {
                     Some(m) => ops::percent_format(m, &V::tuple(vec![V::str(&s), V::Float(msecs)])).unwrap_or(s),
                     None => s,
@@ -1093,7 +1093,7 @@ impl Formatter {
         };
         let secs = created.floor() as i64;
         let utc = chrono::DateTime::from_timestamp(secs, 0).map(|d| d.naive_utc()).unwrap_or_default();
-        let stamp = format!("{}.{:03}Z", super::libs::strftime(&utc, Some(0), Some("UTC".into()), "%Y-%m-%dT%H:%M:%S"), msecs.trunc() as i64);
+        let stamp = format!("{}.{:03}Z", super::libs::strftime_lenient(&utc, Some(0), Some("UTC".into()), "%Y-%m-%dT%H:%M:%S"), msecs.trunc() as i64);
         let level = rec.get("levelname").map(|v| ops::truthy(&v).map(|t| (t, v))).transpose()?
             .and_then(|(t, v)| t.then(|| ops::str_(&v).map(|s| V::str(s.to_lowercase())))).transpose()?;
         let stack = if has_exc && exc.is_some() && o.stack_trace_limit.is_none_or(|l| l > 0) {

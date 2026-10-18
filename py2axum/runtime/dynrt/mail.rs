@@ -709,7 +709,7 @@ pub async fn smtp_send(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
         _ => Some(std::time::Duration::from_secs(60)),
     };
     let smtp_err = |e: String| Exc::msg(&SMTP_EXCEPTION, e);
-    let tls_params = TlsParameters::builder(host.clone()).dangerous_accept_invalid_certs(!validate).build().map_err(|e| smtp_err(e.to_string()))?;
+    let tls_params = TlsParameters::builder(host.clone()).dangerous_accept_invalid_certs(!validate).dangerous_accept_invalid_hostnames(!validate).build().map_err(|e| smtp_err(e.to_string()))?;
     let tls = if use_tls {
         Tls::Wrapper(tls_params)
     } else {
