@@ -143,7 +143,9 @@ and the runtime's locks do not poison.
   `_joinrealpath`, including below a final part that does not exist yet. The common upload guard
   `(BASE / name).resolve().relative_to(BASE.resolve())` therefore refuses `name = "link/new"` when `BASE/link`
   points outside `BASE`, as in Python.
-- No temporary files: `UploadFile` is in memory, `tempfile` is not translated.
+- Temporary files: `UploadFile` is in memory. The only `tempfile` calls translated are `NamedTemporaryFile` and
+  `gettempdir` ([Documents](documents.md#temporary-files-tempfile)): the file is created exclusively with mode `0o600`, as in Python; every other `tempfile`
+  call is refused at translation time.
 
 ## Errors and logs
 
@@ -189,6 +191,37 @@ and the runtime's locks do not poison.
   not stall other requests.
 - Key material is never printed: the runtime's key types have no debug representation and their errors carry
   no key bytes.
+- **Stripe**: webhook signatures (`Webhook.construct_event`, `WebhookSignature.verify_header`) are compared in
+  constant time, as stripe-python's `hmac.compare_digest` (until 0.9.x a plain comparison let a client time its
+  guesses of the signature of a forged event). The API key only goes into the `Authorization` header, never into
+  logs, errors or `repr()`; TLS is verified (rustls), timeouts are stripe-python's 80 s; ids in URLs are
+  percent-encoded (`/` included), so a request value cannot change the host or the path.
+
+## Outgoing mail, subprocesses and documents
+
+- **Mail headers** (`email.mime`, compat32): a header value holding line breaks raises as CPython does when the
+  message is written (`as_string()`, `aiosmtplib.send`): `\n<name>:` is a HeaderParseError ("embedded header"),
+  any other unfolded line break a HeaderWriteError (CPython 3.12.5+, CVE-2024-6923). A request value put in
+  `msg["Subject"]` can no longer add a `Bcc:` or end the headers (until 0.9.x the binary sent it). The message
+  sent is normalised as `aiosmtplib.data()` does: every `\r\n`, lone `\r` or `\n` becomes CRLF before the dots are
+  doubled, so a lone `\r` cannot end the DATA early on a lenient server (SMTP smuggling).
+- **SMTP TLS, risks kept as in aiosmtplib:** `validate_certs=False` checks neither the certificate chain nor the
+  host name (anyone on the path to the relay reads the mail and the credentials); without `start_tls=`/`use_tls=`
+  STARTTLS is opportunistic, so an attacker on the path can strip it and the `AUTH` goes in clear. Use
+  `start_tls=True` (refuses a server that does not offer it) or `use_tls=True`, and keep `validate_certs`.
+  The SMTP password is only used to authenticate, never logged.
+- **Subprocesses** (`asyncio.create_subprocess_exec`): no shell (`shell=True` raises), arguments passed as given.
+  A NUL byte in an argument, the program, `cwd` or the environment raises `ValueError("embedded null byte")` under
+  asyncio; under uvloop (libuv) the value **ends at the NUL**, as in CPython with uvloop: `"a\0b"` runs with `"a"`,
+  a truncation an application must not rely on for validation. The environment is the process's (with CPython's
+  coerced `LC_CTYPE`) unless `env=` replaces it; a child the application never awaits is reaped by the runtime (no
+  zombie); `kill()`/`terminate()` on a process already reaped raise ProcessLookupError and never signal a reused
+  pid. Output read by `communicate()` is kept in memory whole, as in asyncio: bound what the command can print.
+- **xlsx** (openpyxl): styles are found by a hash index as openpyxl's IndexedList (a linear search made a book
+  with one style per row quadratic, its lock held); a numeric sheet-title suffix has no size limit (a 20-digit
+  one wrapped to a duplicate title). Cell values are checked for the characters XML 1.0 refuses
+  (`IllegalCharacterError`); a string starting with `=` is a formula, as in openpyxl (escape user values that
+  must stay text).
 
 ## Hybrid deployments: the Python-side relay
 
@@ -211,7 +244,9 @@ Routes left to Python (`--python-side`) are relayed by the binary to `PY2AXUM_PY
   the `request.client.host` and scheme the Python routes see. The translated routes always use the TCP peer.
 - The connection to the sidecar times out after 10 s if it cannot be established; a slow response is waited
   for, as uvicorn waits for the application.
-- WebSocket upgrades are never relayed.
+- WebSocket upgrades of a route left to Python (or of a whole application relayed) are relayed the same
+  way: the client's headers but the handshake's own (`Sec-WebSocket-Key`, `-Version`, `-Extensions`), its
+  `Host` kept; frames up to 16 MiB, as uvicorn's `ws_max_size`.
 
 ## Per-request state
 
@@ -280,4 +315,7 @@ The generated application code contains no `unsafe`.
 - `tests/test_rejects_dyn.py`: a raw ASGI middleware that looks at websockets, next to a WebSocket route.
 - The existing PyJWT, python-jose, itsdangerous and Fernet cases of the dynapp scenario (wrong algorithms,
   `none`, PEM keys used as HMAC secrets, tampered and expired tokens).
+- The third review's cases: `/small/mime-header` in the integapp scenario (line breaks in a header value, a lone
+  `\r` in the body), `/x/ops` in docapp (sheet-title suffix past 64 bits, 3 000 distinct styles),
+  `/sp/nul/*` and `/sp/locale` in subprocapp (NUL bytes, illegal environment names, the coerced locale).
 - The `audit` CI job (`cargo audit`).

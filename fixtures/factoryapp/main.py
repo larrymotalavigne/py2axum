@@ -3,6 +3,7 @@ factory's locals; a missing optional module is an ImportError caught at run time
 import logging
 import os
 import traceback
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Request
@@ -76,10 +77,25 @@ def country_for(ip: str) -> str | None:
         return None
 
 
+LIFE: list = []
+
+
 def create_app(observed: bool = True) -> FastAPI:
     settings = get_settings()
     prefix = settings.app_name.upper() + "-"
-    app = FastAPI(strict_content_type=False)
+    if not settings.TESTING:
+        # a lifespan the factory defines, used only on this branch: native, with the factory's locals
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            app.state.boot = prefix + settings.app_name
+            LIFE.append("started")
+            yield
+            LIFE.append("stopped")
+
+        app = FastAPI(strict_content_type=False, lifespan=lifespan)
+    else:
+        app = FastAPI(strict_content_type=False)
 
     # last added = outermost: CORS, then the counter, then the security headers
     app.add_middleware(StampMiddleware)
@@ -156,6 +172,10 @@ def create_app(observed: bool = True) -> FastAPI:
     async def health_check():
         return {"status": "healthy", "service": settings.app_name, "version": settings.app_version,
                 "ts_ok": datetime.now(UTC).year > 2000}
+
+    @app.get("/life")
+    async def life(request: Request):
+        return {"boot": getattr(request.app.state, "boot", None), "life": LIFE}
 
     @app.get("/")
     async def root():

@@ -19,16 +19,24 @@ type from another module...) is left as written: the translator then refuses it 
 from __future__ import annotations
 
 import ast
+import builtins
 import copy
 
 SHIM_MODULE = "_py2axum_shim_sqlmodel"
-SUPPORTED = {"SQLModel", "Field", "Session", "create_engine", "select"}
-SA_FIELD_KW = {"primary_key", "index", "unique", "nullable", "foreign_key", "ondelete"}
-SA_REFUSED_KW = {"sa_type", "sa_column", "sa_column_args", "sa_column_kwargs", "sa_relationship",
+SUPPORTED = {"SQLModel", "Field", "Session", "create_engine", "select", "Relationship"}
+SA_FIELD_KW = {"primary_key", "index", "unique", "nullable", "foreign_key", "ondelete", "sa_column"}
+SA_REFUSED_KW = {"sa_type", "sa_column_args", "sa_column_kwargs", "sa_relationship",
                  "sa_relationship_args", "sa_relationship_kwargs"}
 # SQLModel's get_sqlalchemy_type for a plain annotation (str -> AutoString, a VARCHAR without length)
 SA_TYPES = {"str": "String", "int": "Integer", "float": "Float", "bool": "Boolean", "bytes": "LargeBinary",
-            "date": "Date", "time": "Time", "timedelta": "Interval", "UUID": "Uuid", "Decimal": "Numeric"}
+            "date": "Date", "time": "Time", "timedelta": "Interval", "UUID": "Uuid", "Decimal": "Numeric",
+            "EmailStr": "String"}  # EmailStr: AutoString, like str
+# names that are not Enum classes (SQLModel has its own column type for them, or none)
+NOT_ENUM = {"datetime", "date", "time", "timedelta", "Any", "Json", "HttpUrl", "AnyUrl", "AnyHttpUrl", "IPv4Address",
+            "IPv6Address", "IPv4Network", "IPv6Network", "Path", "NaiveDatetime", "AwareDatetime", "SecretStr",
+            "Optional", "Union", "List", "Dict", "Set", "Tuple"}
+# a datetime column: DateTime (naive TIMESTAMP) before SQLModel 0.0.45, its UTCDateTime decorator since (refused)
+NAIVE_DATETIME_BEFORE = (0, 0, 45)
 
 
 def imports_sqlmodel(tree: ast.Module) -> bool:
@@ -71,11 +79,14 @@ def _base_annotation(ann: ast.AST) -> tuple[ast.AST, bool]:
 
 
 class Rewriter:
-    def __init__(self, tree: ast.Module):
+    def __init__(self, tree: ast.Module, version: tuple = (0, 0, 48)):
         self.tree = tree
+        self.version = version  # the SQLModel the project locks
         self.names: dict[str, str] = {}  # local name -> sqlmodel name
         self.nontable: dict[str, ast.ClassDef] = {}  # SQLModel classes without a table
         self.tables: dict[str, dict] = {}  # table class -> {"fields": [...], "node": ClassDef}
+        # SQLModel classes without a table imported from another module of the project: local name -> their fields
+        self.imported_bases: dict[str, list[tuple[str, ast.AnnAssign]]] = {}
 
     # ------------------------------------------------------------------ module
 
@@ -104,6 +115,11 @@ class Rewriter:
         _Calls(self).visit(self.tree)
         if self.tables:
             self.tree.body.append(self.update_fn())
+            if self.local("SQLModel") is None:
+                # a table whose SQLModel base comes from another module: the shared declarative base, imported here
+                first = next(i for i, st in enumerate(self.tree.body) if isinstance(st, (ast.Import, ast.ImportFrom)))
+                imp = ast.ImportFrom(module="sqlmodel", names=[ast.alias("SQLModel", "_p2a_sm_SQLModel")], level=0)
+                self.tree.body.insert(first, ast.copy_location(imp, self.tree.body[first]))
         ast.fix_missing_locations(self.tree)
         return self.tree
 
@@ -118,7 +134,7 @@ class Rewriter:
             self.names[local] = a.name
             src = {"SQLModel": ("sqlmodel", "SQLModel"), "Session": ("sqlalchemy.orm", "Session"),
                    "create_engine": ("sqlalchemy", "create_engine"), "select": ("sqlalchemy", "select"),
-                   "Field": ("pydantic", "Field")}[a.name]
+                   "Field": ("pydantic", "Field"), "Relationship": ("sqlalchemy.orm", "relationship")}[a.name]
             out.append(ast.copy_location(ast.ImportFrom(module=src[0], names=[ast.alias(src[1], local)], level=0), node))
         # names the translator also reads by their last attribute (`Mapped[...]`, `mapped_column(...)`)
         extra = [ast.copy_location(ast.ImportFrom(module="pydantic", names=[ast.alias("BaseModel", "_p2a_sm_BaseModel")], level=0), node),
@@ -134,18 +150,21 @@ class Rewriter:
 
     def is_sqlmodel_class(self, node: ast.ClassDef) -> bool:
         sm = self.local("SQLModel")
-        return any(isinstance(b, ast.Name) and (b.id == sm or b.id in self.nontable or b.id in self.tables) for b in node.bases)
+        return any(isinstance(b, ast.Name) and (b.id == sm or b.id in self.nontable or b.id in self.tables
+                                                or b.id in self.imported_bases) for b in node.bases)
 
     # ------------------------------------------------------------------ classes
 
     def fields_of(self, node: ast.ClassDef) -> list[tuple[str, ast.AnnAssign]]:
         out = []
         for b in node.bases:
-            if isinstance(b, ast.Name) and b.id in self.nontable:
-                for n, st in self.fields_of(self.nontable[b.id]):
+            inherited = (self.fields_of(self.nontable[b.id]) if isinstance(b, ast.Name) and b.id in self.nontable
+                         else self.imported_bases.get(b.id, []) if isinstance(b, ast.Name) else [])
+            if inherited:
+                for n, st in inherited:
                     out = [(x, s) for x, s in out if x != n] + [(n, st)]
         for st in node.body:
-            if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+            if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and not self.is_relationship(st.value):
                 ann = st.annotation
                 if isinstance(ann, ast.Subscript) and getattr(ann.value, "id", getattr(ann.value, "attr", "")) == "ClassVar":
                     continue
@@ -154,6 +173,68 @@ class Rewriter:
                 else:
                     out.append((st.target.id, st))
         return out
+
+    def is_relationship(self, v: ast.AST | None) -> bool:
+        r = self.local("Relationship")
+        return isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and r is not None and v.func.id == r
+
+    def relationship(self, st: ast.AnnAssign) -> ast.AnnAssign:
+        """`x: list["Hero"] = Relationship(back_populates="team")` as SQLModel's metaclass builds it:
+        `x: Mapped[list["Hero"]] = relationship("Hero", back_populates=..., cascade="all, delete-orphan" when
+        cascade_delete=True, passive_deletes=..., **sa_relationship_kwargs)`. link_model=, sa_relationship= and
+        sa_relationship_args= are left to the translator (refused)."""
+        call = st.value
+        if call.args:
+            raise _Unsupported("Relationship(): positional arguments", st)
+        kws = {k.arg: k.value for k in call.keywords}
+        if None in kws or not set(kws) <= {"back_populates", "cascade_delete", "passive_deletes", "sa_relationship_kwargs"}:
+            raise _Unsupported("Relationship(): " + ", ".join(sorted(str(k) for k in kws)), st)
+        ann = st.annotation
+        if isinstance(ann, ast.Subscript) and getattr(ann.value, "id", getattr(ann.value, "attr", "")) == "Mapped":
+            ann = ann.slice
+        target = ann
+        while True:  # get_relationship_to: Optional[X] / X | None / list[X] -> X
+            if isinstance(target, ast.Constant) and isinstance(target.value, str):
+                inner = ast.parse(target.value, mode="eval").body
+                if not isinstance(inner, ast.Name):
+                    target = inner
+                    continue
+                target = inner
+            base, _ = _base_annotation(target)
+            if base is not target:
+                target = base
+                continue
+            if isinstance(target, ast.Subscript) and getattr(target.value, "id", "") in {"list", "List"}:
+                target = target.slice
+                continue
+            break
+        if not isinstance(target, ast.Name):
+            raise _Unsupported(f"Relationship(): annotation `{ast.unparse(st.annotation)}`", st)
+        out_kw = []
+        if "back_populates" in kws:
+            out_kw.append(ast.keyword("back_populates", kws["back_populates"]))
+        cd = kws.get("cascade_delete")
+        if cd is not None:
+            if not isinstance(cd, ast.Constant):
+                raise _Unsupported("Relationship(cascade_delete=): not a literal", st)
+            if cd.value:
+                out_kw.append(ast.keyword("cascade", ast.Constant("all, delete-orphan")))
+        pdel = kws.get("passive_deletes")
+        if pdel is not None:
+            if not isinstance(pdel, ast.Constant):
+                raise _Unsupported("Relationship(passive_deletes=): not a literal", st)
+            if pdel.value:
+                out_kw.append(ast.keyword("passive_deletes", pdel))
+        extra = kws.get("sa_relationship_kwargs")
+        if extra is not None:
+            if not (isinstance(extra, ast.Dict) and all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in extra.keys)):
+                raise _Unsupported("Relationship(sa_relationship_kwargs=): a literal dict", st)
+            for k, v in zip(extra.keys, extra.values):
+                out_kw = [x for x in out_kw if x.arg != k.value] + [ast.keyword(k.value, v)]
+        mapped = ast.Subscript(value=_attr("_p2a_sm_orm", "Mapped"), slice=copy.deepcopy(ann), ctx=ast.Load())
+        rel = ast.Call(_attr("_p2a_sm_orm", "relationship"), [ast.Constant(target.id)], out_kw)
+        out = ast.AnnAssign(target=ast.Name(id=st.target.id, ctx=ast.Store()), annotation=mapped, value=rel, simple=1)
+        return ast.copy_location(out, st)
 
     def field_call(self, v: ast.AST | None) -> ast.Call | None:
         f = self.local("Field")
@@ -203,10 +284,37 @@ class Rewriter:
             return [new]
         return self.table(node)
 
+    def sa_column(self, name: str, st: ast.AnnAssign, col: ast.AST, default) -> ast.AnnAssign:
+        """`Field(sa_column=Column(...))`: SQLModel takes that Column as it is (its type, nullability, defaults; the
+        Field's column options ignored). As `mapped_column(<the same arguments>)`, nullable as Column sets it (not
+        from the annotation); the Field's default, when it has one, as the instance's (SQLModel's __init__ sets it)."""
+        if not (isinstance(col, ast.Call) and (ast.unparse(col.func).split(".")[-1] == "Column") and not any(
+                isinstance(a, ast.Starred) for a in col.args) and all(k.arg is not None for k in col.keywords)):
+            raise _Unsupported(f"SQLModel field `{name}`: sa_column= must be a Column(...) call", st)
+        args = list(col.args)
+        if args and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
+            raise _Unsupported(f"SQLModel field `{name}`: a Column named apart from its field", st)
+        if not args:
+            raise _Unsupported(f"SQLModel field `{name}`: a Column without a type", st)
+        kws = {k.arg: k.value for k in col.keywords}
+        pk = isinstance(kws.get("primary_key"), ast.Constant) and kws["primary_key"].value is True
+        if "nullable" not in kws:
+            kws["nullable"] = ast.Constant(not pk)
+        if default is not None and not (isinstance(default, ast.Constant) and default.value in (None, Ellipsis)):
+            kws["default"] = default
+        mapped = ast.Subscript(value=_attr("_p2a_sm_orm", "Mapped"), slice=copy.deepcopy(st.annotation), ctx=ast.Load())
+        out = ast.AnnAssign(target=ast.Name(id=name, ctx=ast.Store()), annotation=mapped,
+                            value=ast.Call(_attr("_p2a_sm_orm", "mapped_column"), args, [ast.keyword(k, v) for k, v in kws.items()]),
+                            simple=1)
+        return ast.copy_location(out, st)
+
     def column(self, name: str, st: ast.AnnAssign) -> ast.AnnAssign:
         """SQLModel's get_column_from_field, statically"""
         call = self.field_call(st.value)
         kw = {k.arg: k.value for k in call.keywords} if call is not None else {}
+        if "sa_column" in kw:
+            dflt = call.args[0] if call.args else kw.get("default", kw.get("default_factory"))
+            return self.sa_column(name, st, kw["sa_column"], dflt)
         default = None
         if call is not None and call.args:
             default = call.args[0]
@@ -217,7 +325,14 @@ class Rewriter:
         base, optional = _base_annotation(st.annotation)
         tname = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", None)
         sa = SA_TYPES.get(tname)
-        if sa is None:
+        if tname == "datetime" and self.version < NAIVE_DATETIME_BEFORE:
+            sa = "DateTime"
+        enum = None
+        if sa is None and isinstance(base, ast.Name) and not hasattr(builtins, base.id) and base.id not in NOT_ENUM:
+            # a class of the module's names: SQLModel's sa_Enum(type_) when it is an Enum (the translator refuses
+            # an Enum() column of anything else)
+            enum = base
+        if sa is None and enum is None:
             raise _Unsupported(f"SQLModel field `{name}`: type `{ast.unparse(st.annotation)}` (a column of str, int, float, "
                                "bool, bytes, date, time, timedelta, UUID or Decimal is supported)", st)
         pk = isinstance(kw.get("primary_key"), ast.Constant) and kw["primary_key"].value is True
@@ -229,7 +344,8 @@ class Rewriter:
             nullable = kw["nullable"]
         else:
             nullable = ast.Constant(nullable)
-        args: list[ast.AST] = [_attr("_p2a_sm_sa", sa)]
+        args: list[ast.AST] = [_attr("_p2a_sm_sa", sa)] if enum is None else [
+            ast.Call(_attr("_p2a_sm_sa", "Enum"), [copy.deepcopy(enum)], [])]
         if sa == "String" and "max_length" in kw:
             # AutoString(length=max_length)
             args = [ast.Call(_attr("_p2a_sm_sa", "String"), [kw["max_length"]], [])]
@@ -256,6 +372,7 @@ class Rewriter:
         fields = self.fields_of(node)
         try:
             cols = [self.column(n, st) for n, st in fields]
+            rels = [self.relationship(st) for st in node.body if isinstance(st, ast.AnnAssign) and self.is_relationship(st.value)]
         except _Unsupported:
             return [node]
         others = [st for st in node.body if not (isinstance(st, ast.AnnAssign) or isinstance(st, ast.Pass)
@@ -263,15 +380,16 @@ class Rewriter:
         tablename = [st for st in others if isinstance(st, ast.Assign) and any(getattr(t, "id", "") == "__tablename__" for t in st.targets)]
         if [st for st in others if st not in tablename]:
             return [node]  # methods, config... on a table class: left to the translator
-        sa = ast.ClassDef(name=node.name, bases=[_name(self.local("SQLModel"))], keywords=[],
+        sa = ast.ClassDef(name=node.name, bases=[_name(self.local("SQLModel") or "_p2a_sm_SQLModel")], keywords=[],
                           body=(tablename or [ast.Assign(targets=[ast.Name("__tablename__", ast.Store())],
-                                                         value=ast.Constant(node.name.lower()))]) + cols,
+                                                         value=ast.Constant(node.name.lower()))]) + cols + rels,
                           decorator_list=[], type_params=[])
         ast.copy_location(sa, node)
         ast.fix_missing_locations(sa)
         view_bases = [ast.copy_location(_name("_p2a_sm_BaseModel") if isinstance(b, ast.Name) and b.id == self.local("SQLModel") else b, b)
                       for b in node.bases]
-        own = [self.pyd_field(st) for st in node.body if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)]
+        own = [self.pyd_field(st) for st in node.body if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)
+               and not self.is_relationship(st.value)]
         view_body = own
         if any(isinstance(b, ast.Name) and b.id == self.local("SQLModel") for b in node.bases):
             view_body = [ast.parse("model_config = {'from_attributes': True}").body[0]] + own
@@ -395,6 +513,7 @@ class _Calls(ast.NodeTransformer):
     def __init__(self, rw: Rewriter):
         self.rw = rw
         self.assigned: dict[str, ast.AST] = {}
+        self.update = True  # obj.sqlmodel_update(...) -> the module's _p2a_sm_sqlmodel_update (its own tables only)
 
     def visit_FunctionDef(self, node):
         prev, self.assigned = self.assigned, {}
@@ -407,10 +526,38 @@ class _Calls(ast.NodeTransformer):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
-    def select_width(self, e: ast.AST) -> int | None:
-        """the number of entities of a `select(...)` chain (a name assigned once to one, too), else None"""
-        if isinstance(e, ast.Name) and len(self.assigned.get(e.id, [])) == 1:
-            e = self.assigned[e.id][0]
+    PLAIN = {"text", "update", "delete", "insert"}
+
+    def plain_statement(self, e: ast.AST) -> bool:
+        """`text(...)` / `update(...)` / `delete(...)` / `insert(...)` (possibly chained: `.where(...)`), the names
+        imported from sqlalchemy or sqlmodel"""
+        while isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute):
+            e = e.func.value
+        if not (isinstance(e, ast.Call) and isinstance(e.func, ast.Name)):
+            return False
+        for st in self.rw.tree.body:
+            if isinstance(st, ast.ImportFrom) and st.level == 0 and (st.module or "").split(".")[0] in {"sqlalchemy", "sqlmodel"}:
+                for a in st.names:
+                    if (a.asname or a.name) == e.func.id and a.name in self.PLAIN:
+                        return True
+        return False
+
+    def select_width(self, e: ast.AST, _seen: frozenset = frozenset()) -> int | None:
+        """the number of entities of a `select(...)` chain, else None; a name: every value assigned to it in the
+        function is such a chain, or a chain on the name itself (`stmt = stmt.where(...)`), all of one width"""
+        if isinstance(e, ast.Name):
+            values = self.assigned.get(e.id, [])
+            if not values or e.id in _seen:
+                return None
+            widths = set()
+            for v in values:
+                root = v
+                while isinstance(root, ast.Call) and isinstance(root.func, ast.Attribute):
+                    root = root.func.value
+                if isinstance(root, ast.Name) and root.id == e.id:
+                    continue  # refines the statement it already holds
+                widths.add(self.select_width(v, _seen | {e.id}))
+            return widths.pop() if len(widths) == 1 else None
         while isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute):
             e = e.func.value
         if (isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id == self.rw.local("select")
@@ -425,7 +572,9 @@ class _Calls(ast.NodeTransformer):
             w = self.select_width(node.args[0])
             if w is not None:
                 f.attr = "scalars" if w == 1 else "execute"
-        elif isinstance(f, ast.Attribute) and f.attr == "sqlmodel_update" and self.rw.tables and node.args:
+            elif self.plain_statement(node.args[0]):
+                f.attr = "execute"  # SQLModel's exec() of anything but a select: the Result, as execute()
+        elif isinstance(f, ast.Attribute) and f.attr == "sqlmodel_update" and self.update and self.rw.tables and node.args:
             node = ast.copy_location(ast.Call(func=_name("_p2a_sm_sqlmodel_update"), args=[f.value, *node.args],
                                               keywords=node.keywords), node)
         elif (isinstance(f, ast.Attribute) and f.attr == "model_validate" and isinstance(f.value, ast.Name)
@@ -437,9 +586,69 @@ class _Calls(ast.NodeTransformer):
         return node
 
 
-def rewrite(tree: ast.Module) -> ast.Module:
+def rewrite(tree: ast.Module, version: tuple = (0, 0, 48), bases: dict | None = None) -> ast.Module:
+    """The module rewritten for the SQLModel `version` the project locks. `bases`: SQLModel classes without a
+    table this module imports from another (local name -> their fields, already bound here: modules.py). Its table
+    classes (name -> fields) in `tree._p2a_sm_tables` (import_tables reads them), its classes without a table
+    (name -> fields) in `tree._p2a_sm_nontable`."""
     if not imports_sqlmodel(tree):
         return tree
-    return Rewriter(tree).run()
+    rw = Rewriter(tree, version)
+    rw.imported_bases = dict(bases or {})
+    out = rw.run()
+    out._p2a_sm_tables = {name: list(t["fields"]) for name, t in rw.tables.items()}
+    out._p2a_sm_nontable = {name: rw.fields_of(node) for name, node in rw.nontable.items()}
+    return out
+
+
+def free_names(fields: list[tuple[str, ast.AnnAssign]]) -> set[str]:
+    """The names the fields' annotations and values read (what the importing module must bind the same way)."""
+    out = set()
+    for _, st in fields:
+        for part in (st.annotation, st.value):
+            for n in ast.walk(part) if part is not None else ():
+                if isinstance(n, ast.Name):
+                    out.add(n.id)
+                elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n is st.annotation:
+                    try:
+                        out |= {x.id for x in ast.walk(ast.parse(n.value, mode="eval")) if isinstance(x, ast.Name)}
+                    except SyntaxError:
+                        pass
+    return out
+
+
+HELPERS = ("raw", "build_raw", "view", "build")
+
+
+def import_tables(tree: ast.Module, imported: dict[str, tuple[str, str]]) -> bool:
+    """Table classes another project module defines, used here (`from app.models import Song`): what `Rewriter` does
+    for its own tables, in the routes of this module only (a route's parameter, return annotation and
+    response_model= are the table's unvalidating view, a parameter turned into the table's instance first;
+    `Song.model_validate(x)` validated by the view). `imported`: local name -> (module, table class). Their helpers
+    are imported under `<local>_p2a_sm_<helper>`. Plain functions are left as written: a table instance they receive
+    is the caller's object. Whether anything changed."""
+    rw = Rewriter(tree)
+    rw.tables = {local: {"fields": [], "node": None} for local in imported}
+    changed = False
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(isinstance(d, ast.Call) for d in fn.decorator_list):
+            before = ast.dump(fn)
+            rw.function(fn)
+            changed |= ast.dump(fn) != before
+    calls = _Calls(rw)
+    calls.update = False
+    before = ast.dump(tree)
+    calls.visit(tree)
+    changed |= ast.dump(tree) != before
+    if not changed:
+        return False
+    at = next((i for i, st in enumerate(tree.body) if not (isinstance(st, ast.ImportFrom) and st.module == "__future__")
+               and not (i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))), len(tree.body))
+    anchor = tree.body[at] if at < len(tree.body) else tree.body[-1]
+    for local, (module, name) in sorted(imported.items()):
+        imp = ast.ImportFrom(module=module, names=[ast.alias(f"{name}_p2a_sm_{h}", f"{local}_p2a_sm_{h}") for h in HELPERS], level=0)
+        tree.body.insert(at, ast.copy_location(imp, anchor))
+    ast.fix_missing_locations(tree)
+    return True
 
 

@@ -71,35 +71,70 @@ fn negative_size() -> &'static str {
     if super::python() >= (3, 15) { "size cannot be negative" } else { "negative argument not allowed" }
 }
 
-pub fn token_urlsafe(n: &V) -> R {
-    use base64::Engine;
+/// `secrets.token_bytes(nbytes)`'s bytes, as `os.urandom` takes its size: None is DEFAULT_ENTROPY (32), a bool
+/// is an int, anything else not an int a TypeError
+fn random_bytes(n: &V) -> R<Vec<u8>> {
     use rand::RngCore;
     let n = match n {
+        V::None => 32,
+        V::Bool(b) => *b as usize,
         V::Int(i) if *i < 0 => return Err(Exc::value_error(negative_size())),
         V::Int(i) => *i as usize,
-        V::None => 32,
-        _ => return Err(Exc::type_error("token_urlsafe() needs an int")),
+        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
     };
     let mut buf = Vec::new();
     buf.try_reserve_exact(n).map_err(|_| Exc::msg(&super::v::MEMORY_ERROR, ""))?;
     buf.resize(n, 0u8);
-    rand::thread_rng().fill_bytes(&mut buf);
-    Ok(V::str(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)))
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    Ok(buf)
 }
 
+/// `secrets.token_bytes(nbytes=None)`
+pub fn token_bytes(n: &V) -> R {
+    Ok(V::Bytes(std::sync::Arc::from(random_bytes(n)?)))
+}
+
+/// `secrets.token_urlsafe(nbytes=None)`
+pub fn token_urlsafe(n: &V) -> R {
+    use base64::Engine;
+    Ok(V::str(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes(n)?)))
+}
+
+/// `secrets.token_hex(nbytes=None)`
 pub fn token_hex(n: &V) -> R {
-    use rand::RngCore;
-    let n = match n {
-        V::Int(i) if *i < 0 => return Err(Exc::value_error(negative_size())),
-        V::Int(i) => *i as usize,
-        V::None => 32,
-        _ => return Err(Exc::type_error("token_hex() needs an int")),
+    Ok(V::str(hex::encode(random_bytes(n)?)))
+}
+
+/// `secrets.randbelow(exclusive_upper_bound)`: `n <= 0` tested first (its TypeError for a non-number), then
+/// `n.bit_length()` (an AttributeError for a float or a Decimal)
+pub fn randbelow(n: &V) -> R {
+    use rand::Rng;
+    if ops::truthy(&ops::le(n, &V::Int(0))?)? {
+        return Err(Exc::value_error("Upper bound must be positive."));
+    }
+    match n {
+        V::Bool(_) => Ok(V::Int(0)),
+        V::Int(i) => Ok(V::Int(rand::rngs::OsRng.gen_range(0..*i))),
+        o => Err(Exc::attr_error(format!("'{}' object has no attribute 'bit_length'", o.type_name()))),
+    }
+}
+
+/// `secrets.randbits(k)` (`SystemRandom.getrandbits`): `k < 0` tested first, then the byte count
+/// `(k + 7) // 8` given to `os.urandom`; beyond 63 bits the integer does not fit the runtime's
+pub fn randbits(k: &V) -> R {
+    use rand::Rng;
+    if ops::truthy(&ops::lt(k, &V::Int(0))?)? {
+        return Err(Exc::value_error("number of bits must be non-negative"));
+    }
+    let k = match k {
+        V::Bool(b) => *b as i64,
+        V::Int(i) => *i,
+        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
     };
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(n).map_err(|_| Exc::msg(&super::v::MEMORY_ERROR, ""))?;
-    buf.resize(n, 0u8);
-    rand::thread_rng().fill_bytes(&mut buf);
-    Ok(V::str(hex::encode(buf)))
+    if k > 63 {
+        return Err(Exc::msg(&OVERFLOW_ERROR, format!("py2axum: secrets.randbits({k}) is beyond 64 bits (integers are 64-bit)")));
+    }
+    Ok(V::Int(if k == 0 { 0 } else { (rand::rngs::OsRng.gen::<u64>() >> (64 - k)) as i64 }))
 }
 
 pub fn compare_digest(a: &V, b: &V) -> R {
@@ -723,6 +758,62 @@ pub static NAMESPACE: pyd::SchemaDesc = pyd::SchemaDesc {
     x: pyd::SchemaX::NONE,
 };
 
+/// `sys.modules`: one table for the process, holding only what the project stores in it (the translation admits
+/// only keys of modules the project's Python cannot import: absent in CPython too)
+pub fn sys_modules() -> V {
+    static M: std::sync::LazyLock<V> = std::sync::LazyLock::new(|| V::dict_from(vec![]).expect("empty dict"));
+    M.clone()
+}
+
+static MODULE_CLASS: Class = Class { name: "module", qualname: "module", bases: &[], kind: ClassKind::Schema(&MODULE) };
+/// `types.ModuleType(name, doc=None)`: an empty module object (a stub put in `sys.modules`), attributes only
+pub static MODULE: pyd::SchemaDesc = pyd::SchemaDesc {
+    name: "module",
+    class: &MODULE_CLASS,
+    fields: &[],
+    from_attributes: false,
+    extra: pyd::Extra::Allow,
+    validators: &[],
+    validate_assignment: false,
+    populate_by_name: false,
+    methods: &[],
+    open: true,
+    model_after: &[],
+    before: &[],
+    model_before: &[],
+    has_before: false,
+    frozen: false,
+    post_init: None,
+    hash: pyd::HashKind::Id,
+    dataclass: false,
+    async_methods: &[],
+    slots: &[],
+    settings: None,
+    init: None,
+    private: &[],
+    ser_bytes: pyd::BytesMode::Utf8,
+    computed: &[],
+    json_schema: None,
+    x: pyd::SchemaX::NONE,
+};
+
+pub fn module_type(args: &[V], kwargs: &[(String, V)]) -> R {
+    let (name, doc) = match (args, kwargs) {
+        ([n], []) => (n.clone(), V::None),
+        ([n, d], []) => (n.clone(), d.clone()),
+        ([n], [(k, d)]) if k == "doc" => (n.clone(), d.clone()),
+        ([], [(k, n)]) if k == "name" => (n.clone(), V::None),
+        _ => return Err(Exc::type_error("py2axum: types.ModuleType(name, doc=None) takes the name and an optional doc")),
+    };
+    if !matches!(name, V::Str(_)) {
+        return Err(Exc::type_error(format!("module.__init__() argument 'name' must be str, not {}", name.type_name())));
+    }
+    let o = pyd::object_new(&MODULE);
+    super::methods::setattr(&o, "__name__", name)?;
+    super::methods::setattr(&o, "__doc__", doc)?;
+    Ok(o)
+}
+
 /// `types.SimpleNamespace(**kwargs)`
 pub fn namespace(args: &[V], kwargs: &[(String, V)]) -> R {
     if !args.is_empty() {
@@ -1012,12 +1103,13 @@ pub fn random(name: &str, args: &[V]) -> R {
 
 pub fn choice(seq: &V) -> R {
     use rand::Rng;
-    let items = ops::iter(seq)?;
-    if items.is_empty() {
+    // Random.choice: `len(seq)` (a TypeError without one), then `seq[i]` (a set is not subscriptable, a dict
+    // is indexed by key)
+    let n = ops::len(seq)?;
+    if n == 0 {
         return Err(Exc::msg(&INDEX_ERROR, "Cannot choose from an empty sequence"));
     }
-    let i = rand::rngs::OsRng.gen_range(0..items.len());
-    Ok(items[i].clone())
+    ops::getitem(seq, &V::Int(rand::rngs::OsRng.gen_range(0..n) as i64))
 }
 
 

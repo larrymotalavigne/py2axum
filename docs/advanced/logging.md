@@ -89,6 +89,38 @@ reads them for uvicorn.
 - **Sentry**: `LoggingIntegration` receives the records a logger lets through, as in Python
   ([Sentry](sentry.md)).
 
+## loguru
+
+loguru 0.7 (`from loguru import logger`) is native for what applications do with it:
+
+- **The default handler** that `import loguru` adds on `sys.stderr` (unless `LOGURU_AUTOINIT` is false), with
+  `LOGURU_LEVEL` and `LOGURU_COLORIZE`: its format (`2026-10-19 21:04:05.123 | INFO     | app.users:create:42 -
+  message`), the module (`__name__`), function and line of the call site, the local time to the millisecond.
+- **Colours** as loguru decides them: when the stream is a terminal, or when `CI` and a CI's own variable
+  (`GITLAB_CI`, `GITHUB_ACTIONS`, `TRAVIS`, `CIRCLECI`, `APPVEYOR`) are set, or `PYCHARM_HOSTED`; `colorize=`
+  forces them on or off.
+- **Logging**: `logger.trace/debug/info/success/warning/error/critical(message, *args, **kwargs)` and
+  `logger.log(level, message, ...)` (a level name, or a number: `Level 25`), the message formatted by
+  `str.format` only when there are arguments, a message that is not a string (`str()`), loguru's errors (an
+  unknown level, a negative number, a missing argument of the format).
+- **Sinks**: `logger.add(sys.stderr | sys.stdout, level=, format=, colorize=, backtrace=, diagnose=, catch=)`
+  returning its id, `logger.remove()` and `logger.remove(id)`, at import (module level), in the app factory or in
+  a route. A literal `format=` is compiled at translation with loguru's colour markups (`<green>`, `<level>`,
+  `<fg #ff8800>`, `</>`, `\<` ...) and these fields: `time` (loguru's tokens `YYYY`, `MM`, `DD`, `HH`, `mm`,
+  `ss`, `SSS`..., `Z`, `!UTC`, or strftime's `%Y %m %d %H %M %S %f %z %Z %j %a %A %b %B %p %I %y`), `level`,
+  `level.name`, `level.no`, `level.icon`, `name`, `function`, `line`, `message`, `module`, `file`, `file.name`,
+  `file.path`, `exception`, with a format spec and `!r`/`!s`.
+
+Refused at translation, with the file and line: `logger.exception()` and `opt(exception=...)` (loguru prints the
+exception with its `backtrace`/`diagnose` formatter, the values of the variables included by default),
+`opt`, `bind`, `contextualize`, `patch`, `catch`, `configure`, `level`, `enable`/`disable`, the logger used as a
+value (handed to a function, stored), file sinks (`rotation`, `retention`, `compression`), callables, coroutines
+and `logging` handlers as sinks, `serialize=True`, `enqueue=True`, `filter=`, a format that is not a literal text
+or that reads `extra`, `elapsed`, `process` or `thread`. A lifespan left to Python (`--python-side lifespan`) that
+adds or removes a sink keeps the whole application in Python, since the binary's logger would not have it.
+The binary stops at startup when another `LOGURU_*` variable is set (`LOGURU_FORMAT`, the levels' colours...),
+or `LOGURU_ENQUEUE` / `LOGURU_SERIALIZE` is true.
+
 ## Differences
 
 - A traceback holds the project's frames only: the frames of libraries (FastAPI, Starlette, uvicorn,

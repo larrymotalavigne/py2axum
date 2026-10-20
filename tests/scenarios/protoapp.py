@@ -19,6 +19,14 @@ STEPS += [("POST", "/p/key/one", None), ("POST", "/p/key/two", None), ("GET", "/
 
 STEPS += [("GET", f"/p/flags/{s}", None) for s in ("abc", "%C3%A9t%C3%A9", "x%20y")]
 
+# class protocols (fixtures/protoapp/klass.py): ABCMeta, abstract methods, class-body version test, exception dunders
+STEPS += [("GET", "/k/abc/square/3", None), ("GET", "/k/abc/loose", None), ("GET", "/k/abc/versioned", None),
+          ("GET", "/k/stateful", None)]
+STEPS += [("GET", f"/k/abc/bad/{w}", None) for w in ("half", "shape")]
+STEPS += [("GET", f"/k/exc/{w}", None) for w in ("plain", "msg", "sub", "raise", "log")]
+STEPS += [("GET", f"/k/exc/other/{w}", None) for w in ("plain", "broken", "broken-raise", "wrong", "wrong-raise")]
+STEPS += [("GET", f"/k/exc/tb/{n}", None) for n in (1, 2)]
+
 
 def reset(db: str) -> None:
     pass

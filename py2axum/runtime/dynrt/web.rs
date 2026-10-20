@@ -40,12 +40,65 @@ pub struct ReqCell {
     pub body_override: Mutex<Option<Bytes>>,
     /// that Request subclass's instance: the endpoint's `request` parameter while the handler runs
     pub custom_request: Mutex<Option<V>>,
+    /// Starlette's `_body` of each Request object of the request (REQ_ROUTE, REQ_EXC, REQ_SERVER, REQ_MW + layer):
+    /// set by its `body()`/`json()`, or assigned in a BaseHTTPMiddleware's dispatch (what the inner app then reads)
+    pub bodies: Mutex<Vec<(u32, Bytes)>>,
+    /// `request.form()` streamed the route's Request object's body (no `_body`)
+    pub form_read: AtomicBool,
 }
+
+/// the Request objects Starlette builds for one HTTP request: the route's (`request_response`), the one
+/// ExceptionMiddleware hands its handlers when no route ran (404, 405), ServerErrorMiddleware's `Request(scope)`
+/// (no receive channel), and one `_CachedRequest` per BaseHTTPMiddleware (REQ_MW + its index in the stack)
+pub const REQ_ROUTE: u32 = 1;
+pub const REQ_EXC: u32 = 2;
+pub const REQ_SERVER: u32 = 3;
+pub const REQ_MW: u32 = 100;
 
 impl ReqCell {
     /// the body the route parses (`body_override` while a custom request's handler runs)
     pub fn body_bytes(&self) -> Bytes {
-        self.body_override.lock().clone().unwrap_or_else(|| self.body.clone())
+        self.body_override.lock().clone().unwrap_or_else(|| self.incoming(REQ_ROUTE))
+    }
+
+    /// what the receive channel of a Request object yields: the `_body` of the closest BaseHTTPMiddleware around
+    /// it that has one (its `_CachedRequest.wrapped_receive` hands that on), else the client's body
+    pub fn incoming(&self, obj: u32) -> Bytes {
+        // the middlewares around `obj`: all of them for the route's and the handlers' objects, the outer ones for a
+        // middleware's (a lower index is further out)
+        let around = |o: u32| o >= REQ_MW && (obj < REQ_MW || o < obj);
+        let b = self.bodies.lock();
+        b.iter().filter(|(o, _)| around(*o)).max_by_key(|(o, _)| *o).map(|(_, x)| x.clone()).unwrap_or_else(|| self.body.clone())
+    }
+
+    /// `request._body` (an AttributeError until it is read or assigned)
+    pub fn cached_body(&self, obj: u32) -> Option<Bytes> {
+        self.bodies.lock().iter().find(|(o, _)| *o == obj).map(|(_, x)| x.clone())
+    }
+
+    pub fn set_body(&self, obj: u32, body: Bytes) {
+        let mut b = self.bodies.lock();
+        match b.iter_mut().find(|(o, _)| *o == obj) {
+            Some(slot) => slot.1 = body,
+            None => b.push((obj, body)),
+        }
+    }
+
+    /// `await request.body()` on a Request object: its `_body`, read once from its receive channel
+    pub fn read_body(&self, obj: u32) -> R<Bytes> {
+        if let Some(b) = self.cached_body(obj) {
+            return Ok(b);
+        }
+        if obj == REQ_ROUTE && self.form_read.load(Ordering::Relaxed) {
+            return Err(Exc::runtime("Stream consumed"));
+        }
+        if obj == REQ_SERVER {
+            // ServerErrorMiddleware's `Request(scope)`: Starlette's `empty_receive`
+            return Err(Exc::runtime("Receive channel has not been made available"));
+        }
+        let b = if obj == REQ_ROUTE { self.body_bytes() } else { self.incoming(obj) };
+        self.set_body(obj, b.clone());
+        Ok(b)
     }
 
     pub fn empty() -> ReqCell {
@@ -65,6 +118,8 @@ impl ReqCell {
             disconnected: AtomicBool::new(false),
             body_override: Mutex::new(None),
             custom_request: Mutex::new(None),
+            bodies: Mutex::new(vec![]),
+            form_read: AtomicBool::new(false),
         }
     }
     pub fn from_parts(method: &str, uri: &axum::http::Uri, headers: &HeaderMap, path_params: Vec<(String, String)>, body: Bytes) -> ReqCell {
@@ -89,6 +144,8 @@ impl ReqCell {
             disconnected: AtomicBool::new(false),
             body_override: Mutex::new(None),
             custom_request: Mutex::new(None),
+            bodies: Mutex::new(vec![]),
+            form_read: AtomicBool::new(false),
         }
     }
     pub fn header(&self, name: &str) -> Option<String> {
@@ -239,6 +296,10 @@ fn strict_content_type() -> bool {
 /// `json_invalid` at its character position, any other error (bad UTF-8, nesting too deep) a 400.
 pub fn read_body(cx: &Cx) -> R<Option<V>> {
     let bytes = &cx.req.body_bytes();
+    // `await request.body()` on the route's Request object: its `_body` (an exception handler of the route sees it)
+    if cx.req.cached_body(REQ_ROUTE).is_none() {
+        cx.req.set_body(REQ_ROUTE, bytes.clone());
+    }
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -459,7 +520,7 @@ fn http_basic(cx: &Cx, realm: Option<&str>, auto_error: bool) -> R {
         Some(r) => format!("Basic realm=\"{r}\""),
         None => "Basic".into(),
     };
-    let denied = || Err(Exc::http(401, V::str("Not authenticated"), vec![("WWW-Authenticate".into(), challenge.clone())]));
+    let denied = || Err(Exc::http_fastapi(401, V::str("Not authenticated"), vec![("WWW-Authenticate".into(), challenge.clone())]));
     let authorization = cx.req.header("authorization").unwrap_or_default();
     let (scheme, param) = authorization.split_once(' ').unwrap_or((&authorization, ""));
     if authorization.is_empty() || !scheme.eq_ignore_ascii_case("basic") {
@@ -501,7 +562,7 @@ pub fn security(cx: &Cx, kind: Security, auto_error: bool) -> R {
     };
     if !ok {
         if auto_error {
-            return Err(Exc::http(401, V::str("Not authenticated"), vec![("WWW-Authenticate".into(), "Bearer".into())]));
+            return Err(Exc::http_fastapi(401, V::str("Not authenticated"), vec![("WWW-Authenticate".into(), "Bearer".into())]));
         }
         return Ok(V::None);
     }
@@ -537,7 +598,7 @@ pub async fn security_with(cx: &Cx, kind: Security, auto_error: bool, error: Opt
             for (_, (k, v)) in d.lock().iter() {
                 out.push((super::ops::str_(k)?, super::ops::str_(v)?));
             }
-            Err(Exc::http(401, V::str("Not authenticated"), out))
+            Err(Exc::http_fastapi(401, V::str("Not authenticated"), out))
         }
         r => r,
     }
@@ -552,6 +613,10 @@ pub enum FormVal {
 
 /// `await request.form()` as Starlette parses it: multipart or urlencoded, anything else is empty.
 pub async fn read_form(cx: &Cx) -> R<Vec<(String, FormVal)>> {
+    // the route's Request object streamed its body: a later `body()` on it raises "Stream consumed"
+    if cx.req_obj.load(Ordering::Relaxed) == REQ_ROUTE {
+        cx.req.form_read.store(true, Ordering::Relaxed);
+    }
     let ct = cx.req.header("content-type").unwrap_or_default();
     let main = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     let bad = || Exc::http(400, V::str("There was an error parsing the body"), vec![]);
@@ -1755,7 +1820,7 @@ pub async fn call_original(cx: &Cx, run: RunFn, args: &[V]) -> R {
     // FastAPI reads the body (a body or form parameter), what its `body()` returns is the body the route parses,
     // any error there a 400 (`There was an error parsing the body`)
     match req {
-        V::Native(n) if matches!(&**n, Native::Request(_)) => return Ok(super::resp::from_response(run(cx).await?)),
+        V::Native(n) if matches!(&**n, Native::Request(..)) => return Ok(super::resp::from_response(run(cx).await?)),
         V::Inst(i) if i.extra.lock().contains_key(INNER_REQUEST) => {}
         _ => return Err(Exc::type_error(format!("py2axum: a route handler called with a '{}' (the request only)", req.type_name()))),
     }
@@ -1913,6 +1978,19 @@ fn quote_url(s: &str) -> String {
     out
 }
 
+/// Routes under an `if` around their `include_router` that is off at startup (`if settings.ENABLE_X:`), by index
+/// in ROUTES: never registered in Python, so never matched. Unset when no route is conditional.
+static DISABLED: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+
+pub fn set_disabled(off: Vec<bool>) {
+    let _ = DISABLED.set(off);
+}
+
+#[inline]
+fn route_off(i: usize) -> bool {
+    DISABLED.get().is_some_and(|d| d[i])
+}
+
 /// Starlette's Router: routes tried in declaration order on the decoded path; the first full match
 /// (path and method) runs, else the first path-only match raises a 405 HTTPException with its methods,
 /// else the path with/without a trailing slash is tried (307 redirect), else a 404 HTTPException
@@ -1922,7 +2000,10 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
     let full = unquote(&cx.req.path);
     let path = route_path(&full);
     let mut partial: Option<&RouteDef> = None;
-    for (r, re) in routes.iter().zip(res) {
+    for (i, (r, re)) in routes.iter().zip(res).enumerate() {
+        if route_off(i) {
+            continue;
+        }
         if let Some(caps) = re.captures(&path) {
             if r.method == cx.req.method {
                 let pp: Vec<(String, String)> = re
@@ -1982,7 +2063,7 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
         // the scope's path (root_path included), matched without the root_path
         let alt_full = if path.ends_with('/') { full.trim_end_matches('/').to_string() } else { format!("{full}/") };
         let alt = route_path(&alt_full);
-        if res.iter().any(|re| re.is_match(alt)) || super::routing::added_is_match(alt) {
+        if res.iter().enumerate().any(|(i, re)| !route_off(i) && re.is_match(alt)) || super::routing::added_is_match(alt) {
             let host = cx.req.header("host").unwrap_or_default();
             let mut url = format!("http://{host}{alt_full}");
             if !cx.req.raw_query.is_empty() {
@@ -2004,13 +2085,13 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
 pub fn full_match(raw_path: &str, method: &str, routes: &'static [RouteDef]) -> bool {
     let res = ROUTE_RES.get_or_init(|| routes.iter().map(|r| route_regex(r.pattern)).collect());
     let path = unquote(raw_path);
-    if routes.iter().zip(res).any(|(r, re)| r.method == method && re.is_match(&path)) {
+    if routes.iter().zip(res).enumerate().any(|(i, (r, re))| !route_off(i) && r.method == method && re.is_match(&path)) {
         return true;
     }
-    if routes.iter().zip(res).any(|(_, re)| re.is_match(&path)) {
+    if routes.iter().zip(res).enumerate().any(|(i, (_, re))| !route_off(i) && re.is_match(&path)) {
         return false; // `route` would answer 405 without looking at the added routes: Python decides
     }
-    matches!(super::routing::added_match(&path, method), Some((_, true)))
+    matches!(super::routing::added_match_native(&path, method), Some((_, true)))
 }
 
 pub async fn not_found() -> Response {

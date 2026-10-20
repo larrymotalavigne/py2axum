@@ -7,6 +7,8 @@ from contextvars import ContextVar
 
 from fastapi import APIRouter
 
+from . import sessforms
+
 router = APIRouter(prefix="/life")
 
 STATE = {"started": False, "ticks": 0, "stopped": False}
@@ -23,6 +25,7 @@ async def _tick_loop():
 
 @asynccontextmanager
 async def lifespan(_app):
+    await sessforms.late_manager.initialize()  # its session maker, read by sessforms.late_session
     task: asyncio.Task | None = asyncio.create_task(_tick_loop())
     STATE["started"] = True
     async with resource("lifespan"):

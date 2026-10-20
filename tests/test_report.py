@@ -154,7 +154,7 @@ def test_python_side_auto(tmp_path, capsys):
     """`--python-side auto`: the routes that do not translate are left to Python, the others are generated."""
     pkg = write_project(tmp_path)
     out = tmp_path / "out"
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(out)]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(out)]) == 1
     capsys.readouterr()
     assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(out)]) == 0
     err = capsys.readouterr().err
@@ -168,14 +168,28 @@ def test_python_side_auto(tmp_path, capsys):
 
 
 def test_python_side_auto_global_error(tmp_path, capsys):
-    """An error about the whole application cannot be avoided by moving routes: refused, with file:line."""
+    """An error about the whole application cannot be avoided by moving routes: refused with file:line, and with
+    --python-side auto the whole application stays in Python (the binary relays every request)."""
     pkg = write_project(tmp_path)
     main_py = pkg / "main.py"
     main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(telemetry=True)"))
-    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "main.py" in err and "FastAPI(telemetry=...)" in err  # its message depends on the FastAPI version
-    assert "only moves routes" in err
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 0
+    err = capsys.readouterr().err
+    assert "python-side (auto): the whole application — " in err and "FastAPI(telemetry=...)" in err
+    assert 'set_python_side(&[], &[""])' in (tmp_path / "out" / "src" / "main.rs").read_text()
+
+
+def test_python_side_auto_syntax_error(tmp_path, capsys):
+    """A module that does not parse: the Python application does not import either, auto refuses it."""
+    pkg = write_project(tmp_path)
+    (pkg / "broken.py").write_text("def f(:\n")
+    main_py = pkg / "main.py"
+    main_py.write_text("from proj import broken  # noqa\n" + main_py.read_text())
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 1
+    assert "syntax error" in capsys.readouterr().err
 
 
 def test_python_side_auto_raw_route(tmp_path, capsys):
@@ -190,3 +204,13 @@ def test_python_side_auto_raw_route(tmp_path, capsys):
     assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(out)]) == 0
     assert "python-side (auto): /raw (raw route)" in capsys.readouterr().err
     assert '"/raw"' in (out / "src" / "main.rs").read_text()
+
+
+def test_adopted_module_app_is_not_served():
+    """fixtures/bodycrash imports a middleware class from fixtures/bodyapp, whose own `app` has another middleware:
+    the served app is the package's, not the adopted module's."""
+    from py2axum.frontend import Frontend
+
+    root = Path(__file__).resolve().parent.parent
+    fe = Frontend(root / "fixtures" / "bodycrash", root)
+    assert "fixtures.bodyapp.main" not in fe.app_vars

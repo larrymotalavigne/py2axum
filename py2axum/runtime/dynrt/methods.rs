@@ -128,6 +128,7 @@ fn deepcopy(v: &V) -> R {
         })),
         V::Obj(_) => return Err(Exc::type_error("py2axum: deepcopy of a mapped object is not supported")),
         V::Set(_) => return Err(Exc::type_error("py2axum: deepcopy of a set is not supported")),
+        V::Frozen(_) => return Err(Exc::type_error("py2axum: deepcopy of a frozenset is not supported")),
         other => other.clone(),
     })
 }
@@ -150,6 +151,8 @@ pub fn default_copy(v: &V) -> R {
             }
         }
         V::Set(s) => V::Set(Arc::new(Mutex::new(s.lock().clone()))),
+        // copy.copy(frozenset) is the same object
+        V::Frozen(_) => v.clone(),
         V::Native(n) => match &**n {
             Native::Deque(d) => V::native(Native::Deque(Arc::new(super::deque::Deque {
                 items: Mutex::new(d.items.lock().iter().map(default_copy).collect::<R<_>>()?),
@@ -169,6 +172,9 @@ const NATIVE_METHODS: &[&str] = &["acquire", "release", "locked", "set", "clear"
     "call_soon", "call_soon_threadsafe", "run_forever", "stop", "close", "create_task", "run_in_executor"];
 
 pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
+    if let Some(r) = super::stripe::getattr(v, name) {
+        return r;
+    }
     if let V::Native(n) = v {
         match &**n {
             Native::Module(m) => return (m.attr)(cx, name).await,
@@ -177,6 +183,10 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => return super::satable::attr(n, name),
             Native::RelDelta(r) => return super::reldelta::attr(r, name).ok_or_else(|| no_attr(v, name)),
             Native::Cron(c) => return super::croniter::attr(c, name),
+            Native::Xl(x) => return super::xlsx::attr(x, name),
+            Native::Rl(x) => return super::rlbind::attr(x, name),
+            Native::File(f) if name == "name" => return Ok(super::pathio::file_name(f)),
+            Native::TempDir(t) => return super::pathio::tempdir_attr(v, t, name),
             Native::CtCache(c) => {
                 if let Some(r) = super::ctools::attr(c, name) {
                     return r;
@@ -210,6 +220,15 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                     return r;
                 }
             }
+            Native::Pgp(o) => {
+                if let super::pgpy::Obj::Fp(s) = &**o {
+                    if !matches!(name, "keyid" | "shortid") {
+                        return Box::pin(getattr(cx, &V::Str(s.clone()), name)).await;
+                    }
+                }
+                return super::pgpy::attr(v, o, name);
+            }
+            Native::Qr(o) => return super::qr::attr(o, name),
             _ => {}
         }
     }
@@ -354,6 +373,8 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             "__notes__" => Err(no_attr(v, name)),
             // SQLAlchemy's StatementError/DBAPIError: the exception met (read above), absent elsewhere
             "orig" => Err(no_attr(v, name)),
+            // DBAPIError: false unless the connection failed (set when raised: v.rs)
+            "connection_invalidated" if e.isinstance(&DBAPI_ERROR) => Ok(V::Bool(false)),
             // the frames a `sys.settrace` function saw, else none (the binary has no Python frames)
             "__traceback__" => Ok({
                 let chain: Vec<_> = e.0.tb.lock().iter().rev().cloned().collect();
@@ -457,7 +478,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
         },
         V::Native(n) => match &**n {
             Native::WebSocket(s) => super::ws::attr(cx, s, name),
-            Native::Request(r) => Ok(match name {
+            Native::Request(r, o) => Ok(match name {
+                "_body" => match r.cached_body(*o) {
+                    Some(b) => V::Bytes(Arc::from(&b[..])),
+                    None => return Err(no_attr(v, name)),
+                },
                 "headers" => V::native(Native::Headers(r.clone())),
                 "state" => V::native(Native::State(r.clone())),
                 "url" => V::native(Native::Url(r.clone())),
@@ -475,9 +500,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 _ => return Err(no_attr(v, name)),
             }),
             Native::Totp(t) => super::auth::totp_attr(t, name),
+            Native::Array(a) => super::arr::attr(a, name).ok_or_else(|| no_attr(v, name)),
+            Native::IpAddr(a) => super::net::addr_attr(a, name).ok_or_else(|| no_attr(v, name)),
             Native::UrlParts(u) => super::stdlib::url_parts_attr(u, name),
             Native::IniConfig(c) => super::ini::attr(c, name),
-            Native::PydUrl(_, u) => pyd::url_attr(u, name),
+            Native::PydUrl(kind, u) => pyd::url_attr(kind, u, name),
             Native::Row(names, vals) => match name {
                 "_mapping" => V::dict_from(names.iter().zip(vals.iter()).map(|(k, x)| (V::str(k), x.clone())).collect()),
                 "_fields" => Ok(V::tuple(names.iter().map(V::str).collect())),
@@ -487,6 +514,12 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::HttpResp(r) => super::http::resp_attr(r, name),
             Native::HttpClient(c) => super::http::client_attr(c, name),
             Native::HttpUrl(u) => super::http::url_attr(u, name),
+            Native::HttpReq(r) => super::http::req_attr(r, name),
+            // a CryptContext's method read as a value (`v = pwd_context.verify`)
+            Native::PassCtx(_) => match ["hash", "verify", "verify_and_update", "needs_update", "identify", "dummy_verify"].iter().find(|m| **m == name) {
+                Some(m) => Ok(V::native(Native::MethodOf(v.clone(), m))),
+                None => Err(no_attr(v, name)),
+            },
             // `re.Pattern` -> Pattern (type names carry their module where CPython's repr does)
             Native::Type(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t.rsplit('.').next().unwrap_or(t))),
             Native::TThread(t) => super::thread::thread_attr(t, name),
@@ -511,6 +544,10 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 "path" => V::str(web::unquote(&r.path).replace(['\t', '\r', '\n'], "")),
                 "query" => V::str(r.raw_query.replace(['\t', '\r', '\n'], "")),
                 "hostname" => r.header("host").map(|h| V::str(h.split(':').next().unwrap_or(""))).unwrap_or(V::None),
+                // urlsplit of the scheme://Host header+path URL; uvicorn passes no fragment, no userinfo
+                "fragment" => V::str(""),
+                "username" | "password" => V::None,
+                "port" => r.header("host").and_then(|h| h.rsplit_once(':').and_then(|(_, p)| p.parse::<i64>().ok())).map(V::Int).unwrap_or(V::None),
                 "scheme" => V::str(&r.scheme),
                 "netloc" => V::str(r.header("host").unwrap_or_default()),
                 _ => return Err(no_attr(v, name)),
@@ -527,6 +564,11 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 _ => Err(no_attr(v, name)),
             },
             Native::Log(o) => super::logging::attr(o, v, name),
+            // `sp.is_active` of `session.begin_nested()` / `session.begin()` ("": the session's transaction)
+            Native::Savepoint(sess, sp) if name == "is_active" => {
+                Ok(V::Bool(if sp.is_empty() { sess.in_transaction().await } else { sess.savepoint_active(sp).await }))
+            }
+            Native::Proc(p) => super::subproc::attr(p, name),
             // a method of a lock, event, loop... read as a value (`loop.call_soon(ready.set)`)
             Native::TLock(_) | Native::TEvent(_) | Native::ELoop(_) | Native::Sem(_) => match NATIVE_METHODS.iter().find(|m| **m == name) {
                 Some(m) => Ok(V::native(Native::MethodOf(v.clone(), m))),
@@ -535,7 +577,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             _ => Err(no_attr(v, name)),
         },
         V::Session(s) if name == "bind" => Ok(V::native(Native::Engine(s.is_sync()))),
-        V::List(_) | V::Dict(_) | V::Set(_) | V::Str(_) | V::Tuple(_) | V::Bytes(_) => match BUILTIN_METHODS.iter().find(|(t, m)| *t == v.type_name() && *m == name) {
+        V::List(_) | V::Dict(_) | V::Set(_) | V::Frozen(_) | V::Str(_) | V::Tuple(_) | V::Bytes(_) => match BUILTIN_METHODS.iter().find(|(t, m)| *t == v.type_name() && *m == name) {
             // `items.append` read as a value: called later with its receiver
             Some((_, m)) => Ok(V::native(Native::MethodOf(v.clone(), m))),
             // `frozenset(words).__contains__` (keyword.iskeyword): the operator's method
@@ -565,6 +607,8 @@ const BUILTIN_METHODS: &[(&str, &str)] = &[
     ("list", "index"), ("list", "count"),
     ("dict", "get"), ("dict", "pop"), ("dict", "setdefault"), ("dict", "update"), ("dict", "keys"), ("dict", "values"),
     ("dict", "items"), ("dict", "clear"),
+    ("frozenset", "union"), ("frozenset", "intersection"), ("frozenset", "difference"), ("frozenset", "symmetric_difference"),
+    ("frozenset", "copy"), ("frozenset", "issubset"), ("frozenset", "issuperset"), ("frozenset", "isdisjoint"),
     ("set", "add"), ("set", "discard"), ("set", "remove"), ("set", "pop"), ("set", "clear"), ("set", "update"),
     ("str", "upper"), ("str", "lower"), ("str", "strip"), ("str", "format"), ("str", "join"), ("str", "split"),
 ];
@@ -820,7 +864,28 @@ fn bytes_method(b: &Arc<[u8]>, name: &str, args: &[V]) -> R {
     }
 }
 
-fn set_of(items: Vec<V>) -> R {
+fn frozen_of(items: Vec<V>) -> R {
+    match set_of(items)? {
+        V::Set(m) => Ok(V::Frozen(m)),
+        other => Ok(other),
+    }
+}
+
+/// a frozenset's methods: the read-only ones of a set, the results frozen
+fn frozen_method(s: &Arc<Mutex<IndexMap<Key, V>>>, name: &str, args: &[V]) -> R {
+    match name {
+        "copy" => Ok(V::Frozen(s.clone())),
+        "union" | "intersection" | "difference" | "symmetric_difference" | "issubset" | "issuperset" | "isdisjoint" => {
+            match set_method(s, name, args)? {
+                V::Set(m) => Ok(V::Frozen(m)),
+                other => Ok(other),
+            }
+        }
+        _ => Err(Exc::attr_error(format!("'frozenset' object has no attribute '{name}'"))),
+    }
+}
+
+pub fn set_of(items: Vec<V>) -> R {
     let mut m = IndexMap::new();
     for v in items {
         m.insert(Key::set_elem(&v)?, v);
@@ -851,6 +916,20 @@ pub async fn setattr_cx(cx: &Cx, v: &V, name: &str, val: V) -> R<()> {
         if i.desc.validate_assignment && ops::dunder(v, "__setattr__").is_none() {
             return pyd::assign_validated(cx, i, name, val).await;
         }
+        if i.desc.open && !name.starts_with("__") && ops::dunder(v, "__setattr__").is_none() {
+            // a property is a data descriptor: the class's `@name.setter` runs, without one the assignment fails
+            // (the table holds `set:<name>` beside the getter `<name>`, `ro:<name>` for a property without setter)
+            if let Some((_, f)) = find_method(i.desc.methods, &format!("set:{name}")) {
+                return f(cx, v.clone(), vec![val]).await.map(|_| ());
+            }
+            if find_method(i.desc.methods, &format!("ro:{name}")).is_some() {
+                return Err(Exc::attr_error(if super::python() >= (3, 11) {
+                    format!("property '{name}' of '{}' object has no setter", i.desc.name)
+                } else {
+                    "can't set attribute".to_string()
+                }));
+            }
+        }
     }
     if let V::Class(c) = v {
         if let ClassKind::Schema(s) = c.kind {
@@ -868,6 +947,9 @@ pub async fn setattr_cx(cx: &Cx, v: &V, name: &str, val: V) -> R<()> {
 }
 
 pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
+    if let Some(r) = super::stripe::setattr(v, name, &val) {
+        return r;
+    }
     match v {
         V::Obj(o) => o.set_attr(name, val),
         V::Inst(i) => match ops::dunder(v, "__setattr__") {
@@ -897,7 +979,23 @@ pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
                 Ok(())
             }
             Native::RespObj(r) if name == "status_code" => super::resp::set_status(r, &val),
+            // a BaseHTTPMiddleware's `request._body = data`: what its `call_next` hands the inner app
+            Native::Request(r, o) if name == "_body" => match val {
+                V::Bytes(b) => {
+                    r.set_body(*o, axum::body::Bytes::copy_from_slice(&b));
+                    Ok(())
+                }
+                other => Err(Exc::type_error(format!("py2axum: request._body = <{}> is not supported (only bytes)", other.type_name()))),
+            },
+            // `request._receive = receive` next to `_body`: the inner app reads `_body` first (wrapped_receive), the
+            // channel is never asked for the body again; without `_body` the new channel would be read: refused
+            Native::Request(r, o) if name == "_receive" => match r.cached_body(*o) {
+                Some(_) => Ok(()),
+                None => Err(Exc::type_error("py2axum: request._receive = ... without request._body set first is not supported")),
+            },
             Native::DnsResolver(r) => super::dnsres::resolver_setattr(r, name, val),
+            Native::Xl(x) => super::xlsx::setattr(x, name, val),
+            Native::Rl(x) => super::rlbind::setattr(x, name, val),
             Native::Log(o) => super::logging::setattr(o, name, val),
             Native::PyFn(f) => {
                 let mut a = f.attrs.lock();
@@ -935,7 +1033,10 @@ pub async fn hasattr(cx: &Cx, v: &V, name: &str) -> R {
 // ---------------------------------------------------------------- method calls
 
 pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
-    if matches!(recv, V::List(_) | V::Dict(_) | V::Set(_) | V::Str(_) | V::Tuple(_) | V::Bytes(_)) && CONTAINER_DUNDERS.contains(&name) {
+    if let Some(f) = super::stripe::call_method(cx, recv, name, &args, &kwargs) {
+        return f.await;
+    }
+    if matches!(recv, V::List(_) | V::Dict(_) | V::Set(_) | V::Frozen(_) | V::Str(_) | V::Tuple(_) | V::Bytes(_)) && CONTAINER_DUNDERS.contains(&name) {
         let t = recv.type_name();
         if !kwargs.is_empty() {
             return Err(Exc::type_error(format!("{t}.{name}() takes no keyword arguments")));
@@ -1075,6 +1176,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let Native::Redis(c) = &**n else { unreachable!() };
             super::rds::method(c, name, args, kwargs).await
         }
+        V::Native(n) if matches!(&**n, Native::RPipe(_)) => {
+            let Native::RPipe(p) = &**n else { unreachable!() };
+            super::rds::pipe_method(p, recv, name, args, kwargs).await
+        }
         V::Native(n) if matches!(&**n, Native::Sem(_)) => {
             let Native::Sem(s) = &**n else { unreachable!() };
             super::aio::sem_method(s, name).await
@@ -1083,13 +1188,40 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let Native::ZipW(z) = &**n else { unreachable!() };
             super::zipw::method(z, name, &args, &kwargs)
         }
+        V::Native(n) if matches!(&**n, Native::TempDir(_)) => {
+            let Native::TempDir(t) = &**n else { unreachable!() };
+            if let Some((k, _)) = kwargs.first() {
+                return Err(Exc::type_error(format!("TemporaryDirectory.{name}() got an unexpected keyword argument '{k}'")));
+            }
+            super::pathio::tempdir_method(t, name, &args)
+        }
         V::Native(n) if matches!(&**n, Native::Socket(_)) => {
             let Native::Socket(s) = &**n else { unreachable!() };
             super::net::sock_method(s, name)
         }
+        V::Native(n) if matches!(&**n, Native::Proc(_)) => {
+            let Native::Proc(p) = &**n else { unreachable!() };
+            super::subproc::method(p, name, &args, &kwargs).await
+        }
         V::Native(n) if matches!(&**n, Native::Rsa(_)) => {
             let Native::Rsa(k) = &**n else { unreachable!() };
             super::crypto::method(k, name, &args, &kwargs)
+        }
+        V::Native(n) if matches!(&**n, Native::Pgp(_)) => {
+            let Native::Pgp(o) = &**n else { unreachable!() };
+            if let super::pgpy::Obj::Fp(s) = &**o {
+                // Fingerprint.__eq__/__ne__/__hash__ are its own; the rest is str's (and returns a str)
+                return match (name, &args[..]) {
+                    ("__eq__", [x]) => Ok(V::Bool(super::ops::eq_bool(recv, x))),
+                    ("__ne__", [x]) => Ok(V::Bool(!super::ops::eq_bool(recv, x))),
+                    _ => Box::pin(call_method(cx, &V::Str(s.clone()), name, args, kwargs)).await,
+                };
+            }
+            super::pgpy::method(recv, o, name, &args, &kwargs)
+        }
+        V::Native(n) if matches!(&**n, Native::Qr(_)) => {
+            let Native::Qr(o) = &**n else { unreachable!() };
+            super::qr::method(o, name, &args, &kwargs)
         }
         V::Native(n) if matches!(&**n, Native::Stream(..)) => {
             let Native::Stream(s, w) = &**n else { unreachable!() };
@@ -1192,6 +1324,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             None => dict_method(d, name, &args, &kwargs),
         },
         V::Set(s) => set_method(s, name, &args),
+        V::Frozen(s) => frozen_method(s, name, &args),
         V::Tuple(t) => match name {
             "count" if args.len() != 1 || !kwargs.is_empty() => Err(Exc::type_error(format!("count() takes exactly one argument ({} given)", args.len()))),
             "index" if args.len() != 1 || !kwargs.is_empty() => seq_index(t, &args, kwargs.is_empty())?
@@ -1369,7 +1502,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                         s.name,
                     ));
                 }
-                pyd::construct(cx, s, obj).await
+                pyd::construct_mode(cx, s, obj, !from_attrs).await
             }
             (ClassKind::Schema(s), "model_construct") => pyd::model_construct(cx, s, args, kwargs).await,
             (ClassKind::Schema(s), "model_json_schema") => match s.json_schema {
@@ -1460,6 +1593,16 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             },
             "delete" => s.delete(&args[0]).await.map(|_| V::None),
             "begin_nested" => s.begin_nested().await,
+            "in_transaction" => Ok(V::Bool(s.in_transaction().await)),
+            "in_nested_transaction" => Ok(V::Bool(s.in_nested_transaction().await)),
+            // `async with session.begin():` (its transaction, committed or rolled back at the block's end); the
+            // name "" marks the session's own transaction, not a savepoint
+            "begin" => {
+                if s.in_transaction().await {
+                    return Err(Exc::msg(&INVALID_REQUEST_ERROR, "A transaction is already begun on this Session."));
+                }
+                Ok(V::native(Native::Savepoint(s.clone(), String::new())))
+            }
             "query" => orm::query(s, args),
             "close" | "aclose" => s.close().await.map(|_| V::None),
             "expunge_all" => s.expunge(None).await.map(|_| V::None),
@@ -1485,6 +1628,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                     Ok(r.header(&key).map(V::str).unwrap_or_else(|| arg(&args, &kwargs, 1, "default").cloned().unwrap_or(V::None)))
                 }
                 "keys" => Ok(V::list(r.headers.iter().map(|(k, _)| V::str(k)).collect())),
+                "values" => Ok(V::list(r.headers.iter().map(|(_, x)| V::str(x)).collect())),
                 "items" => Ok(V::list(r.headers.iter().map(|(k, x)| V::tuple(vec![V::str(k), V::str(x)])).collect())),
                 // Headers.getlist(key): every value of the (case-insensitive) name, in order
                 "getlist" if args.len() == 1 && kwargs.is_empty() => {
@@ -1498,11 +1642,11 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 Some(v) => Ok(v),
                 None => Err(Exc::new(&STOP_ASYNC_ITERATION, vec![])),
             },
-            Native::Request(r) => match name {
+            Native::Request(r, o) => match name {
                 "is_disconnected" => Ok(V::Bool(r.disconnected.load(std::sync::atomic::Ordering::Relaxed))),
-                "body" => Ok(V::Bytes(Arc::from(&r.body_bytes()[..]))),
+                "body" => Ok(V::Bytes(Arc::from(&r.read_body(*o)?[..]))),
                 // Starlette: `json.loads(await self.body())` (bytes: json.detect_encoding, UnicodeDecodeError)
-                "json" => super::libs::json_loads(&V::Bytes(Arc::from(&r.body_bytes()[..]))),
+                "json" => super::libs::json_loads(&V::Bytes(Arc::from(&r.read_body(*o)?[..]))),
                 _ => Err(no_attr(recv, name)),
             },
             Native::Queue(q) => match name {
@@ -1523,6 +1667,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::CellHeaders(c) => super::resp::headers_method(&c.headers, name, &args, &kwargs),
             Native::Totp(t) => super::auth::totp_method(t, name, &args, &kwargs),
             Native::PwdHash => super::auth::pwd_method(name, &args, &kwargs),
+            Native::PassCtx(c) => super::auth::passlib_method(cx, c, name, &args, &kwargs).await,
             Native::Row(names, vals) if name == "_asdict" => V::dict_from(names.iter().zip(vals.iter()).map(|(k, x)| (V::str(k), x.clone())).collect()),
             Native::Row(_, vals) if name == "_tuple" => Ok(V::tuple(vals.to_vec())),
             Native::UrlParts(u) if name == "geturl" => Ok(V::str(super::stdlib::url_parts_geturl(u))),
@@ -1532,7 +1677,13 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::McpServer(s) => super::mcp::server_method(s, name),
             Native::McpManager(s) => super::mcp::manager_method(cx, s, name, &args).await,
             Native::IniConfig(c) => super::ini::method(c, name, &args, &kwargs),
+            Native::PydUrl(kind, u) if pyd::is_multi_host(kind) => match name {
+                "hosts" => pyd::url_hosts(u),
+                "unicode_string" => Ok(V::str(u.as_str())),
+                _ => Err(Exc::attr_error(format!("'{kind}' object has no attribute '{name}'"))),
+            },
             Native::PydUrl(_, u) if name == "unicode_string" => Ok(V::str(u.as_str())),
+
             Native::SessConn(s) => match name {
                 "close" => s.close_connection().await.map(|_| V::None),
                 // Core execution in the session's transaction (no ORM bulk mode, no synchronization)
@@ -1551,6 +1702,8 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::HttpResp(r) => super::http::resp_method(r, recv, name, &args, &kwargs),
             Native::WriteOnly(o, ri) => orm::write_only_method(o, *ri, name, args, kwargs),
             Native::Savepoint(sess, sp) => match name {
+                "commit" if sp.is_empty() => sess.commit().await.map(|_| V::None),
+                "rollback" if sp.is_empty() => sess.rollback().await.map(|_| V::None),
                 "commit" | "rollback" => sess.end_savepoint(sp, name == "commit").await.map(|_| V::None),
                 _ => Err(no_attr(recv, name)),
             },
@@ -1577,7 +1730,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::JinjaTpl(t) => super::mail::tpl_method(t, name, &args, &kwargs),
             Native::Mime(m) => super::mail::mime_method(m, name, &args, &kwargs),
             Native::EmailMsg(m) => super::emailmsg::method(m, name, &args, &kwargs),
+            Native::Xl(x) => super::xlsx::method(x, name, &args, &kwargs),
+            Native::Rl(x) => super::rlbind::method(cx, recv, x, name, &args, &kwargs).await,
             Native::Deque(d) => super::deque::method(d, name, &args),
+            Native::Array(a) => super::arr::method(a, name, &args),
             Native::Template(t) => super::stdlib::template_method(t, name, &args, &kwargs),
             Native::Tasks(t) => super::resp::tasks_method(t, name, &args, &kwargs),
             Native::Response(r) if name == "set_cookie" || name == "delete_cookie" => {
@@ -1607,8 +1763,24 @@ pub fn call_value_kw_boxed<'a>(cx: &'a Cx, f: &'a V, kwargs: Vec<(String, V)>) -
     Box::pin(call_value(cx, f, vec![], kwargs))
 }
 
+/// A method whose decorators left a function object (`@wraps` wrappers, `@contextmanager`...): read on an instance
+/// it is bound, the instance goes first. Another object (a descriptor, a partial) binds by its own rules: refused.
+pub async fn call_decorated_method(cx: &Cx, d: &V, recv: V, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if !matches!(d, V::Native(n) if matches!(&**n, Native::PyFn(_) | Native::Unbound(_, false))) {
+        return Err(Exc::type_error(format!(
+            "py2axum: a method decorated into a '{}' object is not supported (only a function is bound to its instance)", d.type_name())));
+    }
+    let mut all = Vec::with_capacity(args.len() + 1);
+    all.push(recv);
+    all.extend(args);
+    call_value(cx, d, all, kwargs).await
+}
+
 pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     if let V::Native(n) = f {
+        if let Native::Pgp(o) = &**n {
+            return super::pgpy::call(o);
+        }
         if let Native::Bound(m, recv) = &**n {
             return m(cx, recv.clone(), super::pack(args, kwargs)).await;
         }
@@ -1653,11 +1825,13 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
             return super::ctools::decorate(c, &args);
         }
         // `async_sessionmaker(...)()`: a new session on the process pool
-        if let Native::Maker(expire, autoflush, sync) = &**n {
+        if let Native::Maker(expire, autoflush, sync, params) = &**n {
             if !args.is_empty() || !kwargs.is_empty() {
                 return Err(Exc::type_error("py2axum: calling a sessionmaker with arguments is not supported"));
             }
-            return Ok(V::Session(orm::Session::new(cx.app.pool.clone(), *expire, *autoflush, *sync, Arc::downgrade(cx))));
+            let s = orm::Session::new(cx.app.pool.clone(), *expire, *autoflush, *sync, Arc::downgrade(cx));
+            s.set_params(params.clone());
+            return Ok(V::Session(s));
         }
         // a builtin type used as a function value (`map(str, xs)`, `defaultdict(list)`)
         if let Native::Type(t) = &**n {
@@ -1671,7 +1845,8 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
                 "bool" => b_bool(&args),
                 "list" => b_list(&args),
                 "tuple" => b_tuple(&args),
-                "set" | "frozenset" => b_set(&args),
+                "set" => b_set(&args),
+                "frozenset" => b_frozenset(&args),
                 "dict" => b_dict(&args, &kwargs),
                 "datetime" => super::libs::datetime_new(&args, &kwargs),
                 other => Err(Exc::type_error(format!("py2axum: calling the type {other} as a value is not supported"))),
@@ -1778,7 +1953,7 @@ pub async fn schema_new(cx: &Cx, s: &'static pyd::SchemaDesc, args: Vec<V>, kwar
             return Err(Exc::type_error(format!(
                 "py2axum: {}(): pydantic-settings init options are not supported (set them in model_config)", s.name)));
         }
-        return super::settings(cx, s, st.prefix, st.case_sensitive, st.none_str, kwargs).await;
+        return super::settings(cx, s, st.prefix, st.case_sensitive, st.none_str, st.ignore_empty, kwargs).await;
     }
     if !args.is_empty() {
         return Err(Exc::type_error(format!("BaseModel.__init__() takes 1 positional argument but {} were given", args.len() + 1)));
@@ -2114,6 +2289,20 @@ fn str_method(s: &Arc<str>, name: &str, args: &[V], kwargs: &[(String, V)]) -> R
         "format" => {
             let pos = |i: usize| args.get(i).cloned().ok_or_else(|| Exc::msg(&INDEX_ERROR, format!("Replacement index {i} out of range for positional args tuple")));
             V::str(format_with(s, &pos, &|n: &str| kw(kwargs, n).cloned().ok_or_else(|| Exc::new(&KEY_ERROR, vec![V::str(n)])), false)?)
+        }
+        // CPython reads each field through `mapping[key]` (a defaultdict inserts its default, a missing key raises
+        // the mapping's KeyError); a positional field is refused before any lookup of its own
+        "format_map" => {
+            if args.len() != 1 || !kwargs.is_empty() {
+                return Err(Exc::type_error(if !kwargs.is_empty() {
+                    "str.format_map() takes no keyword arguments".to_string()
+                } else {
+                    format!("format_map() takes exactly one argument ({} given)", args.len())
+                }));
+            }
+            let m = &args[0];
+            let pos = |_: usize| Err(Exc::value_error("Format string contains positional fields"));
+            V::str(format_with(s, &pos, &|n: &str| super::ops::getitem(m, &V::str(n)), false)?)
         }
         _ => return Err(Exc::attr_error(format!("'str' object has no attribute '{name}'"))),
     })
@@ -2653,21 +2842,27 @@ pub fn bytes_decode(b: &[u8], args: &[V], kwargs: &[(String, V)], what: &str) ->
     if args.len() > 2 || kwargs.iter().any(|(k, _)| k != "encoding" && k != "errors") {
         return Err(Exc::type_error(format!("{what}() takes at most 2 arguments")));
     }
-    if let Some(e) = arg_or_kw(args, kwargs, 1, "errors") {
-        if ops::str_(e)? != "strict" {
-            return Err(Exc::type_error(format!("py2axum: {what}(errors=) supports 'strict' only")));
-        }
-    }
+    let errors = match arg_or_kw(args, kwargs, 1, "errors") {
+        None => "strict".to_string(),
+        Some(e) => ops::str_(e)?,
+    };
     let enc = arg_or_kw(args, kwargs, 0, "encoding");
+    let lossy = |b: &[u8], sig: bool| -> R {
+        if errors == "strict" {
+            return if sig { utf8_decode(b, 3) } else { utf8_decode(b, 0) };
+        }
+        decode_handled(b, &errors, false, what)
+    };
     match codec(enc)? {
-        Some("utf-8") => utf8_decode(b, 0),
+        Some("utf-8") => lossy(b, false),
         Some("utf-8-sig") => match b.strip_prefix(b"\xef\xbb\xbf") {
-            Some(rest) => utf8_decode(rest, 3),
-            None => utf8_decode(b, 0),
+            Some(rest) => lossy(rest, true),
+            None => lossy(b, false),
         },
         Some("latin-1") => Ok(V::str(b.iter().map(|&c| c as char).collect::<String>())),
         Some(_) => match b.iter().position(|c| *c >= 0x80) {
             None => Ok(V::str(b.iter().map(|&c| c as char).collect::<String>())),
+            Some(_) if errors != "strict" => decode_handled(b, &errors, true, what),
             Some(p) => Err(Exc::msg(
                 &UNICODE_DECODE_ERROR,
                 format!("'ascii' codec can't decode byte 0x{:02x} in position {p}: ordinal not in range(128)", b[p]),
@@ -2675,6 +2870,52 @@ pub fn bytes_decode(b: &[u8], args: &[V], kwargs: &[(String, V)], what: &str) ->
         },
         None => Err(Exc::type_error(format!("py2axum: {what}({}) is not supported (utf-8, utf-8-sig, latin-1, ascii)", ops::repr(enc.unwrap())?))),
     }
+}
+
+/// decoding with `errors=` ignore / replace / backslashreplace, as CPython's utf-8 and ascii decoders (each
+/// invalid sequence is the maximal subpart, one U+FFFD for `replace`). The other handlers: surrogateescape
+/// would need lone surrogates (not representable), xmlcharrefreplace / namereplace raise TypeError in CPython
+/// for a decode error, a custom one is looked up lazily (LookupError): refused (a literal one at generation).
+fn decode_handled(b: &[u8], errors: &str, ascii: bool, what: &str) -> R {
+    let valid = if ascii { b.is_ascii() } else { std::str::from_utf8(b).is_ok() };
+    if valid {
+        return Ok(V::str(String::from_utf8_lossy(b).into_owned()));
+    }
+    if !matches!(errors, "ignore" | "replace" | "backslashreplace") {
+        return Err(Exc::type_error(format!("py2axum: {what}(errors={errors:?}) is not supported (strict, ignore, replace, backslashreplace)")));
+    }
+    let mut out = String::with_capacity(b.len());
+    let bad = |out: &mut String, seq: &[u8]| match errors {
+        "replace" => out.push('\u{fffd}'),
+        "backslashreplace" => seq.iter().for_each(|c| out.push_str(&format!("\\x{c:02x}"))),
+        _ => {}
+    };
+    let mut rest = b;
+    while !rest.is_empty() {
+        if ascii {
+            let n = rest.iter().position(|c| *c >= 0x80).unwrap_or(rest.len());
+            out.extend(rest[..n].iter().map(|&c| c as char));
+            if n < rest.len() {
+                bad(&mut out, &rest[n..n + 1]);
+            }
+            rest = &rest[(n + 1).min(rest.len())..];
+            continue;
+        }
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let p = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&rest[..p]).unwrap());
+                let n = e.error_len().unwrap_or(rest.len() - p);
+                bad(&mut out, &rest[p..p + n]);
+                rest = &rest[p + n..];
+            }
+        }
+    }
+    Ok(V::str(out))
 }
 
 /// `str.encode(encoding="utf-8", errors="strict")`: utf-8, ascii and latin-1, errors strict / ignore / replace
@@ -2708,7 +2949,13 @@ pub fn str_encode(s: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         match errors.as_str() {
             "ignore" => {}
             "replace" => out.push(b'?'),
-            "strict" => {
+            "backslashreplace" => {
+                let n = c as u32;
+                out.extend(if n < 0x100 { format!("\\x{n:02x}") } else if n < 0x10000 { format!("\\u{n:04x}") } else { format!("\\U{n:08x}") }.bytes());
+            }
+            "xmlcharrefreplace" => out.extend(format!("&#{};", c as u32).bytes()),
+            // no lone surrogate exists in a Rust string: these two raise as "strict" does for any other character
+            "strict" | "surrogateescape" | "surrogatepass" => {
                 // CPython reports the whole run of unencodable characters
                 let end = (i..chars.len()).find(|j| (chars[*j] as u32) < limit).unwrap_or(chars.len());
                 let msg = if end - i == 1 {
@@ -2718,7 +2965,7 @@ pub fn str_encode(s: &str, args: &[V], kwargs: &[(String, V)]) -> R {
                 };
                 return Err(Exc::msg(&UNICODE_ENCODE_ERROR, msg));
             }
-            other => return Err(Exc::type_error(format!("py2axum: str.encode(errors={other:?}) is not supported (strict, ignore, replace)"))),
+            other => return Err(Exc::type_error(format!("py2axum: str.encode(errors={other:?}) is not supported (strict, ignore, replace, backslashreplace, xmlcharrefreplace, surrogateescape, surrogatepass)"))),
         }
         i += 1;
     }
@@ -2736,7 +2983,7 @@ pub fn b_callable(args: &[V]) -> R {
     let [v] = args else { return Err(Exc::type_error(format!("callable() takes exactly one argument ({} given)", args.len()))) };
     Ok(V::Bool(match v {
         V::Class(_) => true,
-        V::Native(n) => matches!(&**n, Native::Bound(..) | Native::Unbound(..) | Native::PyFn(_) | Native::Builtin(..) | Native::Type(_) | Native::Maker(..) | Native::CallNext(_) | Native::AsgiApp(_)),
+        V::Native(n) => matches!(&**n, Native::RequestReceive | Native::Bound(..) | Native::Unbound(..) | Native::PyFn(_) | Native::Builtin(..) | Native::Type(_) | Native::Maker(..) | Native::CallNext(_) | Native::AsgiApp(_)),
         V::Inst(i) => find_method(i.desc.methods, "__call__").is_some(),
         V::Obj(o) => find_method(o.desc.methods, "__call__").is_some(),
         _ => false,
@@ -2782,7 +3029,8 @@ pub fn format_with(s: &str, positional: &dyn Fn(usize) -> R, named: &dyn Fn(&str
             field.push(d);
         }
         if !closed {
-            return Err(Exc::value_error("expected '}' before end of string"));
+            // CPython's MarkupIterator: a '{' that ends the string is a lone brace, a field left open is not
+            return Err(Exc::value_error(if field.is_empty() { "Single '{' encountered in format string" } else { "expected '}' before end of string" }));
         }
         let (head, spec) = field.split_once(':').map(|(a, b)| (a, b)).unwrap_or((field.as_str(), ""));
         let (fname, conv) = match head.split_once('!') {
@@ -3094,6 +3342,17 @@ pub fn b_tuple(args: &[V]) -> R {
     }))
 }
 
+pub fn b_frozenset(args: &[V]) -> R {
+    // frozenset(fs) is fs itself
+    if let [fs @ V::Frozen(_)] = args {
+        return Ok(fs.clone());
+    }
+    frozen_of(match args.first() {
+        None => vec![],
+        Some(v) => ops::iter(v)?,
+    })
+}
+
 pub fn b_set(args: &[V]) -> R {
     set_of(match args.first() {
         None => vec![],
@@ -3103,6 +3362,17 @@ pub fn b_set(args: &[V]) -> R {
 
 /// The pairs of `dict(seq)` / `d.update(seq)`, with CPython's messages for an element that is not a pair
 pub fn update_pairs(seq: &V) -> R<Vec<(V, V)>> {
+    // a Mapping (request.headers): keys() then __getitem__ (the first value of a repeated name)
+    if let V::Native(n) = seq {
+        if let Native::Headers(r) = &**n {
+            let mut out: Vec<(V, V)> = Vec::new();
+            for (k, _) in r.headers.iter() {
+                let k = k.to_lowercase();
+                out.push((V::str(&k), r.header(&k).map(V::str).unwrap_or(V::None)));
+            }
+            return Ok(out);
+        }
+    }
     let mut items = Vec::new();
     for (i, pair) in ops::iter(seq)?.into_iter().enumerate() {
         let kv = match ops::iter(&pair) {
@@ -3148,7 +3418,7 @@ pub fn b_id(args: &[V]) -> R {
     let p = match v {
         V::List(x) => Arc::as_ptr(x) as *const () as usize,
         V::Dict(x) => Arc::as_ptr(x) as *const () as usize,
-        V::Set(x) => Arc::as_ptr(x) as *const () as usize,
+        V::Set(x) | V::Frozen(x) => Arc::as_ptr(x) as *const () as usize,
         V::Obj(x) => Arc::as_ptr(x) as *const () as usize,
         V::Inst(x) => Arc::as_ptr(x) as *const () as usize,
         V::Native(x) => Arc::as_ptr(x) as *const () as usize,
@@ -3563,14 +3833,16 @@ pub fn b_ord(args: &[V]) -> R {
 pub fn isinstance_builtin(v: &V, ty: &str) -> bool {
     match ty {
         "object" => true,
-        "str" => matches!(v, V::Str(_)) || matches!(v, V::Enum(e, _) if matches!(e.kind, EnumKind::Str | EnumKind::StrEnum)),
+        "str" => matches!(v, V::Str(_)) || matches!(v, V::Enum(e, _) if matches!(e.kind, EnumKind::Str | EnumKind::StrEnum))
+            || super::pgpy::as_str(v).is_some(),
         "int" => matches!(v, V::Int(_) | V::Bool(_)) || matches!(v, V::Enum(e, _) if matches!(e.kind, EnumKind::Int | EnumKind::IntEnum)),
         "float" => matches!(v, V::Float(_)),
         "bool" => matches!(v, V::Bool(_)),
         "dict" => matches!(v, V::Dict(_)),
         "list" => matches!(v, V::List(_)),
         "tuple" => matches!(v, V::Tuple(_)) || matches!(v, V::Inst(i) if i.desc.x.ntuple),
-        "set" | "frozenset" => matches!(v, V::Set(_)),
+        "set" => matches!(v, V::Set(_)),
+        "frozenset" => matches!(v, V::Frozen(_)),
         "bytes" => matches!(v, V::Bytes(_)),
         "datetime" => matches!(v, V::DateTime(_)),
         "date" => matches!(v, V::Date(_) | V::DateTime(_)),
@@ -3671,6 +3943,7 @@ pub fn builtin_dir(v: &V) -> Option<&'static [&'static str]> {
         V::Tuple(_) => &["__add__", "__class__", "__class_getitem__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getnewargs__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__iter__", "__le__", "__len__", "__lt__", "__mul__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__", "__rmul__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__", "count", "index"],
         V::Dict(_) => &["__class__", "__class_getitem__", "__contains__", "__delattr__", "__delitem__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getitem__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__ior__", "__iter__", "__le__", "__len__", "__lt__", "__ne__", "__new__", "__or__", "__reduce__", "__reduce_ex__", "__repr__", "__reversed__", "__ror__", "__setattr__", "__setitem__", "__sizeof__", "__str__", "__subclasshook__", "clear", "copy", "fromkeys", "get", "items", "keys", "pop", "popitem", "setdefault", "update", "values"],
         V::Set(_) => &["__and__", "__class__", "__class_getitem__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__iand__", "__init__", "__init_subclass__", "__ior__", "__isub__", "__iter__", "__ixor__", "__le__", "__len__", "__lt__", "__ne__", "__new__", "__or__", "__rand__", "__reduce__", "__reduce_ex__", "__repr__", "__ror__", "__rsub__", "__rxor__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__xor__", "add", "clear", "copy", "difference", "difference_update", "discard", "intersection", "intersection_update", "isdisjoint", "issubset", "issuperset", "pop", "remove", "symmetric_difference", "symmetric_difference_update", "union", "update"],
+        V::Frozen(_) => &["__and__", "__class__", "__class_getitem__", "__contains__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__iter__", "__le__", "__len__", "__lt__", "__ne__", "__new__", "__or__", "__rand__", "__reduce__", "__reduce_ex__", "__repr__", "__ror__", "__rsub__", "__rxor__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "__xor__", "copy", "difference", "intersection", "isdisjoint", "issubset", "issuperset", "symmetric_difference", "union"],
         V::DateTime(_) => &["__add__", "__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__radd__", "__reduce__", "__reduce_ex__", "__replace__", "__repr__", "__rsub__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "astimezone", "combine", "ctime", "date", "day", "dst", "fold", "fromisocalendar", "fromisoformat", "fromordinal", "fromtimestamp", "hour", "isocalendar", "isoformat", "isoweekday", "max", "microsecond", "min", "minute", "month", "now", "replace", "resolution", "second", "strftime", "strptime", "time", "timestamp", "timetuple", "timetz", "today", "toordinal", "tzinfo", "tzname", "utcfromtimestamp", "utcnow", "utcoffset", "utctimetuple", "weekday", "year"],
         V::Date(_) => &["__add__", "__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__radd__", "__reduce__", "__reduce_ex__", "__replace__", "__repr__", "__rsub__", "__setattr__", "__sizeof__", "__str__", "__sub__", "__subclasshook__", "ctime", "day", "fromisocalendar", "fromisoformat", "fromordinal", "fromtimestamp", "isocalendar", "isoformat", "isoweekday", "max", "min", "month", "replace", "resolution", "strftime", "strptime", "timetuple", "today", "toordinal", "weekday", "year"],
         V::Time(_) => &["__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__", "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__", "__le__", "__lt__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__replace__", "__repr__", "__setattr__", "__sizeof__", "__str__", "__subclasshook__", "dst", "fold", "fromisoformat", "hour", "isoformat", "max", "microsecond", "min", "minute", "replace", "resolution", "second", "strftime", "strptime", "tzinfo", "tzname", "utcoffset"],

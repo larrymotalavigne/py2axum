@@ -3,7 +3,7 @@ import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres@127.0.0.1/py2axum_sync")
@@ -19,5 +19,24 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    finally:
+        db.close()
+
+
+def _prepare_sessionmaker(bind) -> sessionmaker:
+    return sessionmaker(autocommit=False, autoflush=False, bind=bind)
+
+
+OtherSessionLocal = _prepare_sessionmaker(engine)
+
+
+def get_other_db():
+    """Another shape seen in real projects: an annotated session, `raise exc` of the caught exception."""
+    db: Session = OtherSessionLocal()
+    try:
+        yield db
+    except Exception as exc:
+        db.rollback()
+        raise exc
     finally:
         db.close()

@@ -29,7 +29,12 @@ from pathlib import Path
 
 # admitted licences (SPDX identifiers, and the trove classifiers that name them): the translation is a derived work
 # embedded in the binary
-ADMITTED = ("MIT", "BSD-2-Clause", "BSD-3-Clause", "0BSD", "Apache-2.0", "ISC", "PSF-2.0", "Python-2.0", "Unlicense")
+ADMITTED = ("MIT", "BSD-2-Clause", "BSD-3-Clause", "0BSD", "Apache-2.0", "ISC", "PSF-2.0", "Python-2.0", "Unlicense",
+            "Zlib", "HPND",
+            "BSD-4-Clause", "MPL-2.0")  # BSD-4-Clause and MPL-2.0: the project's choice (17/10/2026), per licence
+# distributions admitted whatever licence text was left unrecognised: the project's choice (17/10/2026), per
+# distribution. passlib 1.7: BSD-3-Clause, with code derived from Beer-ware, UnixCrypt and jBCrypt sources
+ADMITTED_DISTS = {"passlib": "1.7."}
 CLASSIFIERS = {
     "License :: OSI Approved :: MIT License": "MIT",
     "License :: OSI Approved :: MIT No Attribution License (MIT-0)": "MIT-0",
@@ -53,7 +58,7 @@ CLASSIFIERS = {
 # packages the translator handles itself (framework, drivers): never translated from source, whatever they import
 FRAMEWORK = {"fastapi", "starlette", "pydantic", "pydantic_core", "pydantic_settings", "sqlalchemy", "alembic",
              "typing_extensions", "typing_inspection", "annotated_types", "annotated_doc", "uvicorn", "anyio",
-             "sniffio", "h11", "httpcore", "certifi", "psycopg", "psycopg_binary", "psycopg_pool", "asyncpg",
+             "sniffio", "httpcore", "psycopg", "psycopg_binary", "psycopg_pool", "asyncpg",
              "greenlet", "mcp", "sse_starlette", "multipart", "python_multipart",
              "_virtualenv", "pip", "setuptools", "pkg_resources", "_distutils_hack", "wheel", "py2axum"}
 # packages the library map covers in part: the modules of their source that stay translatable (the rest is native)
@@ -156,6 +161,16 @@ def native_tops() -> set[str]:
     return tops
 
 
+def mapped_names() -> frozenset[str]:
+    """Every library name the library map translates natively (`jinja2.Environment`, `aiosmtplib.send`...)."""
+    from . import libmap
+
+    names = set()
+    for t in (libmap.VALUES, libmap.EXCEPTIONS, libmap.CALLS, libmap.OBJECT_VALUES, libmap.NAMESPACE_CALLS, libmap.LOGURU):
+        names.update(k for k in t if isinstance(k, str) and "." in k)
+    return frozenset(names)
+
+
 def stdlib_names() -> set[str]:
     return set(sys.stdlib_module_names)
 
@@ -173,6 +188,7 @@ class Dist:
     tops: set[str]
     licence: str | None  # SPDX expression, or None when unknown
     licence_from: str
+    licence_why: str = ""  # what was found when no licence was recognised
     refusal: str | None = None  # why it is not translated (None: translated)
     code: str = ""  # P2A07xx of the refusal
 
@@ -209,7 +225,9 @@ def locked(root: Path, name: str) -> str | None:
                     return m.group(2)
             return None
         for r in sorted(cand.glob("requirements*.txt")):
-            for line in r.read_text().splitlines():
+            from .versions import read_requirements
+
+            for line in read_requirements(r).splitlines():
                 m = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*([^\s;#,]+)", line)
                 if m and _norm(m.group(1)) == want:
                     return m.group(2)
@@ -218,21 +236,99 @@ def locked(root: Path, name: str) -> str | None:
     return None
 
 
-def _licence(meta) -> tuple[str | None, str]:
-    expr = meta.get("License-Expression")
-    if expr:
-        return expr.strip(), "License-Expression"
-    old = (meta.get("License") or "").strip()
-    if old and re.fullmatch(r"\(?[A-Za-z0-9.+-]+\)?(?:\s+(?:AND|OR|WITH)\s+\(?[A-Za-z0-9.+-]+\)?)*", old) and \
-            all(t in ("AND", "OR", "WITH") or re.fullmatch(r"(?:LicenseRef-)?[A-Za-z0-9][A-Za-z0-9.+-]*", t.strip("()"))
-                for t in old.split()):
-        return old, "License"  # the older field, when it holds an SPDX expression (`BSD-2-Clause`)
-    found = [CLASSIFIERS.get(c, f"LicenseRef-{c.rsplit('::', 1)[-1].strip()}")
-             for c in (meta.get_all("Classifier") or []) if c.startswith("License ::")]
+# SPDX identifiers the older `License` field may carry (anything else, `BSD`, `BSD-like`, is free text)
+_SPDX_ID = re.compile(
+    r"(?:MIT(?:-0)?|0BSD|BSD-[1-4]-Clause(?:-[A-Za-z0-9.]+)*|Apache-[12]\.\d|ISC|PSF-2\.0|Python-2\.0(?:\.1)?|Unlicense|"
+    r"Zlib|HPND(?:-[A-Za-z0-9.]+)*|A?L?GPL-[123]\.\d(?:-only|-or-later)?|MPL-[12]\.\d|EPL-[12]\.\d|CC0-1\.0|"
+    r"CC-BY(?:-[A-Za-z0-9.]+)*|Artistic-[12]\.\d|BSL-1\.0|OFL-1\.1|LicenseRef-[A-Za-z0-9.-]+)\+?")
+# classifiers that name no licence: they say nothing, and one of them hides what the text says
+_VAGUE = ("License :: OSI Approved", "License :: Other/Proprietary License", "License :: DFSG approved",
+          "License :: Free For Educational Use", "License :: Free For Home Use", "License :: Free for non-commercial use",
+          "License :: Freely Distributable", "License :: Freeware", "License :: Repoze Public License")
+
+
+def _spdx_field(old: str) -> bool:
+    """`old` (the `License` field) is a syntactically valid SPDX expression of known identifiers."""
+    toks = [t.strip("()") for t in old.split()]
+    return bool(toks) and re.fullmatch(r"\(?[A-Za-z0-9.+-]+\)?(?:\s+(?:AND|OR|WITH)\s+\(?[A-Za-z0-9.+-]+\)?)*", old) \
+        is not None and all(t in ("AND", "OR", "WITH") or _SPDX_ID.fullmatch(t) for t in toks)
+
+
+def _classifiers(meta) -> str | None:
+    cl = [c for c in (meta.get_all("Classifier") or []) if c.startswith("License ::")]
+    if any(c.startswith(_VAGUE) and c != "License :: OSI Approved" for c in cl) and not all(c in CLASSIFIERS for c in cl):
+        return None  # a vague classifier among the others: the text decides
+    found = [CLASSIFIERS.get(c, f"LicenseRef-{c.rsplit('::', 1)[-1].strip()}") for c in cl]
     found = [x for x in dict.fromkeys(found) if x != "LicenseRef-OSI Approved"]
     if found:
-        return " OR ".join(found) if len(found) > 1 else found[0], "classifiers"
-    return None, "none"
+        return " OR ".join(found) if len(found) > 1 else found[0]
+    return None
+
+
+def _licence_files(meta, files, locate) -> list[str]:
+    """The text of the licence files a distribution ships in its `.dist-info` (`License-File`, else by name)."""
+    out = []
+    for rel, _ in files:
+        parts = rel.split("/")
+        if len(parts) >= 2 and parts[0].endswith(".dist-info") and \
+                re.match(r"(?:licen[cs]e|copying|copyright|unlicense)", parts[-1], re.I):
+            p = locate(rel)
+            try:
+                if p.is_file() and p.stat().st_size <= 200_000:
+                    out.append(p.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+    return out
+
+
+def _from_text(texts: list[str]) -> tuple[str | None, str]:
+    """(SPDX expression, detail): the licences the files' texts consist of, or None and the unrecognised text."""
+    from py2axum.licenses import recognise
+
+    ids: list[str] = []
+    for t in texts:
+        found, left = recognise(t)
+        if left:
+            return None, left
+        ids += found
+    ids = list(dict.fromkeys(ids))
+    return (" AND ".join(ids) if ids else None), ""
+
+
+def _licence_ex(meta, texts=lambda: []) -> tuple[str | None, str, str]:
+    """(SPDX expression or None, where it came from, what stopped the search when there is none).
+
+    Order: `License-Expression`; the older `License` field when it is an SPDX expression; then, when that field is
+    free text (`BSD`, `BSD-like`: nothing a machine can trust), the licence files compared with the canonical texts,
+    else the licence classifiers; with no `License` field, the classifiers then the files."""
+    expr = meta.get("License-Expression")
+    if expr:
+        return expr.strip(), "License-Expression", ""
+    old = " ".join((meta.get("License") or "").split())
+    if old and _spdx_field(old):
+        return old, "License", ""
+    detail = f"License field {old!r}" if old else ""
+    if old:
+        e, d = _from_text(texts())
+        if e:
+            return e, "licence file", ""
+        c = _classifiers(meta)
+        if c:
+            return c, "classifiers", ""
+        return None, "none", (f"{detail}; licence file: unrecognised text {d!r}" if d else
+                              detail + "; no recognisable licence file or licence classifier")
+    c = _classifiers(meta)
+    if c:
+        return c, "classifiers", ""
+    e, d = _from_text(texts())
+    if e:
+        return e, "licence file", ""
+    return None, "none", (f"licence file: unrecognised text {d!r}" if d else "")
+
+
+def _licence(meta, texts=lambda: []) -> tuple[str | None, str]:
+    e, src, _ = _licence_ex(meta, texts)
+    return e, src
 
 
 def licence_admitted(expr: str | None, extra=frozenset()) -> bool:
@@ -331,6 +427,8 @@ class LibIndex:
         self.used: dict[str, set[str]] = {}  # dist -> modules loaded from it
         self.stdlib_dist: Dist | None = None  # the standard library's modules of STDLIB_SOURCE
         self.std_refused: dict[str, str] = {}
+        self._mapped: frozenset[str] | None = None
+        self._mapped_prefixes: set[str] = set()
         self._scan()
 
     def _scan(self) -> None:
@@ -357,8 +455,9 @@ class LibIndex:
                     if head.endswith(".dist-info") or head.endswith(".data") or head == "..":
                         continue
                     tops.add(head.removesuffix(".py"))
-            lic, src = _licence(d.metadata)
-            dist = Dist(name, d.version, site, rec, files, tops, lic, src)
+            lic, src, why = _licence_ex(d.metadata, lambda d=d, files=files: _licence_files(
+                d.metadata, files, lambda rel, d=d: Path(str(d.locate_file(rel)))))
+            dist = Dist(name, d.version, site, rec, files, tops, lic, src, why)
             self.dists[_norm(name)] = dist
             for t in tops:
                 self.by_top.setdefault(t, dist)
@@ -388,11 +487,16 @@ class LibIndex:
             dist.refusal, dist.code = (f"distribution {dist.name} {dist.version} is not pure Python (compiled "
                                        f"extension {ext[0]}): only pure-Python libraries are translated from source"), "P2A0702"
             return
-        if not licence_admitted(dist.licence, CONFIG.licences):
-            what = dist.licence or "unknown (no License-Expression nor licence classifier)"
+        forced = dist.licence is None and (
+            _norm(dist.name) in {_norm(x) for x in CONFIG.licences}
+            or dist.version.startswith(ADMITTED_DISTS.get(_norm(dist.name), "\0")))
+        if not forced and not licence_admitted(dist.licence, CONFIG.licences):
+            what = dist.licence or "unknown (" + (dist.licence_why or "no License-Expression, licence file nor "
+                                                  "licence classifier") + ")"
             dist.refusal, dist.code = (f"distribution {dist.name} {dist.version} has licence {what}, not admitted for "
                                        f"translation from source (admitted: {', '.join(ADMITTED)}; "
-                                       f"--allow-license <SPDX> admits another)"), "P2A0701"
+                                       f"--allow-license {'<SPDX>' if dist.licence else dist.name} admits "
+                                       f"{'another' if dist.licence else 'it once you have read its licence'})"), "P2A0701"
             return
         pin = locked(self.root, dist.name)
         if pin is not None and pin != dist.version:
@@ -406,9 +510,32 @@ class LibIndex:
                 return
         dist.code = "ok"
 
-    def locate(self, name: str) -> tuple[Path, Path, Dist] | None:
-        """The source file of library module `name` and its site-packages, when it is translated from source."""
-        if self.native_module(name):
+    def partial(self, top: str) -> Dist | None:
+        """The distribution of `top` when the library map covers only some of its names (`jinja2.Environment`, not
+        `jinja2.Template`) and its source may be translated: the names the map does not cover are read from it."""
+        if top in self.std or top in FRAMEWORK or top in MIXED or top not in self.native:
+            return None
+        dist = self.by_top.get(top)
+        if dist is None or not self.selected(dist):
+            return None
+        self.check(dist)
+        return None if dist.refusal else dist
+
+    def mapped(self, dotted: str) -> bool:
+        """`dotted` is a name of the library map, or a class whose attributes it maps (it stays native)."""
+        if self._mapped is None:
+            self._mapped = mapped_names()
+            self._mapped_prefixes = {k.rpartition(".")[0] for k in self._mapped}
+        return dotted in self._mapped or dotted in self._mapped_prefixes
+
+    def mapped_of(self, top: str) -> list[str]:
+        self.mapped(top)
+        return sorted(k for k in self._mapped if k.split(".")[0] == top)
+
+    def locate(self, name: str, partial: bool = False) -> tuple[Path, Path, Dist] | None:
+        """The source file of library module `name` and its site-packages, when it is translated from source
+        (`partial`: a module of a library the map covers in part, read for the names the map does not cover)."""
+        if self.native_module(name) and not (partial and self.partial(name.split(".")[0]) is not None):
             return None
         top = name.split(".")[0]
         if top in self.std:
@@ -447,7 +574,7 @@ class LibIndex:
         path = next((c for c in (base.with_suffix(".py"), base / "__init__.py") if c.is_file()), None)
         if path is None:
             return None
-        accel = c_accelerator(ast.parse(path.read_text(encoding="utf-8")))
+        accel = c_accelerator(ast.parse(path.read_bytes()))
         if accel is not None:
             self.std_refused[name] = (f"the standard library module {name} is not pure Python (compiled extension "
                                       f"{accel}, which CPython runs instead of its Lib/ code): not translated from source",
@@ -467,7 +594,9 @@ class LibIndex:
         if mod is not None:
             return self.std_refused[mod]
         dist = self.by_top.get(top)
-        if dist is None or self.native_module(dotted.rpartition(".")[0] or dotted):
+        in_part = (top in self.native and top not in self.std and top not in FRAMEWORK and top not in MIXED
+                   and not self.mapped(dotted))
+        if dist is None or (self.native_module(dotted.rpartition(".")[0] or dotted) and not in_part):
             return None
         if not self.selected(dist):
             return (f"{dist.name} {dist.version} is installed: `--translate-libs auto` (or `--translate-libs "
@@ -596,7 +725,7 @@ def parse_cached(dist: Dist, path: Path, python: tuple[int, int]):
             return got[1], got[2]
     except (OSError, EOFError, pickle.UnpicklingError, IndexError, AttributeError, TypeError):
         pass
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = ast.parse(path.read_bytes(), filename=str(path))
     tree, dropped = fold_version_info(tree, python)
     tree = fold_platform(tree)
     from .modules import fold_flags

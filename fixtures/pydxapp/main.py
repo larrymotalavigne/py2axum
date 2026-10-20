@@ -3,10 +3,12 @@ custom APIRoute classes, __get_pydantic_core_schema__, Json, dataclasses. Apart 
 fixtures/langapp, whose crates are at the edge of the CI build containers' memory. No database."""
 from fastapi import FastAPI
 
-from . import cfgx, cmx, coreschx, dcx, dtx, iterx, jsonx, postx, respx, routex, secx
+from . import aliasx, annx, cfgx, cmx, coreschx, dcx, dtx, iterx, jsonx, postx, respx, routex, secx
 
 app = FastAPI()
 app.include_router(iterx.router)
+app.include_router(aliasx.router)
+app.include_router(annx.router)
 app.include_router(coreschx.router)
 app.include_router(jsonx.router)
 app.include_router(dcx.router)

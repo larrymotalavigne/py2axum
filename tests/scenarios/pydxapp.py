@@ -110,6 +110,57 @@ STEPS += [("POST", f"/cmx/{p}", b) for p in ("line", "direct") for b in (
     {"price": 3, "sku": "ab"}, {"price": 30, "qty": 4, "sku": "abc"}, {"price": -1, "sku": "a"}, {"price": 2, "sku": "toolong"},
     {"price": "x", "qty": "y", "sku": "ok", "note": 5}, {})]
 
+STEPS += [("POST", "/annx/strict", b) for b in (
+    {"s": "x"}, {"s": 1}, {"s": "x", "i": "1"}, {"s": "x", "i": 1.0}, {"s": "x", "i": True}, {"s": "x", "f": 1}, {"s": "x", "f": "1.5"},
+    {"s": "x", "b": 1}, {"s": "x", "b": "true"}, {"s": "x", "b": False}, {"s": "x", "b": None}, {"s": "x", "y": "ab"},
+    {"s": "x", "o": 5}, {"s": "x", "ls": [1, "2"]}, {"s": "x", "sm": "a"}, {"s": "x", "sm": "abcde"}, {"s": "x", "sm": 12}, {})]
+STEPS += [("POST", "/annx/paths", b) for b in (
+    {"p": "a/b"}, {"p": ""}, {"p": "/abs//x/../y/"}, {"p": 5}, {"p": None}, {"p": ["a"]}, {"p": "a", "o": "b/c.txt"}, {"p": "a", "o": 3},
+    {"p": "a", "u": "x/y"}, {"p": "a", "u": 7}, {"p": "a", "u": 1.5}, {"p": "a", "u": []}, {"p": "a", "s": "t"}, {"p": "a", "ls": ["x", "y/z"]},
+    {"p": "a", "ls": ["x", 1]}, {"p": "./a/./b/"}, {"p": "a.tar.gz"}, {})]
+PG = "postgresql://u:p@localhost:5432/db"
+STEPS += [("POST", "/annx/dsns", b) for b in (
+    {"pg": PG}, {"pg": "postgresql+asyncpg://u@h/db?x=1#f"}, {"pg": "postgres://h"}, {"pg": "postgresql://"}, {"pg": "postgresql:///db"},
+    {"pg": "mysql://h"}, {"pg": "postgresql://h:abc/db"}, {"pg": ""}, {"pg": 5}, {"pg": None}, {"pg": "postgresql://H/Db"},
+    {"pg": "postgresql://u%40x:p%2Fw@h:99999/db"}, {"pg": "postgresql://h/db", "mongo": "mongodb://h"}, {"pg": PG, "mongo": "mongodb+srv://c.example"},
+    {"pg": PG, "mongo": "http://h"}, {"pg": PG, "amqp": "amqp://g:g@h/v"}, {"pg": PG, "amqp": "amqps://h"}, {"pg": PG, "amqp": "x://h"},
+    {"pg": PG, "kafka": "kafka://"}, {"pg": PG, "kafka": "kafka://k:1"}, {"pg": PG, "mysql": "mysql+pymysql://u@h/d"}, {"pg": PG, "mysql": "mysql://"},
+    {"pg": PG, "mysql": "postgresql://h"}, {})]
+STEPS += [("POST", "/annx/signs", b) for b in (
+    {}, {"p": 0}, {"p": -1}, {"p": "5"}, {"n": 0}, {"n": -3}, {"nn": -1}, {"nn": 0}, {"np": 1}, {"np": 0}, {"pf": 0}, {"pf": 0.1},
+    {"nf": -0.5}, {"nf": "x"}, {"tight": 2}, {"tight": 10}, {"tight": 9}, {"tight": 3})]
+STEPS += [("POST", "/annx/con", b) for b in (
+    {}, {"s": "a"}, {"s": "abcdef"}, {"up": "  hi  "}, {"up": "   "}, {"pat": "ABC"}, {"pat": "abc"}, {"strict_s": 5}, {"strict_s": ""},
+    {"maybe": "abcd"}, {"maybe": "abcde"}, {"maybe": None}, {"i": 0}, {"i": 11}, {"i": 10}, {"mult": 4}, {"mult": "3"}, {"mult": 6},
+    {"f": 0}, {"f": 1}, {"f": 0.25}, {"d": "1.234"}, {"d": "123456"}, {"d": "12.3"}, {"d": 1.5}, {"lst": []}, {"lst": [1, 2, 3, 4]},
+    {"lst": ["x"]}, {"lst": "ab"}, {"tags": ["ab", "c"]}, {"st": [1, 2, 3]}, {"st": [1, 1]}, {"st": ["a"]})]
+STEPS += [("POST", "/annx/con/users", b) for b in ([1], [], [1, 2, 3], ["a"], 5, None)]
+STEPS += [("GET", f"/annx/generic{p}", None) for p in ("", "/list", "/list?n=0", "/list?n=x", "/bad", "/page", "/module")]
+STEPS += [("POST", "/annx/generic/in", b) for b in (
+    {"data": {"id": 1, "name": "a"}}, {"code": "x", "data": {"id": "y"}}, {"data": None}, {"data": 5}, {}, [])]
+
+
+# aliasx: alias generators of several statements, `Other.model_config["alias_generator"]`, `**Base.model_config`,
+# hide_input_in_errors
+_TASKS = ({"taskName": "t", "cronExpression": "* * *", "accountId": 3}, {"task_name": "t", "cron_expression": "c", "account_id": 1,
+          "configJson": {"a": 1}, "enabled": False, "aB": 2}, {"taskName": "", "cronExpression": 1, "accountId": 0},
+          {"taskName": "t", "cronExpression": "c", "accountId": 2, "unknown": 1}, {"taskName": "t", "cron_expression": "c",
+          "accountId": "x", "configJson": "s", "a__b": 5}, {}, [])
+STEPS += [("POST", f"/aliasx/{p}", b) for p in ("task", "task/raw") for b in _TASKS]
+STEPS += [("POST", "/aliasx/dashed", b) for b in ({"X-ray-id": 1}, {"x_ray_id": 1}, {"X-ray-id": "2", "long-field-name": "z",
+                                                  "plain": True}, {"X-ray-id": "q", "long-field-name": 3})]
+STEPS += [("POST", f"/aliasx/{p}", b) for p in ("item", "item/dump", "strict") for b in (
+    {"itemId": 1, "displayName": "n"}, {"item_id": 2, "display_name": "m"}, {"itemId": "x"}, {"pageSize": 3},
+    {"page_size": 4, "other": 1}, {})]
+STEPS += [("POST", "/aliasx/secret", b) for b in ({"pass_code": 1}, {"pass_code": "hunter2", "nested_list": [1, "x"]}, {})]
+STEPS += [("POST", f"/aliasx/hidden/{w}", b) for w in ("secret", "outer", "shown", "child") for b in (
+    {"pass_code": "secret-" * 9, "nested_list": ["a", 2]}, {"inner": {"value": "nope"}}, {"secret": {"pass_code": "x"}},
+    {"pass_code": 5}, {"inner": {"value": 1}}, {"secret": {"pass_code": 9}}, {"extra_field": 3})]
+STEPS += [("GET", f"/aliasx/settings/{w}", None) for w in ("ignore", "keep", "required")]
+STEPS += [("POST", "/aliasx/finite", b) for b in (
+    {"x": 1.5, "xs": [1, 2.5], "z": {"a": 3}}, {"x": "inf"}, {"x": float("nan"), "xs": [1, "-inf"]}, {"x": 1e309},
+    {"x": "Infinity", "y": "nan", "z": {"k": float("-inf")}}, {"x": "-inf", "xs": ["nan", 2], "z": {"k": "inf"}}, {"x": 1, "y": -1}, {"x": 1, "inner": {"value": 2}})]
+
 
 def reset(db: str) -> None:
     pass

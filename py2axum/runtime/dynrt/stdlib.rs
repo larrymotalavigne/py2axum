@@ -526,6 +526,8 @@ pub fn escape(s: &V) -> R {
 pub struct StringIO {
     pub buf: Mutex<Vec<char>>,
     pub pos: Mutex<usize>,
+    /// close() or the end of its `with` block: every method but close/flush then raises ValueError
+    pub closed: std::sync::atomic::AtomicBool,
 }
 
 pub fn stringio_new(init: Option<&V>) -> R {
@@ -534,7 +536,7 @@ pub fn stringio_new(init: Option<&V>) -> R {
         Some(V::Str(s)) => s.chars().collect(),
         Some(o) => return Err(Exc::type_error(format!("initial_value must be str or None, not {}", o.type_name()))),
     };
-    Ok(V::native(Native::StringIO(StringIO { buf: Mutex::new(init), pos: Mutex::new(0) })))
+    Ok(V::native(Native::StringIO(StringIO { buf: Mutex::new(init), pos: Mutex::new(0), closed: Default::default() })))
 }
 
 fn sio_write(s: &StringIO, text: &str) -> usize {
@@ -574,6 +576,13 @@ fn sio_lines(s: &StringIO) -> Vec<String> {
 }
 
 pub fn stringio_method(s: &StringIO, name: &str, args: &[V]) -> R {
+    if name == "close" {
+        s.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(V::None);
+    }
+    if s.closed.load(std::sync::atomic::Ordering::Relaxed) && name != "flush" {
+        return Err(Exc::value_error("I/O operation on closed file"));
+    }
     match name {
         "write" => match args.first() {
             Some(V::Str(t)) => Ok(V::Int(sio_write(s, t) as i64)),
@@ -1154,6 +1163,68 @@ pub fn hmac_method(h: &Mutex<Hmac>, name: &str, args: &[V]) -> R {
 
 // ---------------------------------------------------------------- urllib.parse
 
+/// `urllib.parse.parse_qsl(qs, keep_blank_values=False, strict_parsing=False, encoding='utf-8', errors='replace',
+/// max_num_fields=None, separator='&')` on a str (None: no pairs); bytes and other encodings are refused.
+fn parse_qsl(args: &[V], kwargs: &[(String, V)]) -> R<Vec<(String, String)>> {
+    let names = ["qs", "keep_blank_values", "strict_parsing", "encoding", "errors", "max_num_fields", "separator"];
+    if args.len() > names.len() {
+        return Err(Exc::type_error(format!("parse_qsl() takes from 1 to 7 positional arguments but {} were given", args.len())));
+    }
+    let arg = |i: usize| up_arg("parse_qsl", args, kwargs, i, names[i], &names);
+    let keep = arg(1)?.map(ops::truthy).transpose()?.unwrap_or(false);
+    let strict = arg(2)?.map(ops::truthy).transpose()?.unwrap_or(false);
+    if let Some(e) = arg(3)? {
+        if !matches!(ops::str_(e)?.to_ascii_lowercase().replace('_', "-").as_str(), "utf-8" | "utf8") {
+            return Err(Exc::type_error("py2axum: parse_qs(encoding=) other than utf-8 is not supported"));
+        }
+    }
+    if let Some(e) = arg(4)? {
+        if !matches!(e, V::Str(s) if &**s == "replace") {
+            return Err(Exc::type_error("py2axum: parse_qs(errors=) other than 'replace' is not supported"));
+        }
+    }
+    let sep = match arg(6)? {
+        None => "&".to_string(),
+        Some(V::Str(s)) if !s.is_empty() => s.to_string(),
+        Some(V::Bytes(_)) => return Err(Exc::type_error("py2axum: parse_qs(separator=<bytes>) is not supported")),
+        Some(_) => return Err(Exc::value_error("Separator must be of type string or bytes.")),
+    };
+    let qs = match arg(0)? {
+        None => return Err(Exc::type_error("parse_qsl() missing 1 required positional argument: 'qs'")),
+        Some(V::None) => return Ok(vec![]),
+        Some(V::Str(s)) => s.clone(),
+        Some(other) => return Err(Exc::type_error(format!("py2axum: parse_qs() of a '{}' is not supported (only str)", other.type_name()))),
+    };
+    if qs.is_empty() {
+        return Ok(vec![]);
+    }
+    match arg(5)? {
+        None | Some(V::None) => {}
+        Some(V::Int(m)) => {
+            if *m < 1 + qs.matches(sep.as_str()).count() as i64 {
+                return Err(Exc::value_error("Max number of fields exceeded"));
+            }
+        }
+        Some(other) => return Err(Exc::type_error(format!("py2axum: parse_qs(max_num_fields=<{}>) is not supported", other.type_name()))),
+    }
+    let unq = |s: &str| unquote_str(&s.replace('+', " "));
+    let mut r = Vec::new();
+    for nv in qs.split(sep.as_str()) {
+        if nv.is_empty() && !strict {
+            continue;
+        }
+        let (name, value) = match nv.split_once('=') {
+            Some((n, v)) => (n, v),
+            None if strict => return Err(Exc::value_error(format!("bad query field: {}", ops::repr(&V::str(nv))?))),
+            None => (nv, ""),
+        };
+        if !value.is_empty() || keep {
+            r.push((unq(name), unq(value)));
+        }
+    }
+    Ok(r)
+}
+
 fn up_arg<'a>(f: &str, args: &'a [V], kwargs: &'a [(String, V)], i: usize, name: &str, names: &[&str]) -> R<Option<&'a V>> {
     if let Some((k, _)) = kwargs.iter().find(|(k, _)| !names.contains(&k.as_str())) {
         return Err(Exc::type_error(format!("{f}() got an unexpected keyword argument '{k}'")));
@@ -1224,6 +1295,15 @@ pub fn urllib(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
         }
     }
     match name {
+        "parse_qsl" => parse_qsl(args, kwargs).map(|r| V::list(r.into_iter().map(|(k, v)| V::tuple(vec![V::str(k), V::str(v)])).collect())),
+        "parse_qs" => {
+            // the pairs grouped by name, in the order each name first appears
+            let mut out: indexmap::IndexMap<String, Vec<V>> = indexmap::IndexMap::new();
+            for (k, v) in parse_qsl(args, kwargs)? {
+                out.entry(k).or_default().push(V::str(v));
+            }
+            V::dict_from(out.into_iter().map(|(k, v)| (V::str(k), V::list(v))).collect())
+        }
         "quote" => {
             let names = ["string", "safe", "encoding", "errors"];
             let s = up_arg(name, args, kwargs, 0, "string", &names)?.ok_or_else(|| Exc::type_error("quote() missing 1 required positional argument: 'string'"))?;
@@ -2041,6 +2121,69 @@ pub fn unicodedata_combining(table: &[(u32, u32)], c: &V) -> R {
     }
 }
 
+/// the single character `f(chr)` takes (CPython's messages, reworded in 3.14; `argn` is " 1" for name())
+fn ucd_char(f: &str, argn: &str, c: &V) -> R<char> {
+    let V::Str(s) = c else {
+        return Err(Exc::type_error(format!("{f}() argument{argn} must be a unicode character, not {}", arg_type(c))));
+    };
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(ch), None) => Ok(ch),
+        _ if super::python() < (3, 14) => Err(Exc::type_error(format!("{f}() argument{argn} must be a unicode character, not str"))),
+        _ => Err(Exc::type_error(format!("{f}(): argument{argn} must be a unicode character, not a string of length {}", s.chars().count()))),
+    }
+}
+
+fn ucd_lookup(table: &[(u32, u32, &'static str)], ch: char) -> Option<&'static str> {
+    let cp = ch as u32;
+    let i = table.partition_point(|(lo, _, _)| *lo <= cp);
+    (i > 0 && cp <= table[i - 1].1).then(|| table[i - 1].2)
+}
+
+/// `unicodedata.category(chr)` / `bidirectional(chr)`: the project's Unicode version's value (tables written at
+/// translation from the translating Python, of the same Unicode version), `dflt` outside them
+pub fn unicodedata_prop(f: &str, table: &[(u32, u32, &'static str)], dflt: &'static str, c: &V) -> R {
+    let ch = ucd_char(f, "", c)?;
+    Ok(V::str(ucd_lookup(table, ch).unwrap_or(dflt)))
+}
+
+/// `unicodedata.decomposition(chr)`: the character's decomposition mapping ("" without one)
+pub fn unicodedata_decomposition(table: &[(u32, &'static str)], c: &V) -> R {
+    let ch = ucd_char("decomposition", "", c)?;
+    Ok(V::str(table.binary_search_by_key(&(ch as u32), |(cp, _)| *cp).map(|i| table[i].1).unwrap_or("")))
+}
+
+/// The names of the project's Unicode version: explicit ones (code points, offsets into one text), and the
+/// families named after their code point (`CJK UNIFIED IDEOGRAPH-4E00`)
+pub struct UcdNames {
+    pub cps: &'static [u32],
+    pub offs: &'static [u32],
+    pub text: &'static str,
+    pub hex: &'static [(u32, u32, &'static str)],
+}
+
+/// `unicodedata.name(chr[, default])`
+pub fn unicodedata_name(names: &UcdNames, args: &[V]) -> R {
+    let (c, dflt) = match args {
+        [c] => (c, None),
+        [c, d] => (c, Some(d)),
+        _ => return Err(Exc::type_error(format!("name expected at most 2 arguments, got {}", args.len()))),
+    };
+    let ch = ucd_char("name", " 1", c)?;
+    let cp = ch as u32;
+    if let Ok(i) = names.cps.binary_search(&cp) {
+        let (a, b) = (names.offs[i] as usize, names.offs[i + 1] as usize);
+        return Ok(V::str(&names.text[a..b]));
+    }
+    if let Some(p) = ucd_lookup(names.hex, ch) {
+        return Ok(V::str(format!("{p}{cp:04X}")));
+    }
+    match dflt {
+        Some(d) => Ok(d.clone()),
+        None => Err(Exc::value_error("no such name")),
+    }
+}
+
 // ---------------------------------------------------------------- string.Template
 
 /// `string.Template(template)`
@@ -2141,6 +2284,81 @@ pub fn template_method(t: &str, name: &str, args: &[V], kwargs: &[(String, V)]) 
 
 /// `gzip.decompress(data)` (CPython 3.12+): every member, its header read like `_read_gzip_header`, the
 /// deflate stream inflated raw, then CRC and length checked; NUL padding between members skipped.
+/// `gzip.compress(data, compresslevel=9, *, mtime=...)`: zlib's gzip stream (the system zlib, as CPython's), its
+/// header rewritten as each Python does: 3.12 keeps zlib's whole output for `mtime == 0`, else writes its own
+/// (XFL 2 for level 9, 4 for level 1, else 0; OS 255); 3.13+ keep zlib's XFL, OS 255. The default mtime is the
+/// current time before 3.14, 0 from 3.14.
+pub fn gzip_compress(args: &[V], kwargs: &[(String, V)]) -> R {
+    let py = super::python();
+    let mut data: Option<V> = args.first().cloned();
+    let mut level: Option<V> = args.get(1).cloned();
+    let mut mtime: Option<V> = None;
+    if args.len() > 2 {
+        return Err(Exc::type_error(format!("compress() takes from 1 to 2 positional arguments but {} were given", args.len())));
+    }
+    for (k, v) in kwargs {
+        let slot = match k.as_str() {
+            "data" if data.is_none() => &mut data,
+            "compresslevel" if level.is_none() => &mut level,
+            "mtime" => &mut mtime,
+            _ => return Err(Exc::type_error(format!("compress() got an unexpected keyword argument '{k}'"))),
+        };
+        *slot = Some(v.clone());
+    }
+    let data = match data {
+        Some(V::Bytes(b)) => b,
+        Some(o) => return Err(Exc::type_error(format!("a bytes-like object is required, not '{}'", o.type_name()))),
+        None => return Err(Exc::type_error("compress() missing 1 required positional argument: 'data'")),
+    };
+    let level = match level {
+        None => 9,
+        Some(V::Int(i)) if (-1..=9).contains(&i) => i,
+        Some(V::Int(_)) => return Err(Exc::new(&ZLIB_ERROR, vec![V::str("Bad compression level")])),
+        Some(V::Bool(b)) => b as i64,
+        Some(o) => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+    };
+    let mtime: Option<f64> = match mtime {
+        None if py >= (3, 14) => Some(0.0),
+        None | Some(V::None) => None,
+        Some(V::Int(i)) => Some(i as f64),
+        Some(V::Bool(b)) => Some(b as i64 as f64),
+        Some(V::Float(f)) => Some(f),
+        Some(o) => return Err(Exc::type_error(format!("int() argument must be a string, a bytes-like object or a real number, not '{}'", o.type_name()))),
+    };
+    let mtime = mtime.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0));
+    let mut m = mtime.trunc();
+    if !(0.0..=4294967295.0).contains(&m) {
+        // 3.15 writes 0 for an mtime outside 0..2**32-1 (negative, huge, nan, inf); before, struct.pack refuses it
+        if py >= (3, 15) {
+            m = 0.0;
+        } else {
+            return Err(Exc::new(&STRUCT_ERROR, vec![V::str("'L' format requires 0 <= number <= 4294967295")]));
+        }
+    }
+    // zlib.compress(data, level, wbits=31): the deflate stream in zlib's own gzip wrapper
+    let lvl = if level < 0 { flate2::Compression::default() } else { flate2::Compression::new(level as u32) };
+    let mut c = flate2::Compress::new_gzip(lvl, 15);
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() / 2 + 64);
+    loop {
+        let before = c.total_in() as usize;
+        out.reserve(64 * 1024);
+        let st = c.compress_vec(&data[before..], &mut out, flate2::FlushCompress::Finish)
+            .map_err(|e| Exc::new(&ZLIB_ERROR, vec![V::str(&format!("Error -2 while compressing data: {e}"))]))?;
+        if st == flate2::Status::StreamEnd {
+            break;
+        }
+    }
+    if py < (3, 13) && m == 0.0 {
+        return Ok(V::Bytes(Arc::from(out)));
+    }
+    out[4..8].copy_from_slice(&(m as u32).to_le_bytes());
+    if py < (3, 13) {
+        out[8] = match level { 9 => 2, 1 => 4, _ => 0 };
+    }
+    out[9] = 255;
+    Ok(V::Bytes(Arc::from(out)))
+}
+
 pub fn gzip_decompress(args: &[V], kwargs: &[(String, V)]) -> R {
     let data = match (args, kwargs) {
         ([V::Bytes(b)], []) => b.clone(),

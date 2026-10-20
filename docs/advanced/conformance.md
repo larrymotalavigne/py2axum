@@ -76,6 +76,7 @@ What a scenario can define:
 | `REFERENCE_APP` | `"module:app"`: wait (`SETTLE`) only after the writes that can do work once answered, read from that application — a `yield` dependency, BackgroundTasks, a module that starts tasks or threads, user middlewares, a route not found (`tests/settle.py`); the same for both servers. |
 | `HEADER_MASKS` | names of compared headers whose value is random on both sides (`x-request-id`). |
 | `COOKIE_MASKS`, `FILE_MASKS` | `(regex, replacement)` pairs applied to `Set-Cookie` values and download headers. |
+| `mask_document(path, ctype, data)` | the bytes of a generated document (PDF, OOXML) before they are compared, for what it prints of the clock (a receipt number made of the time of day). A PDF is recognised by its first bytes too, whatever its content type. |
 
 ## Run it
 

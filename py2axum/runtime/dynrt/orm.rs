@@ -2391,7 +2391,7 @@ pub fn sessionmaker(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
             other => return Err(Exc::type_error(format!("py2axum: async_sessionmaker({other}=) is not supported"))),
         }
     }
-    Ok(V::native(Native::Maker(expire, autoflush, sync)))
+    Ok(V::native(Native::Maker(expire, autoflush, sync, Arc::from(Vec::new()))))
 }
 
 /// `insert(Model)`; `pg`: the postgresql dialect's (on_conflict_do_update/nothing)
@@ -4970,7 +4970,23 @@ static SESSION_PARAMS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mute
 /// (psycopg `options="-c name=value ..."`, asyncpg `server_settings={name: value}`). The pool applies
 /// them on every connection (`session_params`); a `TimeZone` among them replaces the discovered one,
 /// as psycopg then decodes timestamptz in it. Other `connect_args` keys stay without effect.
-pub fn engine_connect_args(v: &V) -> R<()> {
+/// A sessionmaker whose engine has its own `connect_args` (a project class wrapping engine and maker, one
+/// instance per pool): the session parameters its sessions set per transaction. A TimeZone among them would
+/// change how the driver decodes timestamps on those connections only: refused.
+pub fn maker_params(maker: V, connect_args: &V) -> R {
+    let params = connect_params(connect_args)?;
+    if params.iter().any(|(n, _)| n.eq_ignore_ascii_case("timezone")) {
+        return Err(Exc::type_error("py2axum: a TimeZone in the connect_args of one of several engines is not supported"));
+    }
+    if let V::Native(n) = &maker {
+        if let Native::Maker(e, a, s, _) = &**n {
+            return Ok(V::native(Native::Maker(*e, *a, *s, Arc::from(params))));
+        }
+    }
+    Ok(maker)
+}
+
+fn connect_params(v: &V) -> R<Vec<(String, String)>> {
     let items: Vec<(V, V)> = match v {
         V::Dict(d) => d.lock().values().cloned().collect(),
         _ => return Err(Exc::type_error("py2axum: connect_args must be a dict")),
@@ -4993,6 +5009,11 @@ pub fn engine_connect_args(v: &V) -> R<()> {
             _ => {}
         }
     }
+    Ok(params)
+}
+
+pub fn engine_connect_args(v: &V) -> R<()> {
+    let mut params = connect_params(v)?;
     if let Some((_, tz)) = params.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case("timezone")) {
         set_db_tz(tz);
     }
@@ -5105,6 +5126,12 @@ pub async fn discover_db_tz_conn(conn: &mut sqlx::PgConnection) -> String {
 struct SessInner {
     pool: sqlx::PgPool,
     tx: Option<sqlx::Transaction<'static, Postgres>>,
+    /// SQLAlchemy's PendingRollbackError state: (its message, the savepoint whose rollback() clears it; None: the
+    /// session's rollback()). Set by a failed flush (the transaction or savepoint is rolled back at once) and by a
+    /// statement abandoned while the database ran it (`wait_for` expired: the connection is invalidated)
+    pending_rb: Option<(String, Option<String>)>,
+    /// a statement is running: still true when its future is dropped mid-flight (cancelled)
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
     identity: IdMap,
     /// modified persistent objects: held strongly until flushed (SQLAlchemy's `_strong_obj`)
     strong: Vec<Arc<ObjCell>>,
@@ -5140,6 +5167,8 @@ struct SessInner {
     tx_deleted: Vec<Weak<ObjCell>>,
     /// objects INSERTed by a flush of the open transaction: transient again if it rolls back
     tx_inserted: Vec<Weak<ObjCell>>,
+    /// `connect_args` session parameters of the engine its maker was built on (per transaction)
+    params: Arc<[(String, String)]>,
 }
 
 /// What a savepoint's rollback undoes in the session: objects INSERTed (expunged), UPDATEd (expired)
@@ -5362,6 +5391,8 @@ impl Session {
                 savepoints: Vec::new(),
                 sp_seq: 0,
                 conn_closed: false,
+                pending_rb: None,
+                in_flight: Default::default(),
                 commit_on_exit: false,
                 wrote: false,
                 expunged: Vec::new(),
@@ -5369,8 +5400,16 @@ impl Session {
                 m2m: Vec::new(),
                 tx_deleted: Vec::new(),
                 tx_inserted: Vec::new(),
+                params: Arc::from(Vec::new()),
             })
         }))
+    }
+
+    /// The session parameters of its maker's engine (`connect_args`): set in each of its transactions
+    pub fn set_params(&self, p: Arc<[(String, String)]>) {
+        if let Ok(mut s) = self.0.try_lock() {
+            s.params = p;
+        }
     }
 
     pub fn add(&self, obj: &V) -> R<()> {
@@ -5884,11 +5923,58 @@ impl Session {
         if s.conn_closed {
             return Err(Exc::msg(&RESOURCE_CLOSED_ERROR, "This Connection is closed"));
         }
+        Session::check_pending(s)?;
         if s.tx.is_none() {
-            s.tx = Some(s.pool.begin().await?);
+            let mut tx = s.pool.begin().await?;
+            // the engine's connect_args options (`-c statement_timeout=60s`): the shared pool's connections
+            // take them for this transaction only (SET LOCAL), as the engine's own connections would hold them
+            for (n, v) in s.params.iter() {
+                sqlx::query("SELECT set_config($1, $2, true)").bind(n).bind(v).execute(&mut *tx).await?;
+            }
+            s.tx = Some(tx);
             s.wrote = false;
         }
         Ok(())
+    }
+
+    /// A statement abandoned mid-flight invalidates the connection (asyncpg / psycopg under SQLAlchemy); then
+    /// every statement, flush and commit raises PendingRollbackError until the matching rollback()
+    fn check_pending(s: &mut SessInner) -> R<()> {
+        if s.in_flight.swap(false, std::sync::atomic::Ordering::SeqCst) && s.pending_rb.is_none() {
+            let (major, minor) = sqlalchemy();
+            s.pending_rb = Some((format!("Can't reconnect until invalid transaction is rolled back.  Please rollback() fully \
+                before proceeding (Background on this error at: https://sqlalche.me/e/{major}{minor}/8s2b)"), None));
+        }
+        match &s.pending_rb {
+            Some((m, _)) => Err(Exc::msg(&PENDING_ROLLBACK_ERROR, m)),
+            None => Ok(()),
+        }
+    }
+
+    /// A failed flush: SQLAlchemy rolls the innermost transaction back at once (ROLLBACK TO SAVEPOINT, or ROLLBACK
+    /// of the session's transaction, its new objects expunged) and keeps the session refusing statements until
+    /// that savepoint's (or the session's) rollback()
+    fn flush_failed<'a>(s: &'a mut SessInner, e: &'a Exc) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if s.pending_rb.is_some() {
+                return;
+            }
+            let (major, minor) = sqlalchemy();
+            let orig = ops::str_(&V::Exc(e.clone())).unwrap_or_default();
+            let msg = format!("This Session's transaction has been rolled back due to a previous exception during flush. \
+                To begin a new transaction with this Session, first issue Session.rollback(). Original exception was: \
+                {orig} (Background on this error at: https://sqlalche.me/e/{major}{minor}/7s2a)");
+            match s.savepoints.last().map(|f| f.name.clone()) {
+                Some(name) => {
+                    let _ = Session::end_savepoint_inner(s, &name, false).await;
+                    s.pending_rb = Some((msg, Some(name)));
+                }
+                None => {
+                    let _ = Session::rollback_inner(s).await;
+                    s.pending_rb = Some((msg, None));
+                }
+            }
+        })
     }
 
     fn cx(s: &SessInner) -> R<super::Cx> {
@@ -5942,19 +6028,35 @@ impl Session {
             s.wrote = true;
         }
         let args = Session::args(s, r).await?;
+        let flag = s.in_flight.clone();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let tx = s.tx.as_mut().unwrap();
-        sqlx::query_with(&r.sql, args).fetch_all(&mut **tx).await.map_err(|e| sql_error(e, &r.sql))
+        let rows = sqlx::query_with(&r.sql, args).fetch_all(&mut **tx).await;
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        rows.map_err(|e| sql_error(e, &r.sql))
     }
 
     async fn run_exec(s: &mut SessInner, r: &Rend) -> R<u64> {
         Session::begin(s).await?;
         s.wrote = true;
         let args = Session::args(s, r).await?;
+        let flag = s.in_flight.clone();
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let tx = s.tx.as_mut().unwrap();
-        Ok(sqlx::query_with(&r.sql, args).execute(&mut **tx).await.map_err(|e| sql_error(e, &r.sql))?.rows_affected())
+        let done = sqlx::query_with(&r.sql, args).execute(&mut **tx).await;
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(done.map_err(|e| sql_error(e, &r.sql))?.rows_affected())
     }
 
     async fn flush_inner(s: &mut SessInner) -> R<()> {
+        if let Err(e) = Session::flush_body(s).await {
+            Session::flush_failed(s, &e).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn flush_body(s: &mut SessInner) -> R<()> {
         // the composites of what is INSERTed or UPDATEd are built again when read (SQLAlchemy's after_insert /
         // after_update handlers pop them)
         for o in s.new.iter().chain(s.strong.iter()).filter(|o| !o.desc.composites.is_empty()) {
@@ -6327,14 +6429,47 @@ impl Session {
         Ok(V::native(super::v::Native::Savepoint(self.clone(), name)))
     }
 
+    /// the savepoint `name` is still open (not released or rolled back, by its block or a `commit()`)
+    pub async fn has_savepoint(&self, name: &str) -> bool {
+        self.0.lock().await.savepoints.iter().any(|f| f.name == name)
+    }
+
+    /// `session.in_nested_transaction()`: a savepoint is open
+    pub async fn in_nested_transaction(&self) -> bool {
+        !self.0.lock().await.savepoints.is_empty()
+    }
+
+    /// `session.in_transaction()`: a transaction is begun (explicitly or by autobegin)
+    pub async fn in_transaction(&self) -> bool {
+        self.0.lock().await.tx.is_some()
+    }
+
     /// `savepoint.commit()` (flush, RELEASE) / `savepoint.rollback()` (ROLLBACK TO, session state undone)
     pub async fn end_savepoint(&self, name: &str, commit: bool) -> R<()> {
         let mut s = self.0.lock().await;
+        // the savepoint a failed flush already rolled back: its rollback() ends the PendingRollbackError state
+        if !commit && s.pending_rb.as_ref().is_some_and(|(_, sp)| sp.as_deref() == Some(name)) {
+            s.pending_rb = None;
+            return Ok(());
+        }
+        if commit {
+            Session::check_pending(&mut s)?;
+        }
+        Session::end_savepoint_inner(&mut s, name, commit).await
+    }
+
+    /// `sp.is_active`: the savepoint is open and no failed flush is waiting for its rollback()
+    pub async fn savepoint_active(&self, name: &str) -> bool {
+        let s = self.0.lock().await;
+        s.savepoints.iter().any(|f| f.name == name) && s.pending_rb.is_none()
+    }
+
+    async fn end_savepoint_inner(s: &mut SessInner, name: &str, commit: bool) -> R<()> {
         let Some(i) = s.savepoints.iter().position(|f| f.name == name) else {
             return Err(Exc::msg(&INVALID_REQUEST_ERROR, "This nested transaction is inactive"));
         };
         if commit {
-            Session::flush_inner(&mut s).await?;
+            Session::flush_inner(s).await?;
             let tx = s.tx.as_mut().ok_or_else(|| Exc::msg(&INVALID_REQUEST_ERROR, "This nested transaction is inactive"))?;
             sqlx::query(&format!("RELEASE SAVEPOINT {name}")).execute(&mut **tx).await?;
             let frames: Vec<SpFrame> = s.savepoints.drain(i..).collect();
@@ -6550,6 +6685,7 @@ impl Session {
         if s.conn_closed {
             return Err(Exc::msg(&INVALID_REQUEST_ERROR, "This transaction is inactive"));
         }
+        Session::check_pending(&mut s)?;
         Session::flush_inner(&mut s).await?;
         if let Some(tx) = s.tx.take() {
             tx.commit().await?;
@@ -6675,6 +6811,12 @@ impl Session {
 
     pub async fn rollback(&self) -> R<()> {
         let mut s = self.0.lock().await;
+        s.pending_rb = None;
+        s.in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        Session::rollback_inner(&mut s).await
+    }
+
+    async fn rollback_inner(s: &mut SessInner) -> R<()> {
         s.conn_closed = false;
         if let Some(tx) = s.tx.take() {
             let _ = tx.rollback().await;

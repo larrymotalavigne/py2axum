@@ -47,10 +47,66 @@ STEPS: list = [
     ("GET", f"{P}/raw", None),
 ]
 
+# a table model used by the routes of another module (fixtures/sqlmodelapp/songs.py)
+STEPS += [
+    ("GET", "/songs", None),
+    ("POST", "/songs", {"name": "Midnight Fit", "artist": "Mogwai", "year": 2021}),
+    ("POST", "/songs", {"name": "Nothing", "artist": "x", "year": "y"}),
+    ("POST", "/songs/table", {"name": "Raw", "artist": "R", "id": 40}),
+    ("POST", "/songs/table", {"name": 5}),
+    ("POST", "/songs/validated", {"name": "V", "artist": "A", "year": "1999"}),
+    ("POST", "/songs/validated", {"name": "V"}),
+    ("GET", "/songs", None),
+    ("GET", "/songs/1", None),
+    ("GET", "/songs/999", None),
+]
+
+# SQLModel relationships (fixtures/sqlmodelapp/heroes.py)
+H = "/heroes"
+STEPS += [
+    ("POST", f"{H}/teams", {"name": "Preventers", "headquarters": "Sharp Tower"}),
+    ("POST", f"{H}/teams", {"name": "Z-Force", "headquarters": "Sister Margaret's Bar"}),
+    ("POST", H, {"name": "Deadpond", "secret_name": "Dive Wilson", "team_id": 2}),
+    ("POST", H, {"name": "Rusty-Man", "secret_name": "Tommy Sharp", "age": 48, "team_id": 1}),
+    ("POST", H, {"name": "Spider-Boy", "secret_name": "Pedro Parqueador"}),
+    ("GET", f"{H}/1", None), ("GET", f"{H}/3", None), ("GET", f"{H}/9", None),
+    ("GET", f"{H}/teams/1", None), ("GET", f"{H}/teams/2", None), ("GET", f"{H}/teams/9", None),
+    ("GET", H, None), ("GET", f"{H}?min_age=40", None), ("GET", f"{H}?team_id=2", None), ("GET", f"{H}?min_age=x", None),
+    ("POST", f"{H}/teams/1/recruit?name=Tarantula", None),
+    ("GET", f"{H}/teams/1", None),
+    ("DELETE", f"{H}/teams/1", None),
+    ("GET", f"{H}/2", None), ("GET", f"{H}/teams/1", None),
+    # columns given by sa_column=Column(...)
+    ("POST", f"{H}/missions", {"title": "Rescue", "notes": "night", "meta": {"risk": 3}}),
+    ("POST", f"{H}/missions", {"title": "Patrol"}),
+    ("POST", f"{H}/missions", {"title": "Rescue"}),
+    ("GET", f"{H}/missions", None),
+]
+
+# a table whose base is in another module, an Enum column, exec() of update()/text() (fixtures/sqlmodelapp/gear.py)
+STEPS += [
+    ("POST", "/gear", {"name": "rope"}),
+    ("POST", "/gear", {"name": "sword", "kind": "weapon", "weight": 2.5}),
+    ("POST", "/gear", {"name": "bad", "kind": "spoon"}),
+    ("POST", "/gear", {"name": "x" * 41}),
+    ("POST", "/gear/heavier", None),
+    ("GET", "/gear", None),
+]
+
 
 def reset(db: str) -> None:
+    """the tables created once, by SQLModel itself (as the startup handler would: both servers starting together on a
+    fresh database would race on CREATE TYPE / CREATE TABLE), then emptied"""
+    import os
+
     import psycopg
 
+    os.environ["DATABASE_URL"] = db
+    from sqlmodel import SQLModel
+
+    from fixtures.sqlmodelapp import main
+
+    SQLModel.metadata.create_all(main.engine)
+    main.engine.dispose()
     with psycopg.connect(db, autocommit=True) as c:
-        if c.execute("SELECT to_regclass('pilot')").fetchone()[0] is not None:
-            c.execute("TRUNCATE pilot RESTART IDENTITY")
+        c.execute("TRUNCATE pilot, song, sm_hero, sm_team, sm_mission, sm_gear RESTART IDENTITY")

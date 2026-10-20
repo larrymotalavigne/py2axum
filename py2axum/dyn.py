@@ -10,6 +10,7 @@ Unsupported constructs raise `TranspileError` with file:line, as everywhere else
 from __future__ import annotations
 
 import ast
+import types
 import copy
 import functools
 import json
@@ -20,7 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import coreschema, libmap
-from .frontend import Frontend, Mount, dotted, literal
+from .frontend import HTTP_METHODS, Frontend, Mount, dotted, literal, route_path
+from .frontend import _enclosing_fn as frontend_enclosing_fn
 from .ir import TranspileError
 from .modules import Ext, ModRef, Sym, import_guard, is_ext, startup_skipped, stmt_bindings
 
@@ -44,6 +46,8 @@ _RS_SPECIAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
 
 # the logging methods that make a record (their call site is passed along: dynrt/logging.rs)
 LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"})
+# loguru's `logger.<level>()` methods (dynrt/loguru.rs)
+LOGURU_LEVEL_METHODS = frozenset({"trace", "debug", "info", "success", "warning", "error", "critical"})
 
 
 def rs(s: str) -> str:
@@ -62,6 +66,21 @@ def rs(s: str) -> str:
 def rs_marked(s: str) -> str:
     """A Rust string literal that may hold runtime prefix markers (`\\x01<index>\\x01`)."""
     return rs(s).replace("\\u0001", "\\u{1}")
+
+
+# a property's setter in a class's method table: entry `set:<name>`, function `Class.<name>.__set__`
+SETTER_PREFIX = "set:"
+RO_PREFIX = "ro:"
+SETTER_SUFFIX = ".__set__"
+
+
+def property_accessor(fn) -> str | None:
+    """"setter"/"deleter" for `@<fn.name>.setter` / `.deleter` (the only decorator forms of a property's accessors)."""
+    for d in fn.decorator_list:
+        if isinstance(d, ast.Attribute) and d.attr in ("setter", "deleter") and isinstance(d.value, ast.Name) \
+                and d.value.id == fn.name:
+            return d.attr
+    return None
 
 
 def ident(s: str) -> str:
@@ -446,6 +465,42 @@ class Project:
             self._async_names = names
         return self._async_names
 
+    def crypt_context_names(self) -> tuple[set, set[str]]:
+        """Where a passlib CryptContext is bound in the project: module globals (`pwd_context = CryptContext(...)`,
+        as Syms) and attribute names (`self.context = CryptContext(...)`). Their attributes and calls are checked
+        against the translated surface (FnCompiler.check_passlib)."""
+        if self.__dict__.get("_crypt_names") is None:
+            globs, attrs = set(), set()
+            for m in list(self.ix.modules.values()):
+                if m.lib is not None:
+                    continue
+                for n in ast.walk(m.tree):
+                    if isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.value, ast.Call):
+                        if not isinstance(self.resolve(m.name, n.value.func), Ext) or \
+                                self.resolve(m.name, n.value.func).dotted != "passlib.context.CryptContext":
+                            continue
+                        for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                            if isinstance(t, ast.Name) and n in m.tree.body:
+                                globs.add(Sym(m.name, t.id))
+                            elif isinstance(t, ast.Attribute):
+                                attrs.add(t.attr)
+            self._crypt_names = (globs, attrs)
+        return self._crypt_names
+
+    def httpx_exc_names(self) -> set[str]:
+        """Names bound by `except httpx.X as name` in the project: `name.request` is httpx's Request, of which
+        only `method` and `url` are translated (FnCompiler.check_httpx_request)."""
+        if self.__dict__.get("_httpx_exc") is None:
+            names = set()
+            for m in list(self.ix.modules.values()):
+                if m.lib is not None:
+                    continue
+                for n in ast.walk(m.tree):
+                    if isinstance(n, ast.ExceptHandler) and n.name and n.type is not None and "httpx" in ast.unparse(n.type):
+                        names.add(n.name)
+            self._httpx_exc = names
+        return self._httpx_exc
+
     def cachedmethod_names(self) -> set[str]:
         """Methods of a project class decorated with `@cachedmethod` (by name: their `cache_*` attributes are
         refused)."""
@@ -596,6 +651,17 @@ class Project:
         return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "setdefault"
                 and bool(node.args) and isinstance(node.args[0], ast.Constant) and node.args[0].value == "state")
 
+    def stripe_fields(self) -> frozenset:
+        """The field names of stripe's API objects when the project imports stripe: a StripeObject's attributes are
+        its keys (`__getattr__`), so these reads may find one."""
+        if self.__dict__.get("_stripe_fields") is None:
+            uses = any((isinstance(n, ast.Import) and any(a.name.split(".")[0] == "stripe" for a in n.names))
+                       or (isinstance(n, ast.ImportFrom) and not n.level and (n.module or "").split(".")[0] == "stripe")
+                       for m in list(self.ix.modules.values()) if m.lib is None for n in ast.walk(m.tree))
+            from . import stripetab
+            self.__dict__["_stripe_fields"] = stripetab.FIELDS if uses else frozenset()
+        return self.__dict__["_stripe_fields"]
+
     def open_attrs(self) -> bool:
         """Does the project give objects attributes that cannot be listed statically (`__getattr__`,
         `setattr`/`__dict__` with a computed name)? Then no attribute read is refused."""
@@ -706,10 +772,31 @@ class Project:
             # try: async with maker() as s: yield s / finally: await s.aclose()
             outer_finally = body[0].finalbody
             body = body[0].body
-        if (sync and len(body) == 2 and isinstance(body[0], ast.Assign) and len(body[0].targets) == 1
-                and isinstance(body[0].targets[0], ast.Name) and isinstance(body[1], ast.Try)):
-            # s = maker() / try: yield s / finally: s.close()
-            maker_call, sname, inner = body[0].value, body[0].targets[0].id, [body[1]]
+
+        def assigned(st):
+            """`name = value` / `name: T = value`: (name, value), else None."""
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                return st.targets[0].id, st.value
+            if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+                return st.target.id, st.value
+            return None
+        if (len(body) == 1 and isinstance(body[0], ast.Try) and len(body[0].body) >= 2 and assigned(body[0].body[0])
+                and isinstance(body[0].body[0].value, ast.Call) and not body[0].body[0].value.args):
+            # try: s = maker() / yield s / finally: s.close() -- the maker called inside the try (it does not fail)
+            t = body[0]
+            body = [t.body[0], ast.copy_location(ast.Try(body=t.body[1:], handlers=t.handlers, orelse=t.orelse,
+                                                         finalbody=t.finalbody), t)]
+        factory = None
+        if (len(body) == 2 and assigned(body[0]) and isinstance(body[1], with_t) and len(body[1].items) == 1
+                and isinstance(body[1].items[0].context_expr, ast.Call)
+                and isinstance(body[1].items[0].context_expr.func, ast.Name)
+                and body[1].items[0].context_expr.func.id == assigned(body[0])[0]):
+            # factory = get_session_factory() / async with factory() as s: ... (the maker read once, then called)
+            factory, body = assigned(body[0])[1], body[1:]
+        if len(body) == 2 and assigned(body[0]) and isinstance(body[1], ast.Try):
+            # s = maker() / try: yield s / finally: [await] s.close()
+            sname, maker_call = assigned(body[0])
+            inner = [body[1]]
             if not body[1].finalbody:
                 raise bad(body[1])
         elif len(body) == 1 and isinstance(body[0], with_t) and len(body[0].items) == 1:
@@ -719,6 +806,10 @@ class Project:
             maker_call, sname, inner = item.context_expr, item.optional_vars.id, body[0].body
         else:
             raise bad(fn)
+        if factory is not None:
+            if maker_call.args or maker_call.keywords:
+                raise bad(maker_call)
+            maker_call = ast.copy_location(ast.Call(func=factory, args=[], keywords=[]), maker_call)
         direct = None
         if isinstance(maker_call, ast.Call) and len(maker_call.args) == 1:
             # `with Session(engine) as session:` (SQLModel's documentation): a session of the engine, default options
@@ -744,6 +835,11 @@ class Project:
             return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield)
                     and isinstance(stmt.value.value, ast.Name) and stmt.value.value.id == sname)
 
+        def is_reraise(stmt, caught):
+            """`raise`, or `raise exc` of the caught exception itself (the traceback FastAPI logs is the endpoint's)."""
+            return isinstance(stmt, ast.Raise) and stmt.cause is None and (
+                stmt.exc is None or (caught is not None and isinstance(stmt.exc, ast.Name) and stmt.exc.id == caught))
+
         commit = False
         if len(inner) == 1 and is_yield(inner[0]):
             pass
@@ -753,7 +849,7 @@ class Project:
                 raise bad(t)
             commit = len(t.body) == 2
             for h in t.handlers:
-                if not (len(h.body) == 2 and is_call(h.body[0], "rollback") and isinstance(h.body[1], ast.Raise) and h.body[1].exc is None):
+                if not (len(h.body) == 2 and is_call(h.body[0], "rollback") and is_reraise(h.body[1], h.name)):
                     raise bad(h)
             if not all(is_call(x, "close") for x in t.finalbody):
                 raise bad(t)
@@ -776,13 +872,19 @@ class Project:
         makers = {"async_sessionmaker", "sessionmaker"}
         f = maker_call.func
         maker = None
-        if isinstance(f, ast.Call) and not f.args and not f.keywords:
+        if isinstance(f, ast.Call) and (dotted(f.func) or "").split(".")[-1] in makers:
+            # `maker = sessionmaker(engine, ...)` inside the dependency (a new maker per request, same sessions)
+            maker, mk = f, sym
+        elif isinstance(f, ast.Call) and not f.args and not f.keywords:
             fs = self.resolve(module, f.func)
             fdef = self.ix.definition(fs) if isinstance(fs, Sym) else None
             if isinstance(fdef, ast.FunctionDef):
                 calls = [n for n in ast.walk(fdef) if isinstance(n, ast.Call) and (dotted(n.func) or "").split(".")[-1] in makers]
                 if len(calls) == 1:
                     maker, mk = calls[0], fs
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and self.instance_maker(module, f) is not None:
+            # `db_manager.session_maker()`: the maker an instance of a project class keeps (instance_maker)
+            maker, mk = self.instance_maker(module, f)
         else:
             mk = self.resolve(module, f)
             mdef = self.ix.definition(mk) if isinstance(mk, Sym) else None
@@ -791,9 +893,21 @@ class Project:
                 maker = mdef.value
             elif isinstance(mdef, (ast.Assign, ast.AnnAssign)) and isinstance(mdef.value, ast.Call):
                 cls = self.resolve(mk.module, mdef.value.func)
+                fdef = self.ix.definition(cls) if isinstance(cls, Sym) else None
+                if isinstance(fdef, ast.FunctionDef):
+                    # `SessionLocal = make_sessionmaker(engine)`: a project function whose body returns the one
+                    # (async_)sessionmaker(...) it calls; its options must be literals (not its parameters)
+                    calls = [n for n in ast.walk(fdef) if isinstance(n, ast.Call) and (dotted(n.func) or "").split(".")[-1] in makers]
+                    rets = [n for n in ast.walk(fdef) if isinstance(n, ast.Return)]
+                    if len(calls) == 1 and len(rets) == 1 and rets[0].value is calls[0]:
+                        maker, mk = calls[0], cls
                 if isinstance(cls, Sym) and isinstance(self.ix.definition(cls), ast.ClassDef):
                     if sync:
                         raise self.err("session maker class: only async_sessionmaker wrappers are supported", mdef.value, mk.module)
+                    if any(k.arg == "connect_args" for k in mdef.value.keywords):
+                        # the request's session runs on the process pool as is
+                        raise self.err(f"session dependency {sym.name}: connect_args= of the session maker it calls is not "
+                                       "supported (the request's session takes no engine options)", mdef.value, mk.module)
                     return (commit, *self.maker_class_options(cls, mdef.value, mk.module), False)
         if maker is None:
             raise self.err(f"session dependency {sym.name}: `{ast.unparse(f)}` must be a module-level "
@@ -815,6 +929,109 @@ class Project:
             raise self.err(f"session dependency {sym.name}: a {'synchronous' if sync else 'coroutine'} dependency "
                            f"needs {'sessionmaker' if sync else 'async_sessionmaker'}(...)", maker, mk.module)
         return commit, expire, autoflush, sync
+
+    def instance_maker(self, module: str, f: ast.Attribute):
+        """`inst.attr` where `inst = Cls(...)` is a module global of a project class whose methods set `self.attr`
+        once to an (async_)sessionmaker(...) (else only to None): (that call, the class's Sym) when the maker is
+        set by a statement of `__init__`'s body, or of a method the application's lifespan calls before its
+        `yield` (`await db_manager.initialize()`); None when `inst.attr` is no such thing. Refused (fichier:ligne)
+        when it is one but set otherwise: conditionally, twice, or from outside the class."""
+        inst = self.resolve(module, f.value)
+        idef = self.ix.definition(inst) if isinstance(inst, Sym) else None
+        if not (isinstance(idef, (ast.Assign, ast.AnnAssign)) and isinstance(idef.value, ast.Call)):
+            return None
+        cls = self.resolve(inst.module, idef.value.func)
+        cdef = self.ix.definition(cls) if isinstance(cls, Sym) else None
+        if not isinstance(cdef, ast.ClassDef):
+            return None
+        makers = {"async_sessionmaker", "sessionmaker"}
+        sets = []  # (method, statement, value) of each `self.<attr> = value`
+        for meth in cdef.body:
+            if not isinstance(meth, (ast.FunctionDef, ast.AsyncFunctionDef)) or not meth.args.args:
+                continue
+            me = meth.args.args[0].arg
+            for n in ast.walk(meth):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, ast.AnnAssign) and n.value else []
+                for tg in targets:
+                    if (isinstance(tg, ast.Attribute) and tg.attr == f.attr and isinstance(tg.value, ast.Name)
+                            and tg.value.id == me):
+                        sets.append((meth, n, n.value))
+        made = [(m, st, v) for m, st, v in sets if isinstance(v, ast.Call) and (dotted(v.func) or "").split(".")[-1] in makers]
+        if not made:
+            return None
+        meth, st, maker = made[0]
+        bad = lambda why, node, mod: self.err(f"session maker `{ast.unparse(f)}`: {why}", node, mod)  # noqa: E731
+        if len(made) > 1 or any(not (isinstance(v, ast.Constant) and v.value is None) for _, _, v in sets if v is not maker):
+            raise bad("set more than once in its class (only one (async_)sessionmaker(...), else None)", st, cls.module)
+        if st not in meth.body:
+            raise bad(f"set conditionally in {cdef.name}.{meth.name} (a statement of the method's body is supported)", st, cls.module)
+        for m in list(self.ix.modules.values()):
+            for n in ast.walk(m.tree):
+                if (isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                        and any(isinstance(tg, ast.Attribute) and tg.attr == f.attr and not (isinstance(tg.value, ast.Name) and tg.value.id == "self")
+                                for tg in (n.targets if isinstance(n, ast.Assign) else [n.target]))):
+                    raise bad("assigned outside its class", n, m.name)
+        if meth.name != "__init__" and not self.lifespan_calls(inst, meth.name):
+            raise bad(f"set by {cdef.name}.{meth.name}(), which the application's lifespan does not call before its yield "
+                      "(only a maker set in __init__ or there is supported)", st, cls.module)
+        return maker, cls
+
+    def lifespan_calls(self, inst: Sym, meth: str) -> bool:
+        """The application's lifespan (FastAPI(lifespan=)) calls `inst.meth()` (awaited or not) as a statement of its
+        body before its `yield`."""
+        # the native lifespan, or the one left to Python (--python-side lifespan): it runs at startup all the same
+        spec = self.fe.__dict__.get("lifespan") or next(
+            ((m.name, kw.value) for m in self.fe.index.package_modules() for n in ast.walk(m.tree)
+             if isinstance(n, ast.Call) and dotted(n.func) in {"FastAPI", "fastapi.FastAPI"}
+             for kw in n.keywords if kw.arg == "lifespan"), None)
+        if spec is None:
+            return False
+        lmod, value = spec
+        t = self.resolve(lmod, value) if isinstance(value, (ast.Name, ast.Attribute)) else None
+        d = self.ix.definition(t) if isinstance(t, Sym) else None
+        if not isinstance(d, ast.AsyncFunctionDef):
+            return False
+        for st in d.body:
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Yield):
+                return False
+            call = st.value.value if isinstance(st, ast.Expr) and isinstance(st.value, ast.Await) else \
+                st.value if isinstance(st, ast.Expr) else None
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == meth
+                    and isinstance(call.func.value, (ast.Name, ast.Attribute)) and self.resolve(t.module, call.func.value) == inst):
+                return True
+        return False
+
+    def maker_wrapper(self, sym: Sym, node) -> bool:
+        """`X = Wrapper(url=..., connect_args=...)`: a module instance of a project class wrapping
+        `async_sessionmaker` (maker_class_options), whatever reads it (a dependency, `get_worker_session()`)."""
+        if not (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call)):
+            return False
+        cls = self.resolve(sym.module, node.value.func)
+        if not (isinstance(cls, Sym) and isinstance(self.ix.definition(cls), ast.ClassDef)
+                and any(isinstance(n, ast.Name) and n.id == "async_sessionmaker" for n in ast.walk(self.ix.definition(cls)))):
+            return False
+        cdef = self.ix.definition(cls)
+        if not cdef.bases and not any(isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == "__call__"
+                                      for st in cdef.body):
+            return False  # not callable: a manager keeping a maker in an attribute (instance_maker), not a wrapper
+        self.maker_class_options(cls, node.value, sym.module)  # refuses what it cannot read
+        return True
+
+    def maker_wrapper_value(self, fc: "FnCompiler", sym: Sym, node) -> str:
+        """The wrapper instance as the binary's own sessionmaker (`X()` is a new AsyncSession on the process pool):
+        its engine's `connect_args` session parameters are set in each transaction of its sessions."""
+        cls = self.resolve(sym.module, node.value.func)
+        expire, autoflush = self.maker_class_options(cls, node.value, sym.module)
+        ca = next((k.value for k in node.value.keywords if k.arg == "connect_args"), None)
+        maker = (f"{RT}::orm::sessionmaker(&[], &[(\"expire_on_commit\".to_string(), V::Bool({str(expire).lower()})), "
+                 f"(\"autoflush\".to_string(), V::Bool({str(autoflush).lower()}))], false)?")
+        if ca is None:
+            return maker
+        if "timezone" in ast.unparse(ca).lower():
+            # psycopg decodes timestamptz in the connection's zone: per engine, not per transaction
+            raise self.err(f"{sym.name}: a TimeZone in the connect_args of a session maker wrapper is not supported "
+                           "(set it on the application's engine)", ca, sym.module)
+        return fc.q(f"{RT}::orm::maker_params({maker}, &{fc.expr(ca)})")
 
     def maker_class_options(self, cls: Sym, call: ast.Call, call_module: str) -> tuple[bool, bool]:
         """A project class wrapping `async_sessionmaker` (an instance per module, called for a session):
@@ -868,12 +1085,52 @@ class Project:
                             return bool(kw.value.value)
         return True
 
+    def factory_member(self, module: str, scope, name: str):
+        """`name` read by a function defined in the application factory (`create_app`), when the factory binds it
+        once at its top level, by a `def` or a single assignment, and nowhere else: (that statement, the factory),
+        else None. The factory runs once, at startup: what it binds there is what every request sees."""
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        m = self.ix.module(module)
+        factory = next((d for d in m.tree.body if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and any(st is scope for st in d.body)), None)
+        if factory is None:
+            return None
+        binds = [st for st in factory.body if (isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == name)
+                 or (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                     and st.targets[0].id == name)]
+        stores = [n for n in ast.walk(factory) if (isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store))
+                  or (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name)
+                  or (isinstance(n, ast.arg) and n.arg == name)]
+        if len(binds) != 1 or len(stores) != 1:
+            return None
+        if factory.body.index(binds[0]) > next(i for i, st in enumerate(factory.body) if st is scope):
+            return None  # bound after the `def` reading it: Python's NameError when the factory runs
+        return binds[0], factory
+
+    def factory_function(self, module: str, scope, name: str) -> Sym | None:
+        """A function of the application factory read by name (`Depends(claims_from_request)`): compiled with the
+        factory's locals, like the endpoints defined there (`nested`)."""
+        hit = self.factory_member(module, scope, name)
+        if hit is None or not isinstance(hit[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        fn, factory = hit
+        nsym = Sym(module, f"{factory.name}.<locals>.{fn.name}")
+        self.__dict__.setdefault("nested", {})[nsym] = (fn, factory)
+        return nsym
+
     def expand_alias(self, ann: ast.AST, module: str, scope=None) -> tuple[ast.AST, str]:
-        """`DbDep = Annotated[AsyncSession, Depends(get_db)]` used as `db: DbDep` -> the aliased type."""
+        """`DbDep = Annotated[AsyncSession, Depends(get_db)]` used as `db: DbDep` -> the aliased type (also bound in
+        the application factory, `Auth = Annotated[Claims, Depends(local)]`)."""
         for _ in range(10):
             if not isinstance(ann, (ast.Name, ast.Attribute)):
                 return ann, module
             t = self.ix.resolve_expr(module, ann, scope)
+            if t is None and isinstance(ann, ast.Name):
+                hit = self.factory_member(module, scope, ann.id)
+                if hit is not None and isinstance(hit[0], ast.Assign) and isinstance(hit[0].value, ast.Subscript):
+                    ann = hit[0].value  # read in the endpoint's scope: its names are the factory's
+                    continue
             if not isinstance(t, Sym):
                 return ann, module
             d = self.ix.definition(t)
@@ -1025,7 +1282,8 @@ class Project:
     def _num(self, cons: dict) -> str:
         def o(k):
             return f"Some({float(cons[k])!r}f64)" if k in cons else "None"
-        return f"{RT}::pyd::NumC {{ ge: {o('ge')}, gt: {o('gt')}, le: {o('le')}, lt: {o('lt')}, mul: {o('multiple_of')} }}"
+        return (f"{RT}::pyd::NumC {{ ge: {o('ge')}, gt: {o('gt')}, le: {o('le')}, lt: {o('lt')}, mul: {o('multiple_of')}, "
+                f"finite: {str(bool(cons.get('_finite'))).lower()} }}")
 
     def _dec(self, cons: dict, node, module: str) -> str:
         def bound(k):
@@ -1050,7 +1308,8 @@ class Project:
                 f"lower: {str(bool(cons.get('_lower'))).lower()}, upper: {str(bool(cons.get('_upper'))).lower()}, "
                 f"ascii: {str(bool(cons.get('_ascii'))).lower()} }}")
 
-    CONFIG_CONS = {"_strip", "_lower", "_upper", "_smin", "_smax", "_enum_values", "_val_bytes", "_dc_strict", "_dc_extra"}
+    CONFIG_CONS = {"_strip", "_lower", "_upper", "_smin", "_smax", "_enum_values", "_val_bytes", "_dc_strict", "_dc_extra",
+                   "_finite"}
 
     @classmethod
     def _cfg(cls, cons: dict) -> dict:
@@ -1083,6 +1342,8 @@ class Project:
         if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
             parts = self._union_parts(ann)
             return self._union(parts, module, cons, scope, ann)
+        if isinstance(ann, ast.Call):
+            return self._constrained_call(ann, module, cons, scope)
         if isinstance(ann, ast.Subscript):
             outer = self.resolve(module, ann.value, scope)
             od = outer.dotted if isinstance(outer, Ext) else (dotted(ann.value) or "")
@@ -1206,6 +1467,7 @@ class Project:
                 "datetime.time": f"{RT}::pyd::TD::Time",
                 "datetime.timedelta": f"{RT}::pyd::TD::Delta",
                 "uuid.UUID": f"{RT}::pyd::TD::Uuid",
+                "pathlib.Path": f"{RT}::pyd::TD::Path",
                 **{f"pydantic{m}.UUID{n}": f"{RT}::pyd::TD::UuidV({n})" for m in ("", ".types") for n in range(1, 9)},
                 **dict.fromkeys(("pydantic.SecretStr", "pydantic.types.SecretStr"), f"{RT}::pyd::TD::Secret"),
                 # Json: the str/bytes input parsed by jiter (pydantic-core's parser), the value as it is
@@ -1220,8 +1482,17 @@ class Project:
                                 + self._str({k: v for k, v in cons.items() if k in ("_strip", "_lower", "_upper")}) + ")"),
                 **{f"pydantic{m}.{n}": f"{RT}::pyd::TD::Url(&{RT}::pyd::{c})" for m in ("", ".networks")
                    for n, c in (("AnyUrl", "ANY_URL"), ("AnyHttpUrl", "ANY_HTTP_URL"), ("HttpUrl", "HTTP_URL"),
-                                ("RedisDsn", "REDIS_DSN"))},
+                                ("RedisDsn", "REDIS_DSN"), ("PostgresDsn", "POSTGRES_DSN"), ("CockroachDsn", "COCKROACH_DSN"),
+                                ("MongoDsn", "MONGO_DSN"), ("AmqpDsn", "AMQP_DSN"), ("KafkaDsn", "KAFKA_DSN"), ("MySQLDsn", "MYSQL_DSN"),
+                                ("MariaDBDsn", "MARIADB_DSN"))},
             }
+            alias = self.CONSTRAINED_ALIASES.get(last) if t.dotted in (f"pydantic.{last}", f"pydantic.types.{last}") else None
+            if alias is not None:
+                base, extra = alias
+                inner = self._td_init(ast.Name(id=base, ctx=ast.Load()), module, {**({} if extra == "strict" else extra), **cons}, scope)
+                if extra == "strict":
+                    return f"{RT}::pyd::TD::StrictTop(&{self._static_td(inner)})"
+                return inner
             aware = {f"pydantic{m}.{n}": n == "AwareDatetime" for m in ("", ".types") for n in ("AwareDatetime", "NaiveDatetime")}
             if t.dotted in aware:
                 return self._dt_cons(f"{RT}::pyd::TD::DateTime", "datetime", cons, aware[t.dotted], ann, module)
@@ -1267,6 +1538,59 @@ class Project:
                                ann, module)
             raise self.err(f"type `{t.qual}` is not a Pydantic model or an enum (other classes are not supported)", ann, module)
         raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
+
+    # pydantic's constrained and strict aliases: the builtin under them, and its constraints ("strict": Strict())
+    CONSTRAINED_ALIASES = {
+        "PositiveInt": ("int", {"gt": 0}), "NegativeInt": ("int", {"lt": 0}),
+        "NonNegativeInt": ("int", {"ge": 0}), "NonPositiveInt": ("int", {"le": 0}),
+        "PositiveFloat": ("float", {"gt": 0}), "NegativeFloat": ("float", {"lt": 0}),
+        "NonNegativeFloat": ("float", {"ge": 0}), "NonPositiveFloat": ("float", {"le": 0}),
+        "StrictStr": ("str", "strict"), "StrictInt": ("int", "strict"), "StrictFloat": ("float", "strict"),
+        "StrictBool": ("bool", "strict"), "StrictBytes": ("bytes", "strict"),
+    }
+    CONSTR_KW = {"strip_whitespace": "_strip", "to_upper": "_upper", "to_lower": "_lower", "min_length": "min_length",
+                 "max_length": "max_length", "pattern": "pattern", "strict": "strict"}
+    CONNUM_KW = {"strict", "gt", "ge", "lt", "le", "multiple_of"}
+
+    def _constrained_call(self, ann: ast.Call, module: str, cons: dict, scope) -> str:
+        """`constr(...)`, `conint(...)`, `confloat(...)`, `condecimal(...)`, `conlist(T, ...)`, `conset(T, ...)`: what
+        pydantic builds is `Annotated[<type>, <constraints>]`, so they translate as the annotation they stand for."""
+        f = self.resolve(module, ann.func, scope)
+        last = f.dotted.rsplit(".", 1)[-1] if isinstance(f, Ext) and f.dotted.startswith("pydantic") else ""
+        if last not in {"constr", "conint", "confloat", "condecimal", "conlist", "conset"}:
+            raise self.err(f"unsupported type annotation `{ast.unparse(ann)}`", ann, module)
+        item = None
+        if last in {"conlist", "conset"}:
+            if len(ann.args) != 1:
+                raise self.err(f"`{ast.unparse(ann)}`: the item type is the one positional argument", ann, module)
+            item = ann.args[0]
+        elif ann.args:
+            raise self.err(f"`{ast.unparse(ann)}`: keyword arguments only", ann, module)
+        allowed = {"constr": set(self.CONSTR_KW), "conint": self.CONNUM_KW, "confloat": self.CONNUM_KW,
+                   "condecimal": {"gt", "ge", "lt", "le", "multiple_of", "max_digits", "decimal_places"},
+                   "conlist": {"min_length", "max_length"}, "conset": {"min_length", "max_length"}}[last]
+        own: dict = {}
+        for k in ann.keywords:
+            if k.arg not in allowed:
+                raise self.err(f"`{ast.unparse(ann)}`: {k.arg or '**'}= is not supported", ann, module)
+            v = self.const_bound(k.value, module, scope) if k.arg in {"gt", "ge", "lt", "le"} else self.const(k.value, module, scope)
+            if v is None and k.arg != "strict":
+                continue
+            own[self.CONSTR_KW.get(k.arg, k.arg) if last == "constr" else k.arg] = v
+        strict = own.pop("strict", False)
+        merged = {**own, **cons}  # the field's own constraints apply after the type's
+        base = {"constr": "str", "conint": "int", "confloat": "float"}.get(last)
+        if base is not None:
+            inner = self._td_init(ast.Name(id=base, ctx=ast.Load()), module, merged, scope)
+        elif last == "condecimal":
+            if "multiple_of" in merged:
+                raise self.err("Field(multiple_of=) on a Decimal is not supported", ann, module)
+            inner = f"{RT}::pyd::TD::Decimal({self._dec(merged, ann, module)})"
+        else:
+            sub = self._static_td(self._td_init(item, module, self._cfg(cons), scope))
+            kind = "List" if last == "conlist" else "Set"
+            inner = self._sized(f"{RT}::pyd::TD::{kind}(Some(&{sub}))", merged, ann, module)
+        return f"{RT}::pyd::TD::StrictTop(&{self._static_td(inner)})" if strict else inner
 
     def _flatten_union(self, parts, module, scope) -> list[ast.AST]:
         """typing flattens nested unions: `int | Optional[str]` is `int | str | None` (labels, nullability)."""
@@ -1787,6 +2111,13 @@ class Project:
         node = self.ix.definition(sym)
         if not isinstance(node, ast.ClassDef):
             raise TranspileError(f"{sym.qual} is not a class")
+        for k in node.keywords:
+            # `metaclass=ABCMeta` is read on plain classes only (is_plain_class); any other keyword changes how the
+            # class is built (a metaclass's __new__/__call__, __init_subclass__ arguments)
+            raise self.err(f"class {sym.name}: the class keyword `{ast.unparse(k)}` is not supported (only "
+                           "metaclass=ABCMeta, on a plain class)", k.value, sym.module)
+        for d in node.decorator_list:
+            raise self.err(f"class {sym.name}: decorator @{ast.unparse(d)} is not supported", d, sym.module)
         name = f"CLS_{mod_ident(sym.module)}__{ident(sym.name)}"
         self.exc_classes[sym] = name
         bases = []
@@ -1814,7 +2145,7 @@ class Project:
                 if stmt.name in COPY_DUNDERS and not self.copies_objects():
                     self.__dict__.setdefault("copy_ignored", []).append((sym, stmt, sym.module))
                     continue
-                if is_dunder(stmt.name):
+                if is_dunder(stmt.name) and (stmt.name not in EXC_DUNDERS or stmt.decorator_list):
                     raise self.err(f"exception class {sym.name}: method {stmt.name} is not supported", stmt, sym.module)
                 last = [((dotted(d.func) if isinstance(d, ast.Call) else dotted(d)) or "").split(".")[-1] for d in stmt.decorator_list]
                 if any(x != "property" for x in last):
@@ -2766,6 +3097,11 @@ class Project:
                     for k, v in zip(st.value.keys, st.value.values):
                         key = self.annotation_key(k, t.module)
                         if key is None:
+                            ks = self.resolve(t.module, k) if isinstance(k, (ast.Name, ast.Attribute)) else None
+                            if isinstance(ks, Sym):
+                                # a class of the project (an Enum): refused for the columns annotated with it only
+                                out[("unsupported", ks)] = (k, t)
+                                continue
                             raise self.err(f"{t.name}.type_annotation_map: key `{ast.unparse(k)}` is not supported "
                                            "(types written by name, or generics of them)", k, t.module)
                         out[key] = (v, t.module)
@@ -2842,6 +3178,10 @@ class Project:
                 elif isinstance(t, Sym) and self.enum_kind(t):
                     col["ty"] = f"Enum(&{self.enum_col(t, False, t.name.lower())})"
                 key = self.annotation_key(p, module) if tam else None
+                if tam and isinstance(t, Sym) and ("unsupported", t) in tam:
+                    k, base = tam[("unsupported", t)]
+                    raise self.err(f"column {name}: the type_annotation_map of {base.name} maps `{ast.unparse(k)}` "
+                                   "(a project class as a key is not supported)", stmt, module)
                 if tam and key not in tam and isinstance(p, ast.Subscript) and self.annotation_key(p.value, module) in tam:
                     # `list[int]` with only `list` in the map: SQLAlchemy's lookup by the generic's origin
                     raise self.err(f"column {name}: `{ast.unparse(p)}` would take the type_annotation_map entry of "
@@ -3093,19 +3433,17 @@ class Project:
         return name
 
     def copies_objects(self) -> bool:
-        """Some module translated imports `copy` or `pickle` (or `copyreg`), whose functions call `__getstate__`,
-        `__reduce__`, `__deepcopy__`...: then a class's such methods are refused, never ignored."""
-        mods = list(self.ix.modules.values())
-        seen = self.__dict__.setdefault("_copies_seen", {})  # module -> imports copy/pickle or reads such a method
-        roots = {"copy", "pickle", "copyreg", "_pickle"}
-        for m in mods:
-            if m.name not in seen:
-                seen[m.name] = any(
-                    (isinstance(n, ast.Import) and any(a.name.split(".")[0] in roots for a in n.names))
-                    or (isinstance(n, ast.ImportFrom) and not n.level and (n.module or "").split(".")[0] in roots)
-                    or (isinstance(n, ast.Attribute) and n.attr in COPY_DUNDERS)  # `obj.__getstate__()` called directly
-                    for n in ast.walk(m.tree))
-        return any(seen.values())
+        """Some translated code calls `copy`, `pickle` or `copyreg` (`pickle.dumps(obj)`, `copy.copy` translated
+        from source) or a copy method itself (`obj.__getstate__()`, `super().__reduce__()`): these call a class's
+        `__getstate__`, `__reduce__`, `__deepcopy__`... Then such methods are refused, never ignored. A library that
+        defines them for pickling (loguru's enqueue, apscheduler's job stores) without the application reaching
+        that code keeps its classes: nothing would call them. Checked again once everything is compiled."""
+        return "copy_use" in self.__dict__
+
+    def note_copy(self, dotted: str | None = None, attr: str | None = None) -> None:
+        """Translated code reaches copy/pickle (`dotted`, a library name) or reads a copy method (`attr`)."""
+        if (dotted is not None and dotted.split(".")[0] in COPY_ROOTS) or (attr is not None and attr in COPY_DUNDERS):
+            self.__dict__.setdefault("copy_use", dotted or attr)
 
     def is_typeddict(self, sym: Sym) -> bool:
         """A `TypedDict` class of the project (bases: TypedDict or such classes; annotations only): calling it
@@ -3126,8 +3464,26 @@ class Project:
         with free attributes."""
         d = self.ix.definition(sym)
         return (isinstance(d, ast.ClassDef) and (self.plain_bases(sym) is not None or self.is_http_middleware(sym))
-                and not d.keywords and not d.decorator_list and sym not in self.fe.model_syms
+                and all(self.abcmeta_kw(sym, k) for k in d.keywords) and not d.decorator_list and sym not in self.fe.model_syms
                 and sym not in self.fe.schema_syms and sym not in self.fe.dataclass_syms)
+
+    def abcmeta_kw(self, sym: Sym, kw: ast.keyword) -> bool:
+        """`metaclass=ABCMeta`: the metaclass `ABC` gives its subclasses (abstract methods block instantiation)."""
+        t = self.resolve(sym.module, kw.value) if kw.arg == "metaclass" else None
+        return isinstance(t, Ext) and t.dotted == "abc.ABCMeta"
+
+    def abc_class(self, sym: Sym) -> bool:
+        """Is ABCMeta the metaclass of this plain class (base `ABC`, `metaclass=ABCMeta`, or a base that has it)?
+        Only then does `@abstractmethod` block `C()` (CPython: object.__new__ reads `__abstractmethods__`, which
+        ABCMeta alone computes)."""
+        d = self.ix.definition(sym)
+        if any(self.abcmeta_kw(sym, k) for k in d.keywords):
+            return True
+        for b in d.bases:
+            t = self.resolve(sym.module, b.value if isinstance(b, ast.Subscript) else b)
+            if (isinstance(t, Ext) and t.dotted == "abc.ABC") or (isinstance(t, Sym) and t != sym and self.abc_class(t)):
+                return True
+        return False
 
     def plain_bases(self, sym: Sym) -> list[Sym] | None:
         """The project base of a plain class (`[]`: none, `ABC` or `object` only); None if a base is anything else."""
@@ -3181,6 +3537,7 @@ class Project:
         attrs = {}
         parent = None
         own: list = []
+        ro_props: set[str] = set()  # the `@property`s (a cached_property is assignable)
         abstract: set[str] = set()
         try:
             for b in self.plain_bases(sym) or []:
@@ -3208,11 +3565,31 @@ class Project:
                     if is_dunder(st.name) and st.name != "__init__" and st.name not in DISPATCHED_DUNDERS:
                         raise self.err(f"class {sym.name}: method {st.name} is not supported", st, module)
                     last = [((dotted(d.func) if isinstance(d, ast.Call) else dotted(d)) or "").split(".")[-1] for d in st.decorator_list]
-                    for d, ln in zip(st.decorator_list, last):
-                        if ln == "cachedmethod" and cachedmethod_deco(self, Sym(module, f"{node.name}.{st.name}"), st) is not None:
-                            continue  # applied by its method wrapper (method_wrapper)
-                        if ln not in {"property", "classmethod", "staticmethod", "abstractmethod"}:
-                            raise self.err(f"{sym.name}.{st.name}: decorator @{ast.unparse(d)} is not supported", d, module)
+                    acc = property_accessor(st)
+                    if acc is not None:
+                        # `@name.setter` after `@property def name`: the property's setter (`obj.name = v` calls it);
+                        # the getter stays the first def of the name
+                        if acc == "deleter":
+                            raise self.err(f"{sym.name}.{st.name}: decorator @{st.name}.deleter is not supported "
+                                           "(`del obj.name` is not translated): remove the deleter or keep the route in Python", st, module)
+                        if not any(n == st.name and prop for n, prop, _ in own):
+                            raise self.err(f"{sym.name}.{st.name}: decorator @{st.name}.setter is not supported without a `@property def {st.name}` "
+                                           "earlier in the same class body (an inherited or assigned property)", st, module)
+                        if len(st.decorator_list) != 1 or any(n == SETTER_PREFIX + st.name for n, _, _ in own):
+                            raise self.err(f"{sym.name}.{st.name}: decorator @{st.name}.setter is not supported beside another decorator, "
+                                           "or as a second setter", st, module)
+                        own.append((SETTER_PREFIX + st.name, False, Sym(module, f"{node.name}.{st.name}{SETTER_SUFFIX}")))
+                        continue
+                    msym = Sym(module, f"{node.name}.{st.name}")
+                    if any(ln == "cachedmethod" and cachedmethod_deco(self, msym, st) is not None for ln in last):
+                        pass  # applied by its method wrapper (method_wrapper)
+                    else:
+                        vdecs, cached = self.method_value_decos(sym, st, module)
+                        if cached:
+                            self.__dict__.setdefault("cached_prop_syms", set()).add(msym)
+                        elif vdecs:
+                            self.__dict__.setdefault("vdeco_methods", set()).add(msym)
+                            self.decorated_value(msym)  # the decorators compile (or refuse) with the class, not at the end
                     if "abstractmethod" in last:
                         abstract.add(st.name)
                     else:
@@ -3220,7 +3597,12 @@ class Project:
                     if st.name == "__init__":
                         info.__dict__["init"] = Sym(module, f"{node.name}.__init__")
                     else:
-                        own.append((st.name, "property" in last, Sym(module, f"{node.name}.{st.name}")))
+                        # a later def of the same name rebinds it (the setter of a property aside)
+                        own[:] = [m for m in own if m[0] not in (st.name, SETTER_PREFIX + st.name)]
+                        ro_props.discard(st.name)
+                        own.append((st.name, "property" in last or msym in self.__dict__.get("cached_prop_syms", ()), msym))
+                        if "property" in last:
+                            ro_props.add(st.name)
                 elif (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
                       and st.targets[0].id == "__hash__" and isinstance(st.value, ast.Constant) and st.value.value is None):
                     info.__dict__["unhashable"] = True
@@ -3246,13 +3628,17 @@ class Project:
         except TranspileError as e:
             self.class_errors[sym] = e
             raise
+        # a name redefined here hides the inherited setter along with the getter; a property without setter refuses assignment
+        # (`ro:<name>` marks it: a class attribute reads as a property too)
+        own += [(RO_PREFIX + n, False, sy) for n, prop, sy in own if prop and n in ro_props and SETTER_PREFIX + n not in {m[0] for m in own}]
         names = {m[0] for m in own} | set(attrs)
+        names |= {pre + n for n in names for pre in (SETTER_PREFIX, RO_PREFIX)}
         info.methods = own + [m for m in (parent.methods if parent else []) if m[0] not in names]
         # CPython: `__eq__` in the class body without `__hash__` sets `__hash__ = None`; otherwise inherited
         info.__dict__["hash_kind"] = ("Unhashable" if info.__dict__.get("unhashable") else "Id" if info.__dict__.get("hash_id")
                                       else "Unhashable" if any(m[0] == "__eq__" for m in own)
                                       else parent.__dict__.get("hash_kind", "Id") if parent else "Id")
-        info.__dict__["abstract"] = sorted(abstract)
+        info.__dict__["abstract"] = sorted(abstract) if self.abc_class(sym) else []
         if parent is not None:
             info.__dict__["base_cls"] = parent.cls
         info.__dict__["class_attrs"] = {n: g for n, g in (parent.__dict__.get("class_attrs", {}) if parent else {}).items()
@@ -3277,6 +3663,38 @@ class Project:
         info.__dict__["own_class_attrs"] = list(attrs)
         self.schemas[sym] = info
         return info
+
+    def method_value_decos(self, csym: Sym, st, module: str) -> tuple[list, bool]:
+        """The decorators of a plain class's method applied as values (`@wraps` wrappers, `@contextmanager`, a project
+        decorator...: `d(f)` built once at class creation, a function bound to the instance), and whether it is a
+        `functools.cached_property`. property, classmethod, staticmethod and abstractmethod are handled apart; a decorator
+        class (descriptor protocol), or one beside them, is refused."""
+        fc = FnCompiler(self, module, None, "deco")
+        shim = types.SimpleNamespace(decorator_list=[
+            d for d in st.decorator_list
+            if ((dotted(d.func) if isinstance(d, ast.Call) else dotted(d)) or "").split(".")[-1] != "abstractmethod"])
+        try:
+            other = value_decorators(shim, fc.static_ref)
+        except TranspileError as e:
+            raise self.err(e.msg, e.node or st, module) from None
+        cached = False
+        vdecs = []
+        for d in other:
+            head = d.func if isinstance(d, ast.Call) else d
+            ref = fc.static_ref(head)
+            if ref == Ext("functools.cached_property") and not isinstance(d, ast.Call):
+                cached = True
+                continue
+            if isinstance(ref, Sym) and isinstance(self.ix.definition(ref), ast.ClassDef):
+                raise self.err(f"{csym.name}.{st.name}: decorator @{ast.unparse(d)} is not supported (it is a class: a "
+                               "descriptor, bound by its `__get__`); use a function decorator, `@property` or "
+                               "`functools.cached_property`", d, module)
+            vdecs.append(d)
+        if cached and (vdecs or len(shim.decorator_list) != 1):
+            raise self.err(f"{csym.name}.{st.name}: decorator @cached_property is not supported beside another decorator", st, module)
+        if vdecs and len(shim.decorator_list) != len(st.decorator_list):
+            raise self.err(f"{csym.name}.{st.name}: decorator @abstractmethod is not supported beside the decorator @{ast.unparse(vdecs[0])}", st, module)
+        return vdecs, cached
 
     def class_attr_value(self, sym: Sym, name: str, value: ast.expr, module: str) -> ast.expr:
         """The expression of a plain class's attribute, read as is through the class and its instances:
@@ -3546,6 +3964,8 @@ class Project:
             cons["_val_bytes"] = info.__dict__["val_json_bytes"]
         if info.__dict__.get("strict"):
             cons["_dc_strict"] = True
+        if info.__dict__.get("finite"):
+            cons["_finite"] = True
         if info.extra != "Ignore":
             cons["_dc_extra"] = info.extra
         return cons
@@ -3707,12 +4127,41 @@ class Project:
         args = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
         if len(args) != len(tvars):
             raise self.err(f"`{ast.unparse(sub)}`: {len(tvars)} type parameter(s) expected", sub, module)
-        for a in args:
-            for n in ast.walk(a):
-                if isinstance(n, ast.Name) and self.resolve(module, n, scope) != self.resolve(sym.module, n):
-                    raise self.err(f"`{ast.unparse(sub)}`: `{n.id}` must mean the same in {sym.module}", n, module)
         shown = ", ".join(ast.unparse(a).split(".")[-1] if isinstance(a, ast.Attribute) else ast.unparse(a) for a in args)
-        return self.specialize(sym, node, f"{sym.name}[{shown}]", dict(zip(tvars, args)), sub, module)
+        args, key = self.rebind_args(args, module, scope, sym.module, sub)
+        name = f"{sym.name}[{shown}]"
+        done = self.fe.schema_syms.get(Sym(sym.module, name))
+        if done is not None and getattr(done, "_py2axum_key", key) != key:
+            raise self.err(f"`{ast.unparse(sub)}`: two different `{shown}` for the same generic model", sub, module)
+        out = self.specialize(sym, node, name, dict(zip(tvars, args)), sub, module)
+        self.fe.schema_syms[out]._py2axum_key = key
+        return out
+
+    def rebind_args(self, args: list, module: str, scope, gmodule: str, sub: ast.AST) -> tuple[list, tuple]:
+        """The arguments of `Model[X]` written in `module`, as the model's own module (`gmodule`) must read them:
+        a name that means something else there (or nothing) is bound to what it means here, under a name of its
+        own (`_p2ag_N`) in the model's module."""
+        import copy
+        m = self.ix.module(gmodule)
+        key: list = []
+
+        class Rebind(ast.NodeTransformer):
+            def visit_Name(_, n):
+                here, there = self.resolve(module, n, scope), self.resolve(gmodule, n)
+                key.append((n.id, here))
+                if here == there:
+                    return n
+                if here is None or m is None:
+                    raise self.err(f"`{ast.unparse(sub)}`: `{n.id}` must mean the same in {gmodule}", n, module)
+                spec = (("module", here.dotted) if isinstance(here, Ext) and "." not in here.dotted
+                        else ("from", here.module, here.name) if isinstance(here, Sym)
+                        else ("module", here.module) if isinstance(here, ModRef)
+                        else ("from", *here.dotted.rsplit(".", 1)))
+                alias = f"_p2ag_{abs(hash(spec)) % 10**8}"
+                m.imports[alias] = spec
+                return ast.copy_location(ast.Name(id=alias, ctx=ast.Load()), n)
+
+        return [Rebind().visit(copy.deepcopy(a)) for a in args], tuple(key)
 
     def _schema(self, sym: Sym) -> SchemaInfo:
         node = self.fe.schema_syms[sym]
@@ -3754,9 +4203,11 @@ class Project:
                 if parent.__dict__.get("init") is not None:
                     info.__dict__["init"] = parent.__dict__["init"]
                 for k in ("strip", "lower", "upper", "smin", "smax", "strict", "field_sers", "model_ser", "root", "enum_values", "validate_assignment", "populate_by_name", "post_init",
-                          "alias_gen", "validate_by_alias", "ser_by_alias"):
+                          "alias_gen", "validate_by_alias", "ser_by_alias", "hide_input", "env_ignore_empty", "finite"):
                     if k in parent.__dict__:
                         info.__dict__[k] = parent.__dict__[k]
+                # the merged `model_config` (pydantic updates it from each base in order): `**Base.model_config`
+                info.__dict__.setdefault("config_kw", {}).update(parent.__dict__.get("config_kw", {}))
             elif isinstance(t, Ext) and t.dotted.split(".")[-1] == "BaseSettings":
                 info.settings = True
             elif isinstance(t, Ext) and t.dotted in {"pydantic.RootModel", "pydantic.root_model.RootModel"}:
@@ -4440,17 +4891,51 @@ class Project:
         info.__dict__["private"] = private + ([(name, spec)] if spec is not None else [])
 
     def model_config(self, info: SchemaInfo, value: ast.AST, module: str) -> None:
+        groups: list[tuple[list, str]] = []  # (keywords, their module), in order: a later key wins
         if isinstance(value, ast.Dict):
-            items = []
             for k, v in zip(value.keys, value.values):
                 if k is None:
-                    raise self.err("model_config: ** expansion is not supported", value, module)
-                items.append(ast.keyword(arg=self.const(k, module), value=v))
-        elif isinstance(value, ast.Call) and (dotted(value.func) or "").split(".")[-1] in {"ConfigDict", "SettingsConfigDict"}:
-            items = value.keywords
+                    groups += self.config_of(v, module)
+                else:
+                    groups.append(([ast.keyword(arg=self.const(k, module), value=v)], module))
+        elif isinstance(value, ast.Call) and (dotted(value.func) or "").split(".")[-1] in {"ConfigDict", "SettingsConfigDict"} \
+                and not value.args:
+            seen: set[str] = set()
+            for kw in value.keywords:
+                got = self.config_of(kw.value, module) if kw.arg is None else [([kw], module)]
+                for items, _ in got:
+                    for k in items:
+                        if k.arg in seen:  # a TypeError when the class is defined
+                            raise self.err(f"model_config: ConfigDict() got multiple values for keyword argument "
+                                           f"'{k.arg}'", kw, module)
+                        seen.add(k.arg)
+                groups += got
         else:
             raise self.err("model_config must be ConfigDict(...) or a dict literal", value, module)
-        self.config_items(info, items, module)
+        for items, m in groups:
+            self.config_items(info, items, m)
+
+    def config_source(self, node: ast.AST, module: str):
+        """`X.model_config` (or `X.model_config or {}`) for a project model `X`: its SchemaInfo; None for pydantic's
+        own BaseModel (an empty config); refused otherwise."""
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or) and len(node.values) == 2 \
+                and isinstance(node.values[1], ast.Dict) and not node.values[1].keys:
+            node = node.values[0]  # a model's config is a dict, `or {}` only matters when it is empty: same keys
+        if isinstance(node, ast.Attribute) and node.attr == "model_config":
+            t = self.resolve(module, node.value)
+            if isinstance(t, Sym) and t in self.fe.schema_syms:
+                return self.schema(t)
+            if isinstance(t, Ext) and t.dotted in {"pydantic.BaseModel", "pydantic.main.BaseModel"}:
+                return None
+        raise self.err(f"model_config: `{ast.unparse(node)}` is not supported (only `Model.model_config` of a "
+                       "project model)", node, module)
+
+    def config_of(self, node: ast.AST, module: str) -> list[tuple[list, str]]:
+        """`**X.model_config`: X's merged configuration, as keyword groups with the module each was written in."""
+        src = self.config_source(node, module)
+        if src is None:
+            return []
+        return [([kw], m) for kw, m in src.__dict__.get("config_kw", {}).values()]
 
     # Pydantic v2 only warns about renamed/removed v1 keys and IGNORES them (checked: `orm_mode` and
     # `anystr_strip_whitespace` have no effect in a v2 `class Config`). Same here: accepted, no effect.
@@ -4477,9 +4962,21 @@ class Project:
 
     def config_items(self, info: SchemaInfo, keywords, module: str) -> None:
         for kw in keywords:
+            if kw.arg is not None:
+                info.__dict__.setdefault("config_kw", {})[kw.arg] = (kw, module)
             v = self.const(kw.value, module) if kw.arg not in {"env_file", "json_encoders", "alias_generator"} else None
             if kw.arg == "alias_generator":
-                info.__dict__["alias_gen"] = None if isinstance(kw.value, ast.Constant) and kw.value.value is None else (kw.value, module)
+                gen = (kw.value, module)
+                if isinstance(kw.value, ast.Subscript) and isinstance(kw.value.slice, ast.Constant) \
+                        and kw.value.slice.value == "alias_generator":
+                    # `Other.model_config["alias_generator"]`: the generator another model was configured with
+                    src = self.config_source(kw.value.value, module)
+                    got = src.__dict__.get("config_kw", {}).get("alias_generator") if src is not None else None
+                    if got is None:  # a KeyError when the class is defined
+                        raise self.err(f"`{ast.unparse(kw.value)}`: that model has no alias generator (a KeyError)", kw.value, module)
+                    gen = (got[0].value, got[1])
+                    info.__dict__.setdefault("config_kw", {})["alias_generator"] = got
+                info.__dict__["alias_gen"] = None if isinstance(gen[0], ast.Constant) and gen[0].value is None else gen
                 continue
             if kw.arg in {"validate_by_alias", "serialize_by_alias"}:
                 info.__dict__["validate_by_alias" if kw.arg == "validate_by_alias" else "ser_by_alias"] = bool(v)
@@ -4496,6 +4993,8 @@ class Project:
                 info.__dict__["populate_by_name"] = bool(v)
             elif kw.arg == "case_sensitive":
                 info.case_sensitive = bool(v)
+            elif kw.arg == "env_ignore_empty":
+                info.__dict__["env_ignore_empty"] = bool(v)  # an empty variable is as if unset
             elif kw.arg == "env_parse_none_str":
                 if v is not None and not isinstance(v, str):
                     raise self.err("model_config env_parse_none_str= must be a string or None", kw, module)
@@ -4519,6 +5018,15 @@ class Project:
                 info.__dict__["validate_assignment"] = bool(v)
             elif kw.arg == "frozen":
                 info.__dict__["frozen"] = bool(v)
+            elif kw.arg == "allow_inf_nan":
+                if v is not False:  # True is a float's default, but would let a Decimal take inf/nan
+                    raise self.err("model_config allow_inf_nan= other than False is not supported", kw, module)
+                info.__dict__["finite"] = True  # every float the model validates rejects inf/nan (finite_number)
+            elif kw.arg == "validate_default":
+                if v is not False:
+                    raise self.err("model_config validate_default=True is not supported (Field(validate_default=True) is)", kw, module)
+            elif kw.arg == "hide_input_in_errors":
+                info.__dict__["hide_input"] = bool(v)  # str(ValidationError) only: errors() keep their input
             elif kw.arg in {"val_json_bytes", "ser_json_bytes"}:
                 if v not in ("utf8", "base64", "hex"):
                     raise self.err(f'model_config {kw.arg}= must be "utf8", "base64" or "hex"', kw, module)
@@ -4545,10 +5053,16 @@ class Project:
         if "." in sym.name:  # Class.method
             cname, mname = sym.name.split(".", 1)
             cls = self.ix.definition(Sym(sym.module, cname))
-            for stmt in cls.body:
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == mname:
-                    return stmt
-            raise TranspileError(f"no method {sym.name}")
+            setter = mname.endswith(SETTER_SUFFIX)
+            if setter:
+                mname = mname[:-len(SETTER_SUFFIX)]
+            found = [stmt for stmt in cls.body if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == mname
+                     and (property_accessor(stmt) == "setter") == setter]
+            if setter or not found:
+                if not found:
+                    raise TranspileError(f"no method {sym.name}")
+                return found[0]
+            return found[-1]  # the last def of a name is the one the class keeps
         return self.ix.definition(sym)
 
     def stmt_runner(self, module: str, st: ast.stmt) -> str:
@@ -4623,6 +5137,11 @@ class Project:
                 )
                 self.__dict__.setdefault("eager", []).append((sym.module, node.lineno, name))
                 return name
+            if isinstance(node, ast.AnnAssign) and node.value is None:
+                # `X: int` at module level then `global X; X = ...` in a function: no value to start from
+                raise self.err(f"`{ast.unparse(node)}` declares the module global `{sym.name}` without a value: give it "
+                               f"one (`{ast.unparse(node)} = ...`), py2axum starts every global from its value", node,
+                               sym.module)
             self.globals[sym] = name
             self.__dict__.setdefault("eager", []).append((sym.module, getattr(node, "lineno", 0), name))
             fc = FnCompiler(self, sym.module, None, name)
@@ -4632,6 +5151,8 @@ class Project:
                 if isinstance(node, ast.Assign) and isinstance(t, Ext) and t.dotted in {"sqlalchemy.Table", "sqlalchemy.schema.Table"}:
                     # a Core table: its descriptor, as an association table's
                     code = f"V::Class(&{self.core_table(sym, node).cls})"
+                elif self.maker_wrapper(sym, node):
+                    code = self.maker_wrapper_value(fc, sym, node)
                 else:
                     code = fc.expr(value)
                 body = "\n".join("        " + l for l in fc.lines)
@@ -4743,11 +5264,16 @@ class Project:
                 self.errors.append(e)
                 self.fn_errors[key] = e
                 try:
-                    nparams = len(fn_params(self.fn_node(sym)))
+                    stub_node = self.fn_node(sym)
+                    nparams = len(fn_params(stub_node))
                 except Exception:
-                    nparams = 0
+                    stub_node, nparams = None, 0
+                # the stub keeps the signature FnCompiler would have given it: a generator also takes its
+                # yielder (its callers pass one)
+                gen = "" if stub_node is None or isinstance(stub_node, ast.Lambda) or not has_yield(stub_node) \
+                    else f", _: &{RT}::web::DepYield" if variant == "depgen" else f", _: &{RT}::web::Yielder"
                 self.items.append(
-                    f"pub async fn {self.fns[key]}(cx: &Cx{', _: V' * nparams}) -> R {{\n"
+                    f"pub async fn {self.fns[key]}(cx: &Cx{', _: V' * nparams}{gen}) -> R {{\n"
                     f"    Err(Exc::runtime({rs('py2axum: ' + e.render())}))\n}}"
                 )
             finally:
@@ -4848,12 +5374,24 @@ class FnCompiler:
         """A library name outside the library map: why its installed distribution was not translated from source
         (--translate-libs), when it is installed."""
         why = self.p.ix.libs.why_not(dotted) if self.p.ix.libs is not None else None
+        hint = libmap.stdlib_hint(dotted)
         if why is None:
-            return self.err(msg, node)
+            return self.err(f"{msg}: {hint}" if hint else msg, node)
         text, code = why
         if not code:
             return self.err(f"{msg}; {text}", node)
         return TranspileError(f"{msg}: {text}", node, self.p.src(self.module), code=code)
+
+    def note_native(self, dotted: str, node) -> None:
+        """A name the library map translates, of a library it covers in part (`jinja2.Environment`): kept to refuse
+        the routes that would mix it with the library's source in one binary (link_partial_mix). Its exceptions are
+        the map's in the source too (ModuleIndex.resolve): they mix."""
+        libs = self.p.ix.libs
+        top = dotted.split(".")[0]
+        if libs is None or dotted in libmap.EXCEPTIONS or libs.partial(top) is None or not libs.mapped(dotted):
+            return
+        self.p.__dict__.setdefault("partial_native", {}).setdefault(top, {}).setdefault(
+            self.p.cur, (dotted, self.p.src(self.module), getattr(node, "lineno", 0)))
 
     def tmp(self, prefix: str = "t") -> str:
         return f"__{prefix}{self.p.uid()}"
@@ -4869,6 +5407,13 @@ class FnCompiler:
     def tb_at(self, r_expr: str) -> str:
         """`r_expr` recording, when it fails, the traceback entry of the innermost node being compiled."""
         node = self.cur_pos_node()
+        root = self
+        while root.parent is not None:
+            root = root.parent
+        if getattr(root.node, "py2axum_noframe", False):
+            # a function the translator writes in place of FastAPI's own call (`Depends(Cls)` calls the class):
+            # no frame of its own in tracebacks
+            return r_expr
         if node is None or self.p.ix.is_shim_module(self.module):
             # a library class translated from py2axum's source: its frames are a library's (not in tracebacks)
             return r_expr
@@ -5028,6 +5573,10 @@ class FnCompiler:
         return n
 
     def stmt(self, node: ast.stmt) -> None:
+        done = self.p.fe.__dict__.get("configure_includes", ())
+        if done and ((isinstance(node, ast.Expr) and id(node.value) in done) or (
+                isinstance(node, ast.For) and all(isinstance(b, ast.Expr) and id(b.value) in done for b in node.body))):
+            return  # `app.include_router(...)` (or a loop of them) registered statically by the frontend
         if getattr(node, "end_col_offset", None) is None:
             return self.stmt_(node)
         self.pos_nodes.append(node)
@@ -5265,6 +5814,10 @@ class FnCompiler:
             for i, e in enumerate(target.elts):
                 self.assign(e, f"{t}[{i}].clone()")
         elif isinstance(target, ast.Attribute):
+            if isinstance(target.value, ast.Name) and target.value.id in self.request_names() and target.attr not in {"_body", "_receive"}:
+                # `request._body = data` (with `request._receive`): what a BaseHTTPMiddleware hands the inner app
+                raise self.err(f"attribute .{target.attr} of a Request cannot be assigned here: a Request keeps no attribute of its "
+                               "own (use request.state)", target)
             ref = self.static_ref(target)
             if isinstance(ref, Ext) and ref.dotted in libmap.HOOKS:
                 # `aiohttp.ClientSession._request = wrapper(...)`: the runtime's client calls the wrapper
@@ -5393,6 +5946,8 @@ class FnCompiler:
         self.emit(self.raise_code(f"{RT}::trace::raised(cx, {RT}::raise_v(&{v}), &self::TB[{i}], {cause})"))
 
     def for_stmt(self, node: ast.For) -> None:
+        if isinstance(node.iter, ast.Name) and node.iter.id in self.request_names():
+            raise self.err("attribute .__iter__ of a Request (a Mapping over its scope) is not supported", node.iter)
         it = self.expr(node.iter)
         lbl = f"'l{self.p.uid()}"
         var = self.tmp("it")
@@ -5456,8 +6011,27 @@ class FnCompiler:
         if t is None:
             return "true"
         if isinstance(t, ast.Tuple):
+            # the whole tuple is evaluated before any test: an element that raises does so first
+            for x in t.elts:
+                if self.stripe_error_missing(x):
+                    return self.exc_match(x, e)
             return " || ".join(self.exc_match(x, e) for x in t.elts)
+        if self.stripe_error_missing(t):
+            return self.no_stripe_error(t, f"Some(&{e})")
         return f"{e}.isinstance(&{self.exc_class(t)})"
+
+    def stripe_error_missing(self, t: ast.AST) -> bool:
+        ref = self.p.resolve(self.module, t, self.scope_root()) if isinstance(t, ast.Attribute) else None
+        return isinstance(ref, Ext) and libmap.stripe_error_missing(ref.dotted)
+
+    def no_stripe_error(self, t: ast.Attribute, tested: str) -> str:
+        """`stripe.error.X` under stripe 14.0.0: the AttributeError raised at `stripe.error`, evaluated only when
+        reached (an except clause: when an exception is tested against it)."""
+        self.pos_nodes.append(t.value)
+        try:
+            return self.q(f"{RT}::stripe::no_error_module(cx, {tested})")
+        finally:
+            self.pos_nodes.pop()
 
     def exc_class(self, t: ast.AST) -> str:
         if isinstance(t, ast.Name) and t.id in libmap.BUILTIN_EXC_NAMES and not self.is_local(t.id):
@@ -5467,16 +6041,42 @@ class FnCompiler:
         ref = self.p.resolve(self.module, t, self.scope_root())
         if isinstance(ref, Sym):
             return self.p.class_static(ref)
-        if isinstance(ref, Ext) and ref.dotted in libmap.EXCEPTIONS:
-            return f"{RT}::v::{libmap.EXCEPTIONS[ref.dotted]}"
         if isinstance(ref, Ext) and libmap.too_new(ref.dotted):
             raise self.err(libmap.too_new(ref.dotted), t)
+        if isinstance(ref, Ext) and ref.dotted in libmap.EXCEPTIONS:
+            return f"{RT}::v::{libmap.EXCEPTIONS[ref.dotted]}"
         raise self.err(f"unsupported exception class `{ast.unparse(t)}`", t)
+
+    # methods of SQLAlchemy sessions, connections and results whose value is never a context manager (a coroutine,
+    # a result, None...): `async with session.execute(...)` is a TypeError in Python, refused at generation. Names
+    # other libraries the runtime maps use for context managers stay out (`http.get(...)` of aiohttp/httpx, `close`)
+    NON_CM_METHODS = {"execute", "scalars", "scalar", "get_one", "merge", "flush", "commit", "rollback", "refresh",
+                      "add", "add_all", "expunge", "expunge_all", "expire", "expire_all", "run_sync", "invalidate",
+                      "scalar_one", "scalar_one_or_none", "one_or_none", "fetchall", "fetchone", "fetchmany",
+                      "mappings", "partitions"}
+
+    def check_cm(self, cm: ast.AST, asynchronous: bool) -> None:
+        """Refuse at generation, with its file:line, a `with`/`async with` whose manager can only be a value
+        without the protocol (CPython's TypeError, a 500 at run time otherwise)."""
+        if not (isinstance(cm, ast.Call) and isinstance(cm.func, ast.Attribute) and cm.func.attr in self.NON_CM_METHODS):
+            return
+        if isinstance(self.static_ref(cm.func.value), (Sym, ModRef, Ext)) or self.project_defines_method(cm.func.attr):
+            return  # a module's function, a library call or a project class's method: not a session's
+        kind = "async with" if asynchronous else "with"
+        raise self.err(f"`{kind} {ast.unparse(cm)}`: the value of .{cm.func.attr}() of a session, connection or result "
+                       f"is not {'an asynchronous' if asynchronous else 'a'} context manager (a TypeError in Python); "
+                       "`async with session.begin()` / `session.begin_nested()` open a transaction block", cm)
+
+    def project_defines_method(self, name: str) -> bool:
+        return any(isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == name
+                   for m in list(self.p.ix.modules.values()) for c in m.tree.body if isinstance(c, ast.ClassDef)
+                   for st in c.body)
 
     def with_stmt(self, node: ast.With) -> None:
         """`with cm as x: body` -> x = enter(cm); try: body finally: exit(cm) (runtime values that are their
         own context managers: open() files, BytesIO)."""
         item = node.items[0]
+        self.check_cm(item.context_expr, False)
         body = node.body if len(node.items) == 1 else [ast.copy_location(ast.With(items=node.items[1:], body=node.body), node)]
         m, flag = self.tmp("w"), self.tmp("wx")
         self.emit(f"let {m} = {self.expr(item.context_expr)};")
@@ -5563,6 +6163,7 @@ class FnCompiler:
         a project class's `__aenter__`/`__aexit__`; anything else raises CPython's TypeError."""
         item = node.items[0]
         cm = item.context_expr
+        self.check_cm(cm, True)
         body = node.body if len(node.items) == 1 else [ast.copy_location(ast.AsyncWith(items=node.items[1:], body=node.body), node)]
         m, flag = self.tmp("w"), self.tmp("wx")
         self.emit(f"let {m} = {self.expr(cm)};")
@@ -5692,7 +6293,13 @@ class FnCompiler:
         name = f"{self.name}__{ident(node.name)}_{self.p.uid()}"
         caps = {v: f"c_{ident(v)}" for v in free}
         sub = FnCompiler(self.p, self.module, node, name, captures=caps, parent=self)
-        self.extra_fns.append(sub.compile_function())  # carries its own nested functions
+        code = sub.compile_function()  # carries its own nested functions
+        if self.node is None:
+            # a block compiled outside a function (a module-level `if`/`try` run at startup, a global's value): no
+            # compile_function will emit it
+            self.p.items.append(code)
+        else:
+            self.extra_fns.append(code)
         decos = [self.expr(d) for d in node.decorator_list]
         params = fn_params(node)
         dflts: dict[int, str] = {}
@@ -5914,6 +6521,8 @@ class FnCompiler:
         return self.q(f"{RT}::ops::truthy(&{self.expr(node)})")
 
     def expr(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Attribute) or (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            self.p.note_copy(attr=(node if isinstance(node, ast.Attribute) else node.func).attr)
         m = getattr(self, "e_" + type(node).__name__, None)
         if m is None:
             raise self.err(f"unsupported expression `{ast.unparse(node)}`", node)
@@ -5968,7 +6577,11 @@ class FnCompiler:
             # importlib.import_module("pkg.mod"): the module itself (a literal project module only)
             name = node.args[0].value
             if not self.p.ix.module(name):
-                raise self.err(f"importlib.import_module({name!r}): only modules of the project are supported", node)
+                if self.p.ix.importable(name):
+                    # an installed library (or the standard library) the library map covers: the module, as `import` gives it
+                    return Ext(libmap.canonical(name))
+                raise self.err(f"importlib.import_module({name!r}): the module is neither a module of the project nor "
+                               "installed in the project's environment (--venv)", node)
             return ModRef(name)
         if isinstance(node, ast.Name):
             if self.is_local(node.id):
@@ -5989,7 +6602,9 @@ class FnCompiler:
                     return Ext(libmap.canonical(t.dotted))
                 return t if t is not None else ("missing", base.module, node.attr)
             if isinstance(base, Ext):
-                return Ext(libmap.canonical(f"{base.dotted}.{node.attr}"))
+                name = libmap.canonical(f"{base.dotted}.{node.attr}")
+                # `jinja2.Template`: read from the source of a library the map covers in part (--translate-libs)
+                return self.p.ix._partial_source(name) or Ext(name)
             if isinstance(base, Sym):
                 d = self.p.ix.definition(base)
                 if isinstance(d, ast.ClassDef):
@@ -6055,6 +6670,9 @@ class FnCompiler:
             if fl is not None:
                 return fl
         if ref is None:
+            if isinstance(node, ast.Name) and node.id in self.REFUSED_BUILTINS:
+                raise self.err(f"unknown name `{node.id}`: the builtin {node.id}() is not supported "
+                               f"({self.REFUSED_BUILTINS[node.id]})", node)
             raise self.err(f"unknown name `{ast.unparse(node)}`", node)
         if isinstance(ref, tuple):
             kind = ref[0]
@@ -6096,6 +6714,10 @@ class FnCompiler:
         if isinstance(ref, ModRef):
             return f"V::native({RT}::Native::Module(&{self.p.module_desc(ref.module, node, self)}))"
         if isinstance(ref, Ext):
+            self.p.note_copy(ref.dotted)
+            self.note_native(ref.dotted, node)
+            if ref.dotted == "sys.modules":
+                self.check_sys_modules(node)
             if ref.dotted in libmap.VALUES:
                 return libmap.VALUES[ref.dotted]
             if ref.dotted == "datetime.datetime":
@@ -6105,6 +6727,10 @@ class FnCompiler:
             if code is not None:
                 return f"V::Int({code})"
             if ref.dotted in libmap.EXCEPTIONS:
+                if libmap.stripe_error_missing(ref.dotted) and isinstance(node, ast.Attribute):
+                    return self.no_stripe_error(node, "None")
+                if libmap.too_new(ref.dotted):
+                    raise self.err(libmap.too_new(ref.dotted), node)
                 return f"V::Class(&{RT}::v::{libmap.EXCEPTIONS[ref.dotted]})"
             if ref.dotted.startswith("builtins.") and ref.dotted[9:] in BUILTIN_TYPES:
                 return f"V::native({RT}::Native::Type({rs(ref.dotted[9:])}))"
@@ -6164,6 +6790,34 @@ class FnCompiler:
     COLUMNS_ATTRS = {"keys", "values", "get"}
     # methods whose arguments are SQL constructs: a table given to them is used as a Core table
     SQL_ARG_METHODS = {"select_from", "join", "outerjoin", "join_from", "where", "filter", "with_only_columns"}
+
+    # the standard-library modules PEP 594 removed in Python 3.13 (`sys.stdlib_module_names` of 3.12 minus 3.13's)
+    REMOVED_IN_313 = {"aifc", "audioop", "cgi", "cgitb", "chunk", "crypt", "imghdr", "mailcap", "msilib", "nis",
+                      "nntplib", "ossaudiodev", "pipes", "sndhdr", "spwd", "sunau", "telnetlib", "uu", "xdrlib"}
+
+    def check_sys_modules(self, node: ast.AST) -> None:
+        """`sys.modules` with a literal key the project's Python cannot import (a module PEP 594 removed, on 3.13+,
+        with no backport installed): absent at startup, as in CPython; `"k" in`/`not in`, `sys.modules["k"]` (read,
+        store), `sys.modules.get("k")`. The other keys name modules CPython may have loaded: refused."""
+        par = self.p.fe._parents(self.module)
+        p = par.get(node)
+        key = None
+        if isinstance(p, ast.Compare) and len(p.ops) == 1 and isinstance(p.ops[0], (ast.In, ast.NotIn)) \
+                and p.comparators[0] is node and isinstance(p.left, ast.Constant):
+            key = p.left.value
+        elif isinstance(p, ast.Subscript) and p.value is node and isinstance(p.slice, ast.Constant):
+            key = p.slice.value
+        elif isinstance(p, ast.Attribute) and p.attr == "get" and isinstance(par.get(p), ast.Call) \
+                and par.get(p).func is p and par.get(p).args and isinstance(par.get(p).args[0], ast.Constant):
+            key = par.get(p).args[0].value
+        if not isinstance(key, str):
+            raise self.err("sys.modules is only supported with a literal key (`'name' in sys.modules`, "
+                           "`sys.modules['name']`, `.get('name')`): the binary keeps no table of loaded modules", node)
+        if not (libmap.PYTHON >= (3, 13) and key in self.REMOVED_IN_313 and self.p.ix.module(key) is None
+                and not locked_version(self.p.ix.root, f"standard-{key}")):
+            raise self.err(f"sys.modules[{key!r}] is not supported: only the key of a module the project's Python "
+                           "cannot import (removed from the standard library in 3.13, no backport installed) is "
+                           "known to be absent; CPython may have loaded any other", node)
 
     def table_uses(self, node: ast.AST, depth: int = 0) -> set[str]:
         """How the value of `node` (`Model.__table__`, or a name bound to it) is used: "core" (a Core construct
@@ -6247,7 +6901,120 @@ class FnCompiler:
             raise self.err(f"the async method {sym.name}.{attr} read on its class is not supported (call it on an "
                            "instance)", node)
 
+    # what the runtime offers of Starlette's Request (dynrt/methods.rs, `Native::Request`): the rest of the class
+    # (session, user, auth, close, stream, url_for, send_push_promise, the Mapping of the scope, free attributes)
+    # is refused where the variable is a parameter annotated `Request`
+    REQUEST_ATTRS = frozenset({"headers", "state", "url", "base_url", "method", "query_params", "cookies", "client",
+                               "path_params", "app", "scope", "receive", "body", "json", "is_disconnected",
+                               # Starlette's cache of body(): per Request object (the route's, a middleware's...)
+                               "_body"})
+
+    ITERATING = frozenset({"sorted", "list", "dict", "len", "tuple", "set", "frozenset", "iter", "enumerate", "sum", "min", "max", "any", "all"})
+
+    def request_names(self) -> frozenset:
+        """Parameters annotated `Request` (never rebound in the function), of this function and the ones around it."""
+        got = self.__dict__.get("_request_names")
+        if got is not None:
+            return got
+        names: set[str] = set()
+        fn = self.node
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = fn.args
+            rebound = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))}
+            for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs):
+                if arg.annotation is not None and arg.arg not in rebound and is_ext(
+                        self.p.resolve(self.module, arg.annotation), "fastapi.Request", "starlette.requests.Request",
+                        "fastapi.requests.Request"):
+                    names.add(arg.arg)
+        if self.parent is not None:
+            names |= {n for n in self.parent.request_names() if n not in self.locals and n not in self.params}
+        self.__dict__["_request_names"] = frozenset(names)
+        return self._request_names
+
+    # the attributes of the objects a Request hands out (`request.url`...) that the runtime reproduces
+    REQUEST_SUB = {"url": {"path", "query", "hostname", "scheme", "netloc", "fragment", "port", "username", "password"},
+                   "base_url": {"path", "scheme"},
+                   "query_params": {"get", "keys", "values", "items"},
+                   "headers": {"get", "getlist", "keys", "values", "items"},
+                   "client": {"host", "port"},
+                   "app": {"state", "router", "routes", "dependency_overrides"}}
+    # the keys of `request.scope` the runtime has (the real one holds more: asgi, server, extensions, fastapi_*...)
+    REQUEST_SCOPE_KEYS = {"type", "http_version", "scheme", "method", "root_path", "path", "raw_path", "query_string",
+                          "headers", "client", "app", "endpoint", "path_params", "route"}
+    # keys only a middleware sets (Starlette's SessionMiddleware, AuthenticationMiddleware: refused by the runtime,
+    # or a raw ASGI middleware of the project, whose scope is the request's): absent otherwise, on both sides
+    REQUEST_SCOPE_MW_KEYS = {"session", "user", "auth"}
+
+    def request_sub(self, node: ast.AST):
+        """`request.<sub>` when `node` is that read on a Request parameter, else None."""
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in self.request_names()):
+            return node.attr
+        return None
+
+    # the scope keys only a middleware of Starlette sets: without that middleware in the project, `scope.get(key)` is None
+    SCOPE_BY_MIDDLEWARE = {"session": "SessionMiddleware", "user": "AuthenticationMiddleware",
+                           "auth": "AuthenticationMiddleware"}
+
+    def scope_key_unset(self, key) -> bool:
+        mw = self.SCOPE_BY_MIDDLEWARE.get(key)
+        if mw is None:
+            return False
+        used = self.p.__dict__.setdefault("_scope_middleware", {})
+        if mw not in used:
+            used[mw] = any(isinstance(n, (ast.Name, ast.Attribute, ast.alias)) and mw in (
+                getattr(n, "id", None), getattr(n, "attr", None), getattr(n, "name", None))
+                for m in self.p.ix.package_modules() for n in ast.walk(m.tree))
+        return not used[mw]
+
+    def check_request_use(self, node: ast.AST) -> None:
+        """An attribute, a subscript or a membership test on a `Request` parameter that the runtime does not provide."""
+        if isinstance(node, ast.Attribute):
+            sub = self.request_sub(node.value)
+            if sub in self.REQUEST_SUB and node.attr not in self.REQUEST_SUB[sub]:
+                raise self.err(f"attribute .{node.attr} of a Request is not supported on request.{sub} (the runtime provides "
+                               f"{', '.join(sorted(self.REQUEST_SUB[sub]))})", node)
+            if sub == "scope" and node.attr in {"keys", "values", "items", "copy", "update", "pop", "setdefault"}:
+                raise self.err(f"attribute .{node.attr} of a Request's scope is not supported (the runtime's scope holds only "
+                               f"{', '.join(sorted(self.REQUEST_SCOPE_KEYS))})", node)
+        if isinstance(node, ast.Subscript) and self.request_sub(node.value) == "scope" and isinstance(node.slice, ast.Constant):
+            if node.slice.value not in self.REQUEST_SCOPE_KEYS | self.REQUEST_SCOPE_MW_KEYS:
+                raise self.err(f"attribute .{node.slice.value} of a Request's scope is not supported (the runtime's scope holds "
+                               f"only {', '.join(sorted(self.REQUEST_SCOPE_KEYS))})", node)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and self.request_sub(node.func.value) == "scope" and node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value not in self.REQUEST_SCOPE_KEYS
+                and not self.scope_key_unset(node.args[0].value)):
+            raise self.err(f"attribute .{node.args[0].value} of a Request's scope is not supported (the runtime's scope holds "
+                           f"only {', '.join(sorted(self.REQUEST_SCOPE_KEYS))})", node)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"str", "repr", "type", "id", "hash", "format"}
+                and any(self.request_sub(a) == "query_params" for a in node.args)):
+            raise self.err("attribute .__str__ of a Request's query_params is not supported (the runtime holds a dict, "
+                           "not Starlette's QueryParams)", node)
+        if isinstance(node, ast.FormattedValue) and self.request_sub(node.value) == "query_params":
+            raise self.err("attribute .__str__ of a Request's query_params is not supported (the runtime holds a dict, "
+                           "not Starlette's QueryParams)", node)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in self.request_names():
+            # form() and stream() have their own refusal, in check_method
+            if node.attr not in self.REQUEST_ATTRS and node.attr not in {"form", "stream"}:
+                raise self.err(f"attribute .{node.attr} of a Request is not supported (the runtime provides "
+                               f"{', '.join(sorted(self.REQUEST_ATTRS))}): it would fail at run time, or read another value", node)
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in self.request_names():
+            raise self.err(f"attribute .__getitem__ of a Request (a Mapping over its scope) is not supported: read `{node.value.id}.scope[...]`", node)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self.ITERATING
+              and any(isinstance(a, ast.Name) and a.id in self.request_names() for a in node.args)):
+            raise self.err(f"attribute .__iter__ of a Request (a Mapping over its scope) is not supported: {node.func.id}(request) "
+                           "iterates the scope's keys", node)
+        elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) and isinstance(c, ast.Name)
+                                                    and c.id in self.request_names() for op, c in zip(node.ops, node.comparators)):
+            raise self.err("attribute .__contains__ of a Request (a Mapping over its scope) is not supported: test `in request.scope`", node)
+
     def e_Attribute(self, node: ast.Attribute) -> str:
+        if node.attr == "__class__" and isinstance(node.ctx, ast.Load) and self.static_ref(node) is None:
+            # `x.__class__`: `type(x)` (`c.__class__ is int`, olefile's i8)
+            return self.expr(ast.copy_location(ast.Call(ast.Name("type", ast.Load()), [node.value], []), node))
+        self.check_request_use(node)
+        self.check_passlib(node)
+        self.check_httpx_request(node)
         self.check_model_table(node)
         ref = self.static_ref(node)
         if ref is not None:
@@ -6296,7 +7063,8 @@ class FnCompiler:
         """An attribute read at run time that no runtime type provides (and the project never defines nor
         names) is a certain AttributeError on that path: refused here, so that --report counts it."""
         name = node.attr
-        if name in self.p.project_attrs() or name in runtime_attr_names() or self.p.open_attrs():
+        self.check_passlib(node)
+        if name in self.p.project_attrs() or name in runtime_attr_names() or self.p.open_attrs() or name in self.p.stripe_fields():
             return
         raise self.err(f"attribute .{name} is not provided by the runtime for any type "
                        "(it would raise AttributeError at run time)", node)
@@ -6358,6 +7126,7 @@ class FnCompiler:
         return f"V::native({RT}::Native::TypeExpr(&{td}, {rs(ast.unparse(node))}))"
 
     def e_Subscript(self, node: ast.Subscript) -> str:
+        self.check_request_use(node)
         te = self.type_expr(node)
         if te is not None:
             return te
@@ -6440,6 +7209,7 @@ class FnCompiler:
         raise TranspileError("unsupported comparison")
 
     def e_Compare(self, node: ast.Compare) -> str:
+        self.check_request_use(node)
         if (len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot)) and isinstance(node.left, ast.Name)
                 and isinstance(node.comparators[0], ast.Constant) and node.comparators[0].value is None
                 and node.left.id not in self.locals and self.p.ix.module(self.module) is not None
@@ -6474,6 +7244,9 @@ class FnCompiler:
                        "string.templatelib.Template. Build the text with an f-string, or leave the route to Python", node)
 
     def e_JoinedStr(self, node: ast.JoinedStr) -> str:
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue):
+                self.check_request_use(part)
         s = self.tmp("s")
         parts = [f"let mut {s} = String::new();"]
         for v in node.values:
@@ -6490,8 +7263,11 @@ class FnCompiler:
                         self.check_strftime("".join(x.value for x in v.format_spec.values), v.format_spec, "an f-string format spec")
                     spec = self.expr(v.format_spec)
                     parts.append(f"{s}.push_str(&{self.q(f'{RT}::ops::format_spec(&{val}, &{RT}::ops::str_(&{spec})?)')});")
-                else:
+                elif v.conversion == ord("s") or v.conversion == ord("r"):
                     parts.append(f"{s}.push_str(&{self.q(f'{RT}::ops::str_(&{val})')});")
+                else:
+                    # `format(x, '')`: str(x), unless the type has its own __format__
+                    parts.append(f"{s}.push_str(&{self.q(f'{RT}::ops::format_empty(&{val})')});")
         return "{ " + " ".join(parts) + f" V::str({s}) }}"
 
     def e_FormattedValue(self, node) -> str:
@@ -6703,6 +7479,7 @@ class FnCompiler:
         return self.q(f"y.send({v}).await")
 
     def e_Call(self, node: ast.Call) -> str:
+        self.check_request_use(node)
         if (len(node.args) == 1 and not node.keywords and isinstance(node.func, (ast.Name, ast.Attribute))
                 and self.static_ref(node.func) == Ext("importlib.import_module")):
             if not (isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
@@ -7028,6 +7805,14 @@ class FnCompiler:
             # `Base.metadata.create_all(engine)` (a synchronous engine): the DDL compiled at translation time
             ddl = self.p.create_all_ddl(self.static_ref(f.value.value), f, self.module, self.scope_root())
             return self.q(f"{RT}::orm::create_all_engine(cx, &{self.expr(node.args[0])}, &{ddl}).await")
+        if (isinstance(f, ast.Attribute) and f.attr == "join" and len(node.args) == 1 and not node.keywords
+                and isinstance(node.args[0], ast.Call)):
+            # str.join(chain(...)): CPython makes a list of the iterable first, so it is consumed whole at once
+            self.__dict__.setdefault("_eager_calls", set()).add(node.args[0])
+        if (isinstance(f, ast.Attribute) and f.attr == "fromkeys" and isinstance(f.value, ast.Name) and f.value.id == "dict"
+                and node.args and isinstance(node.args[0], ast.Call)):
+            # dict.fromkeys(chain(...)): the whole iterable is read before the dict is returned
+            self.__dict__.setdefault("_eager_calls", set()).add(node.args[0])
         ref = self.static_ref(node.func)
         if isinstance(ref, Ext) and ref.dotted.split(".")[-1] in self.STREAM_RESPONSES:
             content = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "content"), None)
@@ -7143,10 +7928,59 @@ class FnCompiler:
             return self.q(f"{RT}::aio::call_value_lazy(cx, &{f}, {args}, {kwargs}).await")
         return self.q(f"{RT}::methods::call_value(cx, &{f}, {args}, {kwargs}).await")
 
+    # passlib's CryptContext as dynrt/auth.rs translates it: method -> (positional parameters, keyword-only ones)
+    PASSLIB_METHODS = {"hash": (("secret",), ()), "verify": (("secret", "hash"), ()),
+                       "verify_and_update": (("secret", "hash"), ()), "needs_update": (("hash",), ("secret",)),
+                       "identify": (("hash",), ("required",)), "dummy_verify": ((), ())}
+
+    def check_passlib(self, attr: ast.Attribute, call: ast.Call | None = None) -> None:
+        """A CryptContext's attribute or method call outside the translated surface: refused here (at run time a
+        py2axum error could be caught by the application's `except Exception` and answered differently)."""
+        recv = attr.value
+        globs, attrs = self.p.crypt_context_names()
+        if not globs and not attrs:
+            return
+        if isinstance(recv, ast.Name) and self.is_local(recv.id):
+            return
+        if not isinstance(recv, (ast.Name, ast.Attribute)):
+            return
+        try:
+            t = self.p.resolve(self.module, recv)
+        except TranspileError:
+            t = None
+        if not (t in globs or isinstance(recv, ast.Attribute) and recv.attr in attrs):
+            return
+        spec = self.PASSLIB_METHODS.get(attr.attr)
+        if spec is None:
+            raise self.err(f"passlib CryptContext.{attr.attr} is not supported (of passlib, hash, verify, verify_and_update, "
+                           "needs_update, identify and dummy_verify are translated)", attr)
+        if call is None:
+            return
+        pos, kwonly = spec
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+            raise self.err(f"passlib CryptContext.{attr.attr}(): `*`/`**` arguments are not supported", call)
+        if len(call.args) > len(pos):
+            raise self.err(f"passlib CryptContext.{attr.attr}() with {len(call.args)} positional arguments is not supported "
+                           f"(scheme, category and handler options are not translated)", call)
+        for k in call.keywords:
+            if k.arg not in pos and k.arg not in kwonly:
+                raise self.err(f"passlib CryptContext.{attr.attr}({k.arg}=) is not supported", call)
+
+    def check_httpx_request(self, node: ast.Attribute) -> None:
+        """`exc.request.<attr>` of an httpx exception: method and url only (the runtime's Request)"""
+        v = node.value
+        if (isinstance(v, ast.Attribute) and v.attr == "request" and isinstance(v.value, ast.Name)
+                and v.value.id in self.p.httpx_exc_names() and node.attr not in ("method", "url")):
+            raise self.err(f"httpx.Request.{node.attr} is not supported (of an exception's request, method and url "
+                           "are translated)", node)
+
     def check_method(self, node: ast.Call) -> None:
         """A method resolved at run time that no runtime type implements (and no project class defines)
         is a certain 500 on that path: refused here, so that --report counts it."""
         name = node.func.attr
+        self.check_passlib(node.func, node)
+        self.check_httpx_request(node.func)
+        self.check_request_use(node.func)
         if (name in CT_WRAPPER_ATTRS and isinstance(node.func.value, ast.Attribute)
                 and node.func.value.attr in self.p.cachedmethod_names()):
             raise self.err(f"`.{node.func.value.attr}.{name}` of a @cachedmethod is not supported (only its calls)", node)
@@ -7178,6 +8012,24 @@ class FnCompiler:
                                  or any(k.arg is None for k in node.keywords)):
             raise self.err(f".{name}() takes at most {most} positional argument{'s' if most != 1 else ''} here "
                            "(no * or ** unpacking)", node)
+        if name in self.CODEC_ERRORS:
+            self.check_codec_errors(node, name)
+
+    CODEC_ERRORS = {"decode": {"strict", "ignore", "replace", "backslashreplace"},
+                    "read_text": {"strict", "ignore", "replace", "backslashreplace"},
+                    "encode": {"strict", "ignore", "replace", "backslashreplace", "xmlcharrefreplace",
+                               "surrogateescape", "surrogatepass"}}
+
+    def check_codec_errors(self, node: ast.Call, name: str) -> None:
+        """`errors=` of decode / encode / read_text written as a literal: only the handlers the runtime renders as
+        CPython does (decode: surrogateescape needs lone surrogates, a Rust string has none; xmlcharrefreplace and
+        namereplace raise TypeError for a decode error; a custom handler is registered at run time)."""
+        lit = next((k.value for k in node.keywords if k.arg == "errors"), None)
+        if lit is None and len(node.args) > 1:
+            lit = node.args[1]
+        if isinstance(lit, ast.Constant) and isinstance(lit.value, str) and lit.value not in self.CODEC_ERRORS[name]:
+            raise self.err(f".{name}(errors=) is not supported (only {', '.join(sorted(self.CODEC_ERRORS[name]))}; "
+                           f"got {lit.value!r})", lit)
 
     def check_strftime(self, fmt: str, node: ast.AST, where: str) -> None:
         """A literal strftime format (or a date's f-string spec) may only use the directives `dynrt::libs::strftime`
@@ -7231,15 +8083,28 @@ class FnCompiler:
             return self.builtin_call(ref[1], node)
         if isinstance(ref, tuple) and ref[0] == "classattr":
             _, sym, attr = ref
-            d = self.p.ix.definition(sym)
-            for stmt in d.body:
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == attr:
+            owner, seen = sym, set()
+            while owner is not None and owner not in seen:
+                # along the bases of a plain class (one project base each): `Sub.make()` of a classmethod of
+                # `Base` gets `Sub` as `cls`
+                seen.add(owner)
+                d = self.p.ix.definition(owner)
+                stmt = next((s for s in d.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == attr), None)
+                if stmt is not None:
                     decos = {dotted(x) for x in stmt.decorator_list}
-                    msym = Sym(sym.module, f"{sym.name}.{attr}")
+                    msym = Sym(owner.module, f"{owner.name}.{attr}")
                     if "staticmethod" in decos:
                         return self.project_call(msym, stmt, node, awaited, prefix=[])
                     if "classmethod" in decos:
                         return self.project_call(msym, stmt, node, awaited, prefix=[self.class_value(sym, node)])
+                    break
+                if any(isinstance(s, (ast.Assign, ast.AnnAssign)) and attr in {getattr(t, "id", None) for t in (
+                        s.targets if isinstance(s, ast.Assign) else [s.target])} for s in d.body):
+                    break
+                plain = (owner not in self.p.fe.schema_syms and owner not in self.p.fe.model_syms
+                         and owner not in self.p.fe.dataclass_syms and self.p.is_plain_class(owner))
+                bases = self.p.plain_bases(owner) if plain else None
+                owner = bases[0] if bases else None
             if sym not in self.p.fe.schema_syms and sym not in self.p.fe.model_syms and sym not in self.p.fe.dataclass_syms \
                     and self.p.is_plain_class(sym):
                 cattrs = self.p.plain_class(sym).__dict__.get("class_attrs", {})
@@ -7260,7 +8125,9 @@ class FnCompiler:
                 return self.project_call(ref, d, node, awaited, prefix=[])
             if isinstance(d, ast.ClassDef):
                 return self.construct(ref, d, node)
-            if isinstance(d, (ast.Assign, ast.AnnAssign)):
+            if isinstance(d, (ast.Assign, ast.AnnAssign, ast.If, ast.Try, ast.For, ast.While, ast.With)):
+                # a module variable, or a name a module-level block binds (`if PY2: def f(...)` / `else: def f(...)`):
+                # whatever value it holds at run time, called
                 f = self.ref_value(ref, node)
                 args, kwargs = self.dyn_args(node)
                 return self.q(f"{RT}::methods::call_value(cx, &{f}, {args}, {kwargs}).await")
@@ -7305,6 +8172,12 @@ class FnCompiler:
                 raise self.err(f"the @cachedmethod {sym.name} not awaited is not supported", node)
             args, kwargs = self.dyn_args(node)
             return self.q(f"{method_wrapper(self.p, sym)}(cx, {prefix[0]}.clone(), {RT}::pack({args}, {kwargs})).await")
+        if sym in self.p.__dict__.get("vdeco_methods", ()):
+            if not prefix:
+                raise self.err(f"decorated {sym.name} called with a receiver is not supported: a decorated method called through its class", node)
+            args, kwargs = self.dyn_args(node)
+            call = self.q(f"{method_wrapper(self.p, sym)}(cx, {prefix[0]}.clone(), {RT}::pack({args}, {kwargs})).await")
+            return call
         if vdecos:
             if "." in sym.name:
                 raise self.err(f"decorator @{ast.unparse(vdecos[0])} on method {sym.name} is not supported", vdecos[0])
@@ -7431,7 +8304,8 @@ class FnCompiler:
                                        "(set them in model_config)", kw)
                 none = f"Some({rs(info.env_none)})" if info.env_none is not None else "None"
                 return self.q(f"{RT}::settings(cx, &{info.rust}, {rs(info.env_prefix)}, "
-                              f"{'true' if info.case_sensitive else 'false'}, {none}, {kwargs}).await")
+                              f"{'true' if info.case_sensitive else 'false'}, {none}, "
+                              f"{'true' if info.__dict__.get('env_ignore_empty') else 'false'}, {kwargs}).await")
             if info.__dict__.get("init") is not None:
                 mw = method_wrapper(self.p, info.__dict__["init"])
                 return self.q(f"{{ let __o = {RT}::pyd::object_new_blank(&{info.rust}); "
@@ -7621,6 +8495,8 @@ class FnCompiler:
 
     def ext_call(self, ref: Ext, node: ast.Call) -> str:
         name = ref.dotted
+        self.p.note_copy(name)
+        self.note_native(name, node)
         # generic namespaces: func.count(...)
         for ns, tmpl in libmap.NAMESPACE_CALLS.items():
             if name.startswith(ns + "."):
@@ -7637,6 +8513,10 @@ class FnCompiler:
             return self.dist_version(node)
         if name.startswith("sentry_sdk."):
             return self.sentry_call(name, node)
+        if name == "loguru.logger" or name.startswith("loguru."):
+            return self.loguru_call(name, node)
+        if name in ("warnings.warn", "warnings.simplefilter", "warnings.filterwarnings", "warnings.catch_warnings"):
+            return self.warnings_call(name, node)
         if name.startswith("logging.") and name[8:] in LOG_METHODS:
             # logging.info(...): the root logger, with the call site (the record's pathname, lineno, funcName)
             args, kwargs = self.dyn_args(node)
@@ -7661,9 +8541,12 @@ class FnCompiler:
         if name in ("itertools.chain", "itertools.chain.from_iterable"):
             # the items of each iterable, in order: lazily in CPython, so only where they are consumed whole
             if node not in getattr(self, "_eager_calls", ()):
-                raise self.err(f"{name}() is supported consumed whole only (list(), tuple(), set(), sorted())", node)
+                raise self.err(f"{name}() is supported consumed whole only (list(), tuple(), set(), sorted(), str.join(), dict.fromkeys())", node)
             if node.keywords:
                 raise self.err(f"{name}() takes no keyword arguments", node)
+            for a in node.args:  # chain(map(...), chain.from_iterable(...)): consumed whole too
+                if isinstance(a, ast.Call):
+                    self.__dict__.setdefault("_eager_calls", set()).add(a)
             if name.endswith("from_iterable"):
                 if len(node.args) != 1 or isinstance(node.args[0], ast.Starred):
                     raise self.err("chain.from_iterable() takes exactly one argument", node)
@@ -7673,6 +8556,10 @@ class FnCompiler:
         if name.startswith("builtins.") and name[9:] in BUILTIN_FUNCS and name not in libmap.CALLS:
             # `from builtins import list` (or `builtins.len(x)`): the builtin itself
             return self.builtin_call(name[9:], node)
+        if name in ("secrets.choice", "random.choice") and node.args and isinstance(node.args[0], ast.GeneratorExp):
+            # Random.choice takes len(seq): a TypeError for a generator, which the runtime evaluates as a list
+            raise self.err(f"library call `{name}()` is not supported on a generator expression (CPython raises TypeError: "
+                           "object of type 'generator' has no len()); pass a list", node.args[0])
         tmpl = libmap.CALLS.get(name)
         recv, _, meth = name.rpartition(".")
         if tmpl is None and self.object_value(recv, values=False) is not None:
@@ -7680,6 +8567,11 @@ class FnCompiler:
             obj = self.object_value(recv, values=False)
             args, kwargs = self.dyn_args(node)
             return self.q(f"{RT}::methods::call_method(cx, &{obj}, {rs(meth)}, {args}, {kwargs}).await")
+        if tmpl is None and name.split(".")[0] == "pgpy":
+            raise self.lib_err(f"library call `{name}()` is not supported: of pgpy, only PGPKey.from_blob() is "
+                               "reproduced (dynrt/pgpy.rs)", name, node)
+        if recv == "sys.modules" and isinstance(node.func, ast.Attribute):
+            self.check_sys_modules(node.func.value)
         if tmpl is None and recv in libmap.VALUES and not libmap.VALUES[recv].startswith("V::Enum("):
             # a method of a library constant (`datetime.min.time()`)
             args, kwargs = self.dyn_args(node)
@@ -7691,9 +8583,23 @@ class FnCompiler:
                 libmap.pyjwt_static(name, node)
             except ValueError as e:
                 raise self.err(f"{name}(): {e}", node) from None
+        if name.startswith("qrcode.") and qrcode_without_pillow(self.p.ix.root):
+            raise self.lib_err(f"library call `{name}()` is not supported: the project's uv.lock has qrcode without "
+                               "Pillow, so qrcode draws with PyPNGImage, whose PNG the runtime does not reproduce "
+                               "(dynrt/qr.rs writes Pillow's)", name, node)
+        if name in libmap.REDIS_CLIENTS or name in libmap.REDIS_FROM_URL or name in libmap.REDIS_POOL_FROM_URL:
+            try:
+                libmap.redis_static(name, node)
+            except ValueError as e:
+                raise self.err(f"{name}(): {e}", node) from None
         if name.startswith("croniter."):
             try:
                 libmap.croniter_static(name, node)
+            except ValueError as e:
+                raise self.err(f"{name}(): {e}", node) from None
+        if name.startswith("passlib."):
+            try:
+                libmap.passlib_static(name, node)
             except ValueError as e:
                 raise self.err(f"{name}(): {e}", node) from None
         if name.startswith("dateutil.parser"):
@@ -7735,6 +8641,85 @@ class FnCompiler:
         if not tpos.all_read and len(pos) > len(tpos.read):
             raise self.err(f"{name}(): {len(pos)} positional arguments, only {len(tpos.read)} supported", node)
         return self.q(code)
+
+    def loguru_call(self, name: str, node: ast.Call) -> str:
+        """loguru 0.7's `logger` (dynrt/loguru.rs): the level methods and `log()` at their call site, `add()` on
+        sys.stderr / sys.stdout with a literal format, `remove()`. What the binary does not reproduce is refused
+        here, with the reason, never at run time."""
+        short = name[len("loguru.logger."):] if name.startswith("loguru.logger.") else None
+        supported = "the level methods (trace, debug, info, success, warning, error, critical), log(), add(sys.stderr | sys.stdout, ...) and remove()"
+        if short in LOGURU_LEVEL_METHODS or short == "log":
+            self.p.__dict__["loguru"] = True
+            args, kwargs = self.dyn_args(node)
+            return self.q(f"{RT}::loguru::log(cx, {rs(short)}, {args}, {kwargs}, {self.log_loc(node)}, {rs(self.module)}).await")
+        if short == "exception":
+            raise self.err("loguru `logger.exception()` is not supported: loguru formats the exception itself (its "
+                           "`backtrace`/`diagnose` traceback, with the values of the variables by default), which the "
+                           "binary does not reproduce", node)
+        if short == "remove":
+            if len(node.args) + len(node.keywords) > 1 or any(isinstance(a, ast.Starred) for a in node.args) \
+                    or any(k.arg != "handler_id" for k in node.keywords):
+                raise self.err("loguru `logger.remove()` takes one argument, `handler_id`", node)
+            self.p.__dict__["loguru"] = True
+            arg = node.args[0] if node.args else (node.keywords[0].value if node.keywords else None)
+            return self.q(f"{RT}::loguru::remove({'None' if arg is None else f'Some({self.expr(arg)})'})")
+        if short == "add":
+            return self.loguru_add(node)
+        what = f"`logger.{short}()`" if short else f"`{name}`"
+        raise self.err(f"loguru {what} is not supported: py2axum reproduces {supported}", node)
+
+    def loguru_add(self, node: ast.Call) -> str:
+        from . import logurufmt
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            raise self.err("loguru `logger.add()`: `*`/`**` expansion is not supported", node)
+        kws = {k.arg: k.value for k in node.keywords}
+        if len(node.args) > 1:
+            raise self.err("loguru `logger.add()` takes the sink only as positional argument", node)
+        sink = node.args[0] if node.args else kws.pop("sink", None)
+        if node.args and "sink" in kws:
+            raise self.err("loguru `logger.add()`: the sink is given twice", node)
+        if sink is None:
+            raise self.err("loguru `logger.add()` needs a sink", node)
+        ref = self.static_ref(sink) if isinstance(sink, (ast.Name, ast.Attribute)) else None
+        fd = {"sys.stdout": 1, "sys.stderr": 2}.get(ref.dotted) if isinstance(ref, Ext) else None
+        if fd is None:
+            raise self.err(f"loguru `logger.add({ast.unparse(sink)})` is not supported: the binary writes to sys.stderr "
+                           "or sys.stdout only (no file sink, rotation or retention, no callable or logging handler)", sink)
+
+        def falsy(k):
+            v = kws.get(k)
+            return v is None or isinstance(v, ast.Constant) and not v.value
+        refused = {"serialize": "the JSON record (serialize=True) is not reproduced",
+                   "enqueue": "the binary writes each message at once (enqueue=True)",
+                   "filter": "a filter is not reproduced", "context": "a multiprocessing context is not reproduced"}
+        for k in kws:
+            if k in refused and not falsy(k):
+                raise self.err(f"loguru `logger.add({k}=...)` is not supported: {refused[k]}", kws[k])
+            if k not in {"level", "format", "colorize", "backtrace", "diagnose", "catch", *refused}:
+                raise self.err(f"loguru `logger.add({k}=...)` is not supported (supported: level, format, colorize, "
+                               "backtrace, diagnose, catch)", kws[k])
+        fmt = kws.get("format")
+        if fmt is None:
+            text = logurufmt.DEFAULT_FORMAT
+        elif isinstance(fmt, ast.Constant) and isinstance(fmt.value, str):
+            text = fmt.value
+        else:
+            raise self.err("loguru `logger.add(format=...)` is supported with a literal text only (compiled at "
+                           "translation)", fmt)
+        try:
+            compiled = logurufmt.compile_format(text)
+        except ValueError as e:
+            raise self.err(f"loguru `logger.add(format=...)`: {e}", fmt or node) from None
+        self.p.__dict__["loguru"] = True
+        # the arguments in the order of the call, each evaluated once (the sink is sys.stderr / sys.stdout)
+        vals = {}
+        for k in node.keywords:
+            if k.arg not in ("sink", "format"):
+                vals[k.arg] = t = self.tmp("lg")
+                self.emit(f"let {t} = {self.expr(k.value)};")
+        level = f"Some({vals['level']})" if "level" in vals else "None"
+        colorize = f"Some({vals['colorize']})" if "colorize" in vals else "None"
+        return self.q(f"{RT}::loguru::add({fd}, {level}, {colorize}, {compiled})")
 
     def sentry_call(self, name: str, node: ast.Call) -> str:
         """sentry_sdk 2.x on the Rust SDK (dynrt/sentry.rs). An option the binary does not reproduce is
@@ -7802,6 +8787,76 @@ class FnCompiler:
                        "set_tag(s), set_user, set_context, set_extra, set_level, add_breadcrumb, new_scope, push_scope, "
                        "get_isolation_scope, get_current_scope, flush, last_event_id, is_initialized and the FastAPI, "
                        "Starlette, logging, SQLAlchemy and asyncio integrations", node)
+
+    REFUSED_BUILTINS = {
+        "dir": "it lists the attributes an object has at run time, which the binary does not keep as names; read the "
+               "attribute you need with getattr()/hasattr(), or vars() for an instance's own fields",
+        "globals": "the binary has no module namespace to hand out; name the module-level variable you need",
+        "locals": "the binary has no frame to hand out; use the local variables by name",
+        "eval": "the binary has no Python interpreter to run source text with",
+        "exec": "the binary has no Python interpreter to run source text with",
+        "compile": "the binary has no Python interpreter to compile source text with",
+    }
+
+    # the categories CPython's default filters ignore (`ignore::DeprecationWarning`...); the others are printed on stderr
+    IGNORED_WARNINGS = {"DeprecationWarning", "PendingDeprecationWarning", "ImportWarning", "ResourceWarning"}
+
+    def warning_ignored(self, node: ast.AST, depth: int = 0) -> bool:
+        """The category written at `node` is one the default filters ignore: a builtin of IGNORED_WARNINGS, or a project
+        class deriving only from such (False when it cannot be told)."""
+        ref = self.static_ref(node)
+        if isinstance(ref, tuple) and ref[:1] == ("builtin",):
+            return ref[1] in self.IGNORED_WARNINGS
+        if isinstance(ref, Ext):
+            return ref.dotted.startswith("builtins.") and ref.dotted[9:] in self.IGNORED_WARNINGS
+        if isinstance(ref, Sym) and depth < 8:
+            m = self.p.ix.module(ref.module)
+            d = m.defs.get(ref.name) if m is not None else None
+            if isinstance(d, ast.ClassDef) and d.bases and not d.keywords:
+                saved = self.module
+                self.module = ref.module
+                try:
+                    return all(self.warning_ignored(b, depth + 1) for b in d.bases)
+                finally:
+                    self.module = saved
+        return False
+
+    def warnings_call(self, name: str, node: ast.Call) -> str:
+        """`warnings.warn` of a category the default filters ignore (evaluated for its effects, then dropped);
+        `simplefilter`/`filterwarnings("ignore")` and `catch_warnings()` (no recording), which then change nothing.
+        What would print to stderr (a module path and line only CPython knows, once per location) or raise
+        (`error` filters) is refused."""
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            raise self.err(f"warnings.{name[9:]}() with * or ** arguments is not supported", node)
+        kws = {k.arg: k.value for k in node.keywords}
+        if name == "warnings.catch_warnings":
+            if node.args or any(k != "record" for k in kws) or (
+                    "record" in kws and not (isinstance(kws["record"], ast.Constant) and kws["record"].value is False)):
+                raise self.err("warnings.catch_warnings(record=True, module=, action=) is not supported: the warnings "
+                               "py2axum drops are never recorded", node)
+            return self.q(f"Ok::<V, Exc>(V::native({RT}::Native::Suppress(Vec::<V>::new())))")
+        if name in ("warnings.simplefilter", "warnings.filterwarnings"):
+            act = node.args[0] if node.args else kws.get("action")
+            if not (isinstance(act, ast.Constant) and act.value == "ignore"):
+                raise self.err(f"warnings.{name[9:]}() is supported with the action \"ignore\" only: another action prints the warnings "
+                               "py2axum drops, or turns them into exceptions", node)
+        else:
+            order = ["message", "category", "stacklevel", "source"]
+            if len(node.args) > 4 or any(k not in order for k in kws) or len(node.args) + len(kws) == 0:
+                raise self.err("warnings.warn(message, category=None, stacklevel=1, source=None) only", node)
+            cat = node.args[1] if len(node.args) > 1 else kws.get("category")
+            msg = node.args[0] if node.args else kws.get("message")
+            if cat is not None:
+                ok = self.warning_ignored(cat)
+            else:  # the category is the message's own: a warning instance written in place
+                ok = isinstance(msg, ast.Call) and self.warning_ignored(msg.func)
+            if not ok:
+                raise self.err("warnings.warn(): only categories CPython's default filters ignore (DeprecationWarning, "
+                               "PendingDeprecationWarning, ImportWarning, ResourceWarning and their subclasses) are "
+                               "supported: any other warning is printed on stderr with the module's file path, once per "
+                               "location; use logging.warning() for it", node)
+        args, kwargs = self.dyn_args(node)
+        return self.q(f"{{ let _a: Vec<V> = {args}; let _k: Vec<(String, V)> = {kwargs}; Ok::<V, Exc>(V::None) }}")
 
     # builtins that consume a whole iterator at once, before returning
     EAGER_CONSUMERS = {"list", "tuple", "set", "frozenset", "sorted"}
@@ -7880,7 +8935,7 @@ class FnCompiler:
             "str": f"{RT}::methods::b_str(&{args})", "int": f"{RT}::methods::b_int(&{args})",
             "float": f"{RT}::methods::b_float(&{args})", "bool": f"{RT}::methods::b_bool(&{args})",
             "list": f"{RT}::methods::b_list(&{args})", "tuple": f"{RT}::methods::b_tuple(&{args})",
-            "set": f"{RT}::methods::b_set(&{args})", "frozenset": f"{RT}::methods::b_set(&{args})",
+            "set": f"{RT}::methods::b_set(&{args})", "frozenset": f"{RT}::methods::b_frozenset(&{args})",
             "dict": f"{RT}::methods::b_dict(&{args}, &{kwargs})", "reversed": f"{RT}::methods::b_reversed(&{args}[0])",
             "sum": f"{RT}::methods::b_sum(&{args})", "any": f"{RT}::methods::b_any(&{args}[0])",
             "all": f"{RT}::methods::b_all(&{args}[0])", "next": f"{RT}::methods::b_next(&{args})",
@@ -8168,18 +9223,18 @@ class RouteBuilder:
     def plain_class_dependency(self, sym: Sym, src: str) -> Sym:
         """`Depends(CommonQueryParams)` on a plain project class: FastAPI reads the parameters from its `__init__`
         signature (without `self`) and calls the class. Compiled as that function (its parameters the
-        `__init__`'s own nodes, so errors point there), returning `CommonQueryParams(**params)`. Refused: a base
-        class, a decorated `__init__`, `*args`/`**kwargs`."""
-        name = f"__py2axum_depends_{sym.name}"
-        m = self.p.ix.module(sym.module)
-        if name in m.defs:
-            return Sym(sym.module, name)
+        `__init__`'s own nodes, so errors point there), returning `CommonQueryParams(**params)`. The `__init__`
+        may be inherited (`inspect.signature` reads the first one of the MRO) from a plain base: the function is
+        then written in the base's module, where its annotations and defaults are read, and calls the class through
+        an import of it there (`class_alias`). Refused: other bases, a decorated `__init__`, `*args`/`**kwargs`."""
         cls = self.p.ix.definition(sym)
         msrc = self.p.src(sym.module)
-        if cls.bases or cls.keywords or cls.decorator_list:
-            raise TranspileError(f"{sym.name}: a class dependency must be a plain class (no base, no decorator) or a "
-                                 "Pydantic model", cls, msrc)
-        init = next((st for st in cls.body if isinstance(st, ast.FunctionDef) and st.name == "__init__"), None)
+        owner, init = self.dep_class_member(sym, "__init__", msrc)
+        home = owner.module if owner is not None else sym.module
+        name = f"__py2axum_depends_{sym.name}" if home == sym.module else f"__py2axum_depends_{mod_ident(sym.module)}__{sym.name}"
+        m = self.p.ix.module(home)
+        if name in m.defs:
+            return Sym(home, name)
         if init is None:
             args = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
         else:
@@ -8190,7 +9245,7 @@ class RouteBuilder:
             args = ast.arguments(posonlyargs=[], args=a.args[1:], vararg=None, kwonlyargs=a.kwonlyargs,
                                  kw_defaults=a.kw_defaults, kwarg=None, defaults=a.defaults)
         names = [x.arg for x in args.args + args.kwonlyargs]
-        call = ast.Call(func=ast.Name(sym.name, ast.Load()), args=[],
+        call = ast.Call(func=ast.Name(self.class_alias(home, sym), ast.Load()), args=[],
                         keywords=[ast.keyword(n, ast.Name(n, ast.Load())) for n in names])
         fn = ast.FunctionDef(name=name, args=args, body=[ast.Return(call)], decorator_list=[], returns=None,
                              type_params=[])
@@ -8199,8 +9254,172 @@ class RouteBuilder:
             if "lineno" in n._attributes:
                 n.lineno, n.end_lineno, n.col_offset, n.end_col_offset = anchor.lineno, anchor.lineno, 0, 0
         fn.lineno, fn.end_lineno, fn.col_offset, fn.end_col_offset = anchor.lineno, anchor.end_lineno, 0, 0
+        fn.py2axum_noframe = True
         m.defs[name] = fn
-        return Sym(sym.module, name)
+        return Sym(home, name)
+
+    def class_alias(self, home: str, sym: Sym) -> str:
+        """The name `sym` (a class) has in `home`: its own there, else a static import of it written into `home`'s
+        index only (`__py2axum_cls_...`: nothing runs, no import cycle), for a function compiled in a base's module
+        that calls the subclass."""
+        if home == sym.module:
+            return sym.name
+        alias = f"__py2axum_cls_{mod_ident(sym.module)}__{sym.name}"
+        self.p.ix.module(home).imports.setdefault(alias, ("from", sym.module, sym.name))
+        return alias
+
+    def dep_class_member(self, sym: Sym, attr: str, msrc: str):
+        """(defining class, function) of `attr` along the MRO of a plain class dependency (None, None: not
+        defined), as `inspect.signature` finds it. Each class: no decorator, keywords `metaclass=ABCMeta` only,
+        bases `ABC`/`object` and at most one plain project class; no `__new__` (the signature would be its)."""
+        cur, seen = sym, set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            d = self.p.ix.definition(cur)
+            if (d.decorator_list or not all(self.p.abcmeta_kw(cur, k) for k in d.keywords)
+                    or cur in self.p.fe.model_syms or cur in self.p.fe.schema_syms or cur in self.p.fe.dataclass_syms):
+                raise TranspileError(f"{sym.name}: a class dependency must be a plain class (no decorator, no class "
+                                     f"keyword but metaclass=ABCMeta) or a Pydantic model ({cur.name})", d, msrc)
+            for st in d.body:
+                tgt = st.name if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+                if tgt is None and isinstance(st, (ast.Assign, ast.AnnAssign)):
+                    ts = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if any(isinstance(t, ast.Name) and t.id in {attr, "__new__", "__signature__"} for t in ts):
+                        raise TranspileError(f"{cur.name}: `{ast.unparse(ts[0])}` assigned in the class body of a "
+                                             "class dependency is not supported (FastAPI reads its signature)", st,
+                                             self.p.src(cur.module))
+                if tgt == "__new__":
+                    raise TranspileError(f"{cur.name}.__new__: a class dependency defining __new__ is not supported",
+                                         st, self.p.src(cur.module))
+                if tgt == attr:
+                    return cur, st
+            nxt = None
+            for b in d.bases:
+                t = self.p.resolve(cur.module, b)
+                if (isinstance(t, Ext) and t.dotted == "abc.ABC") or dotted(b) == "object":
+                    continue
+                if (nxt is None and isinstance(t, Sym) and t != cur and isinstance(self.p.ix.definition(t), ast.ClassDef)
+                        and self.p.is_plain_class(t)):
+                    nxt = t
+                    continue
+                raise TranspileError(f"{sym.name}: a class dependency's bases may be `ABC`, `object` and one plain class "
+                                     f"of the project (`{ast.unparse(b)}` of {cur.name})", b, self.p.src(cur.module))
+            cur = nxt
+        return None, None
+
+    def method_dependency(self, node: ast.AST, module: str, scope, src: str) -> Sym | None:
+        """`Depends(Service.async_init)`: a classmethod (FastAPI reads its signature without `cls`) or a staticmethod
+        of a plain project class, found along its MRO. Compiled as a function of the class's module with that
+        signature, returning `Service.async_init(**params)` (awaited if async). None when `node` is not
+        `<project class>.<name>`."""
+        if not isinstance(node, ast.Attribute):
+            return None
+        csym = self.p.resolve(module, node.value, scope)
+        if not (isinstance(csym, Sym) and isinstance(self.p.ix.definition(csym), ast.ClassDef)):
+            return None
+        msrc = self.p.src(csym.module)
+        if csym in self.p.fe.schema_syms or csym in self.p.fe.model_syms or csym in self.p.fe.dataclass_syms:
+            raise TranspileError(f"Depends({ast.unparse(node)}): a method of a model or dataclass as a dependency is not "
+                                 "supported", node, src)
+        owner, meth = self.dep_class_member(csym, node.attr, msrc)
+        if meth is None:
+            raise TranspileError(f"Depends({ast.unparse(node)}): {csym.name} has no method `{node.attr}`", node, src)
+        # written in the module defining the method (its signature's names are read there)
+        home = owner.module
+        name = (f"__py2axum_depmeth_{csym.name}_{node.attr}" if home == csym.module
+                else f"__py2axum_depmeth_{mod_ident(csym.module)}__{csym.name}_{node.attr}")
+        m = self.p.ix.module(home)
+        if name in m.defs:
+            return Sym(home, name)
+        osrc = self.p.src(owner.module)
+        decos = [dotted(d) for d in meth.decorator_list]
+        if decos not in (["classmethod"], ["staticmethod"]) or any(
+                self.p.resolve(owner.module, d) is not None for d in meth.decorator_list):
+            raise TranspileError(f"Depends({ast.unparse(node)}): a method dependency must be a @classmethod or a "
+                                 "@staticmethod (an unbound instance method needs `self`)", meth, osrc)
+        a = meth.args
+        cm = decos == ["classmethod"]
+        if a.vararg or a.kwarg or a.posonlyargs or (cm and not a.args) or has_yield(meth):
+            raise TranspileError(f"{owner.name}.{meth.name}: *args, **kwargs, positional-only parameters or `yield` are "
+                                 "not supported in a method dependency", meth, osrc)
+        pargs = a.args[1:] if cm else a.args
+        ndef = len(a.defaults)
+        defaults = a.defaults[max(0, ndef - len(pargs)):] if cm else a.defaults
+        args = ast.arguments(posonlyargs=[], args=pargs, vararg=None, kwonlyargs=a.kwonlyargs,
+                             kw_defaults=a.kw_defaults, kwarg=None, defaults=defaults)
+        names = [x.arg for x in args.args + args.kwonlyargs]
+        ret = ast.Call(func=ast.Attribute(ast.Name(self.class_alias(home, csym), ast.Load()), node.attr, ast.Load()), args=[],
+                       keywords=[ast.keyword(n, ast.Name(n, ast.Load())) for n in names])
+        if isinstance(meth, ast.AsyncFunctionDef):
+            ret = ast.Await(ret)
+        kind = ast.AsyncFunctionDef if isinstance(meth, ast.AsyncFunctionDef) else ast.FunctionDef
+        fn = kind(name=name, args=args, body=[ast.Return(ret)], decorator_list=[], returns=None, type_params=[])
+        for n in ast.walk(fn.body[0]):
+            if "lineno" in n._attributes:
+                n.lineno, n.end_lineno, n.col_offset, n.end_col_offset = meth.lineno, meth.lineno, 0, 0
+        fn.lineno, fn.end_lineno, fn.col_offset, fn.end_col_offset = meth.lineno, meth.end_lineno, 0, 0
+        fn.py2axum_noframe = True
+        m.defs[name] = fn
+        return Sym(home, name)
+
+    def library_dependency(self, node, module: str, scope, depth: int = 0) -> str:
+        """Why a dependency that is a library's object is refused (appended to the message): its function, a global
+        the project builds by calling a library (`get_current_user = fastapi_users.current_user()`), an instance of
+        a project subclass of a library class. FastAPI reads the signature of what the library makes, often built at
+        run time (fastapi-users: makefun)."""
+        lib = "; leave the route to Python: --python-side auto)"
+        while isinstance(node, (ast.Call, ast.Subscript)):
+            node = node.func if isinstance(node, ast.Call) else node.value
+        t = self.p.resolve(module, node, scope) if isinstance(node, (ast.Name, ast.Attribute)) else None
+        if isinstance(t, Ext):
+            return (f" (`{t.dotted}`, of the library {t.package}: FastAPI reads the signature of what the library "
+                    f"makes, which the translator does not have{lib}")
+        d = self.p.ix.definition(t) if isinstance(t, Sym) else None
+        if depth < 4 and isinstance(d, (ast.Assign, ast.AnnAssign)) and d.value is not None:
+            inner = self.library_dependency(d.value, t.module, None, depth + 1)
+            if inner:
+                return inner
+        if depth < 4 and isinstance(d, ast.ClassDef):
+            for b in d.bases:
+                bt = self.p.resolve(t.module, b.value if isinstance(b, ast.Subscript) else b)
+                if isinstance(bt, Ext):
+                    return (f" (an instance of {t.name}, a subclass of `{bt.dotted}` of the library {bt.package}: "
+                            f"FastAPI calls the library's `__call__`{lib}")
+                if isinstance(bt, Sym) and bt != t:
+                    inner = self.library_dependency(b, t.module, None, depth + 1)
+                    if inner:
+                        return inner
+        if t is None and isinstance(node, ast.Attribute):
+            inner = self.library_dependency(node.value, module, scope, depth + 1)
+            if inner:
+                return inner
+            if depth == 0:
+                return (" (a method bound to an instance is not supported: make it a module function, a classmethod "
+                        "or a staticmethod)")
+        return ""
+
+    def lambda_dependency(self, lam: ast.Lambda, module: str, scope, src: str) -> Sym:
+        """`Depends(lambda: manager)`: FastAPI reads the lambda's signature and calls it (one object per lambda: its
+        own cache key). Compiled as a module function of that signature returning the lambda's body; the lambda must
+        be written at module level or in the signature of a module-level function (its names are then globals)."""
+        if scope is not None and self.p.ix.definition(Sym(module, getattr(scope, "name", ""))) is not scope:
+            raise TranspileError("Depends(lambda ...) inside a nested function is not supported (it reads that "
+                                 "function's locals)", lam, src)
+        a = lam.args
+        if a.vararg or a.kwarg or a.posonlyargs:
+            raise TranspileError("Depends(lambda ...): *args, **kwargs or positional-only parameters are not "
+                                 "supported", lam, src)
+        name = f"__py2axum_deplambda_{lam.lineno}_{lam.col_offset}"
+        m = self.p.ix.module(module)
+        if name not in m.defs:
+            fn = ast.FunctionDef(name=name, args=copy.deepcopy(a), body=[ast.Return(copy.deepcopy(lam.body))],
+                                 decorator_list=[], returns=None, type_params=[])
+            ast.copy_location(fn, lam)
+            fn.end_lineno = lam.end_lineno
+            ast.fix_missing_locations(fn)
+            fn.py2axum_name = fn.py2axum_qualname = "<lambda>"
+            m.defs[name] = fn
+        return Sym(module, name)
 
     def instance_dependency(self, sym: Sym, src: str) -> Sym | None:
         """`checker = Checker("bar")` then `Depends(checker)`: FastAPI reads the parameters of `Checker.__call__`
@@ -8241,22 +9460,27 @@ class RouteBuilder:
             if "lineno" in n._attributes:
                 n.lineno, n.end_lineno, n.col_offset, n.end_col_offset = call.lineno, call.lineno, 0, 0
         fn.lineno, fn.end_lineno, fn.col_offset, fn.end_col_offset = call.lineno, call.end_lineno, 0, 0
+        fn.py2axum_noframe = True
         m.defs[name] = fn
         return Sym(sym.module, name)
 
-    def factory_dependency(self, call: ast.Call, module: str, scope, src: str) -> Sym | None:
+    def factory_dependency(self, call: ast.Call, module: str, scope, src: str, site: str = "") -> Sym | None:
         """`Depends(make_dep(Query([], alias="ids"), int))`: FastAPI reads the signature of the function the factory
         returns, its defaults and annotations holding the factory's arguments. Compiled as a copy of that inner
         function (in the factory's module) where each factory parameter is replaced by its argument, `<marker>.default`
         by the marker's default. The factory may only define functions and return one of them; its arguments are
-        constants, builtin types and FastAPI markers of constants, named alike in both modules. None when `call` is
-        not a call of a project function."""
+        constants, builtin types and FastAPI markers of constants, named alike in both modules; a `*roles` parameter
+        holds the tuple of the extra positional ones. A factory whose body only returns another factory's call
+        (`def require_admin(): return require_role("admin")`) is that call, its arguments substituted. None when
+        `call` is not a call of a project function."""
         f_sym = self.p.resolve(module, call.func, scope)
         fdef = self.p.ix.definition(f_sym) if isinstance(f_sym, Sym) else None
         if not isinstance(fdef, ast.FunctionDef):
             return None
         fsrc = self.p.src(f_sym.module)
-        name = f"__py2axum_depfactory_{f_sym.name}_{call.lineno}_{call.col_offset}"
+        # one function per call site (FastAPI: one object per call, its own cache key), the outer one first
+        site = site or f"{call.lineno}_{call.col_offset}"
+        name = f"__py2axum_depfactory_{f_sym.name}_{site}"
         m = self.p.ix.module(f_sym.module)
         if name in m.defs:
             return Sym(f_sym.module, name)
@@ -8267,14 +9491,18 @@ class RouteBuilder:
         body = list(fdef.body)
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
             body = body[1:]
-        if (fdef.decorator_list or fdef.args.vararg or fdef.args.kwarg or fdef.args.posonlyargs or not body
-                or not isinstance(body[-1], ast.Return) or not isinstance(body[-1].value, ast.Name)
+        chained = (len(body) == 1 and isinstance(body[0], ast.Return) and isinstance(body[0].value, ast.Call)
+                   and isinstance(self.p.ix.definition(self.p.resolve(f_sym.module, body[0].value.func)
+                                                       if isinstance(body[0].value.func, (ast.Name, ast.Attribute)) else None),
+                                  ast.FunctionDef))
+        if (fdef.decorator_list or fdef.args.kwarg or fdef.args.posonlyargs or not body
+                or (not chained and (not isinstance(body[-1], ast.Return) or not isinstance(body[-1].value, ast.Name)))
                 or not all(isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) for x in body[:-1])):
             refuse("a dependency factory must only define functions and return one of them (no decorator, "
                    "*args or **kwargs)", fdef, fsrc)
         nested = {x.name: x for x in body[:-1]}
-        inner = nested.get(body[-1].value.id)
-        if inner is None or inner.decorator_list:
+        inner = None if chained else nested.get(body[-1].value.id)
+        if not chained and (inner is None or inner.decorator_list):
             refuse("the factory must return one of the functions it defines, undecorated", fdef, fsrc)
         # the factory's parameters bound to the call's arguments (its defaults otherwise)
         a = fdef.args
@@ -8282,10 +9510,12 @@ class RouteBuilder:
         bound: dict[str, ast.expr] = {}
         if any(isinstance(x, ast.Starred) for x in call.args) or any(k.arg is None for k in call.keywords):
             refuse("`*`/`**` expansion in a dependency factory call is not supported")
-        if len(call.args) > len(a.args):
+        if len(call.args) > len(a.args) and a.vararg is None:
             refuse(f"{fdef.name}() takes {len(a.args)} positional arguments")
         for p_, v in zip(a.args, call.args):
             bound[p_.arg] = v
+        if a.vararg is not None:
+            bound[a.vararg.arg] = ast.copy_location(ast.Tuple(list(call.args[len(a.args):]), ast.Load()), call)
         for k in call.keywords:
             if k.arg not in params or k.arg in bound:
                 refuse(f"{fdef.name}() got an unexpected or repeated keyword argument '{k.arg}'")
@@ -8347,6 +9577,17 @@ class RouteBuilder:
                     return ast.copy_location(copy.deepcopy(bound[node.id]), node)
                 return node
 
+        if chained:
+            # `return require_role("admin", *roles)`: the inner factory's call, the outer's arguments in it
+            inner_call = Subst().visit(copy.deepcopy(body[0].value))
+            flat = []
+            for x in inner_call.args:
+                if isinstance(x, ast.Starred) and isinstance(x.value, (ast.Tuple, ast.List)):
+                    flat += x.value.elts
+                else:
+                    flat.append(x)
+            inner_call.args = flat
+            return self.factory_dependency(inner_call, f_sym.module, None, fsrc, site)
         new = Subst().visit(copy.deepcopy(inner))
         new.name = name
         # its frames in tracebacks and logs: the returned function's (`make.<locals>.inner`)
@@ -8472,6 +9713,12 @@ class RouteBuilder:
                 t = self.p.resolve(dmod, dep_call.args[0], dscope)
                 if isinstance(dep_call.args[0], ast.Call):
                     t = self.factory_dependency(dep_call.args[0], dmod, dscope, src) or t
+                elif isinstance(dep_call.args[0], ast.Lambda):
+                    t = self.lambda_dependency(dep_call.args[0], dmod, dscope, src)
+                elif t is None and isinstance(dep_call.args[0], ast.Name):
+                    t = self.p.factory_function(dmod, dscope, dep_call.args[0].id)
+                elif t is None:
+                    t = self.method_dependency(dep_call.args[0], dmod, dscope, src)
                 sec = self.security_scheme(t, src) if isinstance(t, Sym) else None
                 if sec is None and isinstance(dep_call.args[0], ast.Call):
                     sec = self.security_call(dep_call.args[0], dmod)
@@ -8485,9 +9732,10 @@ class RouteBuilder:
                     t = self.plain_class_dependency(t, src)
                 elif isinstance(t, Sym) and isinstance(self.p.ix.definition(t), (ast.Assign, ast.AnnAssign)):
                     t = self.instance_dependency(t, src) or t
-                if not isinstance(t, Sym) or not isinstance(self.p.ix.definition(t), (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not isinstance(t, Sym) or not isinstance(self.p.fn_node(t) if t in self.p.__dict__.get("nested", {}) else self.p.ix.definition(t),
+                                                            (ast.FunctionDef, ast.AsyncFunctionDef)):
                     raise TranspileError(f"{fn.name}: dependency `{ast.unparse(dep_call.args[0])}` must be a project function "
-                                         "or class", arg, src)
+                                         f"or class{self.library_dependency(dep_call.args[0], dmod, dscope)}", arg, src)
                 out.append(RParam(name, "dep", dep=t, scope=self.depends_scope(dep_call, src),
                                   oauth=self.depends_scopes(dep_call, src)))
                 continue
@@ -8600,7 +9848,9 @@ class RouteBuilder:
                 # FastAPI's field_annotation_is_complex: model, mapping, sequence, or a union with one
                 if any(i.startswith(f"{RT}::pyd::TD::{k}") for k in ("Schema", "Dict", "List", "Set", "Tuple", "Coll", "Tagged")):
                     return True
-                if depth < 5 and (i.startswith(f"{RT}::pyd::TD::Optional") or i.startswith(f"{RT}::pyd::TD::Union")):
+                if depth < 5 and (i.startswith(f"{RT}::pyd::TD::Optional") or i.startswith(f"{RT}::pyd::TD::Union")
+                                  or i.startswith((f"{RT}::pyd::TD::Len(", f"{RT}::pyd::TD::Strict(",
+                                                   f"{RT}::pyd::TD::StrictTop("))):
                     return any(complex_td(by_name[r], depth + 1) for r in re.findall(r"&(\w+)", i) if r in by_name)
                 return False
 
@@ -8729,7 +9979,7 @@ class RouteBuilder:
         if sym in memo:
             return memo[sym]
         memo[sym] = False  # a cycle is FastAPI's own error
-        fn = self.p.ix.definition(sym)
+        fn = self.p.fn_node(sym)
         params = self.params(fn, sym.module, set(), for_dep=True)
         memo[sym] = any(p.kind in {"security_scopes", "security"} or (p.kind == "dep" and (p.oauth or self.uses_scopes(p.dep)))
                         for p in params)
@@ -8789,7 +10039,7 @@ class RouteBuilder:
             if orders.setdefault((sym, scope, oauth), current) != current:
                 raise TranspileError(f"dependency {sym.name}: solved with the scopes {list(current)} and "
                                      f"{list(orders[(sym, scope, oauth)])} (same set, another order) in one app is not "
-                                     "supported (FastAPI caches the first)", self.p.ix.definition(sym), self.p.src(sym.module))
+                                     "supported (FastAPI caches the first)", self.p.fn_node(sym), self.p.src(sym.module))
         else:
             current = ()
         dkey = (sym, scope) if oauth is None else (sym, scope, oauth)
@@ -8812,23 +10062,50 @@ class RouteBuilder:
             self.p.cur = prev
 
     def check_dep_yield(self, fn, sym: Sym, src) -> None:
-        """A generator dependency: one `yield`, as a statement of the body or of a top-level `try:` (FastAPI
-        raises the request's exception at the `yield`, its `except` clauses see it, as in the binary)."""
-        yields = [n for n in walk_scope(fn) if isinstance(n, (ast.Yield, ast.YieldFrom))]
-        if len(yields) != 1 or isinstance(yields[0], ast.YieldFrom):
-            raise TranspileError(f"dependency {sym.name}: exactly one `yield` is supported", yields[-1], src)
-        y = yields[0]
-        is_stmt = lambda st: isinstance(st, ast.Expr) and st.value is y  # noqa: E731
-        for st in fn.body:
-            if is_stmt(st):
-                return
-            if isinstance(st, ast.Try) and any(is_stmt(b) for b in st.body):
-                return
-        raise TranspileError(f"dependency {sym.name}: the `yield` must be a statement of the function body "
-                             "or of a top-level try", y, src)
+        """A generator dependency: its `yield`s are statements, under `if`, `try` and `with`/`async with` blocks
+        (FastAPI throws the request's exception in at the `yield`: the enclosing `except` clauses and context
+        managers see it, as in the binary; a path without one is contextlib's "generator didn't yield"). Several
+        only in exclusive branches of an `if`; none in a loop: a second `yield` reached is contextlib's
+        "generator didn't stop", raised outside the generator."""
+        yields = sorted((n for n in walk_scope(fn) if isinstance(n, (ast.Yield, ast.YieldFrom))),
+                        key=lambda n: (n.lineno, n.col_offset))
+        for y in yields:
+            if isinstance(y, ast.YieldFrom):
+                raise TranspileError(f"dependency {sym.name}: `yield from` is not supported", y, src)
+        paths: dict[int, tuple] = {}  # id(yield) -> ((id(if), branch), ...) of the `if`s it is under
+
+        def find(stmts, path) -> None:
+            for st in stmts:
+                if isinstance(st, ast.Expr) and isinstance(st.value, ast.Yield):
+                    paths[id(st.value)] = path
+                    continue
+                if isinstance(st, (ast.For, ast.AsyncFor, ast.While)) and any(n in yields for n in walk_scope(st)):
+                    y = next(n for n in walk_scope(st) if n in yields)
+                    raise TranspileError(f"dependency {sym.name}: a `yield` in a loop is not supported (a second "
+                                         "`yield` is contextlib's \"generator didn't stop\")", y, src)
+                if isinstance(st, ast.If):
+                    find(st.body, path + ((id(st), 0),))
+                    find(st.orelse, path + ((id(st), 1),))
+                elif isinstance(st, (ast.With, ast.AsyncWith)):
+                    find(st.body, path)
+                elif isinstance(st, ast.Try):
+                    for b in (st.body, st.orelse, st.finalbody, *(h.body for h in st.handlers)):
+                        find(b, path)
+
+        find(fn.body, ())
+        for y in yields:
+            if id(y) not in paths:
+                raise TranspileError(f"dependency {sym.name}: the `yield` must be a statement, under `if`, `try` or "
+                                     "`with` blocks only", y, src)
+        for k, a in enumerate(yields):
+            for b in yields[k + 1:]:
+                pa, pb = dict(paths[id(a)]), dict(paths[id(b)])
+                if not any(i in pb and pb[i] != br for i, br in pa.items()):
+                    raise TranspileError(f"dependency {sym.name}: two `yield`s on one path are not supported (only "
+                                         "in exclusive branches of an `if`)", b, src)
 
     def _dep_solver(self, sym: Sym, name: str, scope: str, oauth: tuple | None = None) -> str:
-        fn = self.p.ix.definition(sym)
+        fn = self.p.fn_node(sym)
         src = self.p.src(sym.module)
         gen = has_yield(fn)
         if gen:
@@ -8979,8 +10256,8 @@ class RouteBuilder:
             elif kw.arg in {"response_model_include", "response_model_exclude", "response_model_exclude_unset",
                             "response_model_exclude_none"}:
                 dump_opts[kw.arg] = kw
-            elif kw.arg == "dependencies":
-                pass
+            elif kw.arg in ("dependencies", "path"):
+                pass  # path=: the route's path (route_path)
             elif kw.arg == "response_class":
                 # a returned Response is sent as is; any other value is encoded, then wrapped in this class
                 t = self.p.resolve(module, kw.value, fn)
@@ -8995,7 +10272,20 @@ class RouteBuilder:
             else:
                 raise TranspileError(f"unsupported route option {kw.arg}=", kw, src)
         if resp_cls is None and not any(kw.arg == "response_class" for kw in deco.keywords):
-            resp_cls = self.fe.__dict__.get("default_resp_cls")  # FastAPI(default_response_class=)
+            # APIRouter(default_response_class=): the route's own router, else the nearest router including it
+            # (FastAPI fixes it on the route as it is added or included), else FastAPI(default_response_class=)
+            own = self.fe.routers[router].resp_cls if router is not None else None
+            node, where = (own, router.module) if own is not None else (mount.resp_cls or (None, None))
+            if node is not None:
+                t = self.p.resolve(where, node)
+                last = t.dotted.split(".")[-1] if isinstance(t, Ext) and t.dotted.split(".")[0] in {"fastapi", "starlette"} else None
+                if last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse", "ORJSONResponse"}:
+                    raise TranspileError(f"APIRouter(default_response_class={ast.unparse(node)}) is not supported "
+                                         "(JSONResponse, ORJSONResponse, HTMLResponse or PlainTextResponse)", node,
+                                         self.p.src(where))
+                resp_cls = last
+            else:
+                resp_cls = self.fe.__dict__.get("default_resp_cls")  # FastAPI(default_response_class=)
         gen = self.gen_endpoint(fn, module, resp_cls, has_rm, dump_opts, deco, src)
         if gen is not None and custom_resp != (None, None):
             if custom_resp[1] is not None or gen[0] != "Raw":
@@ -9044,13 +10334,22 @@ class RouteBuilder:
                 t = self.p.resolve(mod, e.args[0])
                 if isinstance(e.args[0], ast.Call):
                     t = self.factory_dependency(e.args[0], mod, None, file) or t
+                elif isinstance(e.args[0], ast.Lambda):
+                    t = self.lambda_dependency(e.args[0], mod, None, file)
+                elif t is None and isinstance(e.args[0], ast.Name):
+                    # the decorator of an endpoint defined in the application factory reads the factory's names
+                    t = self.p.factory_function(mod, fn, e.args[0].id) if file == src else None
+                if t is None and not isinstance(e.args[0], (ast.Call, ast.Lambda)):
+                    t = self.method_dependency(e.args[0], mod, None, file)
                 if isinstance(t, Sym) and isinstance(self.p.ix.definition(t), (ast.Assign, ast.AnnAssign)):
                     t = self.instance_dependency(t, file) or t
                 elif (isinstance(t, Sym) and t not in self.p.fe.schema_syms
                       and isinstance(self.p.ix.definition(t), ast.ClassDef)):
                     t = self.plain_class_dependency(t, file)
-                if not (isinstance(t, Sym) and isinstance(self.p.ix.definition(t), (ast.FunctionDef, ast.AsyncFunctionDef))):
-                    raise TranspileError(f"dependency `{ast.unparse(e.args[0])}` must be a project function", e, file)
+                if not (isinstance(t, Sym) and isinstance(self.p.fn_node(t) if t in self.p.__dict__.get("nested", {})
+                                                          else self.p.ix.definition(t), (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    raise TranspileError(f"dependency `{ast.unparse(e.args[0])}` must be a project function"
+                                         f"{self.library_dependency(e.args[0], mod, None)}", e, file)
                 lines.append(f"let _ = {self.dep_solver(t, self.depends_scope(e, file), (), self.depends_scopes(e, file))}(cx, &__body, __errs).await?;")
                 pre_syms.append(t)
         body_lines, args = self.solve(params, "&__body")
@@ -9318,13 +10617,22 @@ class RouteBuilder:
                 t = self.p.resolve(mod, e.args[0])
                 if isinstance(e.args[0], ast.Call):
                     t = self.factory_dependency(e.args[0], mod, None, file) or t
+                elif isinstance(e.args[0], ast.Lambda):
+                    t = self.lambda_dependency(e.args[0], mod, None, file)
+                elif t is None and isinstance(e.args[0], ast.Name):
+                    # the decorator of an endpoint defined in the application factory reads the factory's names
+                    t = self.p.factory_function(mod, fn, e.args[0].id) if file == src else None
+                if t is None and not isinstance(e.args[0], (ast.Call, ast.Lambda)):
+                    t = self.method_dependency(e.args[0], mod, None, file)
                 if isinstance(t, Sym) and isinstance(self.p.ix.definition(t), (ast.Assign, ast.AnnAssign)):
                     t = self.instance_dependency(t, file) or t
                 elif (isinstance(t, Sym) and t not in self.p.fe.schema_syms
                       and isinstance(self.p.ix.definition(t), ast.ClassDef)):
                     t = self.plain_class_dependency(t, file)
-                if not (isinstance(t, Sym) and isinstance(self.p.ix.definition(t), (ast.FunctionDef, ast.AsyncFunctionDef))):
-                    raise TranspileError(f"dependency `{ast.unparse(e.args[0])}` must be a project function", e, file)
+                if not (isinstance(t, Sym) and isinstance(self.p.fn_node(t) if t in self.p.__dict__.get("nested", {})
+                                                          else self.p.ix.definition(t), (ast.FunctionDef, ast.AsyncFunctionDef))):
+                    raise TranspileError(f"dependency `{ast.unparse(e.args[0])}` must be a project function"
+                                         f"{self.library_dependency(e.args[0], mod, None)}", e, file)
                 lines.append(f"let _ = {self.dep_solver(t, self.depends_scope(e, file), (), self.depends_scopes(e, file))}(cx, &__body, __errs).await?;")
                 deps.append(t)
         body_lines, args = self.solve(params, "&__body")
@@ -9359,6 +10667,41 @@ class RouteBuilder:
         return self.p.ix.module(module).defs.get(fn.name) is fn
 
 
+ROUTE_DECORATOR_ATTRS = HTTP_METHODS | {"websocket"}
+# route decorators of FastAPI/Starlette outside HTTP_METHODS: refused rather than left unregistered
+UNTRANSLATED_ROUTE_ATTRS = {"api_route", "head", "options", "trace", "route"}
+
+
+def endpoint_decorators(fe: Frontend, fn, m, deco: ast.Call) -> None:
+    """The endpoint's decorators besides its route decorator `deco` are refused (fichier:ligne): FastAPI registers
+    the decorated function (a decorator below the route decorator wraps every call: auth, cache, rate limit,
+    transaction...) and runs every decorator at import, while the binary compiles the bare function. Another route
+    decorator of the app or a router (`@app.get` over `@app.post`, `@app.get` with `@app.websocket`) registers the
+    function once more: only one HTTP route decorator per function is translated."""
+    src = str(m.path)
+    parents = fe._parents(m.name)
+    http = [d for d in fn.decorator_list if d is not deco and isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+            and d.func.attr in ROUTE_DECORATOR_ATTRS
+            and (fe._is_app(m.name, d.func.value)
+                 or fe.index.resolve_expr(m.name, d.func.value, frontend_enclosing_fn(fn, parents)) in fe.routers)]
+    for d in fn.decorator_list:
+        if d is deco or (d in http and d.func.attr == "websocket" and deco.func.attr != "websocket") \
+                or (d in http and d.func.attr != "websocket" and deco.func.attr == "websocket"):
+            continue
+        shown = ast.unparse(d)
+        shown = shown if len(shown) <= 60 else shown[:57] + "..."
+        if d in http:
+            raise TranspileError(f"endpoint {fn.name}: several route decorators on one function (@{shown}) are not "
+                                 "supported: FastAPI registers the function once per decorator, the binary would serve "
+                                 "only one of them; define one endpoint per route", d, src)
+        below = fn.decorator_list.index(d) > fn.decorator_list.index(deco)
+        raise TranspileError(f"endpoint {fn.name}: decorator @{shown} on an endpoint is not supported: "
+                             + ("FastAPI registers the decorated function, the binary would run the endpoint without it"
+                                if below else "it runs at import on the registered function, the binary would never run it")
+                             + "; move its logic into a dependency, or leave the route to Python with "
+                             "--python-side '<path>'", d, src)
+
+
 def ws_route(proj: Project, rb: RouteBuilder, fe: Frontend, fn, m, found, idx: int, out: list, collect: bool) -> int:
     """`@app.websocket` / `@router.websocket`: one compiled route per mount, appended to `out` as
     (pattern, handler, fn, module); returns the last route index used."""
@@ -9372,15 +10715,16 @@ def ws_route(proj: Project, rb: RouteBuilder, fe: Frontend, fn, m, found, idx: i
         info = {"method": "websocket", "path": "?", "func": fn.name, "file": src, "line": fn.lineno,
                 "conditional": mt.conditional, "node": fn, "module": m.name, "router": router, "id": rid}
         try:
-            if not deco.args:
-                raise TranspileError("@websocket(...) needs a path", deco, src)
-            path = mt.prefix + (r.prefix if r else "") + literal(deco.args[0], src)
+            path = mt.prefix + (r.prefix if r else "") + route_path(deco, src)
             info["path"] = fe.shown_path(path)
             for k in re.findall("\x01(\\d+)\x01", path):
                 proj.edges.setdefault(rid, set()).add(("prefix", int(k)))
             if fe.shown_path(path) in fe.__dict__.get("python_side", ()):
-                raise TranspileError(f"WebSocket route {fe.shown_path(path)} cannot be declared --python-side: the binary "
-                                     "does not relay WebSocket connections", deco, src)
+                # relayed to the Python process by the binary (ws::relay), by its runtime path like an HTTP route
+                fe.__dict__.setdefault("python_side_raw", set()).add(path)
+                fe.notes.append(f"{src}:{fn.lineno}: WEBSOCKET {fe.shown_path(path)} declared Python-side")
+                proj.cur = None
+                continue
             if r is not None and r.unsupported:
                 raise TranspileError(f"unsupported APIRouter option {r.unsupported[0].arg}=", r.unsupported[0], r.file)
             if mt.unsupported:
@@ -9389,6 +10733,7 @@ def ws_route(proj: Project, rb: RouteBuilder, fe: Frontend, fn, m, found, idx: i
             if mt.conditional:
                 raise TranspileError("include_router(...) under an `if` is not supported: the binary would "
                                      "serve the route unconditionally", fn, src)
+            endpoint_decorators(fe, fn, m, deco)
             handler, pattern = rb.ws_route(fn, m.name, path, deco, router, mt, idx)
             proj.cur = None
             proj.drain()
@@ -9608,8 +10953,8 @@ def async_method_names(p: "Project", methods) -> list[str]:
             node = p.fn_node(s)
         except TranspileError:
             continue
-        if isinstance(node, ast.AsyncFunctionDef) and not has_yield(node) and not prop:
-            out.append(n)
+        if isinstance(node, ast.AsyncFunctionDef) and not has_yield(node) and not prop and s not in p.__dict__.get("vdeco_methods", ()):
+            out.append(n)  # (a decorated one returns what its decorators made: awaited by the caller)
     return out
 
 
@@ -9619,6 +10964,10 @@ def async_names(p: "Project", methods) -> str:
 
 # dunder methods the runtime dispatches to (str(), repr(), ==/!= and the containers' comparisons, `async for`)
 # the methods only pickle and copy call: ignored in a class when nothing imports them (Project.copies_objects)
+# the protocol methods of a project exception class the runtime calls (ops::dunder on V::Exc): str() (and every
+# text of the exception: tracebacks, logs, pydantic's "Value error, ..."), repr(), truth
+EXC_DUNDERS = {"__str__", "__repr__", "__bool__"}
+COPY_ROOTS = {"copy", "pickle", "copyreg", "_pickle"}
 COPY_DUNDERS = {"__getstate__", "__setstate__", "__reduce__", "__reduce_ex__", "__copy__", "__deepcopy__",
                 "__getnewargs__", "__getnewargs_ex__"}
 
@@ -9652,7 +11001,7 @@ def is_dunder(name: str) -> bool:
 
 
 SCALAR_TDS = ("Int(", "Float(", "Str(", "Bool", "Date", "DateTime", "Time", "Delta", "Decimal(", "Uuid", "Enum(", "Bytes(", "Url(",
-              "Email(")
+              "Email(", "Path")
 
 
 def is_app_route_class(fe, module: str, st: ast.AST) -> bool:
@@ -9785,6 +11134,7 @@ def schema_x(p, info) -> str:
             f"model_ser: {('Some(' + ser('', ms, True) + ')') if ms else 'None'}, "
             f"root: {str(bool(info.__dict__.get('root'))).lower()}, eq_id: {str(bool(info.__dict__.get('eq_id'))).lower()}, "
             f"ntuple: {str(bool(info.__dict__.get('ntuple'))).lower()}, "
+            f"hide_input: {str(bool(info.__dict__.get('hide_input'))).lower()}, "
             f"classmethods: &[{', '.join(rs(n) for n in class_level_methods(p, info.methods, {'classmethod'}))}], "
             f"statics: &[{', '.join(rs(n) for n in class_level_methods(p, info.methods, {'staticmethod'}))}], "
             f"new_: {('Some(' + method_wrapper(p, info.__dict__['new']) + ' as ' + RT + '::pyd::MethodFn)') if info.__dict__.get('new') else 'None'} }}")
@@ -9796,7 +11146,8 @@ def settings_desc(info) -> str:
         return "None"
     none = f"Some({rs(info.env_none)})" if info.env_none is not None else "None"
     return (f"Some({RT}::pyd::SettingsDesc {{ prefix: {rs(info.env_prefix)}, "
-            f"case_sensitive: {'true' if info.case_sensitive else 'false'}, none_str: {none} }})")
+            f"case_sensitive: {'true' if info.case_sensitive else 'false'}, none_str: {none}, "
+            f"ignore_empty: {'true' if info.__dict__.get('env_ignore_empty') else 'false'} }})")
 
 
 def hash_kind(info) -> str:
@@ -9932,6 +11283,29 @@ def method_wrapper(p: Project, sym: Sym) -> str:
                 f"    {RT}::methods::call_value(cx, &__f, args, kwargs).await\n}}) }}"
             )
         return name
+    if sym in p.__dict__.get("vdeco_methods", ()):
+        # decorated by functions (`@wraps` wrappers, `@contextmanager`...): `d(f)` built at startup, called with the instance
+        name = f"mwd_{mod_ident(sym.module)}__{ident(sym.name)}"
+        if name not in p.__dict__.setdefault("_wrappers", set()):
+            p._wrappers.add(name)
+            g = p.decorated_value(sym)
+            p.items.append(
+                f"fn {name}<'a>(cx: &'a Cx, slf: V, args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{\n"
+                f"    let __d = {g}(cx).await?;\n    let (args, kwargs) = {RT}::unpack(args);\n"
+                f"    {RT}::methods::call_decorated_method(cx, &__d, slf, args, kwargs).await\n}}) }}")
+        return name
+    if sym in p.__dict__.get("cached_prop_syms", ()):
+        # functools.cached_property: computed on the first read, then kept in the instance (which then shadows the property)
+        raw = raw_method_wrapper(p, sym, f"mwr_{p.function(sym)}")
+        name = f"mwc_{mod_ident(sym.module)}__{ident(sym.name)}"
+        if name not in p.__dict__.setdefault("_wrappers", set()):
+            p._wrappers.add(name)
+            attr = sym.name.split(".")[-1]
+            p.items.append(
+                f"fn {name}<'a>(cx: &'a Cx, slf: V, args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{\n"
+                f"    let __v = {raw}(cx, slf.clone(), args).await?;\n"
+                f"    {RT}::methods::setattr_raw(&slf, {rs(attr)}, __v.clone())?;\n    Ok(__v)\n}}) }}")
+        return name
     rust = p.function(sym)
     name = f"mw_{rust}"
     cm = cachedmethod_deco(p, sym, p.fn_node(sym))
@@ -10002,12 +11376,21 @@ def raw_method_wrapper(p: Project, sym: Sym, name: str) -> str:
             else:
                 vals.append(f"__s[{i}].take().unwrap_or(V::None)")
         first = {"self": "slf, ", "cls": f"{RT}::class_of(&slf), ", "static": ""}[lead]
+        if has_yield(node):
+            # a generator method: the call binds its arguments, the body waits for the first __anext__
+            # (as function_wrapper does for a generator function)
+            binds = "".join(f"    let __a{i} = {v};\n" for i, v in enumerate(([first[:-2]] if first else []) + vals))
+            n = len(vals) + (1 if first else 0)
+            call = (f"{binds}    let cx2 = cx.clone();\n    Ok({RT}::web::spawn_gen(move |y| Box::pin(async move {{ "
+                    f"{rust}(&cx2{''.join(f', __a{i}' for i in range(n))}, &y).await }})))")
+        else:
+            call = f"    {rust}(cx, {first}{', '.join(vals)}).await"
         p.items.append(
             f"fn {name}<'a>(cx: &'a Cx, slf: V, args: Vec<V>) -> {RT}::BoxFut<'a> {{ Box::pin(async move {{\n"
             f"    let (args, kwargs) = {RT}::unpack(args);\n"
             f"    let mut __s = {RT}::bind_params({rs(sym.name + '()')}, {0 if lead == 'static' else 1}, args, kwargs, &[{spec}])?;\n"
             f"    let _ = &mut __s;\n"
-            f"    {rust}(cx, {first}{', '.join(vals)}).await\n}}) }}"
+            f"{call}\n}}) }}"
         )
     return name
 
@@ -10069,6 +11452,8 @@ fn env_or(key: &str, default: &str) -> String {{
 }}
 
 fn main() {{
+    // the environment CPython starts with (its child processes and os.environ see it), before any thread
+    dynrt::coerce_c_locale();
     // Runtime threads get a large stack (reserved address space, touched only as deep as a request goes):
     // CPython accepts JSON nested ~10 000 levels deep (more on 3.14) and the runtime walks such values
     // recursively (validation, serialisation, repr); tokio's 2 MiB default would let one small request
@@ -10132,6 +11517,8 @@ async fn serve() {{
     dynrt::logging::set_source_root({source_root});
     // uvicorn's Config.configure_logging(): its LOGGING_CONFIG and options, before the import
     dynrt::uvicorn::configure_logging();
+    // `import loguru` (its default handler on sys.stderr), when translated code logs through it
+    {loguru_init}
     dynrt::web::set_strict_content_type({strict_ct});
     dynrt::web::set_root_path({root_path});
     dynrt::web::set_starlette({starlette_major}, {starlette_minor});
@@ -10139,6 +11526,7 @@ async fn serve() {{
     dynrt::methods::set_str_classes(&gen::STR_CLASSES);
     dynrt::set_pydantic("{pydantic}");
     dynrt::sentry::set_sdk("{sentry_sdk}", {multipart});
+    dynrt::stripe::set_version("{stripe}");
     gen::register_classes();
     dynrt::asgi::set_python_side(&[{python_side}], &[{mount_fallback}]);
     dynrt::routing::set_app(&gen::APP_ROUTES);
@@ -10394,7 +11782,7 @@ def prepare(fe: Frontend, python_side: set[str]):
                     else:
                         kept.append(TranspileError(f"FastAPI({kw.arg}=...) is not supported", kw, str(m.path)))
     if on_events:
-        kept += events_lifespan(fe, on_events, python_side)
+        kept += [scoped(e, "lifespan") for e in events_lifespan(fe, on_events, python_side)]
     fe._discover_routers()
     n_before = len(fe.global_errors)
     fe.collect = True
@@ -10558,17 +11946,9 @@ def lib_router_refusal(fe: Frontend, e: TranspileError) -> str | None:
     scope = _enclosing_fn(call, parents)
     if any(isinstance(p, (ast.If, ast.For, ast.While, ast.Try, ast.With)) for p in _ancestors(call, parents, scope)):
         return "it is registered conditionally (under an `if`, a loop, a `try` or a `with`)"
-    why = mount_not_last(fe, e)
-    if why:
-        return why
-    body = scope.body if scope is not None else fe.index.module(mod).tree.body
-    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        if isinstance(node, ast.Call) and node.lineno > call.lineno and configure_call(fe, mod, node):
-            found = registers_routes(fe, mod, node, configure_call(fe, mod, node), set())
-            if found:
-                return (f"`{ast.unparse(node.func)}(...)` at {fe.index.module(mod).path}:{node.lineno} registers routes after it "
-                        f"({found})")
-    return None
+    # a route a function given the app registers after it (`configure(app)` -> `app.add_route`) is added at startup:
+    # the binary relays it to Python, which tries the library's routes first (routing::lib_barrier)
+    return mount_not_last(fe, e)
 
 
 def _ancestors(node: ast.AST, parents: dict, stop) -> list:
@@ -10578,32 +11958,6 @@ def _ancestors(node: ast.AST, parents: dict, stop) -> list:
         out.append(p)
         p = parents.get(p)
     return out
-
-
-def registers_routes(fe: Frontend, module: str, call: ast.Call, app_names: set[str], seen: set) -> str | None:
-    """`f(app)`, a project function given the application (`app_names`: the names of it among the arguments):
-    where it, or a project function it passes the application on to, registers a route on it, else None."""
-    t = fe.index.resolve_expr(module, call.func)
-    fn = fe.index.definition(t) if isinstance(t, Sym) else None
-    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or t in seen:
-        return None
-    seen.add(t)
-    params = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args]]
-    bound = {params[i] for i, a in enumerate(call.args) if i < len(params) and isinstance(a, ast.Name) and a.id in app_names}
-    bound |= {k.arg for k in call.keywords if isinstance(k.value, ast.Name) and k.value.id in app_names}
-    where = fe.index.module(t.module).path
-    for n in ast.walk(fn):
-        if not isinstance(n, ast.Call):
-            continue
-        if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id in bound \
-                and (n.func.attr in APP_ROUTE_CALLS or n.func.attr in APP_ROUTE_DECOS):
-            return f"`{ast.unparse(n.func)}(...)` at {where}:{n.lineno}"
-        given = {a.id for a in [*n.args, *(k.value for k in n.keywords)] if isinstance(a, ast.Name) and a.id in bound}
-        if given:
-            found = registers_routes(fe, t.module, n, given, seen)
-            if found:
-                return found
-    return None
 
 
 def mount_not_last(fe: Frontend, e: TranspileError) -> str | None:
@@ -10798,6 +12152,8 @@ def check_configure(p: "Project", fe: Frontend, module: str, call: ast.Call) -> 
     bound = {params[i] for i, a in enumerate(call.args) if i < len(params) and isinstance(a, ast.Name) and a.id in names}
     bound |= {k.arg for k in call.keywords if isinstance(k.value, ast.Name) and k.value.id in names}
     for n in ast.walk(fn):
+        if id(n) in fe.__dict__.get("configure_includes", ()):
+            continue  # an include_router the frontend registered where the function is called (Frontend._configure_site)
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in CONFIGURE_REFUSED
                 and isinstance(n.func.value, ast.Name) and n.func.value.id in bound):
             raise TranspileError(f"{fn.name}(): `{n.func.value.id}.{n.func.attr}(...)` on the application passed to a "
@@ -10805,14 +12161,24 @@ def check_configure(p: "Project", fe: Frontend, module: str, call: ast.Call) -> 
                                  n, p.src(t.module))
 
 
+def lib_router_include(fe: Frontend, module: str, node: ast.AST) -> bool:
+    """`app.include_router(<library router>)` (left to Python, see lib_router_side)."""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "include_router"
+            and bool(node.args) and fe._is_app(module, node.func.value)
+            and fe._library_router(module, node.args[0], None) is not None)
+
+
+def _stack_call(fe: Frontend, module: str, n: ast.AST) -> bool:
+    """A call the middleware stack runs: a registration, `configure(app)`, a library router's inclusion,
+    `FastAPI(middleware=[...])`."""
+    return isinstance(n, ast.Call) and bool(
+        stack_node(fe, module, n) or configure_call(fe, module, n) or lib_router_include(fe, module, n)
+        or (isinstance(n.func, (ast.Name, ast.Attribute)) and dotted(n.func) in {"FastAPI", "fastapi.FastAPI"}
+            and any(k.arg == "middleware" for k in n.keywords)))
+
+
 def _stack_relevant(fe: Frontend, module: str, node: ast.AST) -> bool:
-    for n in ast.walk(node):
-        if isinstance(n, ast.Call) and (stack_node(fe, module, n) or configure_call(fe, module, n)
-                                       or (isinstance(n.func, (ast.Name, ast.Attribute))
-                                           and dotted(n.func) in {"FastAPI", "fastapi.FastAPI"}
-                                           and any(k.arg == "middleware" for k in n.keywords))):
-            return True
-    return False
+    return any(_stack_call(fe, module, n) for n in ast.walk(node))
 
 
 def target_python(root) -> tuple[int, int]:
@@ -10850,6 +12216,13 @@ def fastapi_strict_content_type(root) -> bool:
     return fastapi_at_least(root, (0, 132))
 
 
+def _installed_stripe() -> str | None:
+    """the stripe-python installed next to py2axum, when the supported range has it"""
+    from . import versions
+    v = _installed("stripe")
+    return v if v and versions.in_range("stripe", v) else None
+
+
 def _installed(name: str) -> str | None:
     """the version of a distribution installed next to py2axum (the reference's, when the project locks none)"""
     from importlib import metadata
@@ -10857,6 +12230,19 @@ def _installed(name: str) -> str | None:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
+
+
+def qrcode_without_pillow(root) -> bool:
+    """The project's uv.lock locks qrcode but not Pillow: qrcode then falls back to PyPNGImage (pure Python)."""
+    d = Path(root).resolve()
+    for cand in (d, *d.parents):
+        lock = cand / "uv.lock"
+        if lock.is_file():
+            text = lock.read_text()
+            return '\nname = "qrcode"\n' in text and '\nname = "pillow"\n' not in text
+        if (cand / ".git").exists():
+            break
+    return False
 
 
 def locked_version(root, name: str) -> str | None:
@@ -11164,6 +12550,38 @@ def mcp_register(p: "Project", fe: Frontend) -> None:
         p.cur = None
 
 
+def factory_lifespan(p: "Project", module: str, value: ast.Name):
+    """`FastAPI(lifespan=lifespan)` in the app factory, `lifespan` a function the factory defines (under an `if`
+    even): (its definition, the factory, the `if`s around the call as (test, branch taken)), else None."""
+    from .fallback import _local_def
+
+    tree = p.ix.module(module).tree
+    call = next((n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and any(k.arg == "lifespan" and k.value is value for k in n.keywords)), None)
+    factory = next((f for f in tree.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and call is not None and any(n is call for n in ast.walk(f))), None)
+    if factory is None:
+        return None
+    d = _local_def(tree, call, value.id)
+    if d is None:
+        return None
+    guards = []
+
+    def path(stmts) -> bool:
+        for st in stmts:
+            if any(n is call for n in ast.walk(st)):
+                if isinstance(st, ast.If):
+                    inside = any(n is call for b in st.body for n in ast.walk(b))
+                    guards.append((st.test, inside))
+                    return path(st.body if inside else st.orelse)
+                if isinstance(st, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
+                    return True
+                return False  # a loop, a `try`, a `with` around the app's creation
+        return False
+
+    return (d, factory, guards) if path(factory.body) else None
+
+
 def lifespan_fn(p: "Project", fe: Frontend) -> str:
     """`pub async fn lifespan`: the value of `FastAPI(lifespan=...)` (an `@asynccontextmanager` function or an
     async generator function, called with the app before the server listens), None without one."""
@@ -11173,12 +12591,18 @@ def lifespan_fn(p: "Project", fe: Frontend) -> str:
     module, value = spec
     t = p.resolve(module, value) if isinstance(value, (ast.Name, ast.Attribute)) else None
     d = p.ix.definition(t) if isinstance(t, Sym) else None
+    local = None
+    if d is None and isinstance(value, ast.Name):
+        local = factory_lifespan(p, module, value)
+        if local is not None:
+            d, factory, guards = local
+            t = Sym(module, f"{factory.name}.<locals>.{d.name}")
     if not isinstance(d, ast.AsyncFunctionDef) or not has_yield(d):
         e = TranspileError("FastAPI(lifespan=...): only an `async def` generator of the project (decorated with "
                            "@asynccontextmanager or not) is supported", value, p.src(module))
         if not p.collect:
             raise e
-        fe.global_errors.append(e)
+        fe.global_errors.append(scoped(e, "lifespan"))
         return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
     for n in walk_scope(d):
         if isinstance(n, ast.Yield) and n.value is not None and not (isinstance(n.value, ast.Constant) and n.value.value is None):
@@ -11186,17 +12610,28 @@ def lifespan_fn(p: "Project", fe: Frontend) -> str:
                                n, p.src(t.module))
             if not p.collect:
                 raise e
-            fe.global_errors.append(e)
+            fe.global_errors.append(scoped(e, "lifespan"))
             return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
     p.cur = ("lifespan", 0)
     fc = FnCompiler(p, module, None, "lifespan")
     try:
-        code = fc.expr(value)
+        if local is None:
+            code = fc.expr(value)
+        else:
+            # defined in the app factory: compiled with the factory's locals (read once, as the factory runs once),
+            # used only when the `if`s around `FastAPI(lifespan=...)` hold at startup
+            fc.factory = factory
+            fc.__dict__["app_alias"] = set(fe.app_vars.get(module, ()))
+            p.__dict__.setdefault("nested", {})[t] = (d, factory)
+            for test, taken in guards:
+                cond = fc.truthy(test)
+                fc.emit(f"if {'!' if taken else ''}({cond}) {{ return Ok(None); }}")
+            code = f"V::native({RT}::Native::Bound({function_wrapper(p, t)}, V::None))"
         p.drain()
     except TranspileError as e:
         if not p.collect:
             raise
-        fe.global_errors.append(e)
+        fe.global_errors.append(scoped(e, "lifespan"))
         return "pub async fn lifespan(_cx: &Cx) -> R<Option<V>> {\n    Ok(None)\n}"
     finally:
         p.cur = None
@@ -11207,9 +12642,10 @@ def lifespan_fn(p: "Project", fe: Frontend) -> str:
 
 def _configures_output(t) -> bool:
     """`sentry_sdk.init`, or the `logging` module and the libraries configuring it (python-json-logger,
-    uvicorn's formatters): what an import-time or factory statement must not skip, since it decides what
-    the application prints and reports."""
-    return is_ext(t, "sentry_sdk.init") or (isinstance(t, Ext) and t.dotted.startswith(("logging.", "pythonjsonlogger.", "uvicorn.logging.")))
+    uvicorn's formatters), or loguru's logger: what an import-time or factory statement must not skip, since it
+    decides what the application prints and reports."""
+    return is_ext(t, "sentry_sdk.init") or (isinstance(t, Ext) and t.dotted.startswith(("logging.", "pythonjsonlogger.", "uvicorn.logging.",
+                                                                                          "loguru.logger.")))
 
 
 def _reaches_sentry_init(p: "Project", module: str, call: ast.Call, depth: int = 4, seen=None) -> bool:
@@ -11271,7 +12707,7 @@ def factory_sentry_init(p: "Project", fe: Frontend) -> None:
 def _mapped_roots() -> frozenset[str]:
     from . import libmap
     tables = (libmap.VALUES, libmap.EXCEPTIONS, libmap.CALLS, libmap.NAMESPACE_CALLS)
-    return frozenset({k.split(".")[0] for t in tables for k in t} | {"sentry_sdk"})
+    return frozenset({k.split(".")[0] for t in tables for k in t} | {"sentry_sdk", "loguru"})
 
 
 def unmapped_library(t) -> bool:
@@ -11463,6 +12899,21 @@ def module_statements(p: "Project", fe: Frontend) -> None:
     # the modules of the libraries translated from source (--translate-libs) the translation uses: their
     # statements run at import, as CPython does (`for k, v in a.items(): b[v] = k` filling a table)
     libs = [x for x in list(fe.index.modules.values()) if x.lib is not None and x.name in used]
+
+    def refused(m, e: TranspileError) -> None:
+        """A statement that does not translate. In a library translated from source it blocks only what uses the
+        library: an error node (`("libmod", module, line)`) the functions and globals of the library (and of its
+        submodules, whose import runs it) reach, so the routes using the library go --python-side and the
+        others never run its module code (link_lib_statements). In the project, it blocks the application."""
+        if m.lib is not None:
+            node = ("libmod", m.name, e.node.lineno if e.node is not None and hasattr(e.node, "lineno") else 0)
+            p.fn_errors.setdefault(node, e)
+            p.__dict__.setdefault("libmod_nodes", {}).setdefault(m.name, []).append(node)
+            return
+        if not p.collect:
+            raise e
+        fe.global_errors.append(e)
+
     for m in [*fe.index.package_modules(), *libs]:
         # a module the application imports but the translation does not use: only what configures its
         # output runs (`setup_logging()` at import), as importing it does in Python
@@ -11471,7 +12922,7 @@ def module_statements(p: "Project", fe: Frontend) -> None:
             continue
         for st in m.tree.body:
             if output_only and not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
-                                    and _reaches_sentry_init(p, m.name, st.value)):
+                                    and _reaches_sentry_init(p, m.name, st.value)) and not _sets_library_conf(p, m.name, st):
                 continue
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
                 f = st.value.func
@@ -11511,11 +12962,9 @@ def module_statements(p: "Project", fe: Frontend) -> None:
                             if isinstance(t, ast.Attribute) and isinstance(p.resolve(m.name, t.value), Sym)
                             and isinstance(p.ix.definition(p.resolve(m.name, t.value)), ast.ClassDef)), None)
                 if cls is not None:
-                    e = TranspileError(f"assigning the class attribute `{ast.unparse(cls)}` at module level is not supported "
-                                       "(class attributes are read as declared): set it in the class body", st, p.src(m.name))
-                    if not p.collect:
-                        raise e
-                    fe.global_errors.append(e)
+                    refused(m, TranspileError(f"assigning the class attribute `{ast.unparse(cls)}` at module level is not "
+                                              "supported (class attributes are read as declared): set it in the class body",
+                                              st, p.src(m.name)))
                     continue
             elif not isinstance(st, (ast.For, ast.While, ast.If, ast.With, ast.Try)) or import_guard(st) or startup_skipped(st):
                 continue
@@ -11526,9 +12975,7 @@ def module_statements(p: "Project", fe: Frontend) -> None:
                 try:
                     link_mutated_globals(p, m.name, st, ("modst", p.stmt_runner(m.name, st)))
                 except TranspileError as e:
-                    if not p.collect:
-                        raise
-                    fe.global_errors.append(TranspileError(f"module-level statement not translated: {e.msg}", e.node, e.file))
+                    refused(m, TranspileError(f"module-level statement not translated: {e.msg}", e.node, e.file))
                 continue
             name = f"modst_{mod_ident(m.name)}__{st.lineno}"
             fc = FnCompiler(p, m.name, None, name)
@@ -11537,9 +12984,8 @@ def module_statements(p: "Project", fe: Frontend) -> None:
                 fc.block([st])
                 link_mutated_globals(p, m.name, st, ("modst", name))
             except TranspileError as e:
-                if not p.collect:
-                    raise
-                fe.global_errors.append(TranspileError(f"module-level statement not translated: {e.msg}", e.node, e.file))
+                p.cur = None
+                refused(m, TranspileError(f"module-level statement not translated: {e.msg}", e.node, e.file))
                 continue
             finally:
                 p.cur = None
@@ -11547,6 +12993,111 @@ def module_statements(p: "Project", fe: Frontend) -> None:
             p.items.append(f"/// {m.name}:{st.lineno} (module level, run at startup)\npub async fn {name}(cx: &Cx) -> R {{\n{body}\n    Ok(V::None)\n}}")
             p.__dict__.setdefault("eager", []).append((m.name, st.lineno, name))
             p.__dict__.setdefault("modst", set()).add(name)
+
+
+def _sets_library_conf(p: "Project", module: str, st: ast.stmt) -> bool:
+    """`stripe.api_key = ...` at module level: configures a library for the whole process, so it runs at import
+    even in a module the translation does not otherwise use (as importing it does in Python)."""
+    from . import libmap
+    if not isinstance(st, ast.Assign):
+        return False
+    return all(isinstance(t, ast.Attribute) and isinstance(r := p.resolve(module, t), Ext) and r.dotted in libmap.HOOKS
+               and r.dotted.startswith("stripe.") for t in st.targets)
+
+
+def node_sym(n) -> Sym | None:
+    """The definition a node of the call graph stands for (`(sym, kind)` functions, `("global", sym)`...)."""
+    if isinstance(n, tuple) and n:
+        if isinstance(n[0], Sym):
+            return n[0]
+        if len(n) > 1 and isinstance(n[1], Sym):
+            return n[1]
+    return None
+
+
+def link_partial_mix(p: "Project") -> None:
+    """A library the library map covers in part (`jinja2`: Environment...) whose other names were read from its
+    source (`jinja2.Template`): one binary cannot hold both, the map's objects are not the source's (a map's
+    Environment is no instance of the source's class, and the source's methods do not take it). When a route that
+    translates uses the map's names, the source's nodes get an error: the routes reaching the source are refused
+    (--python-side auto leaves them to Python), those using the map only stay native as before."""
+    native = p.__dict__.get("partial_native", {})
+    if not native or p.ix.libs is None:
+        return
+    nodes = set(p.fns) | set(p.fn_errors) | set(p.edges) | {m for v in list(p.edges.values()) for m in v}
+    sources: dict[str, list] = {}
+    for n in nodes:
+        sym = node_sym(n)
+        top = p.ix.partial_lib(sym.module) if sym is not None else None
+        if top in native:
+            sources.setdefault(top, []).append(n)
+    roots = [info["id"] for info, err in p.__dict__.get("route_infos", []) if err is None]
+    roots += [("stack", 0), ("lifespan", 0), ("mcp", 0)]
+    for top, srcs in sorted(sources.items()):
+        uses = native[top]
+        live = uses.get(None)
+        for rid in roots:
+            if live is not None:
+                break
+            if closure_errors(p, rid):
+                continue
+            seen, todo = {rid}, [rid]
+            while todo and live is None:
+                n = todo.pop()
+                live = uses.get(n)
+                for m in p.edges.get(n, ()):
+                    if m not in seen:
+                        seen.add(m)
+                        todo.append(m)
+        if live is None:
+            continue
+        dotted, file, line = live
+        dist = p.ix.libs.partial(top)
+        first = min((node_sym(n) for n in srcs), key=lambda s: (s.module, s.name))
+        d = p.ix.definition(first) if p.ix.modules.get(first.module) else None
+        at = d if d is not None else p.ix.modules[first.module].tree
+        names = ", ".join(x for x in p.ix.libs.mapped_of(top) if x not in libmap.EXCEPTIONS)
+        e = TranspileError(
+            f"`{first.module}.{first.name}` is translated from the source of {dist.name} {dist.version} (the library "
+            f"map does not cover it), but the map's `{dotted}` is used too ({file}:{line}): the map's objects and the "
+            f"source's do not mix in one binary (an object of one is no instance of the other's classes); use only "
+            f"the map's names of {top} ({names}), or leave the routes reaching its source to Python (--python-side)",
+            at, str(p.ix.modules[first.module].path))
+        p.fn_errors[("libmix", top)] = e
+        for n in srcs:
+            p.edges.setdefault(n, set()).add(("libmix", top))
+
+
+def link_lib_statements(p: "Project") -> None:
+    """The module statements of libraries that did not translate (module_statements): every function, class
+    and global of the library, or of one of its submodules (importing `lib.sub` runs `lib/__init__.py`),
+    reaches their error nodes, so whatever uses the library is refused or moved --python-side with it."""
+    failed = p.__dict__.get("libmod_nodes", {})
+    if not failed:
+        return
+    nodes = set(p.fns) | set(p.fn_errors) | set(p.edges) | {m for v in list(p.edges.values()) for m in v}
+    for n in nodes:
+        sym = node_sym(n)
+        mod = p.ix.modules.get(sym.module) if sym is not None else None
+        if mod is None or mod.lib is None:
+            continue  # the project's own code reaches a library through the library's definitions
+        parts = sym.module.split(".")
+        for i in range(1, len(parts) + 1):
+            for err in failed.get(".".join(parts[:i]), ()):
+                if err != n:
+                    p.edges.setdefault(n, set()).add(err)
+    # a project statement run at startup (`REG.update(lib.table())`) runs whatever it reaches, used or not
+    lib_errs = {id(v) for k, v in p.fn_errors.items() if isinstance(k, tuple) and k and k[0] == "libmod"}
+    of = {name: module for module, _, name in p.__dict__.get("eager", [])}
+    for name in sorted(p.__dict__.get("modst", set())):
+        if name not in of or p.ix.modules[of[name]].lib is not None:
+            continue  # a library's own statements run only when it is used: their errors are its nodes
+        for e in closure_errors(p, ("modst", name)):
+            if id(e) in lib_errs:
+                if not p.collect:
+                    raise e
+                if e not in p.fe.global_errors:
+                    p.fe.global_errors.append(e)
 
 
 def starlette_version(p: "Project") -> tuple[int, int]:
@@ -11628,6 +13179,10 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                         fc.__dict__["app_alias"] = saved
                 fc.emit(f"for __mw in {RT}::routing::take_built() {{ __st.add_middleware(__mw); }}")
                 fc.emit(f"for (__k, __h) in {RT}::routing::take_handlers() {{ __st.exception_handler(&__k, __h)?; }}")
+            elif isinstance(st, ast.Expr) and lib_router_include(fe, module, st.value):
+                # the library's routes come here in Starlette's order: a route `configure(app)` adds after this
+                # point is tried after them, so only Python can answer it (asgi::under_mount)
+                fc.emit(f"{RT}::routing::lib_barrier();")
             elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and stack_node(fe, module, st.value):
                 middleware(fc, module, st.value)
             elif (isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Call)
@@ -11655,7 +13210,8 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                 fc.lines.extend(sub.lines)
                 fc.emit("}")
             else:
-                n = next(n for n in ast.walk(st) if isinstance(n, ast.Call) and stack_node(fe, module, n))
+                # the first call that made the statement relevant (_stack_relevant), whatever its kind
+                n = next(n for n in ast.walk(st) if _stack_call(fe, module, n))
                 raise TranspileError(f"{ast.unparse(n)[:60]} inside `{type(st).__name__}` is not supported "
                                      "(only at the top level of the module or of the app factory, or under an `if`)",
                                      n, p.src(module))
@@ -11824,7 +13380,7 @@ def route_tree(p: "Project", fe: Frontend) -> tuple[str, dict]:
             deco, router = found or ws
             r = fe.routers.get(router) if router else None
             try:
-                path = (r.prefix if r else "") + literal(deco.args[0], str(m.path))
+                path = (r.prefix if r else "") + route_path(deco, str(m.path))
                 pattern = starlette_pattern(path, fn, str(m.path))
             except (TranspileError, IndexError):
                 continue  # the route itself is refused
@@ -11849,18 +13405,19 @@ def route_tree(p: "Project", fe: Frontend) -> tuple[str, dict]:
 
     def owned(owner) -> list[str]:
         out = list(members.get(owner, []))
-        for i, (own, child, call, file, *_) in enumerate(fe.__dict__.get("include_edges", [])):
+        for i, (own, child, call, *_) in enumerate(fe.__dict__.get("include_edges", [])):
             if own != owner:
                 continue
-            prefix = next((k.value.value for k in call.keywords if k.arg == "prefix" and isinstance(k.value, ast.Constant)), "")
+            prefix = next((k.value.value for k in call.keywords if k.arg == "prefix" and isinstance(k.value, ast.Constant)),
+                          fe.__dict__.get("include_prefix", {}).get(id(call), ""))
             # a runtime prefix (settings): its marker, resolved at run time
             prefix = next((f"\x01{j}\x01" for k in call.keywords if k.arg == "prefix"
                            for j, (v, _, _) in enumerate(fe.dyn_prefixes) if v is k.value), prefix)
             node = f"RI_{len(items) + 1}_{i}"
             items.append(f"static {node}: {RT}::routing::Node = {RT}::routing::Node::Included {{ prefix: {rs_marked(prefix)}, "
                          f"router: &{router_def(child)} }};")
-            mod = next((mm.name for mm in fe.index.package_modules() if str(mm.path) == file), "")
-            out.append(((order.get(mod, 0), call.lineno), node))
+            kmod, kline = fe.include_edges[i][7]
+            out.append(((order.get(kmod, 0), *kline), node))
         return [n for _, n in sorted(out, key=lambda x: x[0])]
 
     docs = []
@@ -11933,6 +13490,35 @@ def _conditional(fe: Frontend, e: TranspileError) -> bool:
     return False
 
 
+RELAY_STACK = ("pub fn stack(cx: &Cx) -> std::pin::Pin<Box<dyn std::future::Future<Output = R<dynrt::asgi::Stack>> + Send + '_>> {\n"
+               "    Box::pin(async move {\n        let mut __st = dynrt::asgi::Stack::default();\n"
+               "        dynrt::routing::begin_build();\n        dynrt::routing::end_build();\n        Ok(__st)\n    })\n}")
+
+
+def prepare_relay(fe: Frontend) -> None:
+    """--python-side auto when nothing but the whole application can stay in Python (fallback.py): the binary
+    serves no route and relays every request to PY2AXUM_PYTHON_URL (an empty `mount` prefix: everything is
+    under it), so the Python application's own middlewares, exception handlers and lifespan answer for it. The
+    discovery passes only find the routes' paths (`APP_ROUTES`); their errors are the reason for the relay."""
+    collect = fe.collect
+    fe.collect = True
+    for step in (fe._load_imports, fe._classify, fe._discover_apps, fe._discover_routers):
+        try:
+            step()
+        except TranspileError:
+            pass
+    fe.collect = collect
+    fe._mounts_cache = {}
+    fe.global_errors = []
+    fe.python_side = set()
+    fe.lifespan = None
+    fe.__dict__.pop("root_path", None)
+    fe.relay = True
+    fe.mount_fallback = [""]
+    fe.notes.append("the whole application stays in Python (--python-side auto): every request is relayed to "
+                    "PY2AXUM_PYTHON_URL")
+
+
 def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, gzip=None, collect: bool = False,
                      stream: bool = True) -> Project:
     """Compile every route of the project with the dyn backend and write the Rust crate (`stream=False`:
@@ -11942,16 +13528,34 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     # functions that fail to translate become stubs that raise; the build fails only if a translated
     # route can reach one (below)
     proj.__dict__["defer_fn_errors"] = True
-    for lib in ("httpx", "aiohttp", "uvloop"):
-        v = locked_version(fe.index.root, lib)
+    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt"):
+        # stripe: the installed release when the project locks none (as the conformance fixtures run)
+        v = locked_version(fe.index.root, lib) or (_installed_stripe() if lib == "stripe" else None)
         if v:
             libmap.LIB_VERSIONS[lib] = v
+        else:
+            libmap.LIB_VERSIONS.pop(lib, None)  # a previous project's in the same process
+    from .libsrc import locked as _locked
+    # openpyxl writes through lxml when the project installs it: only its ElementTree writer is translated
+    if lxml := _locked(fe.index.root, "lxml"):
+        libmap.LIB_VERSIONS["lxml"] = lxml
+    else:
+        libmap.LIB_VERSIONS.pop("lxml", None)
+
+    # reportlab's C accelerators and bitmap renderer: their output is not the pure-Python one reproduced
+    for dist in libmap.RL_REFUSED_DISTS:
+        if v := _locked(fe.index.root, dist):
+            libmap.LIB_VERSIONS[dist] = v
+        else:
+            libmap.LIB_VERSIONS.pop(dist, None)
     libmap.set_python(target_python(fe.index.root))
     rb = RouteBuilder(proj)
     routes = []
     idx = 0
     prefix_fns, empty_under = [], {}
-    for i, (value, file, module) in enumerate(fe.dyn_prefixes):
+    # --python-side auto, whole application in Python (fallback.py): no route, stack, lifespan nor module code
+    relay = bool(fe.__dict__.get("relay"))
+    for i, (value, file, module) in enumerate([] if relay else fe.dyn_prefixes):
         name = f"prefix_{i}"
         prefix_fns.append(name)
         proj.cur = ("prefix", i)
@@ -11968,8 +13572,28 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
             proj.fn_errors[("prefix", i)] = e
             proj.items.append(f"async fn {name}(cx: &Cx) -> R {{ unreachable!() }}")
         proj.cur = None
+    cond_fns = []
+    for i, (test, file, module) in enumerate([] if relay else fe.dyn_conds):
+        name = f"route_cond_{i}"
+        cond_fns.append(name)
+        proj.cur = ("cond", i)
+        fc = FnCompiler(proj, module, None, name)
+        try:
+            code = fc.truthy(test)
+            body = "\n".join("    " + l for l in fc.lines)
+            proj.items.append(f"/// `if {ast.unparse(test)}:` around include_router ({Path(file).name}:{test.lineno}), read at startup\n"
+                              f"async fn {name}(cx: &Cx) -> R<bool> {{\n{body}\n    Ok({code})\n}}")
+            proj.drain()
+        except TranspileError as e:
+            if not collect:
+                raise
+            proj.fn_errors[("cond", i)] = e
+            proj.items.append(f"async fn {name}(cx: &Cx) -> R<bool> {{ unreachable!() }}")
+        proj.cur = None
     ws_routes = []
-    for m in fe.index.package_modules():
+    route_keys: dict[int, tuple] = {}
+    route_conds: dict[int, tuple] = {}
+    for m in [] if relay else fe.index.package_modules():
         parents = fe._parents(m.name)
         for fn in ast.walk(m.tree):
             if not isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)):
@@ -11978,6 +13602,15 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                 if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "websocket_route"
                         and not fe._is_app(m.name, d.func.value)):  # the app's is a global error
                     e = TranspileError("@router.websocket_route(...) is not supported: use @router.websocket(...)", d, str(m.path))
+                    if not collect:
+                        raise e
+                    fe.global_errors.append(e)
+                if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in UNTRANSLATED_ROUTE_ATTRS
+                        and (fe._is_app(m.name, d.func.value)
+                             or fe.index.resolve_expr(m.name, d.func.value, frontend_enclosing_fn(fn, parents)) in fe.routers)):
+                    # not a route of the translation: the binary would not serve it at all (404/405 where FastAPI answers)
+                    e = TranspileError(f"route decorator @{ast.unparse(d.func)}(...) is not supported: the binary would not "
+                                       "serve this route; use @app.get/post/put/patch/delete (one per method)", d, str(m.path))
                     if not collect:
                         raise e
                     fe.global_errors.append(e)
@@ -11992,7 +13625,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
             for mt in mounts:
                 idx += 1
                 r = fe.routers.get(router) if router else None
-                path = mt.prefix + (r.prefix if r else "") + literal(deco.args[0], str(m.path))
+                path = mt.prefix + (r.prefix if r else "") + route_path(deco, str(m.path))
                 if fe.shown_path(path) in fe.__dict__.get("python_side", ()):
                     # proxied by its runtime path: a prefix read from the settings stays a marker until startup
                     fe.__dict__.setdefault("python_side_raw", set()).add(path)
@@ -12001,6 +13634,8 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                 rid = ("route", idx)
                 for k in re.findall("\x01(\\d+)\x01", path):
                     proj.edges.setdefault(rid, set()).add(("prefix", int(k)))
+                for k, _ in mt.conds:
+                    proj.edges.setdefault(rid, set()).add(("cond", k))
                 tail = path.rsplit("\x01", 1)[-1] if "\x01" in path else None
                 if tail == "":
                     empty_under.setdefault(int(path.split("\x01")[-2]), fn.name)
@@ -12020,10 +13655,14 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                     if mt.conditional:
                         raise TranspileError("include_router(...) under an `if` is not supported: the binary would "
                                              "serve the route unconditionally", fn, str(m.path))
+                    endpoint_decorators(fe, fn, m, deco)
                     handler, axum_path = rb.route(fn, m.name, path, deco.func.attr, deco, router, mt, idx)
                     proj.cur = None
                     proj.drain()
                     routes.append((deco.func.attr, axum_path, handler, path, fn, m, router))
+                    route_keys[id(routes[-1])] = (*mt.chain, (m.name, (deco.lineno,)))
+                    if mt.conds:
+                        route_conds[id(routes[-1])] = mt.conds
                     proj.__dict__.setdefault("route_infos", []).append((info, None))
                 except TranspileError as e:
                     proj.cur = None
@@ -12031,21 +13670,25 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                         raise
                     proj.errors.append(e)
                     proj.__dict__.setdefault("route_infos", []).append((info, e))
-    engine_globals(proj, fe)
-    module_statements(proj, fe)
-    factory_sentry_init(proj, fe)
+    if not relay:
+        engine_globals(proj, fe)
+        module_statements(proj, fe)
+        link_lib_statements(proj)
+        factory_sentry_init(proj, fe)
     proj.cur = ("stack", 0)
     try:
-        stack = build_stack(proj, fe)
+        stack = RELAY_STACK if relay else build_stack(proj, fe)
     except TranspileError as e:
         if not collect:
             raise
         fe.global_errors.append(e)
         stack = ""
     proj.cur = None
-    mcp_register(proj, fe)
+    if not relay:
+        mcp_register(proj, fe)
     lifespan = lifespan_fn(proj, fe)
     finalize(proj)
+    link_partial_mix(proj)
     if collect:
         # a model holding a union the runtime refuses: its routes are refused (generation would fail)
         bad = union_errors(proj)[0]
@@ -12071,17 +13714,24 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                 for e, td in bad:
                     if td in reach and info.sym not in proj.class_errors:
                         proj.class_errors[info.sym] = e
-        # a middleware that cannot be compiled blocks every route
-        keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
-                                 if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
+        # a middleware that cannot be compiled blocks every route; the lifespan's errors are marked as such
+        # (--python-side auto can leave the lifespan alone to Python: fallback.py)
+        keys = {("stack", 0), ("mcp", 0)} | {k for k in proj.fn_errors
+                                 if isinstance(k, tuple) and k and isinstance(k[0], Sym)
+                                 and any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
                                         for c in proj.__dict__.get("stack_classes", []))}
-        fe.global_errors += closure_errors_of(proj, keys)
+        app_wide = closure_errors_of(proj, keys)
+        fe.global_errors += app_wide
+        fe.global_errors += [scoped(e, "lifespan") for e in closure_errors_of(proj, {("lifespan", 0)})
+                             if all(e is not x for x in app_wide)]
+        fe.__dict__["collected"] = proj
         return proj
     for info, err in proj.__dict__.get("route_infos", []):
         for e in ([err] if err else []) + closure_errors(proj, info["id"]):
             raise e
     stack_keys = {("stack", 0), ("lifespan", 0), ("mcp", 0)} | {k for k in proj.fn_errors
-                                   if any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
+                                   if isinstance(k, tuple) and k and isinstance(k[0], Sym)
+                                 and any(isinstance(c, Sym) and k[0].module == c.module and k[0].name.startswith(c.name + ".")
                                           for c in proj.__dict__.get("stack_classes", []))}
     for e in closure_errors_of(proj, stack_keys):
         raise e
@@ -12100,18 +13750,33 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                   for _, _, g in eager)
         + "}")
 
+    # the routes under an `if` read at startup: served only when every test is on their branch
+    off = []
+    if route_conds:
+        rank = {name: i for i, name in enumerate(import_order(fe))}
+        routes.sort(key=lambda r: tuple((rank.get(mod, 0), ln) for mod, ln in route_keys.get(id(r), ())))
+        for r in routes:
+            c = route_conds.get(id(r), ())
+            off.append("false" if not c else "!(" + " && ".join(f"{'' if b else '!'}__c[{k}]" for k, b in c) + ")")
     proj.items.append(
         "/// The runtime `include_router(prefix=...)` values, read once the module globals are set.\n"
         "pub async fn init_prefixes(cx: &Cx) -> R<()> {\n"
         f"    {RT}::web::set_prefixes(vec![" + "".join(
             f"({f}(cx).await?, {'Some(' + rs(empty_under[i]) + ')' if i in empty_under else 'None'}), "
-            for i, f in enumerate(prefix_fns)) + "])\n}")
+            for i, f in enumerate(prefix_fns)) + "])?;\n"
+        + (f"    let __c: Vec<bool> = vec![{''.join(f'{f}(cx).await?, ' for f in cond_fns)}];\n"
+           f"    {RT}::web::set_disabled(vec![{', '.join(off)}]);\n" if route_conds else "")
+        + "    Ok(())\n}")
     body = emit_descriptors(proj)
     # the project's schema / plain / enum classes, found by name when unpickling
     picklable = sorted({m.group(1) for it in [*proj.items, *body] for m in re.finditer(
         r"pub static (CLS_\w+): [\w:]*Class = [^;]*?ClassKind::(?:Schema|Enum)\(", it)})
     body.append("pub fn register_classes() {\n    " + f"{RT}::pickle::register(&[{', '.join('&' + c for c in picklable)}]);\n}}")
-    # declaration order, as Starlette tries them
+    # registration order, as Starlette tries them: each include_router at its place among its owner's routes
+    # (not the order the modules are walked in: `/items/nested/ping` included before `/items/{id}` wins)
+    if route_keys:
+        rank = {name: i for i, name in enumerate(import_order(fe))}
+        routes.sort(key=lambda r: tuple((rank.get(mod, 0), ln) for mod, ln in route_keys.get(id(r), ())))
     tree, nodes = route_tree(proj, fe)
     proj.items.append(tree)
     route_defs = [f"    {RT}::web::RouteDef {{ method: {rs(method.upper())}, pattern: {rs_marked(pattern)}, run: {handler}, "
@@ -12128,6 +13793,9 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     if any(isinstance(n, (ast.Import, ast.ImportFrom)) and "unicodedata" in ast.unparse(n)
            for m in list(proj.ix.modules.values()) for n in ast.walk(m.tree)):
         proj.items.append(ucd_unassigned(libmap.PYTHON))
+        tables = ucd_tables(proj.items)
+        if tables:
+            proj.items.append(tables)
     proj.items.append(str_classes(libmap.PYTHON))
     proj.items.append(migrations_item(source, fe.index.root))
     gen = [
@@ -12196,17 +13864,28 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                                                          dump_json=b(fastapi_at_least(fe.index.root, (0, 130))),
                                                          pydantic=".".join((locked_version(fe.index.root, "pydantic") or "2.13").split(".")[:2]),
                                                           sentry_sdk=locked_version(fe.index.root, "sentry-sdk") or "2.71.0",
+                                                          stripe=libmap.LIB_VERSIONS.get("stripe", "14.4.1"),
                                                           multipart=b(locked_version(fe.index.root, "python-multipart") is not None),
                                                           python_side=", ".join(rs_marked(x) for x in sorted({x for x in fe.__dict__.get("python_side", ()) if x.startswith("/")}
                                                                                                         | fe.__dict__.get("python_side_raw", set()))),
                                                           mount_fallback=", ".join(rs(x) for x in sorted(set(fe.__dict__.get("mount_fallback", [])))),
                                                           source_root=rs(str(Path(fe.index.root).resolve())),
+                                                          loguru_init=loguru_init(proj),
                                                           sa_major=sa_ver[0], sa_minor=sa_ver[1]))
     (out_dir / "src" / "gen.rs").write_text("\n".join(gen) + "\n")
     if shutil.which("rustfmt"):
         subprocess.run(["rustfmt", "--edition", "2021", str(out_dir / "src" / "gen.rs"), str(out_dir / "src" / "main.rs")], check=False,
                        capture_output=True)
     return proj
+
+
+def loguru_init(proj) -> str:
+    """`import loguru` in the binary: its default handler (the default format, compiled here), when translated code
+    calls the logger"""
+    if not proj.__dict__.get("loguru"):
+        return ""
+    from . import logurufmt
+    return f"dynrt::loguru::init({logurufmt.compile_format(logurufmt.DEFAULT_FORMAT)});"
 
 
 # keyword arguments the runtime implements for these methods (others raise TypeError at run time)
@@ -12368,6 +14047,51 @@ def unicode_of(python: tuple[int, int]) -> str:
     return ucdages.UNICODE.get(python, unicodedata.unidata_version)
 
 
+def ucd_tables(items: list[str]) -> str:
+    """The unicodedata tables the generated code reads (category, bidirectional, name), from the translating
+    Python (libmap._ucd_same checked its Unicode version is the project's): only those referenced."""
+    import re
+    import unicodedata
+
+    used = {n for n in ("UCD_CATEGORY", "UCD_BIDI", "UCD_NAMES", "UCD_DECOMP") if any(f"self::{n}" in it for it in items)}
+    out = []
+
+    def runs(f, skip):
+        r, start, cur = [], None, None
+        for cp in range(0x110001):
+            v = f(chr(cp)) if cp <= 0x10FFFF else None
+            if v != cur:
+                if cur is not None and cur != skip:
+                    r.append(f"({start:#x}, {cp - 1:#x}, {rs(cur)})")
+                start, cur = cp, v
+        return ", ".join(r)
+
+    if "UCD_CATEGORY" in used:
+        out.append(f"pub static UCD_CATEGORY: &[(u32, u32, &str)] = &[{runs(unicodedata.category, 'Cn')}];")
+    if "UCD_BIDI" in used:
+        out.append(f"pub static UCD_BIDI: &[(u32, u32, &str)] = &[{runs(unicodedata.bidirectional, '')}];")
+    if "UCD_DECOMP" in used:
+        pairs = [f"({cp:#x}, {rs(d)})" for cp in range(0x110000) if (d := unicodedata.decomposition(chr(cp)))]
+        out.append(f"pub static UCD_DECOMP: &[(u32, &str)] = &[{', '.join(pairs)}];")
+    if "UCD_NAMES" in used:
+        cps, offs, text, hexes, start, pre = [], [0], [], [], None, None
+        for cp in range(0x110001):
+            nm = unicodedata.name(chr(cp), None) if cp <= 0x10FFFF else None
+            m = re.fullmatch(r"(.*-)([0-9A-F]{4,6})", nm) if nm else None
+            p = m.group(1) if m and int(m.group(2), 16) == cp and len(m.group(2)) == max(4, len(f"{cp:X}")) else None
+            if p != pre:
+                if pre is not None:
+                    hexes.append(f"({start:#x}, {cp - 1:#x}, {rs(pre)})")
+                start, pre = cp, p
+            if nm and p is None:
+                cps.append(str(cp))
+                text.append(nm)
+                offs.append(str(int(offs[-1]) + len(nm)))
+        out.append(f"pub static UCD_NAMES: {RT}::stdlib::UcdNames = {RT}::stdlib::UcdNames {{ cps: &[{', '.join(cps)}], "
+                   f"offs: &[{', '.join(map(str, offs))}], text: {rs(''.join(text))}, hex: &[{', '.join(hexes)}] }};")
+    return "\n".join(out)
+
+
 def ucd_unassigned(python: tuple[int, int]) -> str:
     """The code points unassigned in the project's Python's `unicodedata` (category Cn: the translating
     Python's, plus what a later Unicode assigned, `unassigned_later`): it leaves them alone, while the
@@ -12504,6 +14228,13 @@ def class_level_methods(p: Project, methods, kinds=frozenset({"staticmethod", "c
 
 def _source_order(e: TranspileError):
     return (e.file or "", getattr(e.node, "lineno", 0) or 0, getattr(e.node, "col_offset", 0) or 0, e.msg)
+
+
+def scoped(e: TranspileError, scope: str) -> TranspileError:
+    """Mark a global error with the part of the application it blocks (`"lifespan"`): an unmarked one blocks the
+    whole application (its middleware stack, exception handlers, module code)."""
+    e.__dict__.setdefault("scope", scope)
+    return e
 
 
 def closure_errors_of(p: Project, starts) -> list[TranspileError]:

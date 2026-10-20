@@ -262,8 +262,25 @@ fn exc_line(e: &Exc) -> String {
         Some(m) if m != "builtins" && m != "__main__" && !c.qualname.starts_with(&format!("{m}.")) => format!("{m}.{}", c.qualname),
         _ => c.qualname.to_string(),
     };
-    let msg = super::ops::str_(&V::Exc(e.clone())).unwrap_or_default();
+    // traceback's `_safe_string`: a `__str__` that raises or returns a non-string
+    let mut msg = super::ops::str_(&V::Exc(e.clone())).unwrap_or_else(|_| "<exception str() failed>".to_string());
+    // the name `traceback` suggests for an AttributeError (its `name`/`obj`), computed by the raising code
+    if let Some(V::Str(s)) = e.0.attrs.lock().get("__tb_suggestion__") {
+        msg += &format!(". Did you mean: '{s}'?");
+    }
     if msg.is_empty() { format!("{ty}\n") } else { format!("{ty}: {msg}\n") }
+}
+
+/// `traceback.format_exc()`: the exception being handled as `print_exception` writes it (its chain, project
+/// frames only, as in the logs: docs/advanced/logging.md), "NoneType: None\n" outside an `except`
+pub fn format_exc_now(cx: &Cx, args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() || !kwargs.is_empty() {
+        return Err(Exc::type_error("py2axum: traceback.format_exc(limit=, chain=) is not supported (no arguments)"));
+    }
+    Ok(V::str(match cx.handling.lock().last() {
+        Some(e) => format_exc(e),
+        None => "NoneType: None\n".to_string(),
+    }))
 }
 
 /// `traceback.print_exception(exc)` of a raised exception: its chain (`__cause__`, else `__context__`),
@@ -332,6 +349,10 @@ fn chain(e: &Exc, out: &mut String, seen: &mut Vec<*const ExcObj>) {
     let context = attrs.get("__context__").cloned();
     let suppress = matches!(attrs.get("__suppress_context__"), Some(V::Bool(true)));
     drop(attrs);
+    // TracebackException follows the chain `if exc_value and ...` before Python 3.13 (an exception whose `__bool__`
+    // is false shows alone), `if exc_value is not None and ...` from 3.13
+    let follow = super::python() >= (3, 13) || super::ops::truthy(&V::Exc(e.clone())).unwrap_or(true);
+    let (cause, context) = if follow { (cause, context) } else { (None, None) };
     match (cause, context) {
         (Some(V::Exc(c)), _) if !seen.contains(&Arc::as_ptr(&c.0)) => {
             chain(&c, out, seen);

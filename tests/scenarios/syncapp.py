@@ -101,3 +101,7 @@ def reset(db: str) -> None:
 
 # obj.__dict__ after an INSERT in a synchronous session (fixtures/syncapp/main.py /idict)
 STEPS += [("POST", "/idict", None)]
+
+# another shape of the session dependency (fixtures/syncapp/db.py get_other_db)
+STEPS += [("POST", "/other/authors/oa", None), ("POST", "/other/authors/ob?fail=1", None),
+          ("POST", "/other/authors/oc?fail=2", None)] + [("GET", f"/other/authors/o{x}", None) for x in "abc"]

@@ -77,7 +77,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
         run: |
-          python -m py2axum fixtures/dynapp --root . --backend dyn --python-side mount -o generated/dynapp_axum --name dynapp_axum
+          python -m py2axum fixtures/dynapp --root . --python-side mount -o generated/dynapp_axum --name dynapp_axum
           (cd generated/dynapp_axum && cargo build --release)
           python -c "from tests.scenarios import dynapp; dynapp.reset('$DATABASE_URL')"
           ./scripts_start_dyn.sh
@@ -87,7 +87,7 @@ jobs:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
           BIN: generated/dynapp_axum/target/release/langapp_axum
         run: |
-          python -m py2axum fixtures/langapp --root . --backend dyn --python-side '/dunders/proxied/{name}' -o generated/langapp_axum --name langapp_axum
+          python -m py2axum fixtures/langapp --root . --python-side '/dunders/proxied/{name}' -o generated/langapp_axum --name langapp_axum
           (cd generated/langapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           python -c "from tests.scenarios import langapp; langapp.reset('$DATABASE_URL')"
           ./scripts_start_langapp.sh
@@ -99,7 +99,7 @@ jobs:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
           BIN: generated/dynapp_axum/target/release/integapp_axum
         run: |
-          python -m py2axum fixtures/integapp --root . --backend dyn --python-side mount -o generated/integapp_axum --name integapp_axum
+          python -m py2axum fixtures/integapp --root . --python-side mount -o generated/integapp_axum --name integapp_axum
           (cd generated/integapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           python -c "from tests.scenarios import integapp; integapp.reset('$DATABASE_URL')"
           ./scripts_start_integapp.sh
@@ -109,7 +109,7 @@ jobs:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
           BIN: generated/dynapp_axum/target/release/ormapp_axum
         run: |
-          python -m py2axum fixtures/ormapp --root . --backend dyn -o generated/ormapp_axum --name ormapp_axum
+          python -m py2axum fixtures/ormapp --root . -o generated/ormapp_axum --name ormapp_axum
           (cd generated/ormapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           python -c "from tests.scenarios import ormapp; ormapp.reset('$DATABASE_URL')"
           ./scripts_start_ormapp.sh
@@ -119,7 +119,7 @@ jobs:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
           BIN: generated/dynapp_axum/target/release/queryapp_axum
         run: |
-          python -m py2axum fixtures/queryapp --root . --backend dyn -o generated/queryapp_axum --name queryapp_axum
+          python -m py2axum fixtures/queryapp --root . -o generated/queryapp_axum --name queryapp_axum
           (cd generated/queryapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           python -c "from tests.scenarios import queryapp; queryapp.reset('$DATABASE_URL')"
           ./scripts_start_queryapp.sh
@@ -129,7 +129,7 @@ jobs:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_dyn
           BIN: generated/dynapp_axum/target/release/sqlmodelapp_axum
         run: |
-          python -m py2axum fixtures/sqlmodelapp --root . --backend dyn -o generated/sqlmodelapp_axum --name sqlmodelapp_axum
+          python -m py2axum fixtures/sqlmodelapp --root . -o generated/sqlmodelapp_axum --name sqlmodelapp_axum
           (cd generated/sqlmodelapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           python -c "from tests.scenarios import sqlmodelapp; sqlmodelapp.reset('$DATABASE_URL')"
           ./scripts_start_sqlmodelapp.sh
@@ -138,13 +138,13 @@ jobs:
         env:
           BIN: generated/dynapp_axum/target/release/resolveapp_axum
         run: |
-          python -m py2axum fixtures/resolveapp --root . --backend dyn -o generated/resolveapp_axum --name resolveapp_axum
+          python -m py2axum fixtures/resolveapp --root . -o generated/resolveapp_axum --name resolveapp_axum
           (cd generated/resolveapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           ./scripts_start_resolveapp.sh
           python tests/conformance.py http://127.0.0.1:8520 http://127.0.0.1:8525 --scenario resolveapp
       - name: factoryapp (app factory, middleware stack, exception handlers)
         run: |
-          python -m py2axum fixtures/factoryapp --root . --backend dyn -o generated/factoryapp_axum --name factoryapp_axum
+          python -m py2axum fixtures/factoryapp --root . -o generated/factoryapp_axum --name factoryapp_axum
           (cd generated/factoryapp_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           ./scripts_start_factory.sh
           python tests/conformance.py http://127.0.0.1:8300 http://127.0.0.1:8380 --scenario factoryapp
@@ -162,7 +162,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres@127.0.0.1/py2axum_notes
         run: |
-          python -m py2axum examples/notes/app --root examples/notes --backend dyn -o generated/notes_axum --name notes
+          python -m py2axum examples/notes/app --root examples/notes -o generated/notes_axum --name notes
           (cd generated/notes_axum && CARGO_TARGET_DIR=../dynapp_axum/target cargo build --release)
           python -c "from tests.scenarios import notes; notes.reset('$DATABASE_URL')"
           (cd examples/notes && DATABASE_URL=postgresql+psycopg://postgres@127.0.0.1/py2axum_notes nohup uvicorn app.main:app --port 8500 --log-level warning > /tmp/notes-py.log 2>&1 &)

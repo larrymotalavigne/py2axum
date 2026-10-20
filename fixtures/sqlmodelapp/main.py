@@ -172,3 +172,16 @@ def delete_pilot(pilot_id: int, session: SessionDep):
     session.delete(pilot)
     session.commit()
     return {"ok": True}
+
+
+from . import songs  # noqa: E402  (its table is created by the startup handler above)
+
+app.include_router(songs.router)
+
+from . import heroes  # noqa: E402
+
+app.include_router(heroes.router)
+
+from . import gear  # noqa: E402
+
+app.include_router(gear.router)

@@ -7,7 +7,7 @@ image holds the binary alone.
 
 | Tag | |
 |---|---|
-| `X.Y.Z` | one py2axum release (`0.9.1`); pin this in production builds |
+| `X.Y.Z` | one py2axum release (`0.9.2`); pin this in production builds |
 | `X.Y` | the latest patch release of a minor version (`0.9`) |
 | `latest` | the latest release |
 
@@ -87,7 +87,7 @@ library behaviours follow them. The reference file takes build arguments (`APP_D
 
 ```bash
 docker build -f examples/docker/Dockerfile --build-arg APP_DIR=. --build-arg PACKAGE=api \
-  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.9.1 -t myapp .
+  --build-arg PY2AXUM_IMAGE=ghcr.io/larrymotalavigne/py2axum:0.9.2 -t myapp .
 ```
 
 [`compose.yaml`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/docker/compose.yaml), next to
@@ -123,7 +123,7 @@ Rust versions.
 from a published version or from a checkout:
 
 ```bash
-docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.9.1 -t py2axum .   # a release
+docker build -f docker/Dockerfile --build-arg PY2AXUM=py2axum==0.9.2 -t py2axum .   # a release
 docker build -f docker/Dockerfile --build-arg PY2AXUM=/src -t py2axum .              # this checkout
 ```
 

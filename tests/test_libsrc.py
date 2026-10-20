@@ -161,7 +161,7 @@ def test_framework_never_from_source(tmp_path):
     for name in ("fastapi.routing", "starlette.responses", "pydantic.fields", "sqlalchemy.orm", "json", "yaml",
                  "dateutil.relativedelta", "dateutil"):
         assert ix.native_module(name), name
-    for name in ("humanize", "humanize.number", "slugify.slugify", "dateutil.parser"):
+    for name in ("humanize", "humanize.number", "slugify.slugify", "dateutil.parser", "h11", "certifi"):
         assert not ix.native_module(name), name
 
 
@@ -211,6 +211,31 @@ def test_import_guard_decided_by_the_environment(tmp_path):
     assert gen(tmp_path, pkg, "--translate-libs", "auto") == 0
     rs = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "_guarded_accel_missing" not in rs
+
+
+CYCLIC = {
+    # the package imports itself (structlog's `from structlog import twisted`), and two modules import each other
+    # under a guard: CPython finds the module being imported in sys.modules, partially initialised
+    "cyclib/__init__.py": (
+        "from cyclib.a import double\n\n"
+        "try:\n    from cyclib import extra\nexcept ImportError:\n    extra = None\n"),
+    "cyclib/a.py": (
+        "try:\n    from cyclib import b\nexcept ImportError:\n    b = None\n\n"
+        "try:\n    import _cyclib_accel_missing\n    FAST = True\nexcept ImportError:\n    FAST = False\n\n\n"
+        "def double(x):\n    return b.twice(x) if b is not None and not FAST else -1\n"),
+    "cyclib/b.py": "try:\n    from cyclib import a\nexcept ImportError:\n    a = None\n\n\ndef twice(x):\n    return x * 2\n",
+    "cyclib/extra.py": "def three():\n    return 3\n",
+}
+
+
+def test_import_guard_cycle(tmp_path):
+    """guarded imports that come back to a module being imported (an import cycle) succeed as in CPython: no
+    RecursionError while the guards are decided, and the fallbacks of the imports really missing still run"""
+    make_dist(tmp_path / ".venv", "cyclib", "1.0", CYCLIC)
+    pkg = project(tmp_path, imp="cyclib import double", call="double(n)")
+    assert gen(tmp_path, pkg, "--translate-libs", "auto") == 0
+    rs = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "f_cyclib_a__double" in rs and "f_cyclib_b__twice" in rs and "_cyclib_accel_missing" not in rs
 
 
 LAZY = {
@@ -269,7 +294,129 @@ def test_stdlib_c_accelerator_never_from_source():
     assert "bisect" not in libsrc.STDLIB_SOURCE
 
 
-def test_bisect_stays_refused(tmp_path, capsys):
+def test_bisect_is_native(tmp_path, capsys):
+    """bisect is not translated from Lib/ (CPython runs `_bisect`): the runtime's own bisect answers"""
     pkg = project(tmp_path, imp="bisect import bisect_right", call="bisect_right([1, 2, 3], n)")
+    assert gen(tmp_path, pkg, "--translate-libs", "auto") == 0
+
+
+def test_module_code_refused_moves_the_users(tmp_path, capsys):
+    """Module code of a translated library that does not translate (`sys.meta_path.append(...)` at import): only
+    the routes using the library go --python-side, the binary never runs that module code; without auto, the
+    routes using it are refused (not the whole application)."""
+    files = {"hooklib/__init__.py": "import sys\n\nsys.meta_path.append(None)\n\n\ndef double(x):\n    return x * 2\n"}
+    make_dist(tmp_path / ".venv", "hooklib", "1.0", files)
+    pkg = project(tmp_path, imp="hooklib import double", call="double(n)")
+    (pkg / "main.py").write_text((pkg / "main.py").read_text() + "\n\n@app.get('/ok')\nasync def ok():\n    return 1\n")
     assert gen(tmp_path, pkg, "--translate-libs", "auto") == 1
-    assert "bisect_right" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "hooklib/__init__.py:3: module-level statement not translated" in err
+    assert gen(tmp_path, pkg, "--translate-libs", "auto", "--python-side", "auto") == 0
+    err = capsys.readouterr().err
+    assert "python-side (auto): /x/{n} (GET x) — " in err and "hooklib/__init__.py:3" in err
+    assert "/ok" not in err.split("generated")[0]
+    rs = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "hooklib" not in rs
+
+
+# a library the library map covers in part (`aiosmtplib.send`, `aiosmtplib.SMTPException`), installed as source
+SMTPLIB = {
+    "aiosmtplib/__init__.py": "from .errors import SMTPException, SMTPConnectError\nfrom .api import send\n"
+                              "from .smtp import SMTP\n",
+    "aiosmtplib/errors.py": "class SMTPException(Exception):\n    pass\n\n\nclass SMTPConnectError(SMTPException):\n"
+                            "    pass\n",
+    "aiosmtplib/api.py": "async def send(*args, **kwargs):\n    raise RuntimeError('source read')\n",
+    "aiosmtplib/smtp.py": "from .errors import SMTPConnectError\n\n\nclass SMTP:\n    def __init__(self, hostname=None):\n"
+                          "        self.hostname = hostname\n\n    def fail(self):\n"
+                          "        raise SMTPConnectError(self.hostname)\n",
+}
+SMTP_ROUTE = """
+
+@app.get("/smtp/{h}")
+async def smtp(h: str):
+    s = aiosmtplib.SMTP(hostname=h)
+    try:
+        s.fail()
+    except aiosmtplib.SMTPException as e:
+        return {"host": s.hostname, "err": type(e).__name__}
+"""
+SEND_ROUTE = """
+
+@app.get("/send")
+async def send():
+    await aiosmtplib.send("x", hostname="127.0.0.1", port=1)
+    return 1
+"""
+
+
+def smtp_project(tmp_path, *routes):
+    make_dist(tmp_path / ".venv", "aiosmtplib", "5.0.0", SMTPLIB)
+    pkg = project(tmp_path, imp="fastapi import Query\nimport aiosmtplib", call="n")
+    (pkg / "main.py").write_text((pkg / "main.py").read_text() + "".join(routes))
+    return pkg
+
+
+def test_partly_mapped_library_reads_the_rest_from_source(tmp_path, capsys):
+    """`aiosmtplib.SMTP` is not in the library map, `aiosmtplib.send` and `SMTPException` are: SMTP is translated
+    from the source, whose `SMTPConnectError` derives from the map's SMTPException (the `except` of the project
+    catches it, as in Python); `send` is never read from the source."""
+    pkg = smtp_project(tmp_path, SMTP_ROUTE)
+    assert gen(tmp_path, pkg, "--translate-libs", "auto") == 0, capsys.readouterr().err
+    rs = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "f_aiosmtplib_smtp__SMTP" in rs and "source read" not in rs
+    assert "bases: &[&dynrt::v::SMTP_EXCEPTION]" in rs
+    # without --translate-libs: the library map's refusal, as before
+    libsrc.configure("none")
+    assert gen(tmp_path, pkg) == 1
+    assert "library call `aiosmtplib.SMTP()` is not supported (not in the py2axum library map)" in capsys.readouterr().err
+
+
+def test_partly_mapped_library_refused_with_its_licence(tmp_path, capsys):
+    make_dist(tmp_path / ".venv", "aiosmtplib", "5.0.0", SMTPLIB, licence="GPL-3.0-only")
+    pkg = project(tmp_path, imp="fastapi import Query\nimport aiosmtplib", call="n")
+    (pkg / "main.py").write_text((pkg / "main.py").read_text() + SMTP_ROUTE)
+    assert gen(tmp_path, pkg, "--translate-libs", "auto") == 1
+    err = capsys.readouterr().err
+    assert "error[P2A0701]" in err and "aiosmtplib.SMTP()" in err and "has licence GPL-3.0-only" in err, err
+
+
+def test_partly_mapped_library_never_mixed(tmp_path, capsys):
+    """The map's `send` and the source's `SMTP` in one binary: refused (their objects do not mix); with
+    --python-side auto the route reaching the source goes to Python, the one using the map stays native."""
+    pkg = smtp_project(tmp_path, SMTP_ROUTE, SEND_ROUTE)
+    assert gen(tmp_path, pkg, "--translate-libs", "auto") == 1
+    err = capsys.readouterr().err
+    assert "error[P2A0705]" in err and "the map's `aiosmtplib.send` is used too" in err, err
+    assert gen(tmp_path, pkg, "--translate-libs", "auto", "--python-side", "auto") == 0
+    err = capsys.readouterr().err
+    assert "python-side (auto): /smtp/{h} (GET smtp)" in err and "/send" not in err.split("generated")[0], err
+    rs = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "smtp_send" in rs and "f_aiosmtplib_smtp__SMTP" not in rs
+    # the map's names only: native, the source untouched
+    (tmp_path / "b").mkdir()
+    pkg = smtp_project(tmp_path / "b", SEND_ROUTE)
+    assert gen(tmp_path / "b", pkg, "--translate-libs", "auto") == 0, capsys.readouterr().err
+
+
+MW = """
+
+class Stamp:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(Stamp)
+"""
+
+
+def test_partly_mapped_library_mixed_with_a_middleware_class(tmp_path, capsys):
+    """the refusal of the mix (an error keyed by the library, not by a function) next to a middleware class of
+    the project: the routes reaching the source go to Python, no exception while the stack's errors are collected"""
+    pkg = smtp_project(tmp_path, SMTP_ROUTE, SEND_ROUTE)
+    (pkg / "main.py").write_text((pkg / "main.py").read_text() + MW)
+    assert gen(tmp_path, pkg, "--translate-libs", "auto", "--python-side", "auto") == 0, capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "python-side (auto): /smtp/{h} (GET smtp)" in err, err

@@ -57,6 +57,9 @@ pub fn truthy(v: &V) -> R<bool> {
     if let Some(r) = super::proto::truthy(v) {
         return r;
     }
+    if let Some(s) = super::pgpy::as_str(v) {
+        return truthy(&s);
+    }
     if let Some(t) = seq_tuple(v) {
         return truthy(&t);
     }
@@ -76,8 +79,11 @@ pub fn truthy(v: &V) -> R<bool> {
         V::Bytes(b) => !b.is_empty(),
         V::List(l) => !l.lock().is_empty(),
         V::Tuple(t) => !t.is_empty(),
-        V::Dict(d) => !d.lock().is_empty(),
-        V::Set(s) => !s.lock().is_empty(),
+        V::Dict(d) => match super::stripe::list_data(d) {
+            Some(data) => return truthy(&data),
+            None => !d.lock().is_empty(),
+        },
+        V::Set(s) | V::Frozen(s) => !s.lock().is_empty(),
         V::Delta(d) => !d.is_zero(),
         V::Native(n) if matches!(&**n, Native::RelDelta(_)) => match &**n {
             Native::RelDelta(r) => super::reldelta::truthy(r),
@@ -90,7 +96,7 @@ pub fn truthy(v: &V) -> R<bool> {
         V::Sql(_) | V::Col(..) => {
             return Err(Exc::type_error("Boolean value of this clause is not defined"))
         }
-        V::Native(n) if matches!(&**n, Native::Deque(_) | Native::EmailMsg(_) | Native::DnsAnswer(_)) => len(v)? > 0,
+        V::Native(n) if matches!(&**n, Native::Deque(_) | Native::Array(_) | Native::EmailMsg(_) | Native::DnsAnswer(_)) => len(v)? > 0,
         _ => true,
     })
 }
@@ -173,6 +179,12 @@ pub fn add(a: &V, b: &V) -> R {
     if let Some(r) = super::proto::binop(a, "+", b) {
         return r;
     }
+    if let Some(s) = super::pgpy::as_str(a) {
+        return add(&s, b);
+    }
+    if let Some(s) = super::pgpy::as_str(b) {
+        return add(a, &s);
+    }
     if let Some(r) = counter_binop(a, "+", b) {
         return r;
     }
@@ -246,10 +258,10 @@ pub fn sub(a: &V, b: &V) -> R {
         // date.__sub__: `self + timedelta(-other.days)`
         (V::Date(d), V::Delta(t)) => V::Date(date_plus_days(*d, -td_days(t))?),
         (V::Delta(x), V::Delta(y)) => V::Delta(*x - *y),
-        (V::Set(x), V::Set(y)) => {
+        (V::Set(x) | V::Frozen(x), V::Set(y) | V::Frozen(y)) => {
             let y = y.lock();
             let m: IndexMap<Key, V> = x.lock().iter().filter(|(k, _)| !y.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
-            V::Set(Arc::new(Mutex::new(m)))
+            set_like(a, m)
         }
         _ => match (int_of(a), int_of(b)) {
             (Some(x), Some(y)) => V::Int(x.checked_sub(y).ok_or_else(overflow)?),
@@ -510,12 +522,12 @@ pub fn bitor(a: &V, b: &V) -> R {
             }
             V::Dict(Arc::new(Mutex::new(m)))
         }
-        (V::Set(x), V::Set(y)) => {
+        (V::Set(x) | V::Frozen(x), V::Set(y) | V::Frozen(y)) => {
             let mut m = x.lock().clone();
             for (k, v) in y.lock().iter() {
                 m.entry(k.clone()).or_insert_with(|| v.clone());
             }
-            V::Set(Arc::new(Mutex::new(m)))
+            set_like(a, m)
         }
         _ => match (int_of(a), int_of(b)) {
             (Some(x), Some(y)) => V::Int(x | y),
@@ -558,6 +570,12 @@ pub fn pow(a: &V, b: &V) -> R {
     Ok(V::Float(r))
 }
 
+/// the result of a set operator is the left operand's type (`frozenset | set` is a frozenset, `set | frozenset` a set)
+fn set_like(like: &V, m: IndexMap<Key, V>) -> V {
+    let m = Arc::new(Mutex::new(m));
+    if matches!(like, V::Frozen(_)) { V::Frozen(m) } else { V::Set(m) }
+}
+
 pub fn bitxor(a: &V, b: &V) -> R {
     if let Some(r) = super::proto::binop(a, "^", b) {
         return r;
@@ -584,6 +602,12 @@ pub fn bitxor(a: &V, b: &V) -> R {
     }
     match (a, b) {
         (V::Bool(x), V::Bool(y)) => Ok(V::Bool(x ^ y)),
+        (V::Set(x) | V::Frozen(x), V::Set(y) | V::Frozen(y)) => {
+            let (x, y) = (x.lock().clone(), y.lock().clone());
+            let mut m: IndexMap<Key, V> = x.iter().filter(|(k, _)| !y.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+            m.extend(y.iter().filter(|(k, _)| !x.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())));
+            Ok(set_like(a, m))
+        }
         _ => match (int_of(a), int_of(b)) {
             (Some(x), Some(y)) => Ok(V::Int(x ^ y)),
             _ => Err(unsupported("^", a, b)),
@@ -631,10 +655,10 @@ pub fn bitand(a: &V, b: &V) -> R {
     }
     Ok(match (a, b) {
         (V::Bool(x), V::Bool(y)) => V::Bool(*x & *y),
-        (V::Set(x), V::Set(y)) => {
+        (V::Set(x) | V::Frozen(x), V::Set(y) | V::Frozen(y)) => {
             let y = y.lock();
             let m: IndexMap<Key, V> = x.lock().iter().filter(|(k, _)| y.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
-            V::Set(Arc::new(Mutex::new(m)))
+            set_like(a, m)
         }
         _ => match (int_of(a), int_of(b)) {
             (Some(x), Some(y)) => V::Int(x & y),
@@ -659,7 +683,22 @@ pub fn invert(a: &V) -> R {
 // ---------------------------------------------------------------- comparisons
 
 pub fn eq_bool(a: &V, b: &V) -> bool {
+    if let Some(r) = super::pgpy::eq_hook(a, b) {
+        return r;
+    }
+    // Starlette's URL.__eq__: the other side as its str (a URL or a str)
+    let url_text = |v: &V| match v {
+        V::Native(n) if matches!(&**n, Native::Url(_)) => str_(v).ok(),
+        V::Str(s) => Some(s.to_string()),
+        _ => None,
+    };
+    if matches!(a, V::Native(n) if matches!(&**n, Native::Url(_))) || matches!(b, V::Native(n) if matches!(&**n, Native::Url(_))) {
+        return matches!((url_text(a), url_text(b)), (Some(x), Some(y)) if x == y);
+    }
     if let (V::Native(x), V::Native(y)) = (a, b) {
+        if let (Native::Array(p), Native::Array(q)) = (&**x, &**y) {
+            return super::arr::eq(p, q);
+        }
         if let (Native::DnsName(p), Native::DnsName(q)) = (&**x, &**y) {
             return p == q;
         }
@@ -736,7 +775,10 @@ pub fn eq_bool(a: &V, b: &V) -> bool {
             let (x, y) = (x.lock().clone(), y.lock().clone());
             x.len() == y.len() && x.iter().all(|(k, (_, v))| y.get(k).map(|(_, w)| eq_bool(v, w)).unwrap_or(false))
         }
-        (V::Set(x), V::Set(y)) => {
+        (V::Set(x) | V::Frozen(x), V::Set(y) | V::Frozen(y)) => {
+            if Arc::ptr_eq(x, y) {
+                return true;
+            }
             let (x, y) = (x.lock(), y.lock());
             x.len() == y.len() && x.keys().all(|k| y.contains_key(k))
         }
@@ -815,6 +857,12 @@ pub fn ne(a: &V, b: &V) -> R {
 }
 
 pub fn cmp(a: &V, b: &V) -> R<std::cmp::Ordering> {
+    if let Some(s) = super::pgpy::as_str(a) {
+        return cmp(&s, b);
+    }
+    if let Some(s) = super::pgpy::as_str(b) {
+        return cmp(a, &s);
+    }
     if let Some(t) = seq_tuple(a) {
         return cmp(&t, b);
     }
@@ -897,7 +945,25 @@ macro_rules! cmp_op {
             if is_sql(a) || is_sql(b) {
                 return orm::sql_cmp(a, $sql, b);
             }
-            Ok(V::Bool(matches!(cmp(a, b)?, $pat)))
+            // sets: the subset relations (a partial order: not a three-way comparison)
+            if let (V::Set(x) | V::Frozen(x), V::Set(y) | V::Frozen(y)) = (a, b) {
+                let (x, y) = (x.lock(), y.lock());
+                let sub = |p: &IndexMap<Key, V>, q: &IndexMap<Key, V>| p.keys().all(|k| q.contains_key(k));
+                return Ok(V::Bool(match $sql {
+                    "<" => x.len() < y.len() && sub(&x, &y),
+                    "<=" => sub(&x, &y),
+                    ">" => x.len() > y.len() && sub(&y, &x),
+                    _ => sub(&y, &x),
+                }));
+            }
+            match cmp(a, b) {
+                Ok(o) => Ok(V::Bool(matches!(o, $pat))),
+                // cmp's TypeError names `<` (the order sorted() asks for): this operator's in its place
+                Err(e) if $sql != "<" && e.isinstance(&TYPE_ERROR) && e.message().starts_with("'<' not supported between") => {
+                    Err(Exc::type_error(format!("'{}'{}", $sql, &e.message()[3..])))
+                }
+                Err(e) => Err(e),
+            }
         }
     };
 }
@@ -908,6 +974,9 @@ cmp_op!(ge, ">=", std::cmp::Ordering::Greater | std::cmp::Ordering::Equal);
 
 pub fn is(a: &V, b: &V) -> bool {
     match (a, b) {
+        // the application object is one object (`request.app is request.scope["app"]`)
+        (V::Native(x), V::Native(y)) if matches!((&**x, &**y), (Native::Routing(p), Native::Routing(q))
+            if matches!(**p, super::routing::RObj::App) && matches!(**q, super::routing::RObj::App)) => true,
         (V::None, V::None) => true,
         (V::Bool(x), V::Bool(y)) => x == y,
         (V::Int(x), V::Int(y)) => x == y && (-5..=256).contains(x),
@@ -942,6 +1011,12 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
     if let Some(r) = super::proto::contains(container, item) {
         return r;
     }
+    if let Some(s) = super::pgpy::as_str(container) {
+        return contains(&s, item);
+    }
+    if let (V::Str(_), Some(s)) = (container, super::pgpy::as_str(item)) {
+        return contains(container, &s);
+    }
     if let Some(t) = seq_tuple(container) {
         return contains(&t, item);
     }
@@ -954,6 +1029,9 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
         }
         if let Native::CtCache(c) = &**n {
             return super::ctools::contains(c, item);
+        }
+        if let Native::Rl(x) = &**n {
+            return super::rlbind::contains(x, item);
         }
     }
     Ok(match container {
@@ -971,11 +1049,12 @@ pub fn contains(container: &V, item: &V) -> R<bool> {
         V::List(l) => l.lock().clone().iter().any(|x| eq_bool(x, item)),
         V::Tuple(t) => t.iter().any(|x| eq_bool(x, item)),
         V::Dict(d) => d.lock().contains_key(&Key::dict_key(item)?),
-        V::Set(s) => s.lock().contains_key(&Key::set_elem(item)?),
+        V::Set(s) | V::Frozen(s) => s.lock().contains_key(&Key::set_elem(item)?),
         V::Session(s) => s.contains(item)?,
         V::Native(n) => match &**n {
             Native::SaColumns(t) => super::satable::contains(t, item)?,
             Native::Deque(d) => super::deque::items(d).iter().any(|x| eq_bool(x, item)),
+            Native::Array(a) => super::arr::items(a).iter().any(|x| eq_bool(x, item)),
             Native::IpNet(a, l) => super::net::contains(&(*a, *l), item),
             Native::RespHeaders(r) => super::resp::headers_contains(&r.headers, item)?,
             Native::CellHeaders(c) => super::resp::headers_contains(&c.headers, item)?,
@@ -1090,6 +1169,13 @@ pub fn dunder(v: &V, name: &str) -> Option<super::pyd::MethodFn> {
     let methods = match v {
         V::Inst(i) => i.desc.methods,
         V::Obj(o) => o.desc.methods,
+        // a project exception's own or inherited method (`__str__`, `__repr__`, `__bool__`)
+        V::Exc(e) => {
+            return match e.0.class.exc_lookup(name) {
+                Some(super::v::ExcMember::Method(false, f)) => Some(f),
+                _ => None,
+            };
+        }
         _ => return None,
     };
     methods.iter().find(|(n, prop, _)| *n == name && !prop).map(|(_, _, f)| *f)
@@ -1126,6 +1212,9 @@ fn dunder_text(v: &V, names: &[&str]) -> Option<R<String>> {
         if let Some(f) = dunder(v, name) {
             return Some(call_dunder(f, v, vec![], name).and_then(|r| match r {
                 V::Str(s) => Ok(s.to_string()),
+                // 3.15 names the type (module included) and the method: `C.__str__() must return a str, not int`
+                other if super::python() >= (3, 15) => Err(Exc::type_error(format!(
+                    "{}.{name}() must return a str, not {}", super::proto::qualified(v), other.type_name()))),
                 other => Err(Exc::type_error(format!("{name} returned non-string (type {})", other.type_name()))),
             }));
         }
@@ -1145,6 +1234,12 @@ pub fn eq_r(a: &V, b: &V) -> R<bool> {
 }
 
 pub fn str_(v: &V) -> R<String> {
+    if let Some(r) = super::stripe::str_hook(v) {
+        return r;
+    }
+    if let Some(r) = super::pgpy::str_hook(v) {
+        return r;
+    }
     // the text of a type expression depends on the Python (3.14 writes `Union[int, str]` as `int | str`) and
     // on the modules of its classes: refused rather than approximated
     if matches!(v, V::Native(n) if matches!(&**n, Native::TypeExpr(..))) {
@@ -1159,7 +1254,12 @@ pub fn str_(v: &V) -> R<String> {
             return dunder_text(v, &["__str__"]).unwrap_or_else(|| i.str_());
         }
     }
-    if let Some(r) = dunder_text(v, &["__str__", "__repr__"]) {
+    if let V::Exc(_) = v {
+        // BaseException.__str__ is always there: a project `__repr__` alone does not make the text
+        if let Some(r) = dunder_text(v, &["__str__"]) {
+            return r;
+        }
+    } else if let Some(r) = dunder_text(v, &["__str__", "__repr__"]) {
         return r;
     }
     if let V::Decimal(d) = v {
@@ -1191,6 +1291,9 @@ pub fn str_(v: &V) -> R<String> {
             // Starlette's request.url: scheme://Host header + path (+ ?query)
             let q = if r.raw_query.is_empty() { String::new() } else { format!("?{}", r.raw_query) };
             return Ok(format!("{}{}{q}", request_origin(r), r.path));
+        }
+        if let Native::Proc(p) = &**n {
+            return Ok(super::subproc::repr(p));
         }
         if let Native::IpAddr(a) = &**n {
             return Ok(super::net::addr_str(a));
@@ -1263,6 +1366,12 @@ pub fn addr(p: usize) -> String {
 }
 
 pub fn repr(v: &V) -> R<String> {
+    if let Some(r) = super::stripe::repr_hook(v) {
+        return r;
+    }
+    if let Some(r) = super::pgpy::repr_hook(v) {
+        return r;
+    }
     // the text of a type expression depends on the Python (3.14 writes `Union[int, str]` as `int | str`) and
     // on the modules of its classes: refused rather than approximated
     if matches!(v, V::Native(n) if matches!(&**n, Native::TypeExpr(..))) {
@@ -1298,6 +1407,11 @@ pub fn repr(v: &V) -> R<String> {
     if let Some(r) = dunder_text(v, &["__repr__"]) {
         return r;
     }
+    if let V::Native(n) = v {
+        if let Native::Proc(p) = &**n {
+            return Ok(super::subproc::repr(p));
+        }
+    }
     if let V::Decimal(d) = v {
         return Ok(format!("Decimal('{d}')"));
     }
@@ -1310,6 +1424,9 @@ pub fn repr(v: &V) -> R<String> {
         }
         if let Native::Deque(d) = &**n {
             return super::deque::repr(d);
+        }
+        if let Native::Array(a) = &**n {
+            return super::arr::repr(a);
         }
         if let Native::DnsRdata(d) = &**n {
             return Ok(super::dnsres::rdata_repr(d));
@@ -1377,6 +1494,14 @@ pub fn repr(v: &V) -> R<String> {
                 format!("{{{}}}", items.values().map(repr).collect::<R<Vec<_>>>()?.join(", "))
             }
         }
+        V::Frozen(s) => {
+            let items = s.lock().clone();
+            if items.is_empty() {
+                "frozenset()".into()
+            } else {
+                format!("frozenset({{{}}})", items.values().map(repr).collect::<R<Vec<_>>>()?.join(", "))
+            }
+        }
         V::DateTime(d) => dt::datetime_repr(d),
         V::Date(d) => {
             use chrono::Datelike;
@@ -1391,6 +1516,10 @@ pub fn repr(v: &V) -> R<String> {
             _ => format!("<class '{}'>", c.qualname),
         },
         V::Native(n) if matches!(&**n, Native::AmqpQueue(_) | Native::AmqpExchange(_) | Native::AmqpFrame(..) | Native::AmqpIter(_)) => super::rmq::repr(n)?,
+        V::Native(n) if matches!(&**n, Native::TempDir(_)) => match &**n {
+            Native::TempDir(t) => super::pathio::tempdir_repr(t),
+            _ => unreachable!(),
+        },
         V::Native(n) if matches!(&**n, Native::AFuture(_)) => match &**n {
             Native::AFuture(f) => super::aio::future_repr(f)?,
             _ => unreachable!(),
@@ -1405,8 +1534,37 @@ pub fn repr(v: &V) -> R<String> {
             _ => unreachable!(),
         },
         V::Exc(e) if super::duparse::parser_error_repr(e).is_some() => super::duparse::parser_error_repr(e).unwrap(),
-        V::Exc(e) => format!("{}({})", e.0.class.name, e.args().iter().map(repr).collect::<R<Vec<_>>>()?.join(", ")),
+        // pydantic-core's ValidationError: `repr()` is its `str()` (title line, errors, links)
+        V::Exc(e) if e.0.errors.is_some() && !e.isinstance(&VALIDATION_EXCEPTION)
+            && matches!(e.0.attrs.lock().get("title"), Some(V::Str(_))) => e.base_message(),
+        V::Exc(e) => match super::stripe::exc_repr(e) {
+            Some(r) => r,
+            None => format!("{}({})", e.0.class.name, e.args().iter().map(repr).collect::<R<Vec<_>>>()?.join(", ")),
+        },
         V::Inst(i) => i.repr()?,
+        V::Native(n) if matches!(&**n, Native::Url(_)) => format!("URL({})", str_repr(&str_(v)?)),
+        V::Native(n) if matches!(&**n, Native::Address(..)) => match &**n {
+            Native::Address(h, p) => format!("Address(host={}, port={p})", str_repr(h)),
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::HttpReq(_)) => match &**n {
+            Native::HttpReq(r) => format!("<Request({}, {})>", str_repr(&r.0), str_repr(&r.1)),
+            _ => unreachable!(),
+        },
+        V::Native(n) if matches!(&**n, Native::Headers(_)) => match &**n {
+            Native::Headers(r) => {
+                // Starlette: `Headers({...})` of the items, `Headers(raw=[...])` when a name repeats
+                let mut seen = std::collections::HashSet::new();
+                if r.headers.iter().all(|(k, _)| seen.insert(k.to_lowercase())) {
+                    let parts = r.headers.iter().map(|(k, x)| format!("{}: {}", str_repr(&k.to_lowercase()), str_repr(x))).collect::<Vec<_>>();
+                    format!("Headers({{{}}})", parts.join(", "))
+                } else {
+                    let parts = r.headers.iter().map(|(k, x)| format!("(b{}, b{})", str_repr(&k.to_lowercase()), str_repr(x))).collect::<Vec<_>>();
+                    format!("Headers(raw=[{}])", parts.join(", "))
+                }
+            }
+            _ => unreachable!(),
+        },
         V::Native(n) if matches!(&**n, Native::Path(_) | Native::Uuid(_) | Native::Upload(_) | Native::Secret(_) | Native::Fraction(_) | Native::Complex(..)) => match &**n {
             Native::Path(p) => format!("PosixPath({})", str_repr(p)),
             Native::Secret(s) => format!("SecretStr('{}')", if s.is_empty() { "" } else { "**********" }),
@@ -1492,9 +1650,23 @@ fn fmt_general_none(x: f64, prec: usize) -> String {
     if s.ends_with('.') { format!("{s}0") } else if s.contains('.') { s } else { format!("{s}.0") }
 }
 
+/// `f"{x}"`: `format(x, '')`, which is `str(x)` but for a type with its own `__format__` (pgpy's PGPUID)
+pub fn format_empty(v: &V) -> R<String> {
+    if let Some(r) = super::pgpy::format_hook(v) {
+        return r;
+    }
+    str_(v)
+}
+
 pub fn format_spec(v: &V, spec: &str) -> R<String> {
     if let V::Decimal(d) = v {
         return super::decimal::format(d, spec);
+    }
+    if let Some(r) = super::pgpy::format_hook(v) {
+        return r;
+    }
+    if let Some(s) = super::pgpy::as_str(v) {
+        return format_spec(&s, spec);
     }
     if spec.is_empty() {
         return str_(v);
@@ -1988,6 +2160,9 @@ pub fn getslice(v: &V, start: &V, stop: &V, step: &V) -> R {
     if let Some(t) = seq_tuple(v) {
         return getslice(&t, start, stop, step);
     }
+    if let Some(s) = super::pgpy::as_str(v) {
+        return getslice(&s, start, stop, step);
+    }
     Ok(match v {
         V::Str(s) => {
             let cs: Vec<char> = s.chars().collect();
@@ -2208,6 +2383,9 @@ pub fn getitem(v: &V, k: &V) -> R {
     if let Some(r) = super::proto::getitem(v, k) {
         return r;
     }
+    if let Some(s) = super::pgpy::as_str(v) {
+        return getitem(&s, k);
+    }
     if let Some(t) = seq_tuple(v) {
         return getitem(&t, k);
     }
@@ -2217,6 +2395,8 @@ pub fn getitem(v: &V, k: &V) -> R {
             Native::SaColumns(t) => return super::satable::getitem(t, k),
             Native::Mime(m) => return super::mail::mime_getitem(m, k),
             Native::EmailMsg(m) => return super::emailmsg::getitem(m, k),
+            Native::Xl(x) => return super::xlsx::getitem(x, k),
+            Native::Rl(x) => return super::rlbind::getitem(x, k),
             Native::DnsAnswer(a) => {
                 let items = super::dnsres::answer_items(a);
                 if a.rrset.is_none() {
@@ -2230,6 +2410,7 @@ pub fn getitem(v: &V, k: &V) -> R {
                 };
             }
             Native::Deque(d) => return super::deque::getitem(d, k),
+            Native::Array(a) => return super::arr::getitem(a, k),
             Native::RespHeaders(r) => return super::resp::headers_getitem(&r.headers, k),
             Native::CellHeaders(c) => return super::resp::headers_getitem(&c.headers, k),
             Native::Headers(r) => {
@@ -2268,10 +2449,14 @@ pub fn getitem(v: &V, k: &V) -> R {
             norm_index(i, cs.len()).map(|j| V::str(cs[j].to_string())).ok_or_else(|| Exc::msg(&INDEX_ERROR, "string index out of range"))?
         }
         V::Dict(d) => {
+            if let Some(e) = super::stripe::list_getitem(d, k) {
+                return Err(e);
+            }
             let key = Key::dict_key(k)?;
             let found = d.lock().get(&key).map(|(_, v)| v.clone());
             match found {
                 Some(v) => v,
+                None if super::stripe::missing_key(d, k).is_some() => return Err(super::stripe::missing_key(d, k).unwrap()),
                 None => match default_factory(d) {
                     // Counter.__missing__: 0, not stored
                     Some("Counter") => V::Int(0),
@@ -2307,8 +2492,10 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
         match &**n {
             Native::CtCache(c) => return super::ctools::setitem(c, k, val),
             Native::Deque(d) => return super::deque::setitem(d, k, val),
+            Native::Array(a) => return super::arr::setitem(a, k, val),
             Native::Mime(m) => return super::mail::mime_setitem(m, k, &val),
             Native::EmailMsg(m) => return super::emailmsg::setitem(m, k, &val),
+            Native::Xl(x) => return super::xlsx::setitem(x, k, val),
             Native::JinjaFilters(j) => return super::mail::add_filter(j, k, val),
             Native::RespHeaders(r) => return super::resp::headers_setitem(&r.headers, k, &val),
             Native::CellHeaders(c) => return super::resp::headers_setitem(&c.headers, k, &val),
@@ -2324,6 +2511,7 @@ pub fn setitem(v: &V, k: &V, val: V) -> R<()> {
             l[j] = val;
         }
         V::Dict(d) => {
+            super::stripe::setitem_check(v, k, &val)?;
             dict_put(&mut d.lock(), Key::dict_key(k)?, k.clone(), val);
         }
         _ => return Err(Exc::type_error(format!("'{}' object does not support item assignment", v.type_name()))),
@@ -2372,6 +2560,9 @@ pub fn iter(v: &V) -> R<Vec<V>> {
     if let Some(r) = super::proto::iter_all(v) {
         return r;
     }
+    if let Some(s) = super::pgpy::as_str(v) {
+        return iter(&s);
+    }
     if let Some(t) = seq_tuple(v) {
         return iter(&t);
     }
@@ -2379,12 +2570,18 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         if let Native::CtCache(c) = &**n {
             return Ok(super::ctools::iter(c));
         }
+        if let Native::Xl(x) = &**n {
+            return super::xlsx::iter(x);
+        }
     }
     Ok(match v {
         V::List(l) => l.lock().clone(),
         V::Tuple(t) => t.to_vec(),
-        V::Dict(d) => d.lock().values().map(|(k, _)| k.clone()).collect(),
-        V::Set(s) => s.lock().values().cloned().collect(),
+        V::Dict(d) => match super::stripe::list_data(d) {
+            Some(data) => return iter(&data),
+            None => d.lock().values().map(|(k, _)| k.clone()).collect(),
+        },
+        V::Set(s) | V::Frozen(s) => s.lock().values().cloned().collect(),
         V::Str(s) => s.chars().map(|c| V::str(c.to_string())).collect(),
         V::Bytes(b) => b.iter().map(|x| V::Int(*x as i64)).collect(),
         V::Result(r) => r.lock().take_rows()?,
@@ -2398,6 +2595,10 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         },
         V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => super::deque::items(d),
+            _ => vec![],
+        },
+        V::Native(n) if matches!(&**n, Native::Array(_)) => match &**n {
+            Native::Array(a) => super::arr::items(a),
             _ => vec![],
         },
         V::Native(n) if matches!(&**n, Native::SaColumns(_)) => match &**n {
@@ -2432,7 +2633,9 @@ pub fn iter(v: &V) -> R<Vec<V>> {
         V::Native(n) if matches!(&**n, Native::Cron(_)) => {
             return Err(Exc::type_error("py2axum: iterating a croniter object is not supported (endless): call get_next() or next() on it"))
         }
-        V::Native(n) if matches!(&**n, Native::UrlParts(_) | Native::Record(..)) => match &**n {
+        V::Native(n) if matches!(&**n, Native::UrlParts(_) | Native::Record(..) | Native::Headers(_) | Native::Address(..)) => match &**n {
+            Native::Headers(r) => r.headers.iter().map(|(k, _)| V::str(k.to_lowercase())).collect(),
+            Native::Address(h, p) => vec![V::str(h), V::Int(*p as i64)],
             Native::UrlParts(u) => super::stdlib::url_parts_tuple(u),
             Native::Record(_, f) => f.iter().map(|(_, x)| x.clone()).collect(),
             _ => unreachable!(),
@@ -2450,19 +2653,28 @@ pub fn len(v: &V) -> R<usize> {
     if let Some(r) = super::proto::len(v) {
         return r;
     }
+    if let Some(s) = super::pgpy::as_str(v) {
+        return len(&s);
+    }
     if let Some(t) = seq_tuple(v) {
         return len(&t);
     }
     if let V::Native(n) = v {
-        if let Native::CtCache(c) = &**n {
-            return super::ctools::len(c);
+        match &**n {
+            Native::CtCache(c) => return super::ctools::len(c),
+            Native::Headers(r) => return Ok(r.headers.len()),
+            Native::Address(..) => return Ok(2),
+            _ => {}
         }
     }
     Ok(match v {
         V::List(l) => l.lock().len(),
         V::Tuple(t) => t.len(),
-        V::Dict(d) => d.lock().len(),
-        V::Set(s) => s.lock().len(),
+        V::Dict(d) => match super::stripe::list_data(d) {
+            Some(data) => return len(&data),
+            None => d.lock().len(),
+        },
+        V::Set(s) | V::Frozen(s) => s.lock().len(),
         V::Str(s) => s.chars().count(),
         V::Bytes(b) => b.len(),
         V::Class(c) => match c.kind {
@@ -2476,6 +2688,10 @@ pub fn len(v: &V) -> R<usize> {
         },
         V::Native(n) if matches!(&**n, Native::Deque(_)) => match &**n {
             Native::Deque(d) => d.items.lock().len(),
+            _ => 0,
+        },
+        V::Native(n) if matches!(&**n, Native::Array(_)) => match &**n {
+            Native::Array(a) => a.items.lock().len(),
             _ => 0,
         },
         V::Native(n) if matches!(&**n, Native::EmailMsg(_)) => match &**n {

@@ -17,6 +17,8 @@ from tests.test_report import write_project
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "tests" / "contract" / "public.json"
 SCHEMA = ROOT / "docs" / "reference" / "check-schema.json"
+HELP = ROOT / "tests" / "contract" / "help.json"
+SCHEMA_SNAPSHOT = ROOT / "tests" / "contract" / "check-schema.json"
 # read by the runtime but not configuration of py2axum: the stand-in of socket.getfqdn() in Message-ID
 NOT_CONFIG = {"HOSTNAME"}
 
@@ -75,6 +77,21 @@ def current() -> dict:
     }
 
 
+def help_texts() -> dict:
+    """What `--help` says, from the parsers' own structure rather than argparse's rendering (which differs between
+    Python 3.12 and 3.15): the description and, per option, its flags, metavar and help text."""
+    from py2axum.__main__ import parser as generate
+    from py2axum.check import parser as check
+    from py2axum.watch import parser as watch
+
+    out = {}
+    for name, ap in (("py2axum", generate()), ("py2axum check", check()), ("py2axum watch", watch())):
+        out[name] = {"description": ap.description,
+                     "arguments": [{"flags": list(a.option_strings) or [a.dest], "help": a.help}
+                                   for a in ap._actions if type(a).__name__ != "_HelpAction"]}
+    return out
+
+
 def snapshot() -> dict:
     return json.loads(SNAPSHOT.read_text())
 
@@ -88,6 +105,8 @@ def test_update_snapshot_when_asked():
     new["retired_error_codes"] = sorted(set(old.get("retired_error_codes", [])) | set(gone))
     SNAPSHOT.parent.mkdir(exist_ok=True)
     SNAPSHOT.write_text(json.dumps(new, indent=1, ensure_ascii=False) + "\n")
+    HELP.write_text(json.dumps(help_texts(), indent=1, ensure_ascii=False) + "\n")
+    SCHEMA_SNAPSHOT.write_text(SCHEMA.read_text())
 
 
 MSG = ("public contract changed (docs/reference/versioning.md): if intended, UPDATE_CONTRACT=1 python -m pytest "
@@ -97,6 +116,30 @@ MSG = ("public contract changed (docs/reference/versioning.md): if intended, UPD
 @pytest.mark.parametrize("command", ["py2axum", "py2axum check", "py2axum watch"])
 def test_command_lines_are_frozen(command):
     assert current()["cli"][command] == snapshot()["cli"][command], MSG
+
+
+def test_help_texts_are_frozen():
+    """The wording of `--help` is documentation, but a changed sentence should be a decision, not an accident."""
+    assert help_texts() == json.loads(HELP.read_text()), MSG
+
+
+@pytest.mark.parametrize("args", [[], ["check"], ["watch"]])
+def test_help_runs_and_lists_every_option(args, capsys):
+    with pytest.raises(SystemExit) as stop:
+        main([*args, "--help"])
+    assert stop.value.code == 0
+    text = capsys.readouterr().out
+    name = "py2axum" + "".join(f" {a}" for a in args)
+    # a hidden option (help=SUPPRESS: `--report`, an internal tool) is not listed
+    shown = [a for a in help_texts()[name]["arguments"] if a["help"] != "==SUPPRESS=="]
+    assert all(f in text for a in shown for f in a["flags"] if f.startswith("-"))
+    assert "--backend" not in text and "--report" not in text
+
+
+def test_check_schema_is_frozen():
+    """The published schema of `check --format json` changes only on purpose (an addition is a minor release, a
+    removal, a rename or a retyping a major one)."""
+    assert json.loads(SCHEMA.read_text()) == json.loads(SCHEMA_SNAPSHOT.read_text()), MSG
 
 
 def test_binary_options_are_frozen():
@@ -198,3 +241,16 @@ def test_schema_lists_exactly_the_keys_emitted():
         if "items" in s:
             walk(s["items"], where + "[]")
     walk(schema)
+
+
+def test_stability_table_names_existing_elements():
+    """Every flag or variable the stability table of versioning.md names exists (no stale or misspelled entry)."""
+    text = (ROOT / "docs/reference/versioning.md").read_text()
+    table = text[text.index("**Stability of each element.**"):text.index("## What is not")]
+    flags = {f for cmd in snapshot()["cli"].values() for a in cmd for f in a["flags"]}
+    names = {*re.findall(r"`(--?[a-z][a-z-]*)", table), *re.findall(r"`(--?[a-z][a-z-]*)`", table)}
+    assert names and names <= flags | {"--help", "--log-level", "--backend"}  # --backend: removed, named as such, sorted(names - flags)
+    env = set(snapshot()["environment"])
+    vars_ = set(re.findall(r"`([A-Z][A-Z0-9_]{3,})`", table))
+    vars_ = {v for v in vars_ if "_" in v}
+    assert {v for v in vars_ if not v.endswith("*")} <= env | {"PY2AXUM_RECORD*"}, sorted(vars_ - env)

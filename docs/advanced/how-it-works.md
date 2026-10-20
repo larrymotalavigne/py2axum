@@ -119,9 +119,14 @@ Rules:
 
 - A path moves as a whole: if `GET /items/{id}` translates but `DELETE /items/{id}` does not, both are served
   by Python. The binary relays by path, and Python serving a route is always correct.
-- Errors about the whole application (an unsupported middleware, `FastAPI(lifespan=...)`, an app option) are
-  not moved: generation stops on them, with `file:line`. Declare `--python-side lifespan` explicitly: a
-  lifespan left to Python does not run in the binary, which is a decision only you can make.
+- A refusal in the module code of a library translated from source (`--translate-libs`) moves the routes
+  that use the library; the binary then never runs that library's module code.
+- A lifespan (or `@app.on_event` handlers) that does not translate runs in the Python process alone when no
+  translated code reads what it sets in the process; a route that reads it moves too. Errors about the whole
+  application (an unsupported middleware or exception handler, an app option, module code of the project)
+  leave the whole application to Python: the binary relays every request. See
+  [Hybrid mode § What auto leaves to Python](../getting-started/hybrid.md#what-auto-leaves-to-python).
+  Without `auto`, all of these stop the generation with `file:line`.
 - The list follows the code: a route that becomes translatable after a py2axum upgrade moves to the binary on
   the next build. Pin the list with explicit `--python-side PATH` flags (or check `--report` in CI) if you
   want deployments to change only when you decide.

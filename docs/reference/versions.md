@@ -12,7 +12,7 @@ conformance suites run on. CI runs the test suite and the full conformance of th
 | starlette | 1.0.0 | 1.7.0 | `>=1.0.0,<1.8` |
 | pydantic | 2.12.0 | 2.14.0 | `>=2.12.0,<2.15` |
 | pydantic-core | 2.41.1 | 2.50.0 | `>=2.41.1,<2.51` |
-| pydantic-settings | 2.11.0 | 2.15.0 | `>=2.11.0,<2.16` |
+| pydantic-settings | 2.11.0 | 2.16.0 | `>=2.11.0,<2.17` |
 | sqlalchemy | 2.0.44 | 2.1.4 | `>=2.0.44,<2.2` |
 | psycopg | 3.2.12 | 3.3.6 | `>=3.2.12,<3.4` |
 | httpx | 0.28.1 | 0.28.1 | `>=0.28.1,<0.29` |
@@ -20,7 +20,7 @@ conformance suites run on. CI runs the test suite and the full conformance of th
 | mcp | 2.2.0 | 2.2.0 | `>=2.2.0,<2.3` |
 | asyncpg | 0.31.0 | 0.32.0 | `>=0.31.0,<0.33` |
 | icalendar | 7.0.0 | 7.0.0 | `>=7.0.0,<7.1` |
-| orjson | 3.13.0 | 3.13.0 | `>=3.13.0,<3.14` |
+| orjson | 3.12.0 | 3.13.0 | `>=3.12.0,<3.14` |
 | unidecode | 1.4.0 | 1.4.0 | `>=1.4.0,<1.5` |
 | ecs-logging | 2.3.0 | 2.3.0 | `>=2.3.0,<2.4` |
 | pyyaml | 6.0.2 | 6.0.3 | `>=6.0.2,<6.1` |
@@ -30,16 +30,46 @@ conformance suites run on. CI runs the test suite and the full conformance of th
 | pytz | 2026.5 | 2026.5 | `>=2026.5,<2026.6` |
 | python-dateutil | 2.9.0 | 2.9.0.post0 | `>=2.9.0,<2.10` |
 | cachetools | 7.2.2 | 7.2.2 | `>=7.2.2,<7.3` |
+| stripe | 14.0.0 | 14.4.1 | `>=14.0.0,<14.5` |
+| openpyxl | 3.1.5 | 3.1.5 | `>=3.1.5,<3.2` |
+| et-xmlfile | 2.0.0 | 2.0.0 | `>=2.0.0,<2.1` |
+| pgpy | 0.6.0 | 0.6.0 | `>=0.6.0,<0.7` |
+| pyasn1 | 0.6.4 | 0.6.4 | `>=0.6.4,<0.7` |
+| cryptography | 50.0.2 | 50.0.2 | `>=50.0.2,<51` |
+| reportlab | 4.4.5 | 4.4.5 | `>=4.4.5,<4.4.6` |
+| qrcode | 8.2 | 8.2 | `>=8.2,<8.3` |
+| pillow | 12.3.0 | 12.3.0 | `>=12.3.0,<12.4` |
+| loguru | 0.7.2 | 0.7.3 | `>=0.7.2,<0.8` |
+| bcrypt | 4.3.0 | 5.0.0 | `>=4.3.0,<5.1` |
+| passlib | 1.7.4 | 1.7.4 | `>=1.7.4,<1.8` |
 | Python | 3.12 | 3.15 | `>=3.12,<3.16` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;
 `asyncpg` the same way, by the conformance of a real application served with that driver (0.31.0 and 0.32.0),
-and `icalendar` by a real application's calendar export. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
+and `icalendar` by a real application's calendar export. `pgpy`, `pyasn1` and `cryptography` are checked only when the project imports pgpy, and covered by
+`fixtures/pgpyapp` (the inputs measured on pgpy 0.6.0 with pyasn1 0.6.4 and cryptography 50.0.2: pyasn1 decodes the
+curve OIDs, cryptography's deprecated ciphers are touched by the parsing of a protected secret key). `qrcode` and `pillow` are checked only when the project imports qrcode: the PNG is the one of Pillow's PyPI wheels, whose zlib differs by platform: zlib 1.3.1 in the Linux (manylinux) wheels, zlib-ng (2.3.3 in 12.3.0's) in the macOS ones; the binary compresses as the wheels of the platform it is built for. A Pillow built against another zlib compresses differently. Patch releases inside a range are accepted without being tested one by one. Behaviours that change
 inside a range follow the project's version: CPython's messages and behaviours (3.14 names the role of an
 unhashable dict key or set element and the expected input of a `math` domain error; the full list, from 3.12 to
 3.15, is in [Python versions](../python-versions.md)), Pydantic's (see below), Starlette's `CORSMiddleware`. The project's version is the one of its `uv.lock`, else its `==` pin in `requirements*.txt`
 or `pyproject.toml`, else the one installed next to py2axum (when the project's specifier allows it; otherwise
 the highest tested version the specifier allows).
+
+## Out of scope for 1.0
+
+These are other frameworks, not older versions of the ones py2axum reproduces, and a project that locks one of them is
+refused ([P2A0601](errors.md#p2a0601)) whatever the options:
+
+- **Starlette 0.x** (below 1.0): the hooks, routing, form parsing and response classes changed at 1.0. FastAPI versions
+  that require it are out with it.
+- **Pydantic 1**: another validation engine and other messages.
+- **SQLAlchemy 1.4**: the 1.x `Session` and `Query` semantics; 2.0 is the floor.
+- **Python below 3.12**.
+
+Inside the supported majors, the ranges above are widened only with proof: a version is added when the conformance
+suites run on it and its differences from the neighbouring versions are reproduced (or refused), never by relaxing the
+check. `--allow-untested-versions` translates a project outside the ranges at your own risk; `py2axum check` then lists the
+constructs of the project that are known to differ between versions.
 
 Pydantic behaviours that follow the project's minor version:
 

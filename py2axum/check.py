@@ -34,7 +34,7 @@ _DECLARED_RAW = re.compile(r"^(?P<where>.+?:\d+): .* — (?P<path>\S+) declared 
 ALTERNATIVES = {
     "requests": "httpx.AsyncClient or aiohttp.ClientSession (both native)",
     "urllib3": "httpx.AsyncClient or aiohttp.ClientSession (both native)",
-    "passlib": "bcrypt or pwdlib (both native, same hashes)",
+    "passlib": "CryptContext(schemes=[\"bcrypt\"], deprecated=\"auto\") (native), bcrypt or pwdlib",
     "orjson": "json (native; same output with separators=(',', ':'))",
     "ujson": "json (native)",
     "simplejson": "json (native)",
@@ -79,12 +79,12 @@ def python_target(root: Path) -> dict:
     return {"version": f"{major}.{minor}" + (f".{patch}" if patch is not None else ""), "probed": probed}
 
 
-def run(package: Path, root: Path | None, python_side: list[str], backend: str = "auto",
+def run(package: Path, root: Path | None, python_side: list[str],
         allow_untested: bool = False) -> dict:
     side = set(python_side)
     auto = "auto" in side
     side.discard("auto")
-    result = {"package": str(package), "backend": "dyn", "python_side_auto": auto, "routes": [], "global": [],
+    result = {"package": str(package), "python_side_auto": auto, "routes": [], "global": [],
               "notes": [], "python": python_target(root or package.resolve().parent)}
     codes: dict[str, str] = {}  # construction label -> error code
     if not allow_untested:
@@ -102,16 +102,33 @@ def run(package: Path, root: Path | None, python_side: list[str], backend: str =
         # the whole application, at its file:line, as the generation does
         _global(result, e)
         return _summarise(result, codes)
-    for e in fe.global_errors:
-        _global(result, e)
+    pl = None
+    if auto:
+        from .fallback import plan
+
+        pl = plan(fe, per_route)
+        for e in pl.refused:
+            _global(result, e)
+        if pl.whole is not None:
+            result["notes"].append(f"python-side (auto): the whole application — {pl.whole.render()} [{pl.whole.code}]: "
+                                   "the binary relays every request to PY2AXUM_PYTHON_URL")
+        elif pl.lifespan is not None:
+            result["notes"].append(f"python-side (auto): lifespan — {pl.lifespan.render()} [{pl.lifespan.code}]")
+    else:
+        for e in fe.global_errors:
+            _global(result, e)
     if getattr(fe, "libstats", None):
         result["libraries"] = [{"name": st.name, "version": st.version, "licence": st.licence,
                                 "functions_translated": len(st.ok), "functions_refused": len(st.refused),
                                 "lines": st.lines, "gen_rs_mb": round(st.gen_mb, 2), "peak_gib": round(st.peak_gib, 2),
                                 "refused": [{"function": f, "code": c, "error": m} for f, c, m in st.refused]}
                                for st in fe.libstats]
-    moving = auto and not fe.global_errors
+    moving = auto and not pl.refused
     for info, errs in per_route:
+        if moving and not errs:
+            # left to Python although it translates: the whole application is, or it reads what the lifespan sets
+            why = pl.whole if pl.whole is not None else pl.routes.get(info["path"], (None, None))[1]
+            errs = [why] if why is not None else []
         rr = RouteReport(info["method"].upper(), info["path"], info["func"], f"{info['file']}:{info['line']}",
                          info["conditional"], "native")
         rr.code = rr.suggestion = None
@@ -319,7 +336,8 @@ def parser():
     ap = argparse.ArgumentParser(prog="py2axum check", description=__doc__.splitlines()[0])
     ap.add_argument("package", type=Path, nargs="?", help="directory of the FastAPI application package")
     ap.add_argument("--root", type=Path, default=None, help="import root, like sys.path (default: parent of the package)")
-    ap.add_argument("--backend", choices=["auto", "dyn"], default="auto", help="deprecated, no effect (one backend since 0.4)")
+    ap.add_argument("--path", type=Path, action="append", default=[], metavar="DIR",
+                    help="experimental: one more import root, like an extra sys.path entry (repeatable): the sibling packages of a monorepo the application installs from its own checkout")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="as for generation: routes or the lifespan left to Python; auto: every route that does not translate")
     ap.add_argument("--format", choices=["text", "json", "markdown"], default=None,
@@ -340,17 +358,17 @@ def parser():
 
 
 def main(argv: list[str]) -> int:
+    from .__main__ import removed_backend
     from .versions import apply_python_flag
 
+    if removed_backend(argv):
+        return 2
     ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
     from .libsrc import apply_flags
 
     apply_flags(args)
-    from .__main__ import deprecated_backend
-
-    deprecated_backend(argv)
     if args.explain is not None:
         text = errors.explain(args.explain)
         if text is None:
@@ -362,8 +380,11 @@ def main(argv: list[str]) -> int:
         ap.error("the package directory is required (or --explain CODE)")
     if not args.package.is_dir():
         ap.error(f"{args.package} is not a directory")
+    from .modules import set_extra_roots
+
+    set_extra_roots(args.path)
     fmt = args.format or ("json" if args.json else "text")
-    result = run(args.package, args.root, args.python_side, args.backend, args.allow_untested_versions)
+    result = run(args.package, args.root, args.python_side, args.allow_untested_versions)
     s = result["summary"]
     below = args.fail_under is not None and s["native_pct"] < args.fail_under
     if fmt == "json":

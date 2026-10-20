@@ -63,11 +63,14 @@ python tests/conformance.py http://127.0.0.1:8200 http://127.0.0.1:8280 --scenar
 
 ## Pull requests
 
+Record each user-visible change as a fragment, `changelog.d/<subject>.<added|changed|fixed|security>.md` (see
+`tools/changelog.py`); do not edit `[Unreleased]` in `CHANGELOG.md` directly.
 Keep them focused, describe the Python behaviour you reproduce (with the library version), and include the
 conformance result. By contributing you agree that your contribution is licensed under the Apache License 2.0.
 
 ## Releasing
 
-1. Update `version` in `pyproject.toml` and `CHANGELOG.md`; tag `vX.Y.Z` and create the GitHub release.
+1. Run `python tools/changelog.py assemble` (merges the `changelog.d/` fragments under `[Unreleased]`), cut the section to the new
+   version, `python tools/changelog.py stamp`; update `version` in `pyproject.toml`; tag `vX.Y.Z` and create the GitHub release.
 2. Run the **Publish to PyPI** workflow on that tag (Trusted Publishing: the PyPI project's trusted
    publisher names this repository, `release.yml` and the `pypi` environment).

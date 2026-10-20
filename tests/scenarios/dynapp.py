@@ -469,6 +469,10 @@ STEPS: list = [
     ("GET", "/mail/build", None),
     ("GET", "/mail/build?to=j%C3%B6hn%40ex%C3%A4mple.com", None),
     ("GET", "/mail/build?to=J%C3%B6hn%20%3Cjohn%40example.com%3E", None),
+    *[("GET", f"/mail/build?subject={s}", None) for s in (
+        "D%C3%A9claration%20revenus%20fonciers%202025%20%E2%80%94%20Ana%C3%AFs%20Lef%C3%A8vre-Dupr%C3%A9",
+        "%E2%82%AC" * 40, "a%20b%20c%20%C3%A9" * 30, "ligne%20une%20%C3%A9%0Aligne%20deux")],
+    ("GET", "/mail/build?name=" + "%C3%89quipe%20Easy%20" * 8, None),
     ("POST", "/mail/send?to=nobody@example.com", None),
     ("POST", "/mail/send?to=nobody@example.com&envelope=true", None),  # no SMTP server in the scenario: the error path
     ("POST", "/stdlib", {"text": "<LOC> https://a.fr/x </loc><loc>b</loc> le 05/10/2026 et 31/12/1999"}),
@@ -581,6 +585,8 @@ STEPS: list = [
     ("GET", "/enumcols/2/short", None),
     ("GET", "/enumcols/2/validate", None),
     ("GET", "/enumcols/3/str", None),
+    # a session maker wrapper's sessions take its engine's connect_args (fixtures/dynapp/makerwrap.py)
+    ("GET", "/mkw/settings", None),
     ("POST", "/ddl/fresh", None),
     ("POST", "/ddl/readings", None),
     ("POST", "/ddl/again", None),
@@ -879,3 +885,13 @@ for _body in (b'{"j":"5"}', b'{"j":"[1]"}', b'{"j":5}'):
 # the runtime answers model_attributes_type, FastAPI's from_attributes=True rule, where pydantic says model_type)
 for _body in (b'{"point":5}', b'{"mapping":[]}', b'{"delay":true}', b'{"amount":1.0}'):
     STEPS.append(("POST", "/reqbody/mvj/python", _body, _JSON))
+
+# other shapes of the session dependency (fixtures/dynapp/sessforms.py): commit after the endpoint, nothing left by
+# an HTTPException or an unhandled exception raised after a flush
+STEPS += [
+    ("POST", "/sessf/assigned/sf-a", None), ("POST", "/sessf/assigned/sf-b?fail=1", None),
+    ("POST", "/sessf/assigned/sf-c?fail=2", None), ("POST", "/sessf/factory/sf-d", None),
+    ("POST", "/sessf/factory/sf-e?fail=1", None), ("POST", "/sessf/manager/sf-f", None),
+    ("POST", "/sessf/manager/sf-g?fail=1", None), ("POST", "/sessf/late/sf-h", None), ("POST", "/sessf/late/sf-i?fail=1", None),
+    ("POST", "/smsess/owners/sf-j", None), ("POST", "/smsess/owners/sf-k?fail=1", None),
+] + [("GET", f"/sessf/count/sf-{x}", None) for x in "abcdefghijk"]

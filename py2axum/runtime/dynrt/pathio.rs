@@ -55,6 +55,27 @@ pub fn path_new(args: &[V]) -> R {
     Ok(path(&p))
 }
 
+/// `Path.cwd()` (a Path) and `os.getcwd()` (a str): the process's current directory, as CPython's getcwd(3)
+/// (FileNotFoundError when it was removed, without a filename)
+pub fn cwd(as_path: bool) -> R {
+    let d = std::env::current_dir().map_err(|e| {
+        let full = os_err(e, "");
+        let (errno, text) = {
+            let a = full.0.attrs.lock();
+            (a.get("errno").cloned().unwrap_or(V::Int(0)), a.get("strerror").cloned().unwrap_or(V::str("")))
+        };
+        let exc = Exc::msg(full.0.class, format!("[Errno {}] {}", ops::str_(&errno).unwrap_or_default(), ops::str_(&text).unwrap_or_default()));
+        {
+            let mut a = exc.0.attrs.lock();
+            a.insert("errno".into(), errno);
+            a.insert("strerror".into(), text);
+        }
+        exc
+    })?;
+    let d = d.to_string_lossy().to_string();
+    Ok(if as_path { path(&d) } else { V::str(&d) })
+}
+
 /// `a / b` with a Path on either side
 pub fn truediv(a: &V, b: &V) -> Option<R> {
     let is_path = |v: &V| matches!(v, V::Native(n) if matches!(&**n, Native::Path(_)));
@@ -105,6 +126,7 @@ pub fn os_err(e: std::io::Error, p: &str) -> Exc {
         (Some(17), _) | (None, AlreadyExists) => (&FILE_EXISTS_ERROR, 17, "File exists".into()),
         (Some(13), _) | (None, PermissionDenied) => (&PERMISSION_ERROR, 13, "Permission denied".into()),
         (Some(21), _) | (None, IsADirectory) => (&IS_A_DIRECTORY_ERROR, 21, "Is a directory".into()),
+        (Some(20), _) | (None, NotADirectory) => (&NOT_A_DIRECTORY_ERROR, 20, "Not a directory".into()),
         (Some(n), _) => {
             // the C library's message, as os.strerror (std appends " (os error n)")
             let s = e.to_string();
@@ -351,6 +373,245 @@ pub struct File {
     path: String,
     binary: bool,
     f: Mutex<Option<std::fs::File>>,
+    // tempfile.NamedTemporaryFile(delete=True): removed when closed (or dropped)
+    delete: bool,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        if self.delete && self.f.lock().take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// `f.name`: the path it was opened with
+pub fn file_name(f: &File) -> V {
+    V::str(&f.path)
+}
+
+/// tempfile.gettempdir(): $TMPDIR, $TEMP, $TMP, then /tmp, /var/tmp, /usr/tmp, the working directory: the first
+/// one a file can be created in (tempfile._get_default_tempdir), made absolute
+pub fn gettempdir() -> R<String> {
+    static DIR: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    let r = DIR.get_or_init(|| {
+        let mut cands: Vec<String> = ["TMPDIR", "TEMP", "TMP"].iter().filter_map(|k| std::env::var(k).ok()).filter(|v| !v.is_empty()).collect();
+        cands.extend(["/tmp", "/var/tmp", "/usr/tmp"].iter().map(|s| s.to_string()));
+        if let Ok(c) = std::env::current_dir() {
+            cands.push(c.to_string_lossy().to_string());
+        }
+        for d in cands {
+            let abs = if d.starts_with('/') { d.clone() } else { join(&std::env::current_dir().map(|c| c.to_string_lossy().to_string()).unwrap_or_default(), &d) };
+            let abs = super::stdlib::normpath(&abs);
+            let probe = join(&abs, &format!("tmp{}", random_name()));
+            if std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return Ok(abs);
+            }
+        }
+        Err("No usable temporary directory found".to_string())
+    });
+    r.clone().map_err(|m| Exc::msg(&FILE_NOT_FOUND_ERROR, m))
+}
+
+fn random_name() -> String {
+    use rand::Rng;
+    const C: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
+    let mut r = rand::thread_rng();
+    (0..8).map(|_| C[r.gen_range(0..C.len())] as char).collect()
+}
+
+/// `tempfile.NamedTemporaryFile(mode="w+b", suffix=None, prefix=None, dir=None, delete=True)`: a new file
+/// (O_EXCL, 0o600) named prefix + 8 random characters + suffix, open for reading and writing
+pub fn named_temporary(args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error("py2axum: NamedTemporaryFile() takes keyword arguments only"));
+    }
+    let s = |k: &str| -> R<Option<String>> {
+        match kw(kwargs, k) {
+            None | Some(V::None) => Ok(None),
+            Some(V::Str(x)) => Ok(Some(x.to_string())),
+            Some(o) => Err(Exc::type_error(format!("py2axum: NamedTemporaryFile({k}=) of type {}", o.type_name()))),
+        }
+    };
+    let mode = s("mode")?.unwrap_or_else(|| "w+b".into());
+    let binary = mode.contains('b');
+    let base: String = mode.chars().filter(|c| *c != 'b' && *c != 't').collect();
+    if !matches!(base.as_str(), "w+" | "w") {
+        return Err(Exc::type_error(format!("py2axum: NamedTemporaryFile(mode={mode:?}) is not supported (w, w+)")));
+    }
+    let delete = match kw(kwargs, "delete") {
+        None => true,
+        Some(v) => ops::truthy(v)?,
+    };
+    let dir = match s("dir")? {
+        Some(d) => d,
+        None => gettempdir()?,
+    };
+    let (prefix, suffix) = (s("prefix")?.unwrap_or_else(|| "tmp".into()), s("suffix")?.unwrap_or_default());
+    for _ in 0..10000 {
+        let p = join(&dir, &format!("{prefix}{}{suffix}", random_name()));
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        match o.open(&p) {
+            Ok(f) => return Ok(V::native(Native::File(File { path: p, binary, f: Mutex::new(Some(f)), delete }))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(os_err(e, &p)),
+        }
+    }
+    Err(Exc::msg(&FILE_EXISTS_ERROR, "No usable temporary file name found"))
+}
+
+// ---------------------------------------------------------------- tempfile.TemporaryDirectory
+
+/// `tempfile.TemporaryDirectory()`: a directory made by `mkdtemp`, removed with its content by `cleanup()`, at
+/// the end of its `with` block (`delete=True`) or when the object goes (its weakref finalizer)
+pub struct TempDir {
+    name: String,
+    delete: bool,
+    ignore_errors: bool,
+    /// the finalizer was detached (cleanup() ran once)
+    detached: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // `_cleanup`, the finalizer: its ResourceWarning is ignored by the default filters
+        if self.delete && !self.detached.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = rmtree(&self.name, true);
+        }
+    }
+}
+
+/// `TemporaryDirectory._rmtree`: shutil.rmtree, whose PermissionError is answered by making the entries
+/// writable again and retrying; a missing entry is no error.
+fn rmtree(name: &str, ignore_errors: bool) -> R<()> {
+    match std::fs::remove_dir_all(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            #[cfg(unix)]
+            fn reset(p: &std::path::Path) {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(m) = std::fs::symlink_metadata(p) {
+                    if m.is_dir() {
+                        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+                        if let Ok(rd) = std::fs::read_dir(p) {
+                            for e in rd.flatten() {
+                                reset(&e.path());
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(unix)]
+            reset(std::path::Path::new(name));
+            match std::fs::remove_dir_all(name) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) if ignore_errors => {
+                    let _ = e;
+                    Ok(())
+                }
+                Err(e) => Err(os_err(e, name)),
+            }
+        }
+        Err(_) if ignore_errors => Ok(()),
+        Err(e) => Err(os_err(e, name)),
+    }
+}
+
+/// `tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None, ignore_cleanup_errors=False, *, delete=True)`
+pub fn temporary_directory(args: &[V], kwargs: &[(String, V)]) -> R {
+    const P: [&str; 4] = ["suffix", "prefix", "dir", "ignore_cleanup_errors"];
+    if args.len() > 4 {
+        return Err(Exc::type_error(format!("TemporaryDirectory.__init__() takes from 1 to 5 positional arguments but {} were given", args.len() + 1)));
+    }
+    let get = |i: usize, k: &str| args.get(i).or_else(|| kw(kwargs, k));
+    let s = |i: usize, k: &str| -> R<Option<String>> {
+        match get(i, k) {
+            None | Some(V::None) => Ok(None),
+            Some(V::Str(x)) => Ok(Some(x.to_string())),
+            Some(o) => Err(Exc::type_error(format!("py2axum: TemporaryDirectory({k}=) of type {}", o.type_name()))),
+        }
+    };
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !P.contains(&k.as_str()) && k != "delete") {
+        return Err(Exc::type_error(format!("TemporaryDirectory.__init__() got an unexpected keyword argument '{k}'")));
+    }
+    let (suffix, prefix) = (s(0, "suffix")?.unwrap_or_default(), s(1, "prefix")?.unwrap_or_else(|| "tmp".into()));
+    let dir = match s(2, "dir")? {
+        Some(d) => d,
+        None => gettempdir()?,
+    };
+    let ignore_errors = match get(3, "ignore_cleanup_errors") {
+        None => false,
+        Some(v) => ops::truthy(v)?,
+    };
+    let delete = match kw(kwargs, "delete") {
+        None => true,
+        Some(v) => ops::truthy(v)?,
+    };
+    // tempfile.mkdtemp: os.mkdir(prefix + 8 random characters + suffix, 0o700), the absolute path
+    for _ in 0..10000 {
+        let p = join(&dir, &format!("{prefix}{}{suffix}", random_name()));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&p) {
+            Ok(()) => {
+                let abs = if p.starts_with('/') { p } else { join(&std::env::current_dir().map(|c| c.to_string_lossy().to_string()).unwrap_or_default(), &p) };
+                let abs = super::stdlib::normpath(&abs);
+                return Ok(V::native(Native::TempDir(Arc::new(TempDir { name: abs, delete, ignore_errors, detached: Default::default() }))));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(os_err(e, &p)),
+        }
+    }
+    Err(Exc::msg(&FILE_EXISTS_ERROR, "No usable temporary directory name found"))
+}
+
+pub fn tempdir_name(t: &TempDir) -> V {
+    V::str(&t.name)
+}
+
+pub fn tempdir_repr(t: &TempDir) -> String {
+    format!("<TemporaryDirectory {}>", ops::str_repr(&t.name))
+}
+
+/// `cleanup()`: removes the directory unless it was already (finalizer detached and the path gone)
+pub fn tempdir_cleanup(t: &TempDir) -> R<()> {
+    let was_attached = !t.detached.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if was_attached || std::fs::symlink_metadata(&t.name).is_ok() {
+        rmtree(&t.name, t.ignore_errors)?;
+    }
+    Ok(())
+}
+
+pub fn tempdir_attr(v: &V, t: &TempDir, name: &str) -> R {
+    match name {
+        "name" => Ok(tempdir_name(t)),
+        "cleanup" => Ok(V::native(Native::MethodOf(v.clone(), "cleanup"))),
+        _ => Err(Exc::attr_error(format!("'TemporaryDirectory' object has no attribute '{name}'"))),
+    }
+}
+
+pub fn tempdir_method(t: &TempDir, name: &str, args: &[V]) -> R {
+    match name {
+        "cleanup" if args.is_empty() => {
+            tempdir_cleanup(t)?;
+            Ok(V::None)
+        }
+        "cleanup" => Err(Exc::type_error(format!("TemporaryDirectory.cleanup() takes 1 positional argument but {} were given", args.len() + 1))),
+        _ => Err(Exc::attr_error(format!("'TemporaryDirectory' object has no attribute '{name}'"))),
+    }
 }
 
 /// `open(file, mode="r", encoding=None)` (utf-8 text, no newline translation)
@@ -384,7 +645,54 @@ pub fn open(args: &[V], kwargs: &[(String, V)]) -> R {
         _ => return Err(Exc::value_error(format!("invalid mode: {}", ops::str_repr(&mode)))),
     };
     let f = o.open(&p).map_err(|e| os_err(e, &p))?;
-    Ok(V::native(Native::File(File { path: p, binary, f: Mutex::new(Some(f)) })))
+    Ok(V::native(Native::File(File { path: p, binary, f: Mutex::new(Some(f)), delete: false })))
+}
+
+/// `fcntl.flock(fd, operation)`: `fd` an open file (`open()`) or a descriptor number, the lock held until it is
+/// released (LOCK_UN) or the file closed. A lock already held elsewhere with LOCK_NB: BlockingIOError, as CPython
+pub fn flock(args: &[V], kwargs: &[(String, V)]) -> R {
+    use std::os::fd::AsRawFd;
+    if !kwargs.is_empty() {
+        return Err(Exc::type_error("flock() takes no keyword arguments"));
+    }
+    if args.len() != 2 {
+        return Err(Exc::type_error(format!("flock expected 2 arguments, got {}", args.len())));
+    }
+    let op = match &args[1] {
+        V::Int(n) if i32::try_from(*n).is_ok() => *n as i32,
+        V::Bool(b) => *b as i32,
+        V::Int(_) => return Err(Exc::msg(&OVERFLOW_ERROR, "Python int too large to convert to C int")),
+        o => return Err(Exc::type_error(format!("'{}' object cannot be interpreted as an integer", o.type_name()))),
+    };
+    let rc = match &args[0] {
+        V::Native(n) => match &**n {
+            Native::File(f) => {
+                let g = f.f.lock();
+                let file = g.as_ref().ok_or_else(|| Exc::value_error("I/O operation on closed file"))?;
+                unsafe { libc::flock(file.as_raw_fd(), op) }
+            }
+            _ => return Err(Exc::type_error("argument must be an int, or have a fileno() method.")),
+        },
+        V::Int(fd) if *fd >= 0 && i32::try_from(*fd).is_ok() => unsafe { libc::flock(*fd as i32, op) },
+        V::Int(fd) if *fd < 0 => return Err(Exc::value_error(format!("file descriptor cannot be a negative integer ({fd})"))),
+        _ => return Err(Exc::type_error("argument must be an int, or have a fileno() method.")),
+    };
+    if rc == 0 {
+        return Ok(V::None);
+    }
+    let e = std::io::Error::last_os_error();
+    let n = e.raw_os_error().unwrap_or(0);
+    let s = e.to_string();
+    let text = s.strip_suffix(&format!(" (os error {n})")).unwrap_or(&s).to_string();
+    let class: &'static Class = if n == libc::EWOULDBLOCK { &BLOCKING_IO_ERROR } else { &OS_ERROR };
+    let exc = Exc::msg(class, format!("[Errno {n}] {text}"));
+    {
+        let mut a = exc.0.attrs.lock();
+        a.insert("errno".into(), V::Int(n as i64));
+        a.insert("strerror".into(), V::str(&text));
+        a.insert("filename".into(), V::None);
+    }
+    Err(exc)
 }
 
 /// The whole content of an open file from its position (`yaml.safe_load(f)` reads it by chunks: see `pyyaml`),
@@ -457,7 +765,9 @@ pub fn file_method(f: &File, name: &str, args: &[V]) -> R {
             Ok(V::Int(n as i64))
         }
         "close" => {
-            f.f.lock().take();
+            if f.f.lock().take().is_some() && f.delete {
+                let _ = std::fs::remove_file(&f.path);
+            }
             Ok(V::None)
         }
         "flush" => Ok(V::None),
@@ -569,7 +879,12 @@ pub fn uuid_attr(u: u128, name: &str) -> R {
 /// `with x as y`: the value bound to `y` (these runtime values return themselves)
 pub fn ctx_enter(v: &V) -> R {
     match v {
-        V::Native(n) if matches!(&**n, Native::File(_) | Native::BytesIO(_)) => Ok(v.clone()),
+        V::Native(n) if matches!(&**n, Native::File(_) | Native::BytesIO(_) | Native::StringIO(_)) => Ok(v.clone()),
+        // TemporaryDirectory.__enter__: its name
+        V::Native(n) if matches!(&**n, Native::TempDir(_)) => match &**n {
+            Native::TempDir(t) => Ok(tempdir_name(t)),
+            _ => unreachable!(),
+        },
         other => Err(super::aio::cm_protocol_error(other, false)),
     }
 }
@@ -578,7 +893,19 @@ pub fn ctx_enter(v: &V) -> R {
 pub fn ctx_exit(v: &V) -> R {
     if let V::Native(n) = v {
         if let Native::File(f) = &**n {
-            f.f.lock().take();
+            // close(): a NamedTemporaryFile(delete=True) is removed with it
+            file_method(f, "close", &[])?;
+        }
+        if let Native::BytesIO(b) = &**n {
+            super::files::bytesio_method(b, "close", &[])?;
+        }
+        if let Native::StringIO(s) = &**n {
+            super::stdlib::stringio_method(s, "close", &[])?;
+        }
+        if let Native::TempDir(t) = &**n {
+            if t.delete {
+                tempdir_cleanup(t)?;
+            }
         }
     }
     Ok(V::None)

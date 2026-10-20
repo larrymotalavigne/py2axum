@@ -1,0 +1,283 @@
+{
+ "py2axum": {
+  "description": "py2axum: transpile a FastAPI + SQLAlchemy + Pydantic + aiohttp package to a Rust/axum project.",
+  "arguments": [
+   {
+    "flags": [
+     "package"
+    ],
+    "help": "directory of the FastAPI application package"
+   },
+   {
+    "flags": [
+     "-o",
+     "--out"
+    ],
+    "help": "output directory for the Rust project"
+   },
+   {
+    "flags": [
+     "--root"
+    ],
+    "help": "import root, like sys.path (default: parent of the package)"
+   },
+   {
+    "flags": [
+     "--path"
+    ],
+    "help": "experimental: one more import root, like an extra sys.path entry (repeatable): the sibling packages of a monorepo the application installs from its own checkout"
+   },
+   {
+    "flags": [
+     "--python-side"
+    ],
+    "help": "what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; mount: the app's last app.mount() and include_router() of a library's router, which get every request no translated route fully matches); auto: every route that does not translate, and such mounts"
+   },
+   {
+    "flags": [
+     "--report"
+    ],
+    "help": "==SUPPRESS=="
+   },
+   {
+    "flags": [
+     "--name"
+    ],
+    "help": "crate name (default: <package>_axum)"
+   },
+   {
+    "flags": [
+     "--no-stream"
+    ],
+    "help": "buffer list responses instead of streaming them"
+   },
+   {
+    "flags": [
+     "--allow-untested-versions"
+    ],
+    "help": "translate even if the project locks library versions outside the tested ranges"
+   },
+   {
+    "flags": [
+     "--python"
+    ],
+    "help": "the Python the project runs on (default: its .python-version, else this Python if the project's requires-python allows it); messages and sys.version_info follow it"
+   },
+   {
+    "flags": [
+     "--translate-libs"
+    ],
+    "help": "translate pure-Python libraries of the project's environment from their source (only the functions the routes reach): none (default), auto (every pure-Python distribution under an admitted licence the library map does not cover), or a comma-separated list of distributions"
+   },
+   {
+    "flags": [
+     "--venv"
+    ],
+    "help": "the project's virtual environment, whose site-packages --translate-libs reads (default: a .venv at --root or above, else the environment py2axum runs in)"
+   },
+   {
+    "flags": [
+     "--allow-license"
+    ],
+    "help": "admit a licence for --translate-libs besides MIT, BSD-2-Clause, BSD-3-Clause, 0BSD, Apache-2.0, ISC, PSF-2.0, Python-2.0, Unlicense, Zlib, HPND, BSD-4-Clause, MPL-2.0 (repeatable)"
+   }
+  ]
+ },
+ "py2axum check": {
+  "description": "`py2axum check`: what would translate, route by route, without generating a crate.",
+  "arguments": [
+   {
+    "flags": [
+     "package"
+    ],
+    "help": "directory of the FastAPI application package"
+   },
+   {
+    "flags": [
+     "--root"
+    ],
+    "help": "import root, like sys.path (default: parent of the package)"
+   },
+   {
+    "flags": [
+     "--path"
+    ],
+    "help": "experimental: one more import root, like an extra sys.path entry (repeatable): the sibling packages of a monorepo the application installs from its own checkout"
+   },
+   {
+    "flags": [
+     "--python-side"
+    ],
+    "help": "as for generation: routes or the lifespan left to Python; auto: every route that does not translate"
+   },
+   {
+    "flags": [
+     "--format"
+    ],
+    "help": "text (default), json (machine-readable, on stdout) or markdown (for a pull request or a CI summary)"
+   },
+   {
+    "flags": [
+     "--json"
+    ],
+    "help": "same as --format json"
+   },
+   {
+    "flags": [
+     "--explain"
+    ],
+    "help": "explain an error code (P2A0201...): why it is refused and what to do, then exit"
+   },
+   {
+    "flags": [
+     "--fail-under"
+    ],
+    "help": "also exit 1 when fewer than PCT %% of the routes are native"
+   },
+   {
+    "flags": [
+     "--allow-untested-versions"
+    ],
+    "help": "do not refuse library versions outside the tested ranges"
+   },
+   {
+    "flags": [
+     "--python"
+    ],
+    "help": "the Python the project runs on (default: its .python-version, else this Python if the project's requires-python allows it); messages and sys.version_info follow it"
+   },
+   {
+    "flags": [
+     "--translate-libs"
+    ],
+    "help": "translate pure-Python libraries of the project's environment from their source (only the functions the routes reach): none (default), auto (every pure-Python distribution under an admitted licence the library map does not cover), or a comma-separated list of distributions"
+   },
+   {
+    "flags": [
+     "--venv"
+    ],
+    "help": "the project's virtual environment, whose site-packages --translate-libs reads (default: a .venv at --root or above, else the environment py2axum runs in)"
+   },
+   {
+    "flags": [
+     "--allow-license"
+    ],
+    "help": "admit a licence for --translate-libs besides MIT, BSD-2-Clause, BSD-3-Clause, 0BSD, Apache-2.0, ISC, PSF-2.0, Python-2.0, Unlicense, Zlib, HPND, BSD-4-Clause, MPL-2.0 (repeatable)"
+   }
+  ]
+ },
+ "py2axum watch": {
+  "description": "`py2axum watch`: regenerate, rebuild and restart the binary each time the Python project changes.",
+  "arguments": [
+   {
+    "flags": [
+     "package"
+    ],
+    "help": "directory of the FastAPI application package"
+   },
+   {
+    "flags": [
+     "-o",
+     "--out"
+    ],
+    "help": "output directory of the Rust project"
+   },
+   {
+    "flags": [
+     "--root"
+    ],
+    "help": "import root, like sys.path (default: parent of the package); the directory watched"
+   },
+   {
+    "flags": [
+     "--name"
+    ],
+    "help": "crate name (default: <package>_axum)"
+   },
+   {
+    "flags": [
+     "--python-side"
+    ],
+    "help": "as for generation (auto is handy while porting: refused routes do not stop the cycle)"
+   },
+   {
+    "flags": [
+     "--no-stream"
+    ],
+    "help": "buffer list responses instead of streaming them"
+   },
+   {
+    "flags": [
+     "--allow-untested-versions"
+    ],
+    "help": "translate even if the project locks library versions outside the tested ranges"
+   },
+   {
+    "flags": [
+     "--run"
+    ],
+    "help": "start the binary, and restart it after each successful build"
+   },
+   {
+    "flags": [
+     "--release"
+    ],
+    "help": "build the release profile (slow: fat LTO); default: the debug profile, incremental"
+   },
+   {
+    "flags": [
+     "--no-build"
+    ],
+    "help": "regenerate only (an IDE or another tool builds)"
+   },
+   {
+    "flags": [
+     "--interval"
+    ],
+    "help": "polling interval (default 0.5 s)"
+   },
+   {
+    "flags": [
+     "--debounce"
+    ],
+    "help": "quiet time after the last change before a cycle starts (default 0.3 s)"
+   },
+   {
+    "flags": [
+     "--stop-timeout"
+    ],
+    "help": "time the binary gets to exit after SIGTERM before it is killed (default 5 s)"
+   },
+   {
+    "flags": [
+     "--python"
+    ],
+    "help": "the Python the project runs on (default: its .python-version, else this Python if the project's requires-python allows it); messages and sys.version_info follow it"
+   },
+   {
+    "flags": [
+     "--translate-libs"
+    ],
+    "help": "translate pure-Python libraries of the project's environment from their source (only the functions the routes reach): none (default), auto (every pure-Python distribution under an admitted licence the library map does not cover), or a comma-separated list of distributions"
+   },
+   {
+    "flags": [
+     "--venv"
+    ],
+    "help": "the project's virtual environment, whose site-packages --translate-libs reads (default: a .venv at --root or above, else the environment py2axum runs in)"
+   },
+   {
+    "flags": [
+     "--allow-license"
+    ],
+    "help": "admit a licence for --translate-libs besides MIT, BSD-2-Clause, BSD-3-Clause, 0BSD, Apache-2.0, ISC, PSF-2.0, Python-2.0, Unlicense, Zlib, HPND, BSD-4-Clause, MPL-2.0 (repeatable)"
+   },
+   {
+    "flags": [
+     "binary_args"
+    ],
+    "help": "arguments passed to the binary, after --"
+   }
+  ]
+ }
+}

@@ -700,6 +700,8 @@ pub fn derive(cx: &Cx, scope: &V, body: Option<Bytes>) -> R<Option<Cx>> {
         disconnected: std::sync::atomic::AtomicBool::new(false),
         body_override: Mutex::new(None),
         custom_request: Mutex::new(None),
+        bodies: Mutex::new(vec![]),
+        form_read: std::sync::atomic::AtomicBool::new(false),
     };
     let inner = super::CxInner::new(cx.app.clone(), cell);
     *inner.asgi_seen.lock() = Seen::of(scope)?;

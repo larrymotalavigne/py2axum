@@ -259,3 +259,21 @@ async def mail_tls(validate: bool = True):
         return {"sent": True}
     except aiosmtplib.SMTPException:  # the binary raises SMTPException itself, not aiosmtplib's SMTPConnectError
         return {"sent": False}
+
+
+class MimeIn(BaseModel):
+    subject: str
+    body: str = "corps"
+
+
+@router.post("/mime-header")
+async def mime_header(m: MimeIn):
+    """Security review 2: a header value from the request with line breaks never adds a header nor ends the headers
+    (compat32: HeaderParseError for an embedded header, HeaderWriteError for a newline without folding)."""
+    msg = MIMEText(m.body)
+    msg["Subject"] = m.subject
+    msg["From"] = "a@example.com"
+    try:
+        return {"text": msg.as_string()}
+    except Exception as e:
+        return {"type": type(e).__name__, "str": str(e)}

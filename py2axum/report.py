@@ -77,6 +77,14 @@ def collect_dyn(package: Path, root: Path | None, python_side, auto: bool = Fals
     from .libsrc import stats
 
     fe.libstats = stats(proj)
+    if auto and "lifespan" not in python_side and any(e.__dict__.get("scope") == "lifespan" for e in fe.global_errors) \
+            and all(e.__dict__.get("scope") == "lifespan" for e in fe.global_errors):
+        # the lifespan does not translate: --python-side auto leaves it to Python and generates without it, so the
+        # routes are judged as that generation compiles them (what only the lifespan reached never is: its classes'
+        # methods would otherwise block every `.start()` of a route, method_edges)
+        fe2, per_route = collect_dyn(package, root, set(python_side) | {"lifespan"}, auto=True)
+        fe.__dict__["collected"] = fe2.__dict__.get("collected")
+        return fe, per_route
     return fe, [(info, ([err] if err else []) + dyn.closure_errors(proj, info["id"]))
                 for info, err in getattr(proj, "route_infos", [])]
 
@@ -104,7 +112,6 @@ def build(package: Path, root: Path | None = None, stream: bool = True, python_s
         "global": [(classify(e)[0], e.render()) for e in fe.global_errors],
         "poisoned": [],
         "notes": fe.notes,
-        "backend": "dyn",
     }
 
 

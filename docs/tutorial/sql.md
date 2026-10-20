@@ -92,7 +92,7 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   `expire(obj, ["col", "rel"])` (only those attributes; their changes not flushed are lost),
   `connection()` (a readiness probe: `close()` on it ends the transaction, then statements raise
   `ResourceClosedError` and `commit()` "This transaction is inactive" until `rollback()`/`close()`),
-  `expire_on_commit`, savepoints (`begin_nested()` then `commit()`/`rollback()`), `session.bind`,
+  `expire_on_commit`, savepoints (`begin_nested()` then `commit()`/`rollback()`, or `async with session.begin_nested() [as sp]:`), `async with session.begin():`, `session.bind`,
   `get_bind()`. A flushed UPDATE that matches no row (deleted by another statement) raises `StaleDataError`
   (`sqlalchemy.orm.exc`), as SQLAlchemy does. Server-generated values (identity, `server_default`, SQL defaults) are fetched with
   `RETURNING` at insert, like `eager_defaults="auto"`; `__mapper_args__ = {"eager_defaults": True}` also fetches

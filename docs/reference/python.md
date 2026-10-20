@@ -27,13 +27,17 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   function or lambda reads is a cell, as in CPython: read when the inner function runs, not when it is defined
   (`[lambda: i for i in range(3)]` all see the last `i`; a variable assigned after the `def` raises CPython's
   `NameError` if read before). `nonlocal` rebinds a local of the enclosing function.
-  Refused: `nonlocal` of a parameter of the enclosing function, a project decorator on a method.
-- Classes: plain classes (`__init__`, methods, properties, static/class methods, class attributes (a function
+  Refused: `nonlocal` of a parameter of the enclosing function, a decorator class (descriptor protocol) or a property deleter on a method, `@classmethod`/`@staticmethod` beside a function decorator.
+- Classes: plain classes (`__init__`, methods, properties with setters, `cached_property`, `@contextmanager`, methods decorated by functions, static/class methods, class attributes (a function
   held as one must be wrapped, `impl = staticmethod(f)`: it is then never bound, read through the class or an
   instance; a bare function or lambda, which CPython binds to the instance, and `classmethod(f)` are refused),
-  `__slots__`; single inheritance from another plain class and/or `abc.ABC`, `@abstractmethod` (instantiating
-  a class left abstract raises CPython's `TypeError` when called by name), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `eq=False` (identity, or the base's `__eq__`), `__post_init__`, one plain class as base; `dataclasses.astuple()` / `asdict()`, recursive like CPython), `typing.NamedTuple` classes (fields with literal immutable defaults, methods and properties; a tuple in every sequence operation, compared and hashed as one, `json.dumps` and responses as an array; `_asdict()`, `_replace()`, `_make()`, `_fields`, `_field_defaults`, read-only fields; refused as a Pydantic field or response type, and with its own dunders or `_` methods), exceptions (class attributes,
-  methods, `super().__init__` of `HTTPException`), Enums (methods, `_missing_`). Special methods:
+  `__slots__`; single inheritance from another plain class and/or `abc.ABC` or `metaclass=ABCMeta` (any other class
+  keyword or a class decorator is refused), `@abstractmethod` (instantiating a class left abstract raises CPython's
+  `TypeError` when called by name; without ABCMeta the class is instantiated, as in CPython), a `sys.version_info`
+  test in the class body (folded for the target Python, chained comparisons included), `super().__init__(...)`), `@dataclass` (incl. `frozen=True`, `eq=False` (identity, or the base's `__eq__`), `__post_init__`, one plain class as base; `dataclasses.astuple()` / `asdict()`, recursive like CPython), `typing.NamedTuple` classes (fields with literal immutable defaults, methods and properties; a tuple in every sequence operation, compared and hashed as one, `json.dumps` and responses as an array; `_asdict()`, `_replace()`, `_make()`, `_fields`, `_field_defaults`, read-only fields; refused as a Pydantic field or response type, and with its own dunders or `_` methods), exceptions (class attributes,
+  methods, `super().__init__` of `HTTPException`, `__str__` (every text of the exception: `str()`, tracebacks,
+  logs; one that raises or returns a non-string prints `<exception str() failed>` there, as CPython's traceback
+  does), `__repr__`, `__bool__`; other special methods of an exception class are refused), Enums (methods, `_missing_`). Special methods:
   `__str__`, `__repr__`, `__eq__` (used by `str()`, f-strings, `==`, `in`, `index`, `count`, `remove`),
   `__ne__`, `__lt__`, `__le__`, `__gt__`, `__ge__` (CPython's rich comparison: the left operand's method, then the
   right one's reflected method, their result as is; `sorted()`, `min()`, `max()` compare with `<`),
@@ -51,8 +55,8 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   subclass of the left one's), `__neg__`, `__pos__`, `__invert__`, `__abs__`, with CPython's errors for a wrong
   result (`__bool__ should return bool`, `__len__() should return >= 0`, `iter() returned non-iterator`, and their 3.15 wording). `bool(NotImplemented)` raises TypeError from Python 3.14; before, it is true and CPython's DeprecationWarning is not printed.
   `__getstate__`, `__setstate__`, `__reduce__`, `__reduce_ex__`, `__copy__`, `__deepcopy__` and `__getnewargs__`
-  are ignored when nothing translated imports `copy` or `pickle` nor reads them (only those call them), refused
-  otherwise. Still refused: `__hash__` as a method, `__index__`, descriptors (`__get__`), `__getattribute__`.
+  are ignored when no translated code calls `copy`, `pickle` or `copyreg` nor reads such a method (only those call
+  them; a library importing `pickle` for code the application never reaches keeps its classes), refused otherwise. Still refused: `__hash__` as a method, `__index__`, descriptors (`__get__`), `__getattribute__`.
 - Bases that only type a class are dropped: `Generic[T]`, `Protocol[T]`, the parameters of a generic project base
   (`class Typed(Box[int])`). A method's default reads the class body first, as CPython evaluates it there
   (`def check(self, tolerance=DEFAULT_TOLERANCE)` after `DEFAULT_TOLERANCE = 300` in the class); a name the class
@@ -146,6 +150,16 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   `StreamReader.read/readline/at_eof`; `ssl=`, `limit=` and the other keywords are refused, and so are
   `readexactly`/`readuntil`). The runtime is multi-threaded: two tasks finishing at
   the same instant have no guaranteed order (asyncio follows creation order).
+- `asyncio.create_subprocess_exec(program, *args, stdin=, stdout=, stderr=, cwd=, env=)` with `PIPE`, `DEVNULL`,
+  `STDOUT` (for `stderr`) or `None`, and its `Process`: `await communicate(input=None)`, `await wait()`,
+  `returncode`, `pid`, `kill()`, `terminate()`, `send_signal(n)` (`ProcessLookupError` once the process has exited),
+  `repr()`. A `communicate()` cancelled by `wait_for` leaves the child running, its pipes open, as asyncio. A failed
+  spawn raises the `OSError` of its errno (`FileNotFoundError`, `PermissionError`, `NotADirectoryError` for a `cwd`
+  that is a file): `[Errno 2] No such file or directory: 'prog'` under asyncio, without the file name under uvloop
+  (as for `open_connection`). `shell=True` and `text=True` raise their `ValueError`. Differences: `proc.stdin`,
+  `proc.stdout` and `proc.stderr` of a pipe raise a py2axum `TypeError` (read and write them with `communicate()`),
+  a file or descriptor as `stdout=`… and the other keywords (`limit=`, `start_new_session=`…) raise one too;
+  `create_subprocess_shell` and the synchronous `subprocess` module are refused at translation time.
 - The delays of `asyncio.sleep(delay, result)` and `asyncio.wait_for(aw, timeout)` are read like asyncio:
   `delay <= 0` first (a `str` raises its `TypeError`), then the loop's float time plus the delay (a `Decimal`
   raises `TypeError`, except for `asyncio.sleep` on uvloop, which rounds it); a timeout `<= 0` raises

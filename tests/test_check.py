@@ -60,7 +60,7 @@ def test_fail_under(tmp_path, capsys):
 
 def test_declared_python_side(tmp_path, capsys):
     pkg = write_project(tmp_path)
-    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--backend", "dyn",
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path),
                         "--python-side", "/api/items/me/info")
     routes = {r["path"]: r for r in data["routes"]}
     assert routes["/api/items/me/info"]["status"] == "python-side"
@@ -70,14 +70,20 @@ def test_declared_python_side(tmp_path, capsys):
 
 
 def test_global_error(tmp_path, capsys):
-    """An error about the whole application refuses generation, even with --python-side auto."""
+    """An error about the whole application refuses generation; with --python-side auto, the whole application
+    stays in Python (every route python-side, with that error as its reason)."""
     pkg = write_project(tmp_path)
     main_py = pkg / "main.py"
     main_py.write_text(main_py.read_text().replace("app = FastAPI()", "app = FastAPI(root_path=str(1))"))
-    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--python-side", "auto")
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path))
     assert rc == 1
     assert any("main.py" in g["error"] and "FastAPI(root_path=...)" in g["error"] for g in data["global"])
-    assert not any(r["status"] == "python-side" for r in data["routes"])
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--python-side", "auto")
+    assert rc == 0 and data["global"] == []
+    assert {r["status"] for r in data["routes"]} == {"python-side"}
+    assert "FastAPI(root_path=...)" in data["routes"][0]["reason"] or any(
+        "FastAPI(root_path=...)" in r["reason"] for r in data["routes"])
+    assert any(n.startswith("python-side (auto): the whole application — ") for n in data["notes"])
 
 
 def small_project(tmp_path):
@@ -94,25 +100,20 @@ def test_small_project_is_native(tmp_path, capsys):
     """What the removed typed backend covered goes through the one backend (it was tried first until 0.4)."""
     pkg = small_project(tmp_path)
     rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path))
-    assert rc == 0 and data["backend"] == "dyn"
+    assert rc == 0 and "backend" not in data
     assert [(r["path"], r["status"]) for r in data["routes"]] == [("/users/count", "native")]
 
 
-@pytest.mark.parametrize("backend, rc", [("typed", 2), ("dyn", 0), ("auto", 0)])
-def test_backend_option(tmp_path, capsys, backend, rc):
-    """--backend typed was removed in 0.4 (clear error); dyn and auto stay accepted until 1.0."""
+@pytest.mark.parametrize("backend", ["typed", "dyn", "auto"])
+def test_backend_option_was_removed(tmp_path, capsys, backend):
+    """--backend (no effect since 0.4) is gone in 1.0: an error that says so, whatever the value, everywhere."""
     from py2axum.__main__ import main
 
     pkg = small_project(tmp_path)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", backend, "-o", str(tmp_path / "out")]) == rc
-    err = capsys.readouterr().err
-    if rc:
-        assert "--backend typed was removed in 0.4: use the default backend" in err
-    else:  # deprecated: still accepted, with a warning (docs/reference/versioning.md)
-        assert "warning[deprecated]: --backend has no effect since 0.4 and will be removed in 1.0" in err
-    if not rc:  # check: typed is not even a choice
-        assert main(["check", str(pkg), "--root", str(tmp_path), f"--backend={backend}"]) == 0
-        assert "warning[deprecated]: --backend" in capsys.readouterr().err
+    for argv in ([str(pkg), "--backend", backend], [str(pkg), f"--backend={backend}"], ["check", str(pkg), "--backend", backend]):
+        assert main([*argv, "--root", str(tmp_path), "-o", str(tmp_path / "out")] if argv[0] != "check" else argv) == 2
+        assert "--backend was removed in 1.0" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
 
 
 def test_untested_version_refused(tmp_path, capsys):
@@ -137,23 +138,26 @@ def test_untested_version_refused(tmp_path, capsys):
 
 
 def test_unmapped_library_setting(tmp_path, capsys):
-    """`stripe.api_key = ...` at module level: the library is unknown to the binary, so every read or call of
+    """`braintree.api_key = ...` at module level: the library is unknown to the binary, so every read or call of
     it is refused already; the setting itself does not block the application (it stays Python's)."""
     pkg = write_project(tmp_path)
-    (pkg / "pay.py").write_text("import os\n\nimport stripe\n\nstripe.api_key = os.getenv('STRIPE_KEY')\n\n\n"
-                                "def customers():\n    return stripe.Customer.list(limit=1)\n")
+    (pkg / "pay.py").write_text("import os\n\nimport braintree\n\nbraintree.api_key = os.getenv('BT_KEY')\n\n\n"
+                                "def customers():\n    return braintree.Customer.list(limit=1)\n")
     main_py = pkg / "main.py"
     main_py.write_text(main_py.read_text().replace(
         "app = create_app()\n",
         "app = create_app()\n\n\n@app.get('/pay')\ndef pay():\n    from proj.pay import customers\n    return customers()\n"))
-    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto")
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--python-side", "auto")
     assert rc == 0 and not data["global"]
     pay = next(r for r in data["routes"] if r["path"] == "/pay")
-    assert pay["status"] == "python-side" and "stripe.Customer.list()" in pay["reason"]
+    assert pay["status"] == "python-side" and "braintree.Customer.list()" in pay["reason"]
     # a library the map does know (json) is still refused
     (pkg / "pay.py").write_text("import json\n\njson.encoder = None\n\n\ndef customers():\n    return 1\n")
-    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto")
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path))
     assert rc == 1 and any("json.encoder" in g["error"] for g in data["global"])
+    # --python-side auto: the whole application stays in Python
+    rc, data = run_json(capsys, str(pkg), "--root", str(tmp_path), "--python-side", "auto")
+    assert rc == 0 and any("json.encoder" in n and "the whole application" in n for n in data["notes"])
 
 
 def test_discovery_error_is_a_refusal(tmp_path, capsys):

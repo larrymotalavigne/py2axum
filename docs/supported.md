@@ -16,8 +16,8 @@ New to py2axum? Start with the [getting-started guide](getting-started/index.md)
 route. To check the binary against your application, see [Conformance and replay](advanced/conformance.md).
 
 There is one backend since 0.4 (the statically-typed one was removed: it covered only simple CRUD handlers;
-its list streaming moved to [Large list responses](advanced/streaming.md)). `--backend auto` and
-`--backend dyn` are still accepted until 1.0 and change nothing; `--backend typed` is an error.
+its list streaming moved to [Large list responses](advanced/streaming.md)). The
+`--backend` option, which had no effect since then, was removed in 1.0.
 
 ## Where each part is described
 
@@ -37,7 +37,7 @@ its list streaming moved to [Large list responses](advanced/streaming.md)). `--b
 | Middleware (`BaseHTTPMiddleware`, raw ASGI, GZip, starlette_context), request attributes, `configure(app)` | [Middleware](tutorial/middleware.md) |
 | `CORSMiddleware` | [CORS](tutorial/cors.md) |
 | Shutdown (SIGTERM, SIGINT) | [Graceful shutdown](advanced/shutdown.md) |
-| `logging`, python-json-logger, uvicorn's own lines (startup, access log, errors), tracebacks, uvicorn's command-line options | [Logging](advanced/logging.md) |
+| `logging`, python-json-logger, loguru's `logger`, uvicorn's own lines (startup, access log, errors), tracebacks, uvicorn's command-line options | [Logging](advanced/logging.md) |
 | WebSockets | [WebSockets](tutorial/websockets.md) |
 | Pydantic v2 | [Models (Pydantic)](tutorial/models.md) |
 | SQLAlchemy 2.0 (async and sync, PostgreSQL) | [SQL databases](tutorial/sql.md) |
@@ -48,13 +48,14 @@ its list streaming moved to [Large list responses](advanced/streaming.md)). `--b
 | MCP servers (`mcp` 2.2) | [MCP servers](advanced/mcp.md) |
 | Standard library, `pickle` | [Standard library](reference/stdlib.md) |
 | Libraries | [Libraries](reference/libraries.md) |
-| Hybrid deployments | [Hybrid mode](getting-started/hybrid.md) |
+| Hybrid deployments, what `--python-side auto` leaves to Python (routes, lifespan, the whole application) | [Hybrid mode](getting-started/hybrid.md) |
 | Large list responses | [Large list responses](advanced/streaming.md) |
+| Generated documents: spreadsheets (openpyxl), PDF (reportlab), temporary files | [Generated documents](advanced/documents.md) |
 
 ## Runtime environment
 
 The binary takes uvicorn's command-line options and prints uvicorn's lines and the application's `logging`
-records as Python does ([Logging](advanced/logging.md); a traceback holds the project's frames only).
+and loguru records as Python does ([Logging](advanced/logging.md); a traceback holds the project's frames only).
 It reads its configuration from the environment ([the list](reference/environment.md));
 it does not read `.env` files (pydantic-settings reads environment variables only, see
 [Models](tutorial/models.md)): export the variables, as an orchestrator does.
@@ -62,6 +63,16 @@ Limits on untrusted input (an optional body cap, the stack size) and the differe
 [Security § Request input](advanced/security.md#request-input).
 Object addresses in reprs (`<X object at 0x...>`) are the binary's own; their width matches CPython's on 64-bit
 Linux, not on macOS, where a truncated repr in the logs is cut elsewhere ([Python](reference/python.md)).
+
+## `--python-side auto`
+
+A construct that does not translate in the lifespan, a middleware, an exception handler or module code no
+longer stops the generation with `--python-side auto`: the lifespan alone, or the whole application, is left to
+Python ([Hybrid mode § What auto leaves to Python](getting-started/hybrid.md#what-auto-leaves-to-python)).
+**Known differences:** the Python lifespan runs in its own process, not before the binary listens; its output
+comes from that process; a whole application relayed still gets the binary's uvicorn lines and access log
+(`--no-access-log`). WebSocket connections are relayed too; their handshake lines are the binary's, the
+application's own lines (an error, a traceback) the Python process's.
 
 ## Deeply nested JSON on Python 3.14+
 
@@ -143,6 +154,37 @@ cachetools 7.2 is ported from its source ([Libraries](reference/libraries.md)); 
 - A `lock=` is not acquired: cachetools holds it around the cache's reads and writes only, which the binary does
   without interleaving them (`cache.setdefault()` is used when one is given, as cachetools does).
 
+## stripe
+
+stripe-python 14.0–14.4 is ported (dynrt/stripe.rs, [Libraries](reference/libraries.md)): the request each resource
+classmethod sends (method, URL, form body, headers, retries), the objects built from the response (a `StripeObject` is
+a dict subclass: attribute access to its keys, `str` as JSON, a list object iterating its `data`) and the errors
+(classes, messages, attributes). What the binary does not reproduce:
+
+- `Accept-Encoding` is `gzip, deflate` (requests adds `br` and `zstd` when brotli or zstandard is available).
+- `platform` and `uname` in `X-Stripe-Client-User-Agent` are computed by the binary (on Linux `platform` has no libc
+  version); `X-Stripe-Client-Telemetry` reports the last request of the process (stripe-python: of the thread).
+- TLS checks the system's roots, not stripe-python's bundled `ca-certificates.crt`.
+- The `(Network error: ...)` detail of an `APIConnectionError` is requests' for a refused connection, a read timeout
+  and a URL without a scheme or with another one; for other failures (DNS, TLS) it differs.
+- `auto_paging_iter()` fetches every page when it is called: a loop that stops early has still made each request.
+  The search results' `auto_paging_iter()` raises a py2axum RuntimeError.
+- A nested object without an `object` field is a `StripeObject` (stripe-python: an inner class such as
+  `Subscription.TrialSettings`, with the same keys); `type(obj)` of any StripeObject is `dict`.
+- An error's `headers` is a dict with lowercase names (requests: a case-insensitive dict).
+- In a hybrid deployment, `stripe.api_key = ...` set at run time applies to the process that runs it (the binary or
+  the Python process).
+- Not translated: the `*_async` methods, `StripeClient`, `stripe.default_http_client`/`proxy`/`verify_ssl_certs`,
+  multipart requests (`File.create`), streamed responses (PDF downloads) and the instance methods of an object
+  (`save()`, `refresh()`, `customer.delete()`): refused at transpile time, or a py2axum RuntimeError when the method
+  is only known at run time.
+
+## httpx
+
+A response the server sends malformed (an invalid status line, broken headers) raises `RemoteProtocolError` as in
+httpx, with hyper's message instead of h11's. A connection reset raises `ReadError` with an empty message, as anyio
+reports it.
+
 ## croniter
 
 croniter 6.2 is ported line by line ([Libraries](reference/libraries.md)); what the binary does not reproduce:
@@ -165,6 +207,20 @@ croniter 6.2 is ported line by line ([Libraries](reference/libraries.md)); what 
 - `croniter_range(_croniter=)`, `croniter.expand(from_timestamp=)` and `is_valid(encoding=)` other than UTF-8
   are refused at compile time; a start time other than a `datetime`, an `int` or a `float`, and `croniter_range`
   bounds other than datetimes and numbers raise a py2axum `TypeError`.
+
+## qrcode
+
+qrcode 8.2 and the PNG Pillow 12.3 writes are ported ([Libraries](reference/libraries.md)); what the binary does not
+reproduce:
+
+- The PNG is the one of Pillow's PyPI wheels for the platform the binary is built for: their zlib is zlib 1.3.1 on
+  Linux (manylinux) and zlib-ng on macOS, and the binary compresses the same way on each. A Pillow built from
+  source against another zlib (a distribution package, `--no-binary`) writes the same pixels with other compressed
+  bytes.
+- A negative `error_correction`: qrcode never returns (its BCH loop does not end on a negative number); the binary
+  raises a py2axum `TypeError`.
+- An image of more than 2³¹ − 1 pixels a side raises `MemoryError` (Pillow raises its own error earlier or later,
+  depending on memory).
 
 ## email.message.EmailMessage
 
@@ -192,6 +248,31 @@ dnspython 2.8's stub resolver is ported ([Libraries](reference/libraries.md)); w
 - Durations in `LifetimeTimeout`'s message and the order of `rotate` follow the clock and the random generator,
   as in Python, not Python's own draws.
 
+## pgpy
+
+pgpy 0.6.0's `PGPKey.from_blob()` is ported ([Libraries](reference/libraries.md)): the parsing of a public or secret
+key block, armored or binary, to the same objects, the same order of the user ids and the same exceptions, checked
+against pgpy on the inputs of `fixtures/pgpyapp` (keys of pgpy and GnuPG, armor, base64, packet and user id edge
+cases, mutations of valid keys). Nothing is encrypted, decrypted, signed or verified: those parts of pgpy (and
+`PGPMessage`, `PGPSignature`, `PGPKeyring`, `PGPKey.new()`...) are refused at transpile time. What the binary does
+not reproduce:
+
+- A CompressedData packet compressed with bzip2 whose stream holds a block (pgpy decompresses it) raises a py2axum
+  `NotImplementedError`; empty, truncated or invalid bzip2 data behave as in Python. zlib and raw deflate data are
+  decompressed by zlib, as in CPython (the error messages are zlib's own).
+- `type()` of the tuple's second element and of `key.subkeys` is `dict` (pgpy: `OrderedDict`, same order and
+  contents).
+- The warnings are written on stderr as CPython's default filters write them (once per text and line), naming the
+  path pgpy had where the project was translated. The address in `Warning: Orphaned packet detected! <... at 0x...>`
+  is not CPython's: CPython prints that warning again only when the packet's address differs from an earlier one's,
+  the binary every time.
+- pgpy's `PGPKey.parse` groups packets by `id()`: when CPython reuses the address of a freed packet for the next one
+  of the same class, the two may be read as one group. The binary never does.
+- Inputs that make pgpy loop for minutes (a flags subpacket declaring a length of several gigabytes) answer at once,
+  with pgpy's eventual result.
+- The `__cause__` of a `PGPError` is an exception of the original class and message (binascii, pyasn1, struct and
+  zlib errors included), without their own attributes.
+
 ## OpenTelemetry (FastAPI 0.142+)
 
 FastAPI 0.142 traces requests, records metrics and logs through OpenTelemetry when its SDK is configured (a global
@@ -212,12 +293,20 @@ SQLModel classes are rewritten into SQLAlchemy mapped classes and Pydantic model
 - A table class as a route's body, a required field left out: SQLModel leaves the attribute unset (absent from the
   dumped response), the binary reads it as `None`.
 
+## SQLAlchemy's `DBAPIError.connection_invalidated`
+
+True when the connection itself failed (refused, dropped or reset: an I/O, TLS or protocol error of the driver, raised
+as `OperationalError`), false for an error the server answered (any SQLSTATE). SQLAlchemy asks psycopg's dialect,
+whose test looks at the connection's state: a server that answers an error and then closes the connection
+(`57P01`, administrator shutdown) is invalidated in Python and not in the binary. `InterfaceError` is a class
+(`isinstance`, `except`); the binary raises `OperationalError` for every connection-level failure.
+
 ## Not supported
 
 An application wrapped in a project ASGI class at module level (`app = Wrapper(api)`, refused: the
 binary would serve `api` without it), mounted ASGI apps and routers of libraries (left to Python with
 `--python-side mount` when registered last), libraries not listed, C extensions, `eval`/`exec`, metaclasses, multiple inheritance of
-project classes, OpenAPI `/docs` in the binary, and assigning an attribute of the application at module level
+project classes, the synchronous `subprocess` module and `asyncio.create_subprocess_shell`, `tempfile` beyond `NamedTemporaryFile`/`gettempdir`, OpenAPI `/docs` in the binary, and assigning an attribute of the application at module level
 other than `app.state`, `app.dependency_overrides[f] = g` and `app.router.route_class = R` (`app.openapi = ...`
 is refused with `file:line`). Not native, counted apart in the
 [documentation coverage](coverage.md): what only changes the OpenAPI schema or the documentation pages

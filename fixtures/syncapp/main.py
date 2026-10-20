@@ -5,7 +5,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .db import get_db
+from .db import get_db, get_other_db
 from .models import Author, Book, Review
 from .schemas import AuthorCreate, AuthorRead, AuthorWithBooks, BookCreate, BookFull, BookRead
 
@@ -1060,3 +1060,24 @@ def idict(db: Db):
     db.commit()
     out["committed"] = [_keys(a), _keys(b), _keys(r)]
     return out
+
+
+OtherDb = Annotated[Session, Depends(get_other_db)]
+
+
+@app.post("/other/authors/{name}")
+def other_author(name: str, db: OtherDb, fail: int = 0):
+    """sessions of `get_other_db` (fixtures/syncapp/db.py): committed by the endpoint, else rolled back"""
+    db.add(Author(name=name))
+    db.flush()
+    if fail == 1:
+        raise HTTPException(status_code=409, detail="rolled back")
+    if fail == 2:
+        raise ValueError("rolled back too")
+    db.commit()
+    return {"count": db.query(Author).filter(Author.name == name).count()}
+
+
+@app.get("/other/authors/{name}")
+def other_count(name: str, db: OtherDb):
+    return {"name": name, "count": db.query(Author).filter(Author.name == name).count()}

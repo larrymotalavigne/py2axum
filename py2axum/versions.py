@@ -17,6 +17,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ir import TranspileError
+
 # name -> (lowest tested, highest tested, first untested). Accepted: lowest <= v < first untested. Mirrored by
 # the `conformance` extra of pyproject.toml and by docs/reference/versions.md (tests/test_versions.py); the CI job
 # `versions` installs both ends (`python -m py2axum.versions min|max`) and runs pytest + the dynapp conformance.
@@ -25,7 +27,7 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "starlette": ("1.0.0", "1.7.0", "1.8"),
     "pydantic": ("2.12.0", "2.14.0", "2.15"),
     "pydantic-core": ("2.41.1", "2.50.0", "2.51"),
-    "pydantic-settings": ("2.11.0", "2.15.0", "2.16"),
+    "pydantic-settings": ("2.11.0", "2.16.0", "2.17"),
     "sqlalchemy": ("2.0.44", "2.1.4", "2.2"),
     "psycopg": ("3.2.12", "3.3.6", "3.4"),
     "httpx": ("0.28.1", "0.28.1", "0.29"),
@@ -33,7 +35,9 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     "mcp": ("2.2.0", "2.2.0", "2.3"),  # MCP servers: tested through a real MCP server's lock (internal conformance)
     "asyncpg": ("0.31.0", "0.32.0", "0.33"),
     "icalendar": ("7.0.0", "7.0.0", "7.1"),  # calendar files: tested through a real application's lock (internal conformance)  # the asyncpg driver: transcript-service's production driver (internal conformance)
-    "orjson": ("3.13.0", "3.13.0", "3.14"),  # yyjson's messages and the allocation limit of this release
+    # yyjson's messages and the allocation limit: 3.12.0 answers fixtures/libapp/orjsonx.py's 738 cases byte for byte
+    # like 3.13.0 (measured 18/10, Python 3.12)
+    "orjson": ("3.12.0", "3.13.0", "3.14"),
     "unidecode": ("1.4.0", "1.4.0", "1.5"),  # its transliteration tables (tools/gen_unidecode.py)
     "ecs-logging": ("2.3.0", "2.3.0", "2.4"),
     "pyyaml": ("6.0.2", "6.0.3", "6.1"),  # yaml.safe_load / safe_dump / dump: a port of its pure-Python loader and dumper
@@ -45,6 +49,31 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     # older zoneinfo tarball
     "python-dateutil": ("2.9.0", "2.9.0.post0", "2.10"),
     "cachetools": ("7.2.2", "7.2.2", "7.3"),  # dynrt/ctools.rs (7.2.1 reads the TTL timer later, 7.0 had no size checks)
+    # dynrt/stripe.rs: stripe-python's requests, objects and errors (15.0 rewrote StripeObject: no longer a dict)
+    "stripe": ("14.0.0", "14.4.1", "14.5"),
+    # dynrt/xlsx.rs: openpyxl's writer without lxml (ElementTree through et_xmlfile), its parts byte for byte
+    "openpyxl": ("3.1.5", "3.1.5", "3.2"),
+    "et-xmlfile": ("2.0.0", "2.0.0", "2.1"),
+    # dynrt/pgpy.rs, pgpycore.rs: PGPKey.from_blob() (armor, packets, pgpy's order of the user ids); pyasn1 decodes
+    # the curve OIDs of the EC keys (its messages are in pgpy's errors)
+    "pgpy": ("0.6.0", "0.6.0", "0.7"),
+    "pyasn1": ("0.6.4", "0.6.4", "0.7"),
+    # what pgpy reaches of cryptography while parsing: the deprecation warnings of TripleDES and Camellia (a protected
+    # secret key), whose removal from `algorithms` would change pgpy's behaviour; checked only with pgpy
+    "cryptography": ("50.0.2", "50.0.2", "51"),
+    # dynrt/rl/: reportlab's pure-Python path (no rl_accel), its PDF byte for byte but the instants (4.4.6 changed the
+    # header comment of every PDF)
+    "reportlab": ("4.4.5", "4.4.5", "4.4.6"),
+    # dynrt/qr.rs: qrcode's encoding, and the PNG of Pillow's wheels (zlib-ng 2.3.3 in 12.3.0's: its deflate output)
+    "qrcode": ("8.2", "8.2", "8.3"),
+    "pillow": ("12.3.0", "12.3.0", "12.4"),
+    # dynrt/loguru.rs: the default handler, its format and colours, the level methods, add() on a standard stream
+    "loguru": ("0.7.2", "0.7.3", "0.8"),
+    # dynrt/auth.rs: passlib's CryptContext of bcrypt over pyca/bcrypt. bcrypt 4.0 to 4.2 differ in their errors
+    # (a short salt panics); 4.3 hashes the first 72 bytes of a longer password, 5.0 refuses it, and with 5.0
+    # passlib 1.7.4 can no longer load its bcrypt backend (every hash and verify raises: reproduced)
+    "bcrypt": ("4.3.0", "5.0.0", "5.1"),
+    "passlib": ("1.7.4", "1.7.4", "1.8"),
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
@@ -56,10 +85,64 @@ _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlal
               "orjson": ("orjson",), "unidecode": ("unidecode",), "ecs_logging": ("ecs-logging",),
               "yaml": ("pyyaml",), "croniter": ("croniter",),
               "itsdangerous": ("itsdangerous",), "dns": ("dnspython",), "pytz": ("pytz",), "cachetools": ("cachetools",),
-              "dateutil.parser": ("python-dateutil",), "dateutil.tz": ("python-dateutil",)}
+              "openpyxl": ("openpyxl", "et-xmlfile"), "reportlab": ("reportlab",), "qrcode": ("qrcode", "pillow"),
+              "loguru": ("loguru",),
+              "dateutil.parser": ("python-dateutil",), "dateutil.tz": ("python-dateutil",),
+              "stripe": ("stripe",), "pgpy": ("pgpy", "pyasn1", "cryptography"),
+              "bcrypt": ("bcrypt",), "passlib": ("passlib", "bcrypt")}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
 _FEATURES = [("WebSocket routes (Starlette 1.7's WebSocketDisconnected semantics)", r"\.websocket\(", "starlette", "1.7.0")]
+# what is known to differ between versions of a library, for the message of a version refusal: (label, regex on the
+# package's source, distribution). The runtime reproduces the project's version of these (docs/reference/versions.md);
+# a version outside the tested ranges is where they are not proven. Not a proof of absence: other behaviours may differ.
+_SENSITIVE = [
+    ("an `EmailStr` field (a CR or LF in the address changed in Pydantic 2.14)", r"\bEmailStr\b", "pydantic"),
+    ("a `UUID` field (the error message changed in Pydantic 2.14)", r"\bUUID[1-8]?\b", "pydantic"),
+    ("`max_digits` / `decimal_places` on a `Decimal` (rounding changed in 2.14)", r"\bmax_digits\b|\bdecimal_places\b", "pydantic"),
+    ("an Enum `_missing_` (an exception other than ValueError changed in 2.14)", r"def\s+_missing_\b", "pydantic"),
+    ("a `model_validate_json` or JSON-mode validation (messages follow the minor)", r"model_validate_json|TypeAdapter", "pydantic"),
+    ("WebSocket routes (the disconnect semantics of Starlette 1.7)", r"\.websocket\(", "starlette"),
+    ("`CORSMiddleware` (its preflight and header handling changed between 1.x minors)", r"\bCORSMiddleware\b", "starlette"),
+    ("uploads and forms (the multipart limits and messages follow Starlette's version)", r"\bUploadFile\b|\bForm\(", "starlette"),
+    ("a JSON-lines or server-sent-events endpoint (the status was ignored before 0.141)", r"EventSourceResponse|ServerSentEvent|JSONLResponse", "fastapi"),
+    ("an `include_router` with response models (the element type was lost before 0.141)", r"\binclude_router\(", "fastapi"),
+    ("a lazy-loaded relationship in async code (MissingGreenlet on 2.0, StatementError on 2.1)", r"\blazy=|selectinload|joinedload|AsyncSession", "sqlalchemy"),
+    ("`orjson` (parse messages and size limits follow its yyjson version)", r"\borjson\b", "orjson"),
+    ("`cachetools` caches (the timer and size checks changed between 7.x releases)", r"\bcachetools\b", "cachetools"),
+    ("`pytz` zones (one tz database release per version)", r"\bpytz\b", "pytz"),
+    ("`stripe` objects (StripeObject was rewritten in 15.0)", r"\bstripe\b", "stripe"),
+]
+
+
+def sensitive(package: Path, dist: str) -> list[str]:
+    """The `_SENSITIVE` constructs of `dist` found in the package, as `label (file:line)`."""
+    rules = [(lab, re.compile(rx)) for lab, rx, d in _SENSITIVE if d == dist]
+    found: dict[str, str] = {}
+    if not rules:
+        return []
+    for f in sorted(Path(package).rglob("*.py")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for lab, rx in rules:
+            if lab not in found and (m := rx.search(text)):
+                found[lab] = f"{f.relative_to(package)}:{_line_of(text, m.start())}"
+    return [f"{lab} ({where})" for lab, where in found.items()]
+
+
+def _known_differences(package: Path | None, dist: str) -> str:
+    """The sentence a version refusal adds: what the project uses that is known to differ between versions."""
+    if package is None:
+        return ""
+    hits = sensitive(package, dist)
+    if not hits:
+        return (f" No construct known to differ between {dist} versions was found in the project (that is not a "
+                f"proof: --allow-untested-versions translates it, then compare the binary with the Python app).")
+    return f" Constructs of this project known to differ between {dist} versions: " + "; ".join(hits) + "."
+
+
 # extras installed with the pins (the conformance apps' drivers)
 _EXTRAS = {"psycopg": "psycopg[binary]", "sqlalchemy": "sqlalchemy[asyncio]"}
 
@@ -170,6 +253,10 @@ def _from_requirement(text: str, file: str, base: int = 0, offset: int = 0) -> l
     return out
 
 
+# requirements files the last project_constraints() could not decode: reported by check_project()
+UNREADABLE: list[tuple[str, str, int]] = []
+
+
 def project_constraints(root: Path) -> tuple[list[Found], tuple[str, str, int] | None]:
     """The constraints the project puts on the supported libraries, and its `requires-python`
     (specifier, file, line), from the first directory at --root or above holding a dependency file."""
@@ -198,7 +285,10 @@ def project_constraints(root: Path) -> tuple[list[Found], tuple[str, str, int] |
                     found.append(Found(name, m.group(2), True, str(lock), _line_of(text, m.start()) + 2))
             return found, py
         for r in reqs:
-            found += _from_requirement(r.read_text(), str(r))
+            try:
+                found += _from_requirement(read_requirements(r), str(r))
+            except TranspileError as e:
+                UNREADABLE.append((e.msg, str(r), 1))
         if pp.is_file():
             text = pp.read_text()
             m = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, re.M)
@@ -236,6 +326,35 @@ def used(package: Path) -> tuple[set[str], list[tuple[str, str, str]]]:
             out.update(_BY_IMPORT["dateutil.tz"])
         feats.update(i for i, (_, rx, _, _) in enumerate(_FEATURES) if re.search(rx, text))
     return out, [(_FEATURES[i][0], _FEATURES[i][2], _FEATURES[i][3]) for i in sorted(feats)]
+
+
+def read_requirements(path: Path) -> str:
+    """A requirements file decoded as pip does (pip._internal.utils.encoding.auto_decode): a BOM (UTF-8, UTF-16,
+    UTF-32: `pip freeze > requirements.txt` under PowerShell writes UTF-16), else a `# -*- coding: x -*-` line, else
+    UTF-8. Undecodable: refused with the file's name, never a Python error."""
+    import codecs
+
+    from .ir import TranspileError
+
+    data = path.read_bytes()
+    boms = [(codecs.BOM_UTF8, "utf-8"), (codecs.BOM_UTF16, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16-be"),
+            (codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF32, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+            (codecs.BOM_UTF32_LE, "utf-32-le")]
+    enc, start = "utf-8", 0
+    for bom, name in boms:
+        if data.startswith(bom):
+            enc, start = name, len(bom)
+            break
+    else:
+        m = re.search(rb"coding[:=]\s*([-\w.]+)", b"\n".join(data.split(b"\n")[:2]))
+        if m:
+            enc = m.group(1).decode("ascii")
+    try:
+        return data[start:].decode(enc)
+    except (UnicodeDecodeError, LookupError) as e:
+        why = e.reason if isinstance(e, UnicodeDecodeError) else str(e)
+        raise TranspileError(f"{path}: cannot be read as text ({enc}: {why}); save it as UTF-8 (pip reads a BOM or a "
+                             "`# -*- coding: ... -*-` line)", None, str(path))
 
 
 def python_version_file(root: Path) -> tuple[tuple[int, int], str] | None:
@@ -303,6 +422,13 @@ PROBES = {
     "email_addr_fix": "from email.headerregistry import HeaderRegistry\nr=str(HeaderRegistry()('To', 'a@b.com junk'))=='a@b.com, <>'",
     "email_ew_phrase": "from email import _header_value_parser as p\nr=str(p.get_phrase('=?utf-8?q?a?= =?utf-8?q?b?=')[0])=='ab'",
     "email_verify_bytes": "import email.generator as g\nr=hasattr(g, 'NEWLINE_WITHOUT_FWSP_BYTES')",
+    # html.parser, under reportlab's paragraph markup (dynrt/rl/paraparser.rs): the HTML5 rewrite (3.12.12, 3.13.8),
+    # then the RAWTEXT elements and `&#` (3.12.13 / 3.13.10 / 3.14.1), the abrupt comment close (3.13.15 / 3.14.7)
+    "htmlparser_html5": "import html.parser as h\nr=hasattr(h.HTMLParser, '_set_support_cdata')",
+    "htmlparser_rawtext_more": "import html.parser as h\nr='xmp' in h.HTMLParser.CDATA_CONTENT_ELEMENTS",
+    "htmlparser_charref_data": "import html.parser as h\nr=hasattr(h, 'incomplete_charref')",
+    "htmlparser_abrupt_comment": "import html.parser as h\nclass P(h.HTMLParser):\n def handle_data(s, d): s.d.append(d)\n"
+                                 "p=P(convert_charrefs=False)\np.d=[]\np.feed('<!-->x-->')\nr=p.d==['x-->']",
 }
 
 
@@ -356,12 +482,14 @@ def check_project(root: Path, package: Path | None = None) -> list[tuple[str, st
         mine = "py2axum " + _v("py2axum")
     except Exception:
         mine = "py2axum"
+    UNREADABLE.clear()
     found, py = project_constraints(root)
+    unreadable = list(UNREADABLE)
     features = []
     if package is not None:
         reach, features = used(package)
         found = [f for f in found if f.name in reach]
-    errors = []
+    errors = unreadable
     for f in found:
         for label, dist, lowest in features:
             iv = (parse(f.constraint), parse(f.constraint)) if f.exact else interval(f.constraint)
@@ -372,14 +500,14 @@ def check_project(root: Path, package: Path | None = None) -> list[tuple[str, st
             if not in_range(f.name, f.constraint):
                 errors.append((f"{f.name} {f.constraint} is outside the range {mine} is tested on "
                                f"({f.name}{spec(f.name)}): the binary could behave differently from the Python app. "
-                               f"Use a version in range, or --allow-untested-versions to translate anyway",
-                               f.file, f.line))
+                               f"Use a version in range, or --allow-untested-versions to translate anyway."
+                               + _known_differences(package, f.name), f.file, f.line))
             continue
         iv = interval(f.constraint)
         if iv is not None and (iv[0] >= hi or iv[1] <= lo):
             errors.append((f"{f.name}{f.constraint} excludes every version {mine} is tested on "
                            f"({f.name}{spec(f.name)}). Widen the constraint, or --allow-untested-versions to "
-                           f"translate anyway", f.file, f.line))
+                           f"translate anyway." + _known_differences(package, f.name), f.file, f.line))
     if py is not None:
         iv = interval(py[0])
         lo, hi = parse(PYTHON[0]), parse(PYTHON[2])

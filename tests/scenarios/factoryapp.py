@@ -4,6 +4,7 @@ BAD = {"Origin": "http://evil.example"}
 PRE = {"Origin": "http://ok.example", "Access-Control-Request-Method": "POST"}
 
 STEPS: list = [
+    ("GET", "/life", None),  # the factory-local lifespan ran before the first request
     ("GET", "/health", None),
     ("GET", "/", None),
     ("GET", "/nope", None),

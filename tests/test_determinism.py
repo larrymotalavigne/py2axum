@@ -28,7 +28,7 @@ def test_same_output_whatever_the_hash_seed(tmp_path, args):
 
 
 HELPERS = '''import boto3
-import openpyxl
+import docx
 import reportlab.pdfgen.canvas
 
 
@@ -40,12 +40,12 @@ def use_reportlab():
     return reportlab.pdfgen.canvas.Canvas("x")
 
 
-def use_openpyxl():
-    return openpyxl.Workbook()
+def use_docx():
+    return docx.Document()
 '''
 MAIN = '''from fastapi import FastAPI
 
-from proj.helpers import use_boto, use_openpyxl, use_reportlab
+from proj.helpers import use_boto, use_docx, use_reportlab
 
 app = FastAPI()
 
@@ -53,7 +53,7 @@ app = FastAPI()
 @app.get("/many")
 async def many():
     use_reportlab()
-    use_openpyxl()
+    use_docx()
     use_boto()
     return {}
 '''
@@ -79,4 +79,4 @@ def test_check_json_whatever_the_hash_seed(tmp_path):
     assert len(outs) == 1
     [route] = json.loads(outs.pop())["routes"]
     assert "boto3.client()" in route["reason"]  # helpers.py:7, the first in source order
-    assert list(route["blockers"]) == ["library boto3", "library reportlab", "library openpyxl"]
+    assert list(route["blockers"]) == ["library boto3", "library reportlab", "library docx"]

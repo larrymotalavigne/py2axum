@@ -46,7 +46,9 @@ pub async fn call_method_awaited(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kw
             }
         }
     }
-    let sync = matches!(recv, V::Session(s) if s.is_sync());
+    let sync = matches!(recv, V::Session(s) if s.is_sync())
+        || matches!(recv, V::Native(n) if matches!(&**n, Native::Redis(c) if c.sync))
+        || matches!(recv, V::Native(n) if matches!(&**n, Native::RPipe(p) if p.client.sync));
     let v = call_method(cx, recv, name, args, kwargs).await?;
     if !sync {
         return Ok(v); // awaited by the caller (`await_value`)
@@ -196,7 +198,12 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
     match v {
         V::Native(n) => match &**n {
             Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) => Ok(v.clone()),
+            // `async with session.begin_nested() [as sp]` / `session.begin()`: the AsyncSessionTransaction
+            Native::Savepoint(..) => Ok(v.clone()),
             Native::Sem(s) => sem_method(s, "__aenter__").await,
+            // `async with Redis(...) as r` / `async with r.pipeline() as pipe` (redis.asyncio)
+            Native::Redis(c) if !c.sync => Ok(v.clone()),
+            Native::RPipe(p) if !p.client.sync => Ok(v.clone()),
             Native::AmqpIter(it) => {
                 super::rmq::iter_enter(it).await?;
                 Ok(v.clone())
@@ -235,10 +242,12 @@ pub fn cm_protocol_error(v: &V, asynchronous: bool) -> Exc {
     let other = match v {
         V::Session(s) => s.is_sync() == asynchronous,
         V::Native(n) => if asynchronous {
-            matches!(&**n, Native::TLock(_) | Native::File(_) | Native::BytesIO(_) | Native::Socket(_) | Native::ZipW(_)
+            matches!(&**n, Native::TLock(_) | Native::Gcm(_) | Native::File(_) | Native::BytesIO(_) | Native::Socket(_) | Native::ZipW(_)
                 | Native::Prom(_) | Native::Sentry(_) | Native::Suppress(_) | Native::CtxToken(..))
+                || matches!(&**n, Native::Redis(c) if c.sync) || matches!(&**n, Native::RPipe(p) if p.client.sync)
         } else {
             matches!(&**n, Native::HttpClient(_) | Native::HttpResp(_) | Native::AmqpConn(_) | Native::Sem(_) | Native::Acm(_))
+                || matches!(&**n, Native::Redis(c) if !c.sync) || matches!(&**n, Native::RPipe(p) if !p.client.sync)
         },
         // a project class: its own methods
         V::Inst(_) | V::Obj(_) => super::ops::dunder(v, if asynchronous { "__exit__" } else { "__aexit__" }).is_some(),
@@ -249,6 +258,8 @@ pub fn cm_protocol_error(v: &V, asynchronous: bool) -> Exc {
 
 /// The message of `cm_protocol_error` for a type name, and whether the value has the other protocol
 pub fn cm_error(name: &str, asynchronous: bool, other: bool) -> Exc {
+    // 3.14 qualifies the type by its module (`contextlib._GeneratorContextManager`)
+    let name = if name == "_GeneratorContextManager" && super::python() >= (3, 14) { "contextlib._GeneratorContextManager" } else { name };
     let (kind, missed) = if asynchronous { ("asynchronous context manager", "__aexit__") } else { ("context manager", "__exit__") };
     let mut msg = format!("'{name}' object does not support the {kind} protocol");
     if super::python() >= (3, 14) {
@@ -263,6 +274,37 @@ pub fn cm_error(name: &str, asynchronous: bool, other: bool) -> Exc {
 }
 
 /// leaving `async with v`: `exc` when the body raised; the result suppresses it when true
+/// The end of `async with session.begin_nested()` (`name`, its SAVEPOINT) or `session.begin()` (`""`), as
+/// SQLAlchemy's SessionTransaction.__exit__: nothing when the block already ended it (`await sp.commit()`); a
+/// commit (flush, RELEASE / COMMIT) after a normal exit, rolled back if it fails (an IntegrityError of the flush:
+/// ROLLBACK TO SAVEPOINT, the outer transaction stays usable) and its error raised; a rollback when the body
+/// raised (its exception then propagates)
+async fn savepoint_exit(sess: &super::orm::Session, name: &str, raised: bool) -> R<()> {
+    if name.is_empty() {
+        if raised {
+            return sess.rollback().await;
+        }
+        if let Err(e) = sess.commit().await {
+            let _ = sess.rollback().await;
+            return Err(e);
+        }
+        return Ok(());
+    }
+    if !sess.has_savepoint(name).await {
+        return Ok(());
+    }
+    if raised {
+        return sess.end_savepoint(name, false).await;
+    }
+    if let Err(e) = sess.end_savepoint(name, true).await {
+        // SessionTransaction.__exit__: rollback() after a failed commit (a failed flush already rolled the
+        // savepoint back: this ends its PendingRollbackError state)
+        let _ = sess.end_savepoint(name, false).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
     if let Some(f) = project_dunder(v, "__aexit__") {
         let args = match exc {
@@ -284,8 +326,19 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
             }
             Ok(V::Bool(false))
         }
+        V::Native(n) if matches!(&**n, Native::Savepoint(..)) => {
+            let Native::Savepoint(sess, name) = &**n else { unreachable!() };
+            savepoint_exit(sess, name, exc.is_some()).await?;
+            Ok(V::Bool(false))
+        }
         V::Native(n) if matches!(&**n, Native::McpRun) => {
             super::mcp::log("mcp.server.streamable_http_manager", "StreamableHTTP session manager shutting down", vec![], None);
+            Ok(V::Bool(false))
+        }
+        V::Native(n) if matches!(&**n, Native::Redis(_) | Native::RPipe(_)) => {
+            // the client closed (`aclose()`), the pipeline reset
+            let name = if matches!(&**n, Native::Redis(_)) { "aclose" } else { "reset" };
+            call_method(cx, v, name, vec![], vec![]).await?;
             Ok(V::Bool(false))
         }
         V::Native(n) if matches!(&**n, Native::Acm(_)) => {

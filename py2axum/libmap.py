@@ -58,8 +58,19 @@ def _session(a, kw, sync: bool):
     return f"{RT}::orm::new_session(cx, {_argv(a)}, {_kwvec(kw)}, {'true' if sync else 'false'})"
 
 
+def rs_(s: str) -> str:
+    return '"' + s + '"'
+
+
 def _argv(args: list[str]) -> str:
     return "vec![" + ", ".join(args) + "]"
+
+
+def _array_new(a, kw):
+    # Python 3.15 adds the typecodes e, Zf and Zd: not reproduced, refused when the literal names one
+    if PYTHON >= (3, 15) and a and re.fullmatch(r'V::str\("(e|Zf|Zd)"\)', a[0].strip()):
+        raise ValueError("array.array typecodes e, Zf and Zd (Python 3.15) are not supported (b B h H i I l L q Q f d)")
+    return f"{RT}::arr::new(&{_argv(a)}, &{_kwvec(kw)})"
 
 
 def _mcp_server(a, kw):
@@ -90,6 +101,76 @@ def _zipfile(a, kw):
     if mode != 'V::str("w")':
         raise ValueError('only zipfile.ZipFile(file, "w", ...) is supported (writing, the mode a literal)')
     return f"{RT}::zipw::open(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _qrcode(name, a, kw):
+    """`qrcode.QRCode(...)` / `qrcode.make(data, **kw)` (dynrt/qr.rs): the default image factory only (Pillow's
+    PilImage, the PNG Pillow writes); image_factory= is refused (the factory's own output is not reproduced)"""
+    if name == "make":
+        if len(a) > 1:
+            raise ValueError("qrcode.make(data, **kwargs): the QRCode arguments by keyword")
+        if kw.get("image_factory", "V::None") != "V::None":
+            raise ValueError("qrcode.make(image_factory=) is not supported: only the default factory (Pillow's "
+                             "PilImage, its PNG) is reproduced")
+        _bind("qrcode.make", [], {k: v for k, v in kw.items() if k != "data"}, _QR_PARAMS, set(_QR_PARAMS))
+        return f"{RT}::qr::make(&{_argv(a)}, &{_kwvec(kw)})"
+    vals = _bind("qrcode.QRCode", a, kw, _QR_PARAMS, set(_QR_PARAMS))
+    if vals.get("image_factory", "V::None") != "V::None":
+        raise ValueError("qrcode.QRCode(image_factory=) is not supported: only the default factory (Pillow's PilImage, "
+                         "its PNG) is reproduced")
+    return f"{RT}::qr::new(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+_QR_PARAMS = ["version", "error_correction", "box_size", "border", "image_factory", "mask_pattern"]
+
+
+def _tempfile(a, kw):
+    """`NamedTemporaryFile(...)`: keywords only, without the buffering and text options."""
+    allowed = ("mode", "suffix", "prefix", "dir", "delete")
+    if a:
+        raise ValueError("tempfile.NamedTemporaryFile() with positional arguments is not supported (pass them by keyword)")
+    bad = [k for k in kw if k not in allowed]
+    if bad:
+        raise ValueError(f"tempfile.NamedTemporaryFile({bad[0]}=) is not supported (supported: {', '.join(allowed)})")
+    return f"{RT}::pathio::named_temporary(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _tempdir(a, kw):
+    """`TemporaryDirectory(suffix, prefix, dir, ignore_cleanup_errors, *, delete)`."""
+    allowed = ("suffix", "prefix", "dir", "ignore_cleanup_errors", "delete")
+    if len(a) > 4:
+        raise ValueError("tempfile.TemporaryDirectory() takes at most 4 positional arguments")
+    bad = [k for k in kw if k not in allowed]
+    if bad:
+        raise ValueError(f"tempfile.TemporaryDirectory({bad[0]}=) is not supported (supported: {', '.join(allowed)})")
+    return f"{RT}::pathio::temporary_directory(&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _noargs_call(name, a, kw, code):
+    if a or kw:
+        raise ValueError(f"{name}() takes no argument")
+    return code
+
+
+def _xl(kind, a, kw, allowed):
+    """openpyxl's constructors: keyword arguments only, among those dynrt/xlsx.rs reproduces."""
+    if a:
+        raise ValueError(f"openpyxl {kind}() with positional arguments is not supported (pass them by keyword)")
+    bad = [k for k in kw if k not in allowed]
+    if bad:
+        raise ValueError(f"openpyxl {kind}({bad[0]}=) is not supported (supported: {', '.join(allowed) or 'no argument'})")
+    if kind == "Workbook" and "lxml" in LIB_VERSIONS:
+        raise ValueError(f"openpyxl Workbook() with lxml {LIB_VERSIONS['lxml']} installed is not supported: openpyxl then "
+                         "writes its XML through lxml, and only its ElementTree writer (et_xmlfile, without lxml) is "
+                         "translated. Drop lxml from the lock, or leave the route to Python (--python-side)")
+    fn = "workbook(" if kind == "Workbook" else f'style("{kind}", '
+    return f"{RT}::xlsx::{fn}&{_argv(a)}, &{_kwvec(kw)})"
+
+
+def _xl_letter(a, kw):
+    if len(a) != 1 or kw:
+        raise ValueError("get_column_letter() takes the column index, positionally")
+    return f"{RT}::xlsx::get_column_letter(&{a[0]})"
 
 
 def _noargs(name, code):
@@ -174,7 +255,26 @@ def _one(name):
 
 
 # --- values (attribute or name used as a value) -------------------------------------------
+def _pgpy_dir() -> str:
+    """pgpy's site-packages directory as the transpiler finds it (nothing is imported): the path its warnings
+    name on stderr, as a Rust string literal"""
+    import importlib.util
+    from pathlib import Path
+    try:
+        spec = importlib.util.find_spec("pgpy")
+    except (ImportError, ValueError):
+        spec = None
+    locs = list(spec.submodule_search_locations or []) if spec is not None else []
+    d = str(Path(locs[0]).parent) if locs else ""
+    return '"' + d.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_PGPY_DIR = _pgpy_dir()
+
 VALUES: dict[str, str] = {
+    # subprocess.PIPE / STDOUT / DEVNULL, also asyncio.subprocess's (dynrt/subproc.rs)
+    **{f"{m}.{n}": f"V::Int({v})" for m in ("subprocess", "asyncio.subprocess")
+       for n, v in (("PIPE", -1), ("STDOUT", -2), ("DEVNULL", -3))},
     "sys.maxsize": "V::Int(i64::MAX)",  # CPython's on 64-bit platforms
     "datetime.UTC": f"V::Tz({RT}::dt::Tz::Utc)",
     # pytz 2026.5 (dynrt/pytzrt.rs)
@@ -198,6 +298,9 @@ VALUES: dict[str, str] = {
     **{f"aio_pika.{p}ExchangeType.{m}": f'V::str("{m.lower().replace("_", "-")}")' for p in ("", "exchange.")
        for m in ("DIRECT", "FANOUT", "TOPIC", "HEADERS", "X_DELAYED_MESSAGE", "X_CONSISTENT_HASH", "X_MODULUS_HASH")},
     "zipfile.ZIP_STORED": "V::Int(0)",
+    # qrcode 8.2's error correction levels (dynrt/qr.rs)
+    **{f"qrcode{m}.ERROR_CORRECT_{n}": f"V::Int({v})" for m in ("", ".constants")
+       for n, v in (("L", 1), ("M", 0), ("Q", 3), ("H", 2))},
     "zipfile.ZIP_DEFLATED": "V::Int(8)",
     # cryptography's serialization constants (dynrt/crypto.rs)
     **{f"cryptography.hazmat.primitives.serialization.{c}": f'V::str("{c}")' for c in (
@@ -262,6 +365,26 @@ VALUES: dict[str, str] = {
     # PyYAML: the loader/dumper classes a load()/dump() call may name (dynrt/pyyaml.rs, yamlemit.rs)
     **{f"yaml{m}.{n}": f'V::native({RT}::Native::ExtType("yaml.{n}"))'
        for m in ("", ".loader", ".dumper") for n in ("SafeLoader", "SafeDumper", "Dumper")},
+    # errno: the numbers glibc and macOS agree on (EAGAIN, ENOSYS... differ between the two: refused)
+    **{f"errno.{n}": f"V::Int({v})" for n, v in (
+        ("EPERM", 1), ("ENOENT", 2), ("ESRCH", 3), ("EINTR", 4), ("EIO", 5), ("ENXIO", 6), ("E2BIG", 7), ("ENOEXEC", 8),
+        ("EBADF", 9), ("ECHILD", 10), ("ENOMEM", 12), ("EACCES", 13), ("EFAULT", 14), ("ENOTBLK", 15), ("EBUSY", 16),
+        ("EEXIST", 17), ("EXDEV", 18), ("ENODEV", 19), ("ENOTDIR", 20), ("EISDIR", 21), ("EINVAL", 22), ("ENFILE", 23),
+        ("EMFILE", 24), ("ENOTTY", 25), ("ETXTBSY", 26), ("EFBIG", 27), ("ENOSPC", 28), ("ESPIPE", 29), ("EROFS", 30),
+        ("EMLINK", 31), ("EPIPE", 32), ("EDOM", 33), ("ERANGE", 34))},
+    # the interpreter's constants that do not depend on the build (sys.warnoptions: no -W option, as under uvicorn)
+    # fcntl.flock operations (<sys/file.h>: the same on Linux and macOS)
+    **{f"fcntl.LOCK_{n}": f"V::Int({v})" for n, v in (("SH", 1), ("EX", 2), ("NB", 4), ("UN", 8))},
+    "sys.modules": f"{RT}::libs::sys_modules()",
+    # pgpy 0.6.0 (dynrt/pgpy.rs): the module and its PGPKey class as values (`return pgpy`)
+    "pgpy": f"{RT}::pgpy::module({_PGPY_DIR})",
+    "pgpy.PGPKey": f"{RT}::pgpy::key_class({_PGPY_DIR})",
+    "sys.byteorder": 'V::str("little")',
+    "sys.maxunicode": "V::Int(1114111)",
+    "sys.warnoptions": "V::list(vec![])",
+    # the abstract base classes of collections.abc as isinstance targets (types::abc_isinstance; the ABCs decided by a __subclasshook__ stay refused)
+    **{f"collections.abc.{n}": f'V::native({RT}::Native::ExtType("collections.abc.{n}"))' for n in (
+        "Mapping", "MutableMapping", "Sequence", "MutableSequence", "Set", "MutableSet")},
     "math.pi": "V::Float(std::f64::consts::PI)",
     **{f"decimal.{r}": f'V::str("{r}")' for r in ("ROUND_HALF_EVEN", "ROUND_HALF_UP", "ROUND_HALF_DOWN", "ROUND_DOWN",
                                                    "ROUND_UP", "ROUND_FLOOR", "ROUND_CEILING", "ROUND_05UP")},
@@ -280,7 +403,7 @@ VALUES: dict[str, str] = {
 }
 
 # values above that are snapshots: writing into them would be lost, so it is refused
-READ_ONLY_VALUES = {"os.environ"}
+READ_ONLY_VALUES = {"os.environ", "sys.warnoptions"}
 # library attributes a project may replace (monkeypatching the HTTP clients' request method to wrap it):
 # the runtime's clients then call the replacement
 HOOKS = {
@@ -305,6 +428,18 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.RuntimeError": "RUNTIME_ERROR",
     "builtins.AssertionError": "ASSERTION_ERROR",
     "builtins.NotImplementedError": "NOT_IMPLEMENTED_ERROR",
+    "builtins.Warning": "WARNING",
+    "builtins.UserWarning": "USER_WARNING",
+    "builtins.DeprecationWarning": "DEPRECATION_WARNING",
+    "builtins.PendingDeprecationWarning": "PENDING_DEPRECATION_WARNING",
+    "builtins.SyntaxWarning": "SYNTAX_WARNING",
+    "builtins.RuntimeWarning": "RUNTIME_WARNING",
+    "builtins.FutureWarning": "FUTURE_WARNING",
+    "builtins.ImportWarning": "IMPORT_WARNING",
+    "builtins.UnicodeWarning": "UNICODE_WARNING",
+    "builtins.BytesWarning": "BYTES_WARNING",
+    "builtins.ResourceWarning": "RESOURCE_WARNING",
+    "builtins.EncodingWarning": "ENCODING_WARNING",
     "builtins.RecursionError": "RECURSION_ERROR",
     "builtins.MemoryError": "MEMORY_ERROR",
     "builtins.ZeroDivisionError": "ZERO_DIVISION_ERROR",
@@ -328,8 +463,11 @@ EXCEPTIONS: dict[str, str] = {
     "builtins.ModuleNotFoundError": "MODULE_NOT_FOUND_ERROR",
     "importlib.metadata.PackageNotFoundError": "PACKAGE_NOT_FOUND",
     "builtins.FileExistsError": "FILE_EXISTS_ERROR",
+    "builtins.BlockingIOError": "BLOCKING_IO_ERROR",
     "builtins.PermissionError": "PERMISSION_ERROR",
     "builtins.IsADirectoryError": "IS_A_DIRECTORY_ERROR",
+    "builtins.ProcessLookupError": "PROCESS_LOOKUP_ERROR",
+    "builtins.NotADirectoryError": "NOT_A_DIRECTORY_ERROR",
     "builtins.GeneratorExit": "GENERATOR_EXIT",
     "binascii.Error": "BINASCII_ERROR",
     "json.JSONDecodeError": "JSON_DECODE_ERROR",
@@ -348,6 +486,9 @@ EXCEPTIONS: dict[str, str] = {
         ("DefaultCredentialsError", "DEFAULT_CREDENTIALS_ERROR"), ("MalformedError", "MALFORMED_ERROR"),
         ("InvalidValue", "INVALID_VALUE"))},
     "py_vapid.VapidException": "VAPID_EXCEPTION",
+    **{f"passlib.exc.{n}": f"PASSLIB_{c}" for n, c in (
+        ("UnknownHashError", "UNKNOWN_HASH_ERROR"), ("PasswordValueError", "PASSWORD_VALUE_ERROR"),
+        ("PasswordSizeError", "PASSWORD_SIZE_ERROR"))},
     "requests.RequestException": "REQUESTS_EXCEPTION",
     "requests.exceptions.RequestException": "REQUESTS_EXCEPTION",
     "requests.ConnectionError": "REQUESTS_CONNECTION_ERROR",
@@ -358,7 +499,13 @@ EXCEPTIONS: dict[str, str] = {
         ("HTTPError", "HTTP_ERROR"), ("RequestError", "REQUEST_ERROR"), ("TransportError", "TRANSPORT_ERROR"),
         ("TimeoutException", "TIMEOUT_EXCEPTION"), ("ConnectTimeout", "CONNECT_TIMEOUT"), ("ReadTimeout", "READ_TIMEOUT"),
         ("NetworkError", "NETWORK_ERROR"), ("ConnectError", "CONNECT_ERROR"), ("UnsupportedProtocol", "UNSUPPORTED_PROTOCOL"),
-        ("TooManyRedirects", "TOO_MANY_REDIRECTS"), ("DecodingError", "DECODING_ERROR"), ("HTTPStatusError", "STATUS_ERROR"), ("InvalidURL", "INVALID_URL"))},
+        ("TooManyRedirects", "TOO_MANY_REDIRECTS"), ("DecodingError", "DECODING_ERROR"), ("HTTPStatusError", "STATUS_ERROR"), ("InvalidURL", "INVALID_URL"),
+        ("WriteTimeout", "WRITE_TIMEOUT"), ("PoolTimeout", "POOL_TIMEOUT"), ("ReadError", "READ_ERROR"),
+        ("WriteError", "WRITE_ERROR"), ("CloseError", "CLOSE_ERROR"), ("ProtocolError", "PROTOCOL_ERROR"),
+        ("LocalProtocolError", "LOCAL_PROTOCOL_ERROR"), ("RemoteProtocolError", "REMOTE_PROTOCOL_ERROR"),
+        ("ProxyError", "PROXY_ERROR"), ("CookieConflict", "COOKIE_CONFLICT"), ("StreamError", "STREAM_ERROR"),
+        ("StreamConsumed", "STREAM_CONSUMED"), ("StreamClosed", "STREAM_CLOSED"), ("ResponseNotRead", "RESPONSE_NOT_READ"),
+        ("RequestNotRead", "REQUEST_NOT_READ"))},
     **{f"aiohttp.{n}": f"AIO_{c}" for n, c in (
         ("ClientError", "CLIENT_ERROR"), ("ClientResponseError", "RESPONSE_ERROR"), ("ContentTypeError", "CONTENT_TYPE_ERROR"),
         ("TooManyRedirects", "TOO_MANY_REDIRECTS"), ("ClientConnectionError", "CONNECTION_ERROR"), ("ClientOSError", "OS_ERROR"),
@@ -370,6 +517,8 @@ EXCEPTIONS: dict[str, str] = {
     "mcp.server.mcpserver.exceptions.ToolError": "MCP_TOOL_ERROR",
     "asyncio.QueueFull": "QUEUE_FULL",
     "asyncio.QueueEmpty": "QUEUE_EMPTY",
+    "ipaddress.AddressValueError": "ADDRESS_VALUE_ERROR",
+    "ipaddress.NetmaskValueError": "NETMASK_VALUE_ERROR",
     "fastapi.HTTPException": "HTTP_EXCEPTION",
     "fastapi.exceptions.HTTPException": "HTTP_EXCEPTION",
     # WebSockets (dynrt/ws.rs)
@@ -381,10 +530,11 @@ EXCEPTIONS: dict[str, str] = {
     "fastapi.exceptions.WebSocketRequestValidationError": "WS_VALIDATION_ERROR",
     "fastapi.exceptions.RequestValidationError": "REQUEST_VALIDATION_ERROR",
     "fastapi.exceptions.ValidationException": "VALIDATION_EXCEPTION",
-    "starlette.exceptions.HTTPException": "HTTP_EXCEPTION",
+    "starlette.exceptions.HTTPException": "STARLETTE_HTTP_EXCEPTION",
     "pydantic.ValidationError": "VALIDATION_ERROR",
     **{f"pydantic_core{m}.{n}": c for m in ("", "._pydantic_core") for n, c in (("PydanticCustomError", "PYDANTIC_CUSTOM_ERROR"),
-                                                                               ("PydanticUseDefault", "PYDANTIC_USE_DEFAULT"))},
+                                                                               ("PydanticUseDefault", "PYDANTIC_USE_DEFAULT"),
+                                                                               ("PydanticSerializationError", "PYDANTIC_SERIALIZATION_ERROR"))},
     "sqlalchemy.exc.SQLAlchemyError": "SQLALCHEMY_ERROR",
     "sqlalchemy.exc.DBAPIError": "DBAPI_ERROR",
     "sqlalchemy.exc.IntegrityError": "INTEGRITY_ERROR",
@@ -393,8 +543,10 @@ EXCEPTIONS: dict[str, str] = {
     "sqlalchemy.exc.ProgrammingError": "PROGRAMMING_ERROR",
     "sqlalchemy.exc.InternalError": "INTERNAL_ERROR",
     "sqlalchemy.exc.NotSupportedError": "NOT_SUPPORTED_ERROR",
+    "sqlalchemy.exc.InterfaceError": "INTERFACE_ERROR",
     "sqlalchemy.exc.NoResultFound": "NO_RESULT_FOUND",
     "sqlalchemy.exc.InvalidRequestError": "INVALID_REQUEST_ERROR",
+    "sqlalchemy.exc.PendingRollbackError": "PENDING_ROLLBACK_ERROR",
     "sqlalchemy.orm.exc.UnmappedInstanceError": "UNMAPPED_INSTANCE_ERROR",
     "sqlalchemy.exc.StatementError": "STATEMENT_ERROR",
     "sqlalchemy.exc.MissingGreenlet": "MISSING_GREENLET",
@@ -432,7 +584,7 @@ EXCEPTIONS: dict[str, str] = {
     "aiormq.ChannelPreconditionFailed": "AMQP_CHANNEL_PRECONDITION",
     "aiormq.ConnectionClosed": "AMQP_CONNECTION_CLOSED",
     "aio_pika.exceptions.MessageProcessError": "AMQP_MESSAGE_PROCESS_ERROR",
-    **{f"redis.exceptions.{n}": c for n, c in (("RedisError", "REDIS_ERROR"), ("ConnectionError", "REDIS_CONNECTION_ERROR"),
+    **{f"redis.{m}{n}": c for m in ("exceptions.", "") for n, c in (("RedisError", "REDIS_ERROR"), ("ConnectionError", "REDIS_CONNECTION_ERROR"),
                                                 ("TimeoutError", "REDIS_TIMEOUT_ERROR"), ("DataError", "REDIS_DATA_ERROR"),
                                                 ("ResponseError", "REDIS_RESPONSE_ERROR"))},
     "pickle.PicklingError": "PICKLING_ERROR",
@@ -509,6 +661,7 @@ EXCEPTIONS: dict[str, str] = {
         ("AmbiguousTimeError", "PYTZ_AMBIGUOUS_TIME_ERROR"), ("NonExistentTimeError", "PYTZ_NON_EXISTENT_TIME_ERROR"))},
     "pytz.exceptions.Error": "PYTZ_ERROR",
     **{f"dateutil.parser{m}.ParserError": "DU_PARSER_ERROR" for m in ("", "._parser")},
+    "qrcode.exceptions.DataOverflowError": "QRCODE_DATA_OVERFLOW_ERROR",
     **{f"{m}.{n}": c for m in ("croniter", "croniter.croniter") for n, c in (
         ("CroniterError", "CRONITER_ERROR"), ("CroniterBadCronError", "CRONITER_BAD_CRON_ERROR"),
         ("CroniterBadDateError", "CRONITER_BAD_DATE_ERROR"), ("CroniterBadTypeRangeError", "CRONITER_BAD_TYPE_RANGE_ERROR"),
@@ -517,6 +670,34 @@ EXCEPTIONS: dict[str, str] = {
 }
 
 # keyword arguments refused at transpile time (the call is otherwise supported)
+# redis clients (dynrt/rds.rs): the constructors, and the options they take (rds::OPTIONS, plus the address)
+REDIS_CLIENTS = tuple(f"redis.{m}{c}" for m in ("", "client.", "asyncio.", "asyncio.client.") for c in ("Redis", "StrictRedis"))
+REDIS_FROM_URL = ("redis.from_url", "redis.utils.from_url", "redis.asyncio.from_url", "redis.asyncio.utils.from_url",
+                  "redis.asyncio.client.from_url", *(f"{c}.from_url" for c in REDIS_CLIENTS))
+REDIS_POOL_FROM_URL = tuple(f"redis.{m}ConnectionPool.from_url" for m in ("", "connection.", "asyncio.", "asyncio.connection."))
+REDIS_OPTIONS = {"decode_responses", "encoding", "retry", "retry_on_error", "retry_on_timeout", "health_check_interval",
+                 "socket_keepalive", "socket_timeout", "socket_connect_timeout", "max_connections",
+                 "single_connection_client", "client_name"}
+
+
+def redis_static(name: str, node) -> None:
+    """The options of a redis client or pool written in the call: the ones dynrt/rds.rs applies or that only tune
+    the connection (ValueError otherwise); `encoding=` other than a literal UTF-8 is refused."""
+    import ast
+    allowed = REDIS_OPTIONS | ({"url"} if name.endswith("from_url") else
+                               {"host", "port", "db", "password", "username", "connection_pool"})
+    for k in node.keywords:
+        if k.arg is None:
+            raise ValueError("`**options` is not supported (write the options)")
+        if k.arg not in allowed:
+            raise ValueError(f"option {k.arg}= is not supported (only {', '.join(sorted(allowed))})")
+        if k.arg == "encoding" and not (isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)
+                                        and k.value.value.lower().replace("-", "") == "utf8"):
+            raise ValueError("encoding= other than a literal 'utf-8' is not supported")
+    if node.args and not name.endswith("from_url"):
+        raise ValueError("pass the address as keywords (host=, port=, db=...)")
+
+
 REFUSED_KWARGS = {
     "tenacity.retry": {"sleep", "retry_error_cls"},
     "tenacity.before_sleep_log": {"exc_info"},
@@ -580,12 +761,22 @@ SINCE = {"re.PatternError": (3, 13)}
 
 
 def too_new(dotted: str) -> str | None:
-    """The refusal of a library name newer than the project's Python, None if it exists there."""
+    """The refusal of a library name newer than the project's Python (or than its locked library), None if it
+    exists there."""
     v = SINCE.get(dotted)
     if v is None or PYTHON >= v:
         return None
     return (f"{dotted} needs Python {v[0]}.{v[1]} (the project runs on {PYTHON[0]}.{PYTHON[1]}, "
             "where it raises AttributeError)")
+
+
+def stripe_error_missing(dotted: str) -> bool:
+    """`stripe.error.X` under a locked stripe 14.0.0: the module's `__getattr__` has no `error` entry (added back in
+    14.0.1), so evaluating `stripe.error` raises a bare AttributeError() (dynrt/stripe.rs `no_error_module`)."""
+    if not dotted.startswith("stripe.error."):
+        return False
+    sv = LIB_VERSIONS.get("stripe", "14.4.1")
+    return tuple(int(x) for x in re.findall(r"\d+", sv)[:3]) < (14, 0, 1)
 
 
 def set_python(version: tuple[int, int]) -> None:
@@ -605,6 +796,21 @@ def _no_kw(name: str, kw, refused) -> str:
     for k in kw:
         if k in refused:
             raise ValueError(f"{name}({k}=) is not supported")
+    return ""
+
+
+def _ucd_same() -> str:
+    """unicodedata's category/bidirectional/name tables come from the translating Python: refused when its Unicode
+    version is not the project's (a property of an assigned character may change between versions)."""
+    import unicodedata
+
+    from . import ucdages
+
+    want = ucdages.UNICODE.get(PYTHON)
+    if want is not None and want != unicodedata.unidata_version:
+        raise ValueError(f"unicodedata's tables are written from the translating Python (Unicode {unicodedata.unidata_version}), "
+                         f"the project's Python {PYTHON[0]}.{PYTHON[1]} has Unicode {want}: translate with Python "
+                         f"{PYTHON[0]}.{PYTHON[1]}")
     return ""
 
 
@@ -830,6 +1036,53 @@ def pyjwt_static(name, node):
                          "RSA/EC/EdDSA keys are not reproduced)")
 
 
+def _bcrypt5() -> bool:
+    """the project locks (or the transpiler has) bcrypt 5: its hashpw refuses a password over 72 bytes"""
+    v = LIB_VERSIONS.get("bcrypt")
+    return v is None or int((v.split(".") + ["0"])[0] or 0) >= 5
+
+
+def _passlib_bcrypt() -> str:
+    """the bcrypt release passlib's backend loads (it decides what passlib logs, and whether it works at all)"""
+    v = LIB_VERSIONS.get("bcrypt")
+    if v is None:
+        raise ValueError("passlib's bcrypt handler without the `bcrypt` package (none locked or installed) is not "
+                         "supported: passlib then falls back to another backend")
+    if tuple(int(x) for x in re.findall(r"\d+", v)[:2]) < (4, 0):
+        raise ValueError(f"passlib's bcrypt handler over bcrypt {v} is not supported (bcrypt 4.0 or later)")
+    return v
+
+
+def passlib_static(name, node):
+    """passlib.context.CryptContext: the literal configuration `schemes=["bcrypt"]` (positional or keyword),
+    `deprecated="auto"` (or `["auto"]`, or absent), nothing else."""
+    import ast
+    if name != "passlib.context.CryptContext":
+        return
+
+    def lit(e):
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            return e.value
+        if isinstance(e, (ast.List, ast.Tuple)) and all(isinstance(x, ast.Constant) and isinstance(x.value, str) for x in e.elts):
+            return tuple(x.value for x in e.elts)
+        return None
+    if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+        raise ValueError("`*`/`**` arguments are not supported")
+    if len(node.args) > 1:
+        raise ValueError("only schemes= and deprecated= are supported")
+    kws = {k.arg: k.value for k in node.keywords}
+    for k in kws:
+        if k not in ("schemes", "deprecated"):
+            raise ValueError(f"{k}= is not supported (only schemes=[\"bcrypt\"] and deprecated=\"auto\": passlib's "
+                             "bcrypt handler with its defaults is reproduced)")
+    schemes = node.args[0] if node.args else kws.get("schemes")
+    if schemes is None or lit(schemes) not in ("bcrypt", ("bcrypt",)):
+        raise ValueError("schemes must be the literal [\"bcrypt\"] (of passlib, only the bcrypt handler is reproduced)")
+    dep = kws.get("deprecated")
+    if dep is not None and not (isinstance(dep, ast.Constant) and dep.value is None) and lit(dep) not in ("auto", ("auto",), ()):
+        raise ValueError("deprecated must be \"auto\" (or [\"auto\"]) with the single bcrypt scheme")
+
+
 def _relativedelta(a, kw):
     allowed = {"years", "months", "weeks", "days", "hours", "minutes", "seconds", "microseconds"}
     if a:
@@ -1003,9 +1256,13 @@ CALLS = {
     **{n: (lambda robust: lambda a, kw: f"{RT}::rmq::connect(&{_argv(a)}, &{_kwvec(kw)}, {robust}).await")(
         "true" if n.endswith("robust") else "false") for n in ("aio_pika.connect_robust", "aio_pika.connect")},
     "aio_pika.Message": lambda a, kw: f"{RT}::rmq::message(&{_argv(a)}, &{_kwvec(kw)})",
-    # redis.asyncio (dynrt/rds.rs)
-    **{n: (lambda a, kw: f"{RT}::rds::from_url(&{_argv(a)}, &{_kwvec(kw)})") for n in ("redis.asyncio.from_url", "redis.asyncio.client.from_url")},
-    **{n: (lambda a, kw: f"{RT}::rds::new(&{_argv(a)}, &{_kwvec(kw)})") for n in ("redis.asyncio.Redis", "redis.asyncio.client.Redis", "redis.asyncio.StrictRedis")},
+    # redis.asyncio and redis (dynrt/rds.rs): the same client, `sync` for redis's
+    **{n: (lambda sync: lambda a, kw: f"{RT}::rds::from_url(&{_argv(a)}, &{_kwvec(kw)}, {sync})")(
+        "false" if n.startswith("redis.asyncio") else "true") for n in REDIS_FROM_URL},
+    **{n: (lambda sync: lambda a, kw: f"{RT}::rds::new(&{_argv(a)}, &{_kwvec(kw)}, {sync})")(
+        "false" if n.startswith("redis.asyncio") else "true") for n in REDIS_CLIENTS},
+    **{n: (lambda sync: lambda a, kw: f"{RT}::rds::pool_from_url(&{_argv(a)}, &{_kwvec(kw)}, {sync})")(
+        "false" if n.startswith("redis.asyncio") else "true") for n in REDIS_POOL_FROM_URL},
     "redis.asyncio.retry.Retry": lambda a, kw: f"{RT}::rds::retry(&{_argv(a)}, &{_kwvec(kw)})",
     **{f"redis.backoff.{n}": (lambda a, kw: "{ " + "".join(f"let _ = {x}; " for x in list(a) + list(kw.values())) + f"Ok::<V, Exc>(V::native({RT}::Native::Namespace(\"backoff\"))) }}")
        for n in ("ExponentialBackoff", "ConstantBackoff", "NoBackoff", "EqualJitterBackoff", "FullJitterBackoff", "DecorrelatedJitterBackoff")},
@@ -1051,10 +1308,12 @@ CALLS = {
     # urllib.parse
     **{f"urllib.parse.{f}": (lambda f: lambda a, kw: _no_kw(f, kw, ("missing_as_none",))
                              or f"{RT}::stdlib::urllib(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
-       for f in ("quote", "quote_plus", "unquote", "unquote_plus", "urlencode", "urlparse", "urlsplit")},
-    # bcrypt 5.0, pyotp 2.9
-    **{f"bcrypt.{f}": (lambda f: lambda a, kw: f"{RT}::auth::call(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
+       for f in ("quote", "quote_plus", "unquote", "unquote_plus", "urlencode", "urlparse", "urlsplit", "parse_qs", "parse_qsl")},
+    # bcrypt 4.3 / 5.0 (5.0 refuses a password over 72 bytes), pyotp 2.9
+    **{f"bcrypt.{f}": (lambda f: lambda a, kw: f"{RT}::auth::call(\"{f}\", {str(_bcrypt5()).lower()}, &{_argv(a)}, &{_kwvec(kw)})")(f)
        for f in ("gensalt", "hashpw", "checkpw")},
+    # passlib 1.7.4: CryptContext(schemes=["bcrypt"]) over the bcrypt package (passlib_static checks the call)
+    "passlib.context.CryptContext": lambda a, kw: (list(a), kw.items(), f"{RT}::auth::passlib_context({_passlib_bcrypt()!r})".replace("'", '"'))[2],
     # pwdlib 0.2+: the recommended Argon2 hasher (hash, verify, verify_and_update)
     "pwdlib.PasswordHash.recommended": lambda a, kw: f"{RT}::auth::pwd_recommended()" if not a and not kw else
         (_ for _ in ()).throw(ValueError("PasswordHash.recommended() takes no arguments")),
@@ -1088,6 +1347,9 @@ CALLS = {
     "hashlib.md5": lambda a, kw: f"{RT}::libs::hash_new(\"md5\", {('Some(&' + a[0] + ')') if a else 'None'})",
     "secrets.token_urlsafe": lambda a, kw: f"{RT}::libs::token_urlsafe(&{a[0] if a else kw.get('nbytes', 'V::None')})",
     "secrets.token_hex": lambda a, kw: f"{RT}::libs::token_hex(&{a[0] if a else kw.get('nbytes', 'V::None')})",
+    "secrets.token_bytes": lambda a, kw: f"{RT}::libs::token_bytes(&{a[0] if a else kw.get('nbytes', 'V::None')})",
+    "secrets.randbelow": lambda a, kw: f"{RT}::libs::randbelow(&{a[0] if a else kw['exclusive_upper_bound']})",
+    "secrets.randbits": lambda a, kw: f"{RT}::libs::randbits(&{a[0] if a else kw['k']})",
     "secrets.compare_digest": lambda a, kw: f"{RT}::libs::compare_digest(&{a[0]}, &{a[1]})",
     "statistics.median": lambda a, kw: f"{RT}::libs::median(&{a[0]})",
     "json.dumps": _json_dumps,
@@ -1143,18 +1405,46 @@ CALLS = {
                                                           f"{RT}::emailmsg::new(&{_argv(a)}, &{_kwvec(kw)})"),
     # positional-only in CPython: keywords are a TypeError there, refused here
     "unicodedata.normalize": lambda a, kw: f"{RT}::stdlib::unicodedata_normalize(self::UCD_UNASSIGNED, &{a[0]}, &{a[1]})" if len(a) == 2 and not kw else (_ for _ in ()).throw(ValueError("normalize(form, unistr): two positional arguments")),
+    # category, bidirectional, name: tables of the project's Unicode version, written into the crate (dyn.ucd_tables)
+    "unicodedata.category": lambda a, kw: _ucd_same() or (f"{RT}::stdlib::unicodedata_prop(\"category\", self::UCD_CATEGORY, \"Cn\", &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("category(chr): one positional argument"))),
+    "unicodedata.bidirectional": lambda a, kw: _ucd_same() or (f"{RT}::stdlib::unicodedata_prop(\"bidirectional\", self::UCD_BIDI, \"\", &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("bidirectional(chr): one positional argument"))),
+    "unicodedata.name": lambda a, kw: _ucd_same() or (f"{RT}::stdlib::unicodedata_name(&self::UCD_NAMES, &{_argv(a)})" if 1 <= len(a) <= 2 and not kw else (_ for _ in ()).throw(ValueError("name(chr[, default]): positional arguments"))),
+    "unicodedata.decomposition": lambda a, kw: _ucd_same() or (f"{RT}::stdlib::unicodedata_decomposition(self::UCD_DECOMP, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("decomposition(chr): one positional argument"))),
     "unicodedata.combining": lambda a, kw: f"{RT}::stdlib::unicodedata_combining(self::UCD_UNASSIGNED, &{a[0]})" if len(a) == 1 and not kw else (_ for _ in ()).throw(ValueError("combining(chr): one positional argument")),
+    **{f"bisect.{n}": (lambda n, left, f: lambda a, kw: f"{RT}::bisect::{f}(cx, {rs_(n)}, {left}, &{_argv(a)}, &{_kwvec(kw)}).await")(n, l, f)
+       for n, l, f in (("bisect_left", "true", "bisect"), ("bisect_right", "false", "bisect"), ("bisect", "false", "bisect"),
+                       ("insort_left", "true", "insort"), ("insort_right", "false", "insort"), ("insort", "false", "insort"))},
     "collections.deque": lambda a, kw: f"{RT}::deque::new(&{_argv(a)}, &{_kwvec(kw)})",
     "socket.getaddrinfo": lambda a, kw: f"{RT}::net::getaddrinfo(&{_argv(a)}, &{_kwvec(kw)})",
     "collections.Counter": lambda a, kw: f"{RT}::ops::counter(&{_argv(a)}, &{_kwvec(kw)})",
     "zipfile.ZipFile": lambda a, kw: _zipfile(a, kw),
+    # qrcode 8.2 with Pillow's PilImage (dynrt/qr.rs): QRCode and make; their methods in the runtime
+    **{f"qrcode{m}.{n}": (lambda n: lambda a, kw: _qrcode(n, a, kw))(n) for m in ("", ".main") for n in ("QRCode", "make")},
+    # tempfile: a named file, mode w/w+ (dynrt/pathio.rs)
+    "tempfile.NamedTemporaryFile": lambda a, kw: _tempfile(a, kw),
+    "tempfile.TemporaryDirectory": lambda a, kw: _tempdir(a, kw),
+    "tempfile.gettempdir": lambda a, kw: _noargs_call("tempfile.gettempdir", a, kw, f"{RT}::pathio::gettempdir().map(V::str)"),
+    # openpyxl 3.1 (no lxml): Workbook(), styles, get_column_letter (dynrt/xlsx.rs)
+    **{f"openpyxl{m}.Workbook": lambda a, kw: _xl("Workbook", a, kw, ()) for m in ("", ".workbook", ".workbook.workbook")},
+    **{f"openpyxl.styles{m}.{k}": (lambda k, ok: lambda a, kw: _xl(k, a, kw, ok))(k, ok)
+       for k, mods, ok in (("Font", (".fonts",), ("name", "size", "sz", "bold", "b", "italic", "i", "strike", "color")),
+                           ("PatternFill", (".fills",), ("patternType", "fill_type", "fgColor", "start_color", "bgColor", "end_color")),
+                           ("Side", (".borders",), ("style", "border_style", "color")),
+                           ("Border", (".borders",), ("left", "right", "top", "bottom", "diagonal")),
+                           ("Alignment", (".alignment",), ("horizontal", "vertical", "wrap_text", "wrapText", "shrink_to_fit", "shrinkToFit")))
+       for m in ("",) + mods},
+    **{f"openpyxl.utils{m}.get_column_letter": lambda a, kw: _xl_letter(a, kw) for m in ("", ".cell")},
     "socket.create_connection": lambda a, kw: (
         f"{RT}::net::create_connection(&{_argv(a)}, &{_kwvec(_checked('socket.create_connection', a, kw, ['address', 'timeout']))}).await"),
     # uvicorn runs on uvloop when the project installs it (`uvicorn[standard]`): its error messages differ
     "asyncio.open_connection": lambda a, kw: (
         f"{RT}::net::open_connection(&{_argv(a)}, &{_kwvec(_checked('asyncio.open_connection', a, kw, ['host', 'port']))}, "
         f"{str('uvloop' in LIB_VERSIONS).lower()}).await"),
+    # array.array: typed arrays of numbers (dynrt/arr.rs)
+    "array.array": lambda a, kw: _array_new(a, kw),
     "ipaddress.ip_address": lambda a, kw: f"{RT}::net::ip_address(&{_argv(a)})",
+    "ipaddress.IPv4Address": lambda a, kw: f"{RT}::net::ip_typed(false, &{_argv(a)})" if not kw else (_ for _ in ()).throw(ValueError("IPv4Address(address): one positional argument")),
+    "ipaddress.IPv6Address": lambda a, kw: f"{RT}::net::ip_typed(true, &{_argv(a)})" if not kw else (_ for _ in ()).throw(ValueError("IPv6Address(address): one positional argument")),
     "ipaddress.ip_network": lambda a, kw: f"{RT}::net::ip_network(&{_argv(a)}, &{_kwvec(kw)})",
     "nh3.clean": lambda a, kw: f"{RT}::nh3::clean(&{_argv(a)}, &{_kwvec(kw)})",
     "nh3.clean_text": lambda a, kw: f"{RT}::nh3::clean_text(&{_argv(a)}, &{_kwvec(kw)})",
@@ -1219,19 +1509,25 @@ CALLS = {
     **{n: (lambda a, kw: f"{RT}::trace::settrace(&{_argv(a)})") for n in ("sys.settrace", "threading.settrace", "threading.settrace_all_threads")},
     "sys.gettrace": lambda a, kw: f"{RT}::trace::gettrace()",
     "gzip.decompress": lambda a, kw: f"{RT}::stdlib::gzip_decompress(&{_argv(a)}, &{_kwvec(kw)})",
+    "gzip.compress": lambda a, kw: f"{RT}::stdlib::gzip_compress(&{_argv(a)}, &{_kwvec(kw)})",
     "traceback.extract_tb": lambda a, kw: f"{RT}::trace::extract_tb(&{_argv(a)}, &{_kwvec(kw)})",
     "traceback.format_exception": lambda a, kw: f"{RT}::trace::format_exception(cx, &{_argv(a)}, &{_kwvec(kw)})",
     "traceback.format_exception_only": lambda a, kw: f"{RT}::trace::format_exception_only(&{_argv(a)}[0])",
+    "traceback.format_exc": lambda a, kw: f"{RT}::trace::format_exc_now(cx, &{_argv(a)}, &{_kwvec(kw)})",
     "timeit.default_timer": lambda a, kw: f"{RT}::stdlib::time_now(\"perf_counter\")",
     **{f"os.path.{n}": (lambda n: lambda a, kw: f"{RT}::stdlib::os_path(\"{n}\", &{_argv(a)})")(n)
        for n in ("exists", "isfile", "isdir", "join", "basename", "dirname", "splitext", "normpath", "abspath", "realpath")},
     **{f"os.{n}": (lambda n: lambda a, kw: f"{RT}::pathio::os_remove(\"{n}\", &{_argv(a)})"
                    if not kw else (_ for _ in ()).throw(ValueError(f"os.{n}(dir_fd=) is not supported")))(n)
        for n in ("remove", "unlink")},
+    "fcntl.flock": lambda a, kw: f"{RT}::pathio::flock(&{_argv(a)}, &{_kwvec(kw)})",
     "hmac.new": lambda a, kw: f"{RT}::stdlib::hmac_new(&{_argv(a)}, &{_kwvec(kw)})",
     "hmac.compare_digest": lambda a, kw: f"{RT}::libs::compare_digest(&{a[0]}, &{a[1]})",
     # calendar, types
     "calendar.monthrange": lambda a, kw: f"{RT}::libs::monthrange(&{a[0]}, &{a[1]})",
+    "types.ModuleType": lambda a, kw: f"{RT}::libs::module_type(&{_argv(a)}, &{_kwvec(kw)})",
+    # pgpy 0.6.0: PGPKey.from_blob(blob) only (dynrt/pgpy.rs, pgpycore.rs)
+    "pgpy.PGPKey.from_blob": lambda a, kw: f"{{ let _ = {RT}::pgpy::key_class({_PGPY_DIR}); {RT}::pgpy::from_blob(&{_argv(a)}, &{_kwvec(kw)}) }}",
     "types.SimpleNamespace": lambda a, kw: f"{RT}::libs::namespace(&{_argv(a)}, &{_kwvec(kw)})",
     "operator.index": lambda a, kw: _no_kw("operator.index", kw, kw) or f"{RT}::libs::operator_index(&{_argv(a)})",
     "threading.local": lambda a, kw: f"{RT}::libs::thread_local(&{_argv(a)}, &{_kwvec(kw)})",
@@ -1239,6 +1535,8 @@ CALLS = {
     "fastapi.sse.ServerSentEvent": lambda a, kw: f"{RT}::web::sse_event(&{_argv(a)}, &{_kwvec(kw)})",
     # pathlib, uuid
     **{f"pathlib.{n}": (lambda a, kw: f"{RT}::pathio::path_new(&{_argv(a)})") for n in ("Path", "PurePath", "PosixPath", "PurePosixPath")},
+    **{f"pathlib.{n}.cwd": _noargs(f"{n}.cwd", f"{RT}::pathio::cwd(true)") for n in ("Path", "PosixPath")},
+    "os.getcwd": _noargs("os.getcwd", f"{RT}::pathio::cwd(false)"),
     "uuid.uuid4": lambda a, kw: f"Ok::<V, Exc>({RT}::pathio::uuid4())",
     "uuid.uuid7": lambda a, kw: (_since((3, 14), "uuid.uuid7()"), _bind("uuid7", a, kw, [], set()),
                                  f"Ok::<V, Exc>({RT}::pathio::uuid7())")[2],
@@ -1285,6 +1583,7 @@ CALLS = {
     "fastapi.exception_handlers.http_exception_handler": _default_handler("http"),
     "fastapi.exception_handlers.request_validation_exception_handler": _default_handler("validation"),
     "contextlib.asynccontextmanager": lambda a, kw: f"{RT}::agen::asynccontextmanager(&{a[0]})",
+    "contextlib.contextmanager": lambda a, kw: f"{RT}::agen::contextmanager(&{a[0]})",
     # mcp 2.2 (dynrt/mcp.rs): the server object; its tools, transport options and attributes are checked
     # by the transpiler (dyn.mcp_tools)
     "mcp.server.mcpserver.MCPServer": lambda a, kw: _mcp_server(a, kw),
@@ -1297,7 +1596,7 @@ CALLS = {
     # FastAPI / Starlette
     "fastapi.HTTPException": _http_exc,
     "fastapi.exceptions.HTTPException": _http_exc,
-    "starlette.exceptions.HTTPException": _http_exc,
+    "starlette.exceptions.HTTPException": lambda a, kw: _http_exc(a, kw).replace("::http_exc(", "::http_exc_starlette("),
     "fastapi.responses.StreamingResponse": _stream,
     **{n: lambda a, kw: f"{RT}::ws::disconnect_exc({_argv(a)}, {_kwvec(kw)})"
        for n in ("fastapi.WebSocketDisconnect", "fastapi.websockets.WebSocketDisconnect", "starlette.websockets.WebSocketDisconnect")},
@@ -1385,6 +1684,8 @@ CALLS = {
     "sqlalchemy.distinct": lambda a, kw: f"{RT}::orm::sql_method(&{a[0]}, \"distinct\", vec![], vec![])",
     # typing no-ops
     # cast(type, value) is the value (the type only informs a type checker: read, never evaluated)
+    # markers on a def or class: the object itself (CPython also sets an introspection attribute on it)
+    **{f"{m}.{n}": (lambda a, kw: f"Ok::<V, Exc>({a[0]})") for m in ("typing", "typing_extensions") for n in ("final", "override", "no_type_check")},
     "typing.cast": lambda a, kw: (a[0], f"Ok::<V, Exc>({a[1]})")[1],
 }
 
@@ -1417,7 +1718,135 @@ DYN_ARGS = {
     **{f"dateutil.parser{m}.parse": (lambda a, kw: f"{RT}::duparse::parse(cx, {a}, {kw}).await") for m in ("", "._parser")},
     # case(*whens, else_=...): the (condition, value) tuples of a list built at run time
     "sqlalchemy.case": lambda a, kw: f"{RT}::orm::case(&{a}, &{kw})",
+    # create_subprocess_exec(*cmd, stdout=PIPE): the OSError of a failed spawn names the file under asyncio, not
+    # under uvloop (uvicorn runs on it when the project installs it)
+    **{f"asyncio{m}.create_subprocess_exec": (lambda a, kw: f"{RT}::subproc::exec(&{a}, &{kw}, "
+                                              f"{str('uvloop' in LIB_VERSIONS).lower()}).await")
+       for m in ("", ".subprocess")},
 }
+# stripe-python 14 (dynrt/stripe.rs): every resource classmethod of the release (`stripe.Customer.create(...)`),
+# by the number of positional ids it is given (py2axum/stripetab.py, tools/gen_stripe.py); `*_async`, StripeClient
+# and the instance methods (`customer.save()`) are not mapped
+from . import stripetab as _stripetab  # noqa: E402
+
+
+def _stripe_method(path: str):
+    arms = ", ".join(f"({n}, {i})" for n, i in sorted(_stripetab.METHODS[path].items()))
+    return lambda a, kw: f"{RT}::stripe::call(cx, &[{arms}], {a}, {kw}).await"
+
+
+DYN_ARGS.update({p: _stripe_method(p) for p in _stripetab.METHODS})
+DYN_ARGS["stripe.Webhook.construct_event"] = lambda a, kw: f"{RT}::stripe::construct_event(cx, {a}, {kw}).await"
+DYN_ARGS["stripe.WebhookSignature.verify_header"] = lambda a, kw: f"{RT}::stripe::verify_header_call(cx, {a}, {kw}).await"
+# the module configuration the binary keeps (read and assigned, at module level or in a function)
+STRIPE_CONF = ("api_key", "api_base", "api_version", "max_network_retries", "enable_telemetry", "log")
+VALUES.update({f"stripe.{n}": f'{RT}::stripe::conf("{n}")' for n in STRIPE_CONF + ("VERSION",)})
+VALUES["stripe.Webhook.DEFAULT_TOLERANCE"] = "V::Int(300)"
+VALUES["secrets.DEFAULT_ENTROPY"] = "V::Int(32)"
+HOOKS.update({f"stripe.{n}": f'{RT}::stripe::set_conf("{n}", {{val}})' for n in STRIPE_CONF})
+_STRIPE_ERRORS = {"StripeError": "STRIPE_ERROR", "APIError": "STRIPE_API_ERROR", "APIConnectionError": "STRIPE_API_CONNECTION_ERROR",
+                  "StripeErrorWithParamCode": "STRIPE_ERROR_WITH_PARAM_CODE", "CardError": "STRIPE_CARD_ERROR",
+                  "IdempotencyError": "STRIPE_IDEMPOTENCY_ERROR", "InvalidRequestError": "STRIPE_INVALID_REQUEST_ERROR",
+                  "AuthenticationError": "STRIPE_AUTHENTICATION_ERROR", "PermissionError": "STRIPE_PERMISSION_ERROR",
+                  "RateLimitError": "STRIPE_RATE_LIMIT_ERROR", "SignatureVerificationError": "STRIPE_SIGNATURE_VERIFICATION_ERROR",
+                  "TemporarySessionExpiredError": "STRIPE_TEMPORARY_SESSION_EXPIRED_ERROR"}
+EXCEPTIONS.update({f"{m}.{n}": c for n, c in _STRIPE_ERRORS.items() for m in ("stripe", "stripe.error", "stripe._error")})
+EXCEPTIONS.update({f"stripe.oauth_error.{n}": c for n, c in (
+    ("OAuthError", "STRIPE_OAUTH_ERROR"), ("InvalidClientError", "STRIPE_OAUTH_INVALID_CLIENT"),
+    ("InvalidGrantError", "STRIPE_OAUTH_INVALID_GRANT"), ("InvalidRequestError", "STRIPE_OAUTH_INVALID_REQUEST"),
+    ("InvalidScopeError", "STRIPE_OAUTH_INVALID_SCOPE"), ("UnsupportedGrantTypeError", "STRIPE_OAUTH_UNSUPPORTED_GRANT_TYPE"),
+    ("UnsupportedResponseTypeError", "STRIPE_OAUTH_UNSUPPORTED_RESPONSE_TYPE"))})
+
+# reportlab 4.4.5, pure-Python path (dynrt/rl/, bound in dynrt/rlbind.rs): SimpleDocTemplate into an io.BytesIO,
+# Paragraph and its styles, Spacer, PageBreak, HRFlowable, Table and TableStyle, colours, the graphics shapes; the
+# parameters below are the reproduced ones, any other is refused here
+_RL_STYLE_KW = ("fontName", "fontSize", "leading", "leftIndent", "rightIndent", "firstLineIndent", "alignment",
+                "spaceBefore", "spaceAfter", "bulletFontName", "bulletFontSize", "bulletIndent", "textColor", "backColor",
+                "wordWrap", "borderWidth", "borderPadding", "borderColor", "borderRadius", "allowWidows", "allowOrphans",
+                "textTransform", "endDots", "splitLongWords", "bulletAnchor", "justifyLastLine", "justifyBreaks",
+                "spaceShrinkage", "hyphenationLang", "embeddedHyphenation", "uriWasteReduce", "linkUnderline", "shaping",
+                "autoLeading", "keepWithNext", "bulletText")
+_RL_DOC_KW = ("pagesize", "leftMargin", "rightMargin", "topMargin", "bottomMargin", "title", "author", "subject",
+              "creator", "producer", "keywords", "invariant", "pageCompression", "allowSplitting", "rotation",
+              "initialFontName", "initialFontSize", "initialLeading")
+_RL_LINE_KW = ("strokeColor", "strokeWidth", "strokeLineCap", "strokeLineJoin", "strokeMiterLimit", "strokeDashArray",
+               "strokeOpacity")
+_RL_SOLID_KW = ("fillColor", "fillOpacity", "fillMode") + _RL_LINE_KW
+# class -> (modules, positional parameters, other keywords, *args)
+_RL_CLASSES = {
+    "SimpleDocTemplate": ((".platypus", ".platypus.doctemplate"), ("filename",), _RL_DOC_KW, False),
+    "Paragraph": ((".platypus", ".platypus.paragraph"), ("text", "style"), (), False),
+    "Spacer": ((".platypus", ".platypus.flowables"), ("width", "height"), (), False),
+    "PageBreak": ((".platypus", ".platypus.flowables"), (), (), False),
+    "HRFlowable": ((".platypus", ".platypus.flowables"),
+                   ("width", "thickness", "lineCap", "color", "spaceBefore", "spaceAfter", "hAlign", "vAlign", "dash"), (), False),
+    "Table": ((".platypus", ".platypus.tables"), ("data", "colWidths", "rowHeights", "style", "repeatRows"),
+              ("hAlign", "vAlign", "spaceBefore", "spaceAfter"), False),
+    "TableStyle": ((".platypus", ".platypus.tables"), ("cmds",), (), False),
+    "ParagraphStyle": ((".lib.styles",), ("name", "parent"), _RL_STYLE_KW, False),
+    "getSampleStyleSheet": ((".lib.styles",), (), (), False),
+    "HexColor": ((".lib.colors",), ("val",), (), False),
+    "Color": ((".lib.colors",), ("red", "green", "blue", "alpha"), (), False),
+    "landscape": ((".lib.pagesizes",), ("pagesize",), (), False),
+    "portrait": ((".lib.pagesizes",), ("pagesize",), (), False),
+    "Drawing": ((".graphics.shapes",), ("width", "height"), ("hAlign", "vAlign", "renderScale"), True),
+    "Group": ((".graphics.shapes",), (), (), True),
+    "Rect": ((".graphics.shapes",), ("x", "y", "width", "height", "rx", "ry"), _RL_SOLID_KW, False),
+    "Circle": ((".graphics.shapes",), ("cx", "cy", "r"), _RL_SOLID_KW, False),
+    "Ellipse": ((".graphics.shapes",), ("cx", "cy", "rx", "ry"), _RL_SOLID_KW, False),
+    "Polygon": ((".graphics.shapes",), ("points",), _RL_SOLID_KW, False),
+    "Line": ((".graphics.shapes",), ("x1", "y1", "x2", "y2"), _RL_LINE_KW, False),
+    "PolyLine": ((".graphics.shapes",), ("points",), _RL_LINE_KW, False),
+}
+# distributions that change what reportlab writes (C accelerators of fp_str, escapes, widths; the bitmap renderer)
+RL_REFUSED_DISTS = ("rl-accel", "rl-renderpm")
+
+
+def _rl(kind, a, kw):
+    _mods, params, other, star = _RL_CLASSES[kind]
+    if len(a) > len(params) and not star:
+        raise ValueError(f"reportlab {kind}() takes at most {len(params)} positional arguments here")
+    bad = [k for k in kw if k not in params and k not in other]
+    if bad:
+        allowed = ", ".join(params + other) or "no argument"
+        raise ValueError(f"reportlab {kind}({bad[0]}=) is not supported (supported: {allowed})")
+    if kind in ("SimpleDocTemplate", "Paragraph"):
+        for d in RL_REFUSED_DISTS:
+            if d in LIB_VERSIONS:
+                raise ValueError(f"reportlab {kind}() with {d} {LIB_VERSIONS[d]} installed is not supported: its C code "
+                                 "replaces the pure-Python functions the binary reproduces. Drop it from the lock, or "
+                                 "leave the route to Python (--python-side)")
+    if kind in ("HexColor", "Color"):
+        return f'{RT}::rlbind::color("{kind}", &{_argv(a)}, &{_kwvec(kw)})'
+    if kind in ("landscape", "portrait"):
+        if len(a) != 1 or kw:
+            raise ValueError(f"{kind}(pagesize): one positional argument")
+        return f"{RT}::rlbind::orient({str(kind == 'landscape').lower()}, &{_argv(a)})"
+    return f'{RT}::rlbind::new("{kind}", &{_argv(a)}, &{_kwvec(kw)})'
+
+
+def _rl_colors() -> tuple[str, ...]:
+    """The colour names of reportlab.lib.colors, as the engine's table has them (dynrt/rl/fontdata.rs)."""
+    from pathlib import Path
+
+    src = (Path(__file__).parent / "runtime" / "dynrt" / "rl" / "fontdata.rs").read_text()
+    return tuple(re.findall(r'\("(\w+)", NamedColor::', src))
+
+
+CALLS.update({f"reportlab{m}.{k}": (lambda k: lambda a, kw: _rl(k, a, kw))(k)
+              for k, (mods, *_r) in _RL_CLASSES.items() for m in mods})
+VALUES.update({
+    **{f"reportlab.lib.colors.{n}": f'{RT}::rlbind::named_color("{n}")' for n in _rl_colors()},
+    **{f"reportlab.lib.pagesizes.{n}": f'{RT}::rlbind::pagesize("{n}")' for n in ("A3", "A4", "A5", "letter", "LETTER", "legal", "LEGAL")},
+    "reportlab.lib.units.inch": f"V::Float({RT}::rl::INCH)",
+    "reportlab.lib.units.cm": f"V::Float({RT}::rl::cm())",
+    "reportlab.lib.units.mm": f"V::Float({RT}::rl::mm())",
+    **{f"reportlab.lib.enums.TA_{n}": f"V::Int({v})" for n, v in (("LEFT", 0), ("CENTER", 1), ("RIGHT", 2), ("JUSTIFY", 4))},
+})
+EXCEPTIONS.update({f"reportlab.platypus{m}.LayoutError": "RL_LAYOUT_ERROR" for m in ("", ".doctemplate")})
+# the colours are objects (`colors.grey.red`)
+OBJECT_VALUES.update(k for k in VALUES if k.startswith("reportlab.lib.colors."))
+
 for _n in DYN_ARGS:
     CALLS.setdefault(_n, DYN_ARGS[_n])
 
@@ -1434,13 +1863,56 @@ PROM_SUBMODULES = {
 }
 
 
+# standard-library names outside the map for a reason worth saying (what to do instead), by dotted prefix
+STDLIB_HINTS = (
+    ("inspect.", "the binary keeps no function objects to reflect on (signatures, source, frames); a library built on "
+                 "them (decorator, makefun...) cannot be translated: call the function it wraps directly"),
+    ("sys._getframe", "the binary has no Python frames; pass the information the caller needs as an argument"),
+    ("sys.exc_info", "the binary has no sys.exc_info(); catch the exception with `except E as e`"),
+    ("xml.", "no XML parser or tree is in the map (xml.etree, xml.dom, xml.sax); parse the document with a supported "
+             "library (xmltodict) or leave the route to Python (--python-side)"),
+    ("array.", "array.array is in the map (numbers, typecodes b B h H i I l L q Q f d), not the rest of the module"),
+    ("ctypes.", "the binary calls no C library through ctypes"),
+    ("multiprocessing.", "the binary starts no worker processes of its own; leave the route to Python (--python-side)"),
+    ("importlib.", "only importlib.import_module('literal') of an installed module is supported"),
+)
+
+
+def stdlib_hint(dotted: str) -> str | None:
+    return next((h for p, h in STDLIB_HINTS if dotted.startswith(p)), None)
+
+
+# the SQLAlchemy objects `sqlmodel` re-exports as they are (`from sqlmodel import Column, DateTime, func`): the same
+# objects (checked on sqlmodel 0.0.48); sqlmodel's own select/Session/Field are rewritten (sqlmodel_rewrite.py)
+SQLMODEL_SQLALCHEMY = frozenset({
+    "ARRAY", "BIGINT", "BINARY", "BLANK_SCHEMA", "BLOB", "BOOLEAN", "BigInteger", "Boolean", "CHAR", "CLOB",
+    "CheckConstraint", "Column", "ColumnDefault", "Computed", "Constraint", "DATE", "DATETIME", "DDL", "DECIMAL",
+    "DOUBLE", "DOUBLE_PRECISION", "Date", "DateTime", "DefaultClause", "Double", "Enum", "FLOAT", "FetchedValue",
+    "Float", "ForeignKey", "ForeignKeyConstraint", "INT", "INTEGER", "Identity", "Index", "Integer", "Interval",
+    "JSON", "LABEL_STYLE_DEFAULT", "LABEL_STYLE_DISAMBIGUATE_ONLY", "LABEL_STYLE_NONE",
+    "LABEL_STYLE_TABLENAME_PLUS_COL", "LargeBinary", "MetaData", "NCHAR", "NUMERIC", "NVARCHAR", "Numeric",
+    "PickleType", "PrimaryKeyConstraint", "QueuePool", "REAL", "SMALLINT", "Sequence", "SmallInteger",
+    "StaticPool", "String", "TEXT", "TIME", "TIMESTAMP", "Table", "Text", "Time", "TupleType", "TypeDecorator",
+    "UUID", "Unicode", "UnicodeText", "UniqueConstraint", "Uuid", "VARBINARY", "VARCHAR", "alias", "bindparam",
+    "column", "create_engine", "create_mock_engine", "delete", "engine_from_config", "except_", "except_all",
+    "exists", "false", "func", "insert", "inspect", "intersect", "intersect_all", "join", "lambda_stmt", "lateral",
+    "literal", "literal_column", "modifier", "null", "nullsfirst", "nullslast", "outerjoin", "outparam", "table",
+    "tablesample", "text", "true", "union", "union_all", "update", "values",
+})
+
+
 def canonical(dotted: str) -> str:
     """Aliases of the same API (`sqlalchemy.sql.expression.select` -> `sqlalchemy.select`)."""
+    if dotted.startswith("sqlmodel.") and dotted[9:].split(".")[0] in SQLMODEL_SQLALCHEMY:
+        return "sqlalchemy." + dotted[9:]
     for prefix, repl in (
         ("sqlalchemy.sql.expression.", "sqlalchemy."),
         ("sqlalchemy.sql.functions.func", "sqlalchemy.func"),
         ("sqlalchemy.orm.exc.", "sqlalchemy.exc."),
         ("sqlalchemy.ext.asyncio.session.", "sqlalchemy.ext.asyncio."),
+        # SQLModel's sessions: SQLAlchemy's, plus `exec()` (rewritten by sqlmodel_rewrite where it is translated)
+        ("sqlmodel.ext.asyncio.session.AsyncSession", "sqlalchemy.ext.asyncio.AsyncSession"),
+        ("sqlmodel.orm.session.Session", "sqlalchemy.orm.Session"),
         ("fastapi.routing.", "fastapi."),
         ("starlette.status", "fastapi.status"),
         ("sqlalchemy.dialects.postgresql.dml.insert", "sqlalchemy.dialects.postgresql.insert"),
@@ -1450,3 +1922,11 @@ def canonical(dotted: str) -> str:
         if dotted.startswith(prefix):
             return repl + dotted[len(prefix):]
     return dotted
+
+
+# loguru's `logger` (dyn.loguru_call, dynrt/loguru.rs): every attribute of loguru.Logger, so that --translate-libs
+# never reads one from loguru's source; dyn.loguru_call translates the level methods, log(), add() and remove()
+# and refuses the others with the reason
+LOGURU = frozenset(f"loguru.logger.{m}" for m in (
+    "trace", "debug", "info", "success", "warning", "error", "critical", "exception", "log", "add", "remove", "complete",
+    "catch", "opt", "bind", "contextualize", "patch", "level", "disable", "enable", "configure", "parse", "start", "stop"))

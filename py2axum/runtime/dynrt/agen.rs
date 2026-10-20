@@ -319,6 +319,38 @@ pub async fn acm_enter(g: &Arc<AGen>) -> R {
 
 /// leaving `async with cm`: true suppresses the body's exception
 pub async fn acm_exit(g: &Arc<AGen>, exc: Option<Exc>) -> R {
+    cm_exit(g, exc, "athrow").await
+}
+
+/// `@contextmanager`: the decorated generator function, called, gives a `_GeneratorContextManager`
+/// (the generator runs as an async generator: the runtime has no other kind, `with` drives it step by step).
+pub fn contextmanager(f: &V) -> R {
+    let (module, qual, doc) = fn_names(f);
+    let f = f.clone();
+    Ok(super::pyfn(&module, &qual, doc.as_deref(), false, Arc::new(move |cx: &Cx, args: Vec<V>, kwargs: Vec<(String, V)>| {
+        let f = f.clone();
+        Box::pin(async move {
+            let g = super::methods::call_value(cx, &f, args, kwargs).await?;
+            match as_gen(&g) {
+                Some(g) => Ok(V::native(Native::Gcm(g))),
+                // CPython: the function is called, `next()` is only taken on entering
+                None => Err(Exc::type_error(format!("'{}' object is not an iterator", g.type_name()))),
+            }
+        })
+    })))
+}
+
+/// `with cm` on a `@contextmanager` generator: the value of its first `yield`
+pub async fn gcm_enter(g: &Arc<AGen>) -> R {
+    acm_enter(g).await
+}
+
+/// leaving `with cm`: true suppresses the body's exception
+pub async fn gcm_exit(g: &Arc<AGen>, exc: Option<Exc>) -> R {
+    cm_exit(g, exc, "throw").await
+}
+
+async fn cm_exit(g: &Arc<AGen>, exc: Option<Exc>, thrower: &str) -> R {
     match exc {
         None => match g.asend(V::None).await {
             Ok(_) => Err(Exc::runtime("generator didn't stop")),
@@ -326,7 +358,7 @@ pub async fn acm_exit(g: &Arc<AGen>, exc: Option<Exc>) -> R {
             Err(e) => Err(e),
         },
         Some(e) => match g.athrow(e.clone()).await {
-            Ok(_) => Err(Exc::runtime("generator didn't stop after athrow()")),
+            Ok(_) => Err(Exc::runtime(format!("generator didn't stop after {thrower}()"))),
             // the exception was swallowed by the generator: suppressed
             Err(x) if x.isinstance(&STOP_ASYNC_ITERATION) && !e.isinstance(&STOP_ASYNC_ITERATION) => Ok(V::Bool(true)),
             // re-raised as is: not suppressed (the `async with` raises it)

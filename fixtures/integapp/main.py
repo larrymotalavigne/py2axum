@@ -1,4 +1,4 @@
-"""Reference app of the libraries and the platform around the application (bcrypt, itsdangerous, Jinja2, PyJWT,
+"""Reference app of the libraries and the platform around the application (bcrypt, passlib, itsdangerous, Jinja2, PyJWT,
 pywebpush, alembic, prometheus_client, logging and python-json-logger, retries, tracing, aio-pika, outbound HTTP,
 background loops, ATOM's small apps), apart from fixtures/dynapp: with them, dynapp's crate no longer compiled
 within the CI build containers' 6 GiB. Tables and enums are dynapp's (fixtures/dynapp/models.py)."""
@@ -9,7 +9,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from extroutes import views as ext_views
 
-from . import amqp, bgloop, libs, logs, markers, outbound, prom, pyjwt_auth, retrying, small, tracing
+from . import addedroutes, amqp, bgloop, httpxerr, libs, logs, markers, outbound, passlibx, prom, pyjwt_auth, retrying, small, tracing
 
 app = FastAPI()
 app.include_router(libs.router)
@@ -23,6 +23,9 @@ app.include_router(small.router)
 app.include_router(pyjwt_auth.router)
 app.include_router(logs.router)
 app.include_router(markers.router)
+app.include_router(passlibx.router)
+app.include_router(httpxerr.router)
+addedroutes.add_early(app)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -46,3 +49,5 @@ async def health():
 app.include_router(ext_views.router)
 app.include_router(ext_views.extra)
 app.include_router(ext_views.make_router("built"), prefix="/made")
+# added after the library's routers: relayed to Python, which tries the library's routes first
+addedroutes.add_late(app)

@@ -29,6 +29,10 @@ def fold(src: str, py: tuple[int, int]) -> str:
     ("sys.version_info[0]", (3, 15), "3"),
     ("sys.version_info[:2]", (3, 13), "(3, 13)"),
     ("not sys.version_info >= (3, 14)", (3, 14), "False"),
+    # chained (apscheduler's class body): the conjunction of its pairs
+    ("(3, 8) <= sys.version_info < (3, 10)", (3, 9), "True"),
+    ("(3, 8) <= sys.version_info < (3, 10)", (3, 14), "False"),
+    ("(3, 8) <= sys.version_info < (3, 10, 1)", (3, 10), "sys.version_info < (3, 10, 1)"),  # the pair that folds is dropped
     # depends on the patch level: left as written (refused where it is used)
     ("sys.version_info >= (3, 14, 2)", (3, 14), "sys.version_info >= (3, 14, 2)"),
     ("sys.version_info.micro", (3, 14), "sys.version_info.micro"),

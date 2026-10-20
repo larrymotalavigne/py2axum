@@ -5,6 +5,8 @@ cd "$(dirname "$0")"
 REF_PORT=${REF_PORT:-8560}; CAND_PORT=${CAND_PORT:-8596}
 LOG=${LOG:-/tmp/py2axum-logs}; mkdir -p "$LOG"
 for port in $REF_PORT $CAND_PORT; do pid=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -n "$pid" ] && kill $pid; done; sleep 1
+# fixtures/pydxapp/aliasx.py: env_ignore_empty
+export PYDX_EMPTY_STR= PYDX_EMPTY_INT= PYDX_EMPTY_REQ= PYDX_SET_STR=v
 # stdout and stderr apart, process ids kept: the log conformance (tests/conformance.py --logs) compares them
 PYTHONUNBUFFERED=1 nohup uvicorn fixtures.pydxapp.main:app --host 127.0.0.1 --port $REF_PORT \
   > "$LOG/pydx-py-$REF_PORT.out" 2> "$LOG/pydx-py-$REF_PORT.err" & echo $! > "$LOG/pydx-py-$REF_PORT.pid"

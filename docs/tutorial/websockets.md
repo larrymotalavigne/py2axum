@@ -46,8 +46,9 @@ closed with code 1012 ([Graceful shutdown](../advanced/shutdown.md)).
 - Refused: `Request`, `Response`, `BackgroundTasks`, body/`Form`/`File` parameters and security schemes
   on a WebSocket route or in one of its dependencies (FastAPI does not provide them there),
   `app.add_websocket_route`, `add_api_websocket_route`, `websocket_route` decorators, sync endpoints.
-- WebSocket requests are never relayed to `PY2AXUM_PYTHON_URL`, and a WebSocket route cannot be declared
-  `--python-side`: route it to Python with your ingress if it does not translate.
+- A WebSocket route that does not translate can be left to Python (`--python-side '/ws/{room}'`, or `auto`):
+  the binary relays its connections to `PY2AXUM_PYTHON_URL` ([Hybrid mode](../getting-started/hybrid.md)).
+  Without that variable, its path answers 403, as Starlette does for a WebSocket without a route.
 
 ## Differences
 

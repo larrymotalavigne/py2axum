@@ -38,9 +38,11 @@ def test_runtime_is_a_library_crate(tmp_path):
     assert 'dynrt = { path = "dynrt" }' in cargo
     assert re.search(r'\[profile\.release\]\n(#.*\n)*lto = "thin"\ncodegen-units = 1\n', cargo)
     assert 'default = ["mimalloc"]' in cargo
-    # the runtime's sources and manifest, as shipped (the same files, nothing generated in them)
-    shipped = sorted(p.name for p in dyn.RUNTIME_DIR.iterdir() if p.is_file())
+    # the runtime's sources and manifest, as shipped (the same files and module directories such as rl/, nothing
+    # generated in them)
+    shipped = sorted(p.name for p in dyn.RUNTIME_DIR.iterdir() if p.is_file() or (p.is_dir() and p.name != "target"))
     assert sorted(p.name for p in (out / "dynrt").iterdir()) == shipped
+    assert sorted(p.name for p in (out / "dynrt" / "rl").iterdir()) == sorted(p.name for p in (dyn.RUNTIME_DIR / "rl").iterdir())
     assert not (out / "src" / "dynrt").exists()
     main_rs = (out / "src" / "main.rs").read_text()
     assert "#[macro_use]\nextern crate dynrt;\nmod gen;" in main_rs

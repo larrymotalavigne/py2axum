@@ -78,10 +78,15 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   missing field is reported at the first one, the input keys a field did not consume are its extras) and
   `serialization_alias=` apart; `validate_by_alias`/`validate_by_name` (`populate_by_name`), `serialize_by_alias`
   (each model's own setting when `by_alias=` is not given). `alias_generator=`: `pydantic.alias_generators`
-  (`to_camel`, `to_pascal`, `to_snake`), a lambda or a one-`return` function of the name made of string operations,
-  or an `AliasGenerator(alias=, validation_alias=, serialization_alias=)` of those, evaluated at translation time
-  on the field names (a field that declares an alias keeps it, the generator fills the others, as pydantic does);
-  anything else is refused.
+  (`to_camel`, `to_pascal`, `to_snake`), a lambda or a function of the name made of string operations (`if`,
+  `for`, assignments, `return`), an `AliasGenerator(alias=, validation_alias=, serialization_alias=)` of those, or
+  `Other.model_config["alias_generator"]`, evaluated at translation time on the field names (a field that declares
+  an alias keeps it, the generator fills the others, as pydantic does); anything else is refused. A configuration
+  may spread another model's: `ConfigDict(**Base.model_config, ...)`, `{**Base.model_config, ...}`.
+- `allow_inf_nan=False` in `model_config` (every float of the model, in its containers too: `finite_number`);
+  `validate_default=False`.
+- `hide_input_in_errors=True`: `str()` of the model's `ValidationError` without `input_value`/`input_type`
+  (`errors()` and the 422 body keep the input, as in pydantic).
 - `Field(exclude=True)` (never dumped), `repr=False`, `frozen=True` (an assignment raises `frozen_field`),
   `multiple_of=` (on `int`/`float`, checked before the bounds; a float within `|x| / 1e9`, like pydantic-core),
   `union_mode="left_to_right"`, `discriminator="field"` (a discriminated union, possibly nested in another one:
@@ -170,20 +175,28 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
 - Generic models (`class Response(BaseModel, Generic[T])`, `class Response[T](BaseModel)`, a subclass of
   `Parent[T]`): each `Response[int]` used is specialized at translation time, named like pydantic does
   (`Response[int]`, in errors and `type(m).__name__`); the generic class used as such validates a parameter as
-  its default, else its bound, else `Any`. Its arguments must mean the same in the model's module; TypeVar
-  constraints are refused.
+  its default, else its bound, else `Any`. The arguments may be written in another module than the model's
+  (`Response[Role]` with `Role` imported where it is used); TypeVar constraints are refused.
 - JSON dumps (responses, `model_dump(mode="json")`, `model_dump_json`) write a `float` field holding an int
   (a default `0`) as a float, like pydantic-core's typed serializer; `model_fields_set` includes the extras of
   an `extra="allow"` model.
 - `TypeAdapter(T)`: `validate_python` (ORM objects with `from_attributes`, iterables), `validate_json`,
   `dump_python`, `dump_json`, for types written in the source or known at run time.
 - `EmailStr` (rule-by-rule port of email-validator, same messages, except IDNA encoding and NFC normalization
-  of internationalized domains, which are accepted and lowercased), `AnyUrl`/`AnyHttpUrl`/`HttpUrl`/`RedisDsn`
-  (parsed with the `url` crate like pydantic-core, type defaults, attributes, same errors).
+  of internationalized domains, which are accepted and lowercased), `AnyUrl`/`AnyHttpUrl`/`HttpUrl`/`RedisDsn`/
+  `AmqpDsn`/`KafkaDsn`/`MySQLDsn`/`MariaDBDsn`/`CockroachDsn` and the multi-host `PostgresDsn`/`MongoDsn` (parsed with
+  the `url` crate like pydantic-core, type defaults, attributes, same errors). A multi-host DSN type holding more than
+  one host (`postgresql://h1:5432,h2:5432/db`) is not supported: validating one answers 500, and the multi-host types
+  have `hosts()` but no `host`/`port`/`username`/`password`, as in pydantic.
+- Strict and constrained aliases: `StrictStr`/`StrictInt`/`StrictFloat`/`StrictBool`/`StrictBytes`,
+  `PositiveInt`/`NegativeInt`/`NonNegativeInt`/`NonPositiveInt` (and the `*Float` ones), and the call forms
+  `constr(...)`, `conint(...)`, `confloat(...)`, `condecimal(...)`, `conlist(T, ...)`, `conset(T, ...)` translate as the
+  `Annotated[...]` they stand for (`unique_items=`, `regex=`, `allow_inf_nan=` are refused). `pathlib.Path` fields
+  accept a `str` or a `Path` (`path_type` otherwise) and dump as a `str` in JSON.
 - pydantic-settings `BaseSettings`: environment variables (not `.env` files), `validate_default=True`,
   `env_prefix`, `case_sensitive` (names compared case-insensitively by default, the last of two names that
   differ only in case wins), `env_parse_none_str` (an environment value equal to it, case included, is
-  `None`; init keywords are not parsed), JSON values for container/model fields (a union with such a
+  `None`; init keywords are not parsed), `env_ignore_empty` (an empty variable is as if unset), JSON values for container/model fields (a union with such a
   member keeps the raw string when the JSON does not parse); other `env_*` options and `_env_*` init keywords are refused;
   a class body run like a script (class-level `if`, attributes reading earlier ones) is evaluated once.
 - `decimal.Decimal` fields: lax validation like pydantic-core (a float through its `repr`, a string through

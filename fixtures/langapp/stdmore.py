@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import io
+import random
+import secrets
 import socket as _socket
 import zipfile
 from collections import Counter
@@ -125,3 +127,68 @@ async def lines(body: dict):
     b = body["text"].encode()
     return {"plain": [x.decode() for x in b.splitlines()], "kept": [x.decode() for x in b.splitlines(True)],
             "str": body["text"].splitlines()}
+
+
+@router.post("/format-map")
+async def format_map(body: dict):
+    """str.format_map(): a defaultdict fills a missing field with its default (and keeps it), a dict raises KeyError,
+    a positional field ValueError; the caller falls back to the template like a letter generator does."""
+    from collections import defaultdict
+
+    out = []
+    for tpl in body["templates"]:
+        safe = defaultdict(str, body["data"])
+        try:
+            r = tpl.format_map(safe)
+        except (KeyError, ValueError, IndexError) as e:
+            r = f"{type(e).__name__}: {e}"
+        try:
+            plain = tpl.format_map(body["data"])
+        except (KeyError, ValueError, IndexError) as e:
+            plain = f"{type(e).__name__}: {e}"
+        out.append({"r": r, "plain": plain, "keys": sorted(safe)})
+    return out
+
+
+SECRET_CASES = {
+    "choice_str": lambda: secrets.choice("abc"), "choice_list": lambda: secrets.choice([1, 2, 3]),
+    "choice_tuple": lambda: secrets.choice((7,)), "choice_range": lambda: secrets.choice(range(5, 9)),
+    "choice_dict0": lambda: secrets.choice({0: "z"}), "choice_dict": lambda: secrets.choice({5: 1}),
+    "choice_set": lambda: secrets.choice({1}),
+    "choice_empty": lambda: secrets.choice(""), "choice_int": lambda: secrets.choice(5),
+    "random_choice_dict": lambda: random.choice({3: 1}),
+    "below": lambda: secrets.randbelow(10), "below1": lambda: secrets.randbelow(1), "below_true": lambda: secrets.randbelow(True),
+    "below_kw": lambda: secrets.randbelow(exclusive_upper_bound=3), "below0": lambda: secrets.randbelow(0),
+    "below_neg": lambda: secrets.randbelow(-3), "below_float": lambda: secrets.randbelow(2.5), "below_float0": lambda: secrets.randbelow(0.0),
+    "below_str": lambda: secrets.randbelow("a"), "below_none": lambda: secrets.randbelow(None),
+    "bits0": lambda: secrets.randbits(0), "bits8": lambda: secrets.randbits(8), "bits63": lambda: secrets.randbits(63),
+    "bits_true": lambda: secrets.randbits(True), "bits_neg": lambda: secrets.randbits(-1), "bits_float": lambda: secrets.randbits(1.5),
+    "bits_str": lambda: secrets.randbits("3"),
+    "bytes": lambda: secrets.token_bytes(), "bytes5": lambda: secrets.token_bytes(5), "bytes_kw": lambda: secrets.token_bytes(nbytes=3),
+    "bytes_true": lambda: secrets.token_bytes(True), "bytes0": lambda: secrets.token_bytes(0), "bytes_none": lambda: secrets.token_bytes(None),
+    "bytes_str": lambda: secrets.token_bytes("a"), "bytes_float": lambda: secrets.token_bytes(1.0),
+    "hex_str": lambda: secrets.token_hex("a"), "hex_float": lambda: secrets.token_hex(2.0), "hex_true": lambda: secrets.token_hex(True),
+    "urlsafe_list": lambda: secrets.token_urlsafe([1]), "urlsafe7": lambda: secrets.token_urlsafe(7),
+    "entropy": lambda: secrets.DEFAULT_ENTROPY,
+}
+
+
+@router.get("/secrets/{case}")
+async def secrets_case(case: str):
+    """The secrets module: random values compared by their shape (type, length, range), errors as CPython's."""
+    try:
+        r = SECRET_CASES[case]()
+    except Exception as e:
+        return {"error": type(e).__name__, "msg": str(e)}
+    out = {"type": type(r).__name__}
+    if isinstance(r, (str, bytes)):
+        out["len"] = len(r)
+        out["alphabet"] = sorted(set(r.hex() if isinstance(r, bytes) else r) - set("0123456789abcdef")) if case.startswith(("hex", "bytes")) else None
+    elif isinstance(r, int):
+        out["range"] = {"below": 0 <= r < 10, "below1": r == 0, "below_true": r == 0, "below_kw": 0 <= r < 3, "bits0": r == 0,
+                        "bits8": 0 <= r < 256, "bits63": r >= 0, "bits_true": r in (0, 1), "entropy": r,
+                        "choice_list": r in (1, 2, 3), "choice_tuple": r, "choice_range": 5 <= r < 9,
+                        "choice_dict": r, "random_choice_dict": r}.get(case)
+    else:
+        out["value"] = r
+    return out

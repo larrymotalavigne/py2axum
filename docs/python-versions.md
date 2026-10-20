@@ -38,6 +38,7 @@ both when the binary starts. `py2axum check` prints the Python it targets and wh
 | `base64.b64decode` padding rules (data after `=` decoded) | 3.13.13, 3.14.4 | the named patch, else the newest |
 | `datetime.strptime` accepts `%e` | 3.13.6 | the named patch, else the newest |
 | `json.loads('"\\u0041')`: unterminated string (was "Invalid \\uXXXX escape") | 3.13.13, 3.14.4 | the named patch, else the newest |
+| `html.parser` under reportlab's paragraph markup: the HTML5 rewrite, raw-text elements and `&#`, abrupt comments ([Generated documents](advanced/documents.md#pdf-reportlab)) | 3.12.12-3.12.13, 3.13.8-3.13.15, 3.14.1-3.14.7 | the named patch, else the newest |
 
 The probe measures the Python that translates, not the one in production. **Translate with the same Python
 as production**: the same image (the builder stage of a Dockerfile `FROM` the production image), or the same
@@ -156,7 +157,7 @@ release then (`--python 3.13.5` or `.python-version`).
 | `sentinel` (PEP 661) | Refused (P2A0105) | |
 | `bytes.replace(..., count=)` as a keyword | Supported | `/pyver/bytes_replace_kw` (a `TypeError` before 3.15, as in CPython); `bytes.replace` itself was missing from the runtime and is now supported on every Python |
 | `bytearray.take_bytes()`, `slice[...]`, `memoryview` complex formats, `__slots__` changes | N/A | Not translated |
-| Timestamps and timeouts accept any real number (`Decimal`, `Fraction`) | Supported | `datetime.fromtimestamp` (`/pyver/fromtimestamp_decimal`, with 3.14's reworded error before: `argument must be int or float, not decimal.Decimal`) and `socket.create_connection(timeout=)` (`/pyver/timeout_*`: `must be real number, not str`). The other C functions taking a timestamp or a timeout (`time.sleep`, `time.localtime`, `date.fromtimestamp`, `threading`, `select`...) are not translated (P2A0201). asyncio's delays are Python code, unchanged: `asyncio.sleep`/`wait_for` add the delay to the loop's float time (a `Decimal` fails, except `asyncio.sleep` on uvloop), `/pyver/aio/*` |
+| Timestamps and timeouts accept any real number (`Decimal`, `Fraction`) | Supported | `datetime.fromtimestamp` (`/pyver/fromtimestamp_decimal`, with 3.14's reworded error before: `argument must be int or float, not decimal.Decimal`) and `socket.create_connection(timeout=)` (`/pyver/timeout_*`: `must be real number, not str`). The other C functions taking a timestamp or a timeout (`time.sleep`, `time.localtime`, `date.fromtimestamp`, `threading`, `select`...) are not translated: refused with P2A0201 and `file:line` (`tests/test_rejects_dyn.py::test_real_timestamp_functions_rejected`). asyncio's delays are Python code, unchanged: `asyncio.sleep`/`wait_for` add the delay to the loop's float time (a `Decimal` fails, except `asyncio.sleep` on uvloop), `/pyver/aio/*` |
 | `AttributeError` hints from other languages (`Did you mean '.append'?`) | Difference | `str(exc)` is unchanged; `traceback.format_exception_only` adds the hint in Python (on every Python for a close name, from 3.15 for these), not in the binary. Reading an attribute no runtime type has is refused anyway (P2A0204) |
 
 ### Standard library

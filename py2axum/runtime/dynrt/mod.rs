@@ -11,6 +11,8 @@ pub mod fraction;
 pub mod auth;
 pub mod crypto;
 pub mod decimal;
+pub mod arr;
+pub mod bisect;
 pub mod deque;
 pub mod dt;
 pub mod dutz;
@@ -24,6 +26,8 @@ pub mod htmlent;
 pub mod ini;
 pub mod email;
 pub mod stdlib;
+pub mod stripe;
+pub mod stripetab;
 pub mod thread;
 pub mod types;
 pub mod sysmon;
@@ -33,9 +37,13 @@ pub mod emailmsg;
 pub mod dnsres;
 pub mod nh3;
 pub mod net;
+pub mod subproc;
 pub mod resp;
 pub mod pathio;
+pub mod pgpy;
+pub mod pgpycore;
 pub mod pickle;
+pub mod qr;
 pub mod proto;
 pub mod rds;
 pub mod rmq;
@@ -55,6 +63,7 @@ pub mod jose;
 pub mod pyjwt;
 pub mod libs;
 pub mod logging;
+pub mod loguru;
 pub mod mcp;
 pub mod methods;
 pub mod migrate;
@@ -72,9 +81,12 @@ pub mod rawasgi;
 pub mod sentry;
 pub mod sqlstate;
 pub mod v;
+pub mod rl;
+pub mod rlbind;
 pub mod web;
 pub mod webpush;
 pub mod ws;
+pub mod xlsx;
 pub mod zipw;
 
 use std::future::Future;
@@ -136,6 +148,8 @@ pub struct CxInner {
     pub route_def: std::sync::OnceLock<&'static web::RouteDef>,
     /// the stages of the request still running (`web::Phase`): the last to end frees `request.state`
     pub phases: std::sync::atomic::AtomicUsize,
+    /// the Starlette Request object the code running now was given (web::REQ_*): `request._body` is per object
+    pub req_obj: std::sync::atomic::AtomicU32,
 }
 
 pub type Cx = Arc<CxInner>;
@@ -163,6 +177,7 @@ impl CxInner {
             task_no: std::sync::OnceLock::new(),
             route_def: std::sync::OnceLock::new(),
             phases: std::sync::atomic::AtomicUsize::new(0),
+            req_obj: std::sync::atomic::AtomicU32::new(web::REQ_ROUTE),
         }
     }
 
@@ -189,12 +204,27 @@ pub async fn session(cx: &Cx) -> R {
         .clone())
 }
 
+/// While it lives, `request` stands for another of Starlette's Request objects (web::REQ_*); the previous one after.
+pub struct ReqObj<'a>(&'a Cx, u32);
+
+impl<'a> ReqObj<'a> {
+    pub fn enter(cx: &'a Cx, obj: u32) -> ReqObj<'a> {
+        ReqObj(cx, cx.req_obj.swap(obj, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for ReqObj<'_> {
+    fn drop(&mut self) {
+        self.0.req_obj.store(self.1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub fn request(cx: &Cx) -> V {
     // a custom route class's Request subclass, while the route's handler runs on it
     if let Some(r) = cx.req.custom_request.lock().clone() {
         return r;
     }
-    V::native(Native::Request(cx.req.clone()))
+    V::native(Native::Request(cx.req.clone(), cx.req_obj.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 pub fn response(cx: &Cx) -> V {
@@ -403,7 +433,17 @@ pub fn functools_wraps(args: &[V], kwargs: &[(String, V)]) -> R {
 }
 
 /// `HTTPException(status_code, detail, headers)` as an exception value.
+/// `fastapi.HTTPException(...)`
 pub fn http_exc(status: &V, detail: V, headers: &V) -> R {
+    http_exc_of(&v::HTTP_EXCEPTION, status, detail, headers)
+}
+
+/// `starlette.exceptions.HTTPException(...)`
+pub fn http_exc_starlette(status: &V, detail: V, headers: &V) -> R {
+    http_exc_of(&v::STARLETTE_HTTP_EXCEPTION, status, detail, headers)
+}
+
+fn http_exc_of(class: &'static v::Class, status: &V, detail: V, headers: &V) -> R {
     let code = match status {
         V::Int(i) => *i as u16,
         other => return Err(Exc::type_error(format!("status_code must be an int, got {}", other.type_name()))),
@@ -414,7 +454,7 @@ pub fn http_exc(status: &V, detail: V, headers: &V) -> R {
     } else {
         detail
     };
-    Ok(V::Exc(Exc::http(code, detail, dyn_headers(headers)?)))
+    Ok(V::Exc(Exc::http_of(class, code, detail, dyn_headers(headers)?)))
 }
 
 pub fn dyn_headers(h: &V) -> R<Vec<(String, String)>> {
@@ -484,31 +524,45 @@ pub fn kwargs_dict(kw: Vec<(String, V)>) -> R {
 }
 
 /// pydantic-settings `BaseSettings()`: fields read from the environment (case-insensitive unless
-/// `case_sensitive=True`; `env_parse_none_str`: a value equal to it, case included, is `None`).
+/// `case_sensitive=True`; `env_parse_none_str`: a value equal to it, case included, is `None`; `env_ignore_empty`:
+/// an empty variable is dropped before the names are folded, as `parse_env_vars` does).
 pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, case_sensitive: bool,
-                      none_str: Option<&str>, kw: Vec<(String, V)>) -> R {
+                      none_str: Option<&str>, ignore_empty: bool, kw: Vec<(String, V)>) -> R {
     let fold = |k: &str| if case_sensitive { k.to_string() } else { k.to_lowercase() };
-    let env: Vec<(String, String)> = std::env::vars().map(|(k, v)| (fold(&k), v)).collect();
-    let mut items = Vec::new();
+    let env: Vec<(String, String)> = std::env::vars().filter(|(_, v)| !(ignore_empty && v.is_empty()))
+        .map(|(k, v)| (fold(&k), v)).collect();
+    // what pydantic-settings validates: the variables found (field order; an init keyword wins, in place), then
+    // the init keywords of the other fields; the defaults are filled (and validated) by the model, so they are
+    // not in the input an error shows
+    let mut given: Vec<(V, V)> = Vec::new();
     for f in desc.fields {
-        if let Some((_, v)) = kw.iter().find(|(k, _)| k == f.name) {
-            items.push((V::str(f.name), v.clone()));
-            continue;
-        }
         let key = fold(&format!("{}{}", prefix, f.env.unwrap_or(f.name)));
         // a dict built from os.environ: when case folding merges two names, the last one wins
-        if let Some((_, raw)) = env.iter().rev().find(|(k, _)| *k == key) {
-            let v = if none_str == Some(raw.as_str()) {
-                V::None
-            } else {
-                match settings_complex(f.td) {
-                    // a union with a complex member: JSON when it parses, else the raw string
-                    Some(true) => pyd::loads(raw).unwrap_or_else(|_| V::str(raw)),
-                    Some(false) => pyd::loads(raw)?,
-                    None => V::str(raw),
-                }
-            };
-            items.push((V::str(f.name), v));
+        let Some((_, raw)) = env.iter().rev().find(|(k, _)| *k == key) else { continue };
+        if let Some((_, v)) = kw.iter().find(|(k, _)| k == f.name) {
+            given.push((V::str(f.name), v.clone()));
+            continue;
+        }
+        let v = if none_str == Some(raw.as_str()) {
+            V::None
+        } else {
+            match settings_complex(f.td) {
+                // a union with a complex member: JSON when it parses, else the raw string
+                Some(true) => pyd::loads(raw).unwrap_or_else(|_| V::str(raw)),
+                Some(false) => pyd::loads(raw)?,
+                None => V::str(raw),
+            }
+        };
+        given.push((V::str(f.name), v));
+    }
+    for (k, v) in &kw {
+        if desc.fields.iter().any(|f| f.name == k) && !given.iter().any(|(g, _)| matches!(g, V::Str(s) if **s == **k)) {
+            given.push((V::str(k), v.clone()));
+        }
+    }
+    let mut items = given.clone();
+    for f in desc.fields {
+        if items.iter().any(|(g, _)| matches!(g, V::Str(s) if **s == *f.name)) {
             continue;
         }
         // pydantic-settings validates the defaults too (validate_default=True)
@@ -519,7 +573,16 @@ pub async fn settings(cx: &Cx, desc: &'static pyd::SchemaDesc, prefix: &str, cas
             pyd::Dflt::Data(_) => return Err(Exc::type_error("py2axum: a default_factory taking data in settings is not supported")),
         }
     }
-    pyd::construct(cx, desc, V::dict_from(items)?).await
+    let input = V::dict_from(items)?;
+    match pyd::construct(cx, desc, input.clone()).await {
+        Err(e) if e.0.errors.as_ref().is_some_and(|errs| errs.iter().any(|d| ops::is(&d.input, &input))) => {
+            let shown = V::dict_from(given)?;
+            let errs = e.0.errors.clone().unwrap_or_default().into_iter()
+                .map(|mut d| { if ops::is(&d.input, &input) { d.input = shown.clone(); } d }).collect();
+            Err(desc.verror(errs))
+        }
+        r => r,
+    }
 }
 
 /// pydantic-settings' complex fields (decoded as JSON): containers and models; `Some(true)` for a union
@@ -553,6 +616,46 @@ static STACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 thread_local! {
     /// lowest stack address this thread may reach before `stack_guard` raises (0: unknown thread)
     static STACK_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// CPython's coercion of the legacy C locale at startup (PEP 538, `_Py_CoerceLegacyLocale`, 3.7 and later):
+/// when LC_ALL is unset (or empty), PYTHONCOERCECLOCALE is not "0" and the C library's LC_CTYPE of the
+/// environment is "C", Python exports `LC_CTYPE=C.UTF-8` (else `C.utf8`, `UTF-8`, the first the C library
+/// knows) into its own environment: `os.environ` shows it and child processes inherit it (their messages in
+/// UTF-8, with typographic quotes). Called first in main(), before any thread (setenv is not thread-safe); the
+/// binary's own C locale is left as it was ("C": the runtime never reads it).
+pub fn coerce_c_locale() {
+    use std::ffi::{CStr, CString};
+    if std::env::var_os("LC_ALL").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let mode = std::env::var("PYTHONCOERCECLOCALE").ok();
+    if mode.as_deref() == Some("0") {
+        return;
+    }
+    // SAFETY: setlocale with valid C strings, in main() before any other thread exists; the returned pointer
+    // is read at once, before the next call
+    unsafe {
+        let empty = CString::new("").unwrap();
+        libc::setlocale(libc::LC_CTYPE, empty.as_ptr());
+        let cur = libc::setlocale(libc::LC_CTYPE, std::ptr::null());
+        let legacy = !cur.is_null() && CStr::from_ptr(cur).to_bytes() == b"C";
+        if legacy {
+            for target in ["C.UTF-8", "C.utf8", "UTF-8"] {
+                let t = CString::new(target).unwrap();
+                if !libc::setlocale(libc::LC_CTYPE, t.as_ptr()).is_null() {
+                    std::env::set_var("LC_CTYPE", target);
+                    if mode.as_deref() == Some("warn") {
+                        eprintln!("Python detected LC_CTYPE=C: LC_CTYPE coerced to {target} (set another locale or \
+                                   PYTHONCOERCECLOCALE=0 to disable this locale coercion behavior).");
+                    }
+                    break;
+                }
+            }
+        }
+        let c = CString::new("C").unwrap();
+        libc::setlocale(libc::LC_CTYPE, c.as_ptr());
+    }
 }
 
 pub fn set_stack_size(n: usize) {

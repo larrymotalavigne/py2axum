@@ -4,11 +4,10 @@
  "title": "py2axum check --format json",
  "description": "Output of `py2axum check --format json` (stable from 1.0: see Versioning and deprecation). Paths are absolute, as resolved by the translation.",
  "type": "object",
- "required": ["package", "backend", "python_side_auto", "routes", "global", "notes", "python", "summary", "blockers", "unblock"],
+ "required": ["package", "python_side_auto", "routes", "global", "notes", "python", "summary", "blockers", "unblock"],
  "additionalProperties": false,
  "properties": {
   "package": {"type": "string", "description": "the package directory, as given"},
-  "backend": {"const": "dyn", "description": "deprecated: always \"dyn\" (one backend since 0.4), removed in 1.0"},
   "python_side_auto": {"type": "boolean", "description": "--python-side auto was given"},
   "python": {
    "type": "object",

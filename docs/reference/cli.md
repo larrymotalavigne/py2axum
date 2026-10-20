@@ -33,16 +33,16 @@ cargo build --release --manifest-path build/api/Cargo.toml
   the first refused route.
 - `--no-stream` buffers list responses instead of streaming them
   ([Large list responses](../advanced/streaming.md)).
-- `--report FILE` is deprecated: an internal coverage report (Markdown + JSON), outside the
-  [stable interface](versioning.md); use `py2axum check --format json` or `--format markdown` instead.
+- `--translate-libs none|auto|DIST,...`, `--venv` and `--allow-license` (experimental, off by default) translate pure-Python
+  libraries from their source: [Libraries translated from source](../advanced/libraries.md).
 - `--allow-untested-versions` translates even if the project locks library versions outside the
   [tested ranges](versions.md), at your own risk.
 - `--python X.Y` names the Python the project runs on (3.12 to 3.15; also `PY2AXUM_TARGET_PYTHON`): the binary
   reproduces its messages and behaviours, and `sys.version_info` is folded against it. Default: the project's
   `.python-version`, else this Python when `requires-python` allows it ([Python versions](../python-versions.md)).
   `check` and `watch` take it too.
-- `--backend` is deprecated and has no effect: there is one backend since 0.4. `--backend auto` and
-  `--backend dyn` are still accepted until 1.0, with a warning; `--backend typed` is an error.
+- `--backend` was removed in 1.0 (it had no effect since 0.4: there is one backend). Passing it is an error
+  (`error: --backend was removed in 1.0 ...`, exit status 2): drop it.
 
 The options, their defaults and the exit statuses are a stable interface: see
 [Versioning and deprecation](versioning.md).
@@ -56,8 +56,16 @@ py2axum check api --root .
 py2axum check api --root . --python-side auto --fail-under 80     # in CI: exit 1 below 80 % native
 ```
 
-`check` takes the same `package`, `--root`, `--python-side` (`PATH`, `lifespan`, `mount` or `auto`) and
-`--allow-untested-versions` as generation, and:
+`--path DIR` (experimental, repeatable) adds an import root next to `--root`: the sibling packages of a monorepo
+(`oasst-shared/oasst_shared`, `src/lfx/src`) that the application installs from its own checkout resolve as in its
+virtual environment. A module is looked up in `--root` first, then in each `--path` in order.
+
+`check` takes the same options as generation (`package`, `--root`, `--python-side` with `PATH`, `lifespan`,
+`mount` or `auto`, `--allow-untested-versions`, `--python`, `--translate-libs`, `--venv`, `--allow-license`)
+and computes its verdict with the same code: a route is *python-side* when generation with the same options
+would relay it to Python (declared, moved by `auto`, or reading what a lifespan left to Python sets),
+*refused* when generation would stop on it, and `generates` is true when generation would succeed. Native +
+python-side + refused is every route of the application. It adds:
 
 - `--format text|json|markdown`: the terminal report (default); machine-readable output on stdout, with the
   same verdicts, each refused route's `code` and `suggestion`, and the `unblock` list (`--json` is a synonym;

@@ -142,3 +142,20 @@ def test_locked_version_reads_pins_and_specifiers(tmp_path):
     assert locked_version(tmp_path, "pydantic") == (mine if parse(mine) >= parse("2.14") else "2.14.0")
     write(tmp_path, "uv.lock", '[[package]]\nname = "pydantic"\nversion = "2.12.5"\n')
     assert locked_version(tmp_path, "pydantic") == "2.12.5"
+
+
+def test_refusal_lists_the_constructs_known_to_differ(tmp_path):
+    """A version refusal names what the project uses that is known to differ between versions of that library."""
+    write(tmp_path, "uv.lock", '[[package]]\nname = "pydantic"\nversion = "2.9.2"\n')
+    pkg = tmp_path / "api"
+    pkg.mkdir()
+    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom pydantic import EmailStr, BaseModel\n"
+                                 "class U(BaseModel):\n    mail: EmailStr\n")
+    [(msg, _, _)] = check_project(tmp_path, pkg)
+    assert "an `EmailStr` field" in msg and "main.py:2" in msg and "--allow-untested-versions" in msg
+    (pkg / "main.py").write_text("from fastapi import FastAPI\n")
+    [(msg, _, _)] = check_project(tmp_path, pkg)
+    assert "No construct known to differ between pydantic versions" in msg
+    # without a package (the whole lock is checked) the sentence is not added
+    [(msg, _, _)] = check_project(tmp_path)
+    assert "known to differ" not in msg

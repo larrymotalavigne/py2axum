@@ -60,6 +60,8 @@ class Module:
     stars: list[str] = field(default_factory=list)  # modules imported with `*`
     binders: dict[str, list[ast.stmt]] = field(default_factory=dict)  # name -> top-level statements binding it
     lib: str | None = None  # the distribution it was translated from (--translate-libs), None for the project
+    adopted: bool = False  # a project module outside the package dir, adopted because the package imports it
+    sm_tables: dict[str, list] = field(default_factory=dict)  # SQLModel table classes it defines -> fields (rewritten)
 
     @property
     def package(self) -> str:
@@ -256,7 +258,16 @@ class _FoldVersion(ast.NodeTransformer):
         # equal prefix, version_info longer: strictly greater
         return {ast.Lt: False, ast.LtE: False, ast.Gt: True, ast.GtE: True, ast.Eq: False, ast.NotEq: True}[type(op)]
 
+    def _pure(self, e) -> bool:
+        return (isinstance(e, ast.Constant) or self._vi(e) or (isinstance(e, ast.Tuple) and all(self._pure(x) for x in e.elts)))
+
     def visit_Compare(self, node):
+        if len(node.ops) > 1 and all(type(o) in self.OPS for o in node.ops):
+            operands = [node.left, *node.comparators]
+            if any(self._vi(x) for x in operands) and all(self._pure(x) for x in operands):
+                # `(3, 0) <= sys.version_info < (3, 2)`: each pair on its own, `and`ed (the operands have no effects)
+                parts = [ast.copy_location(ast.Compare(a, [o], [b]), node) for a, o, b in zip(operands, node.ops, operands[1:])]
+                return self.visit(ast.copy_location(ast.BoolOp(ast.And(), parts), node))
         self.generic_visit(node)
         if len(node.ops) != 1 or type(node.ops[0]) not in self.OPS:
             return node
@@ -301,6 +312,24 @@ class _FoldVersion(ast.NodeTransformer):
         if isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Constant) and type(node.operand.value) is bool:
             return self._const(not node.operand.value, node)
         return node
+
+    def visit_BoolOp(self, node):
+        self.generic_visit(node)
+        # operands folded to a constant: `False or x` is x, `True and x` is x; `True or x` and `False and x` end the chain
+        stop = isinstance(node.op, ast.Or)
+        keep = []
+        for _i, v in enumerate(node.values):
+            if isinstance(v, ast.Constant) and type(v.value) is bool and self._folded(v):
+                if v.value == stop:
+                    # the value of the chain when everything before it is constant too; else left as written
+                    return self._const(stop, node) if not keep else node
+                continue
+            keep.append(v)
+        if len(keep) == len(node.values):
+            return node
+        if not keep:
+            return self._const(not stop, node)
+        return keep[0] if len(keep) == 1 else ast.copy_location(ast.BoolOp(node.op, keep), node)
 
     def visit_IfExp(self, node):
         self.generic_visit(node)
@@ -392,6 +421,17 @@ def drop_overloads(tree: ast.Module) -> None:
             n.body = clean(n.body) or [ast.copy_location(ast.Pass(), n)]
 
 
+def positional_router(tree: ast.Module) -> None:
+    """`x.include_router(prefix="/v1", router=r)`: the router as the first argument, as every reader of
+    include_router expects it (the keyword form was skipped, its routes never registered)."""
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "include_router"
+                and not n.args and any(k.arg == "router" for k in n.keywords)):
+            kw = next(k for k in n.keywords if k.arg == "router")
+            n.keywords.remove(kw)
+            n.args.append(kw.value)
+
+
 def fold_flags(tree: ast.Module) -> ast.Module:
     """Module constants made of a folded version or platform test (`PY3 = sys.version_info[0] == 3`, `WINDOWS =
     sys.platform == "win32"`), bound once: an `if PY3:` (or `not PY3`, `x if PY3 else y`) keeps only its branch,
@@ -462,9 +502,41 @@ def fold_version_info(tree: ast.Module, python: tuple[int, int]) -> tuple[ast.Mo
     return ast.fix_missing_locations(f.visit(tree)), f.dropped
 
 
+# `--path DIR` (experimental): more import roots, like extra entries of sys.path (the sibling packages of a monorepo
+# that the application installs from its own checkout: `oasst-shared/oasst_shared`)
+EXTRA_ROOTS: list[Path] = []
+
+
+def set_extra_roots(paths) -> None:
+    EXTRA_ROOTS[:] = [Path(p).resolve() for p in paths or ()]
+
+
+def sqlmodel_version(root: Path) -> tuple[int, ...]:
+    """The SQLModel the project locks (its column types change with it): its uv.lock, else an `==` pin in
+    requirements*.txt or pyproject.toml at --root or above (up to the repository's root), else the installed one."""
+    from .dyn import _installed, locked_version
+
+    d = Path(root).resolve()
+    v = None
+    for cand in (d, *d.parents):
+        if (cand / "uv.lock").is_file():
+            break
+        for f in [*sorted(cand.glob("requirements*.txt")), cand / "pyproject.toml"]:
+            if f.is_file():
+                m = re.search(r"(?im)^\s*[\"']?sqlmodel\s*==\s*([0-9][0-9.]*)", f.read_text(errors="replace"))
+                if m:
+                    v = m.group(1)
+                    break
+        if v or (cand / ".git").exists():
+            break
+    v = v or locked_version(root, "sqlmodel") or _installed("sqlmodel") or "0.0.48"
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
 class ModuleIndex:
     def __init__(self, root: Path, package: Path):
         self.root = root.resolve()
+        self.roots = [self.root, *[r for r in EXTRA_ROOTS if r != self.root]]
         self.package_dir = package.resolve()
         self.modules: dict[str, Module] = {}
         self.syntax_errors: list[tuple[str, SyntaxError]] = []
@@ -472,6 +544,9 @@ class ModuleIndex:
         # `lazy import` (Python 3.15, PEP 810): (module name, statement, the modules it names)
         self.lazy: list[tuple[str, ast.stmt, list[str]]] = []
         self._missing: set[str] = set()
+        # library modules whose top-level imports are being decided: CPython has them in sys.modules, partially
+        # initialised, so an import that comes back to one of them (an import cycle) succeeds
+        self._importing: set[str] = set()
         from . import libsrc
 
         self.libs = libsrc.index(self.root)  # --translate-libs: the project's site-packages (None: off)
@@ -479,11 +554,122 @@ class ModuleIndex:
             if SKIP_DIRS & set(path.relative_to(self.package_dir).parts):
                 continue
             self._load_path(path, in_package=True)
+        self._adopt_imported()
+        self._sqlmodel_imports()
+
+    def _adopt_imported(self) -> None:
+        """The project's modules outside the package dir that it imports (a `src/` layout whose app is in
+        `apps/api` and its routers in `platform/...`): Python runs them when the package is imported, so their
+        routers, routes and models are the application's. Project modules only (under --root), never a library's;
+        found from each module's top-level imports, transitively."""
+        todo = [m for m in self.modules.values() if m.in_package]
+        while todo:
+            m = todo.pop()
+            names = []
+            specs = list(m.imports.values())
+            for fn in ast.walk(m.tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    specs += function_imports(fn, m.package).values()  # `from x import router` in the factory
+            for spec in specs:
+                if spec[0] == "module":
+                    parts = spec[1].split(".")
+                    names += [".".join(parts[:i]) for i in range(1, len(parts) + 1)]
+                else:
+                    names += [spec[1], f"{spec[1]}.{spec[2]}"]
+            names += list(m.stars)
+            for n in names:
+                if not n or n in self._missing:
+                    continue
+                dep = self.module(n)
+                if dep is not None and dep.lib is None and not dep.in_package:
+                    dep.in_package = dep.adopted = True
+                    todo.append(dep)
+
+    def _sqlmodel_bases(self, tree: ast.Module, name: str, is_pkg: bool) -> dict:
+        """SQLModel classes without a table that `tree` imports from another module of the project (`from
+        app.schemas import UserBase`): local name -> their fields, when every name those fields read is bound
+        here as there (the same import, or not bound here: imported then from that module, which binds it)."""
+        import builtins
+
+        from .sqlmodel_rewrite import SUPPORTED as SQLMODEL_NAMES, free_names
+
+        package = name if is_pkg else name.rpartition(".")[0]
+        specs, _ = _import_specs(tree.body, package)
+        own = {}
+        for st in tree.body:
+            for n in stmt_bindings(st) if not isinstance(st, (ast.Import, ast.ImportFrom)) else ():
+                own[n] = None
+            if isinstance(st, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                own[st.name] = None
+        loading = self.__dict__.setdefault("_sm_loading", set())
+        out, extra = {}, []
+        for local, spec in specs.items():
+            if spec[0] != "from" or spec[1] == name or spec[1] in loading:
+                continue
+            loading.add(name)
+            try:
+                m = self.module(spec[1])
+            finally:
+                loading.discard(name)
+            fields = getattr(m.tree, "_p2a_sm_nontable", {}).get(spec[2]) if m is not None and m.lib is None else None
+            if not fields:
+                continue
+            ok, add = True, []
+            for free in free_names(fields):
+                theirs = m.imports.get(free)
+                if free in SQLMODEL_NAMES and specs.get(free) == ("from", "sqlmodel", free):
+                    continue  # `Field` & co.: rebound here as there by the rewrite
+                if free in own:
+                    ok = False
+                elif free in specs:
+                    ok = ok and (specs[free] == theirs or (theirs is None and specs[free] == ("from", m.name, free)))
+                elif free in m.defs or theirs is not None:
+                    add.append(free)
+                elif not hasattr(builtins, free):
+                    ok = False
+            if ok:
+                out[local] = fields
+                extra += [(m.name, a) for a in add]
+        if extra:
+            # the names the inherited fields read, imported from the module that binds them
+            at = next((i for i, st in enumerate(tree.body) if not (isinstance(st, ast.ImportFrom) and st.module == "__future__")
+                       and not (i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))), 0)
+            for mod, a in sorted(set(extra)):
+                tree.body.insert(at, ast.copy_location(ast.ImportFrom(module=mod, names=[ast.alias(a)], level=0), tree.body[at]))
+            ast.fix_missing_locations(tree)
+        return out
+
+    def _sqlmodel_imports(self) -> None:
+        """SQLModel table classes a module of the package imports from another (sqlmodel_rewrite.import_tables)."""
+        if not any(m.sm_tables for m in self.modules.values()):
+            return
+        from .sqlmodel_rewrite import import_tables
+
+        for m in list(self.modules.values()):
+            if not m.in_package:
+                continue
+            imported = {}
+            for local, spec in m.imports.items():
+                if spec[0] != "from":
+                    continue
+                t = self.resolve(m.name, local)
+                if isinstance(t, Sym) and t.module != m.name:
+                    src = self.modules.get(t.module)
+                    if src is not None and t.name in src.sm_tables:
+                        imported[local] = (t.module, t.name)
+            if imported and import_tables(m.tree, imported):
+                m.imports, m.stars = _import_specs(m.tree.body, m.package)
 
     # ------------------------------------------------------------------ loading
 
+    def root_of(self, path: Path) -> Path:
+        """The import root a file lives under (the deepest one when they nest)."""
+        path = path.resolve()
+        inside = [r for r in self.roots if path.is_relative_to(r)]
+        return max(inside, key=lambda r: len(r.parts)) if inside else self.root
+
     def _modname(self, path: Path) -> str:
-        rel = path.resolve().relative_to(self.root).with_suffix("")
+        rel = path.resolve().relative_to(self.root_of(path)).with_suffix("")
         parts = list(rel.parts)
         if parts[-1] == "__init__":
             parts = parts[:-1]
@@ -501,7 +687,7 @@ class ModuleIndex:
 
                 tree, dropped = parse_cached(lib, path, target_python(self.root))
             else:
-                tree = ast.parse(path.read_text(), filename=str(path))
+                tree = ast.parse(path.read_bytes(), filename=str(path))
         except SyntaxError as e:
             self.syntax_errors.append((str(path), e))
             return None
@@ -512,7 +698,9 @@ class ModuleIndex:
             if imports_sqlmodel(tree):
                 # SQLModel classes rewritten into mapped classes and Pydantic models; their base loaded now (the
                 # classification of the project's classes reads it)
-                tree = rewrite(tree)
+                if not hasattr(self, "_sqlmodel_version"):
+                    self._sqlmodel_version = sqlmodel_version(self.root)
+                tree = rewrite(tree, self._sqlmodel_version, self._sqlmodel_bases(tree, name, path.name == "__init__.py"))
                 self.load_shim("sqlmodel.SQLModel")
             from .pydrewrite import rewrite as rewrite_create_model
 
@@ -522,12 +710,19 @@ class ModuleIndex:
                 v = tuple(int(x) for x in re.findall(r"\d+", locked_version(self.root, "pydantic") or "2.14")[:2])
                 self._pyd_namespace = v >= (2, 14)
             tree = rewrite_create_model(tree, self._pyd_namespace)  # `M = create_model('M', ...)` as the class it creates
+            self._decide_import_guards(tree, name, path.name == "__init__.py", project=True)
+            positional_router(tree)
             tree = fold_flags(tree)
         else:
-            self._decide_import_guards(tree, name, path.name == "__init__.py")
+            self._importing.add(name)
+            try:
+                self._decide_import_guards(tree, name, path.name == "__init__.py")
+            finally:
+                self._importing.discard(name)
         drop_overloads(tree)
         class_scope_defaults(tree)
-        m = Module(name, path, tree, path.name == "__init__.py", in_package, lib=lib.name if lib is not None else None)
+        m = Module(name, path, tree, path.name == "__init__.py", in_package, lib=lib.name if lib is not None else None,
+                   sm_tables=getattr(tree, "_p2a_sm_tables", {}))
         for node in tree.body:
             if import_guard(node):
                 # `try: import x; FLAG = True / except ImportError: FLAG = False`: the imports were resolved at
@@ -548,6 +743,16 @@ class ModuleIndex:
                 # `A, B = "a", "b"`: one plain assignment per name (literal tuple of the same length)
                 for t, v in zip(node.targets[0].elts, node.value.elts):
                     one = ast.copy_location(ast.Assign(targets=[ast.Name(t.id, ast.Store())], value=v), node)
+                    m.defs[t.id] = ast.fix_missing_locations(one)
+                    m.binders.setdefault(t.id, []).append(one)
+                continue
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                  and all(isinstance(t, ast.Name) for t in node.targets[0].elts)
+                  and isinstance(node.value, ast.Constant) and isinstance(node.value.value, (str, bytes))
+                  and len(node.value.value) == len(node.targets[0].elts)):
+                # `A, B, C = b"VMD"`: the items the literal unpacks to (ints of bytes, 1-char strs)
+                for t, v in zip(node.targets[0].elts, node.value.value):
+                    one = ast.copy_location(ast.Assign(targets=[ast.Name(t.id, ast.Store())], value=ast.Constant(v)), node)
                     m.defs[t.id] = ast.fix_missing_locations(one)
                     m.binders.setdefault(t.id, []).append(one)
                 continue
@@ -619,9 +824,11 @@ class ModuleIndex:
                     return ModRef(sub) if self.module(sub) is not None else Ext(sub)
         return None
 
-    def _decide_import_guards(self, tree: ast.Module, name: str, is_pkg: bool) -> None:
+    def _decide_import_guards(self, tree: ast.Module, name: str, is_pkg: bool, project: bool = False) -> None:
         """A library's `try: import x / except ImportError: <fallback>` at module level, decided by the environment
-        as CPython decides it at import: the fallback replaces the `try` when an imported module is not installed."""
+        as CPython decides it at import: the fallback replaces the `try` when an imported module is not installed.
+        In the project (`project=True`), only an import of the project's own code that cannot succeed decides it:
+        `from app.api import dianjin` when `app/api/dianjin.py` is absent (gitignored optional module)."""
         package = name if is_pkg else name.rpartition(".")[0]
         body = []
         for node in tree.body:
@@ -630,19 +837,49 @@ class ModuleIndex:
                          ("ImportError", "ModuleNotFoundError", "Exception", "BaseException")]
                 def fails(st):
                     specs, stars = _import_specs([st], package)
+                    if project:
+                        return any(self._project_import_fails(spec, name) for spec in specs.values())
                     return any(not self.importable(m) for m in {spec[1] for spec in specs.values()} | set(stars))
 
                 i = next((k for k, st in enumerate(node.body) if fails(st)), None)
                 if i is not None and catch:
-                    # what ran before the failing import stays bound, then the handler runs
+                    # what ran before the failing import stays bound, then the handler runs; its `FLAG = False`
+                    # is then a constant `fold_flags` decides (`if FLAG:` keeps one branch)
+                    for st in catch[0].body:
+                        if isinstance(st, ast.Assign) and isinstance(st.value, ast.Constant) and type(st.value.value) is bool:
+                            st.value._py2axum_folded = True
                     body += node.body[:i] + catch[0].body
                     continue
             body.append(node)
         tree.body = body
 
+    def _project_import_fails(self, spec: tuple, importer: str) -> bool:
+        """An import of the project's own code that raises ImportError: its package is a project package (loaded,
+        not a library) and neither the submodule nor a top-level binding of that name exists. Anything else (a
+        library, a name bound dynamically) is left undecided."""
+        if spec[0] == "from" and self.module(spec[1]) is None:
+            return self._project_import_fails(("module", spec[1]), importer)  # `from app.missing import f`
+        dotted = spec[1] if spec[0] == "module" else f"{spec[1]}.{spec[2]}"
+        parent, _, last = dotted.rpartition(".")
+        if not parent or parent == importer or importer.startswith(dotted) or self.module(dotted) is not None:
+            return False
+        pm = self.module(parent)
+        if pm is None or pm.lib is not None or not pm.is_pkg or pm.stars or "__getattr__" in pm.defs:
+            return False
+        if spec[0] == "from" and (last in pm.defs or last in pm.imports or last in pm.binders):
+            return False
+        if any(isinstance(n, ast.Global) or (isinstance(n, ast.Name) and n.id in ("globals", "setattr", "__path__"))
+               for n in ast.walk(pm.tree)):
+            return False  # names bound dynamically, or a namespace extended at run time
+        base = pm.path.parent / last
+        return not (base.with_suffix(".py").exists() or base.is_dir() or any(pm.path.parent.glob(last + ".*")))
+
     def importable(self, name: str) -> bool:
         """`import name` succeeds in the project's environment: a module of the project or of a translated library,
-        a module of the standard library, or a module of an installed distribution."""
+        a module of the standard library, or a module of an installed distribution. A library module whose own
+        imports are being decided is importable: it is already in sys.modules when an import cycle comes back to it."""
+        if name in self._importing:
+            return True
         if self.module(name) is not None:
             return True
         top = name.split(".")[0]
@@ -671,7 +908,7 @@ class ModuleIndex:
         name, file = self.SHIMS[dotted]
         if name not in self.modules:
             path = Path(__file__).resolve().parent / "shims" / file
-            tree = ast.parse(path.read_text(), filename=str(path))
+            tree = ast.parse(path.read_bytes(), filename=str(path))
             m = Module(name, path, tree, False, False)
             for node in tree.body:
                 if isinstance(node, ast.ClassDef):
@@ -688,8 +925,49 @@ class ModuleIndex:
         return any(module == m for m, _ in self.SHIMS.values())
 
     def _ext(self, dotted: str) -> Target:
-        """A library name: the class py2axum translates from its own source when it has one (`load_shim`)"""
-        return self.load_shim(dotted) or Ext(dotted)
+        """A library name: the class py2axum translates from its own source when it has one (`load_shim`), or the
+        library's source for a name the library map does not cover of a library it covers in part"""
+        return self.load_shim(dotted) or self._partial_source(dotted) or Ext(dotted)
+
+    def _partial_source(self, dotted: str) -> Target | None:
+        """`jinja2.Template`, `aiosmtplib.SMTP`: a name of a library the library map covers only in part (`jinja2`
+        has `Environment`), that the map does not cover, read from the library's source (--translate-libs). The names
+        the map covers stay native everywhere, the library's own modules included (`resolve`)."""
+        if self.libs is None or "." not in dotted:
+            return None
+        from .libmap import canonical
+
+        if self.libs.mapped(canonical(dotted)) or self.libs.partial(dotted.split(".")[0]) is None:
+            return None
+        parts = dotted.split(".")
+        for i in range(len(parts), 0, -1):
+            mod = ".".join(parts[:i])
+            if self._partial_module(mod) is None:
+                continue
+            t: Target | None = ModRef(mod)
+            for a in parts[i:]:
+                if not isinstance(t, ModRef):
+                    return None
+                t = self.resolve(t.module, a)
+            return t
+        return None
+
+    def _partial_module(self, name: str) -> Module | None:
+        if name in self.modules:
+            return self.modules[name]
+        found = self.libs.locate(name, partial=True)
+        if found is None:
+            return None
+        path, _site, dist = found
+        return self._load_path(path, in_package=False, lib=dist, name=name)
+
+    def partial_lib(self, module: str) -> str | None:
+        """The top-level package of `module` when it is the source of a library the map covers in part."""
+        m = self.modules.get(module)
+        if m is None or m.lib is None or self.libs is None:
+            return None
+        top = module.split(".")[0]
+        return top if self.libs.partial(top) is not None else None
 
     def module(self, name: str) -> Module | None:
         """A project module by dotted name, parsed on demand; None if outside the project."""
@@ -697,21 +975,23 @@ class ModuleIndex:
             return self.modules[name]
         if not name or name in self._missing:
             return None
-        base = self.root.joinpath(*name.split("."))
-        for path in (base.with_suffix(".py"), base / "__init__.py"):
-            if path.is_file() and self._exact_case(path):
-                return self._load_path(path, in_package=False)
+        for root in self.roots:
+            base = root.joinpath(*name.split("."))
+            for path in (base.with_suffix(".py"), base / "__init__.py"):
+                if path.is_file() and self._exact_case(path, root):
+                    return self._load_path(path, in_package=False)
         if self.libs is not None and (found := self.libs.locate(name)) is not None:
             path, _site, dist = found
             return self._load_path(path, in_package=False, lib=dist, name=name)
         self._missing.add(name)
         return None
 
-    def _exact_case(self, path: Path) -> bool:
+    def _exact_case(self, path: Path, root: Path | None = None) -> bool:
         """On a case-insensitive file system (macOS), `models/Item.py` "exists" when only
         `models/item.py` does: `from models import Item` must not resolve to a module."""
-        cur = self.root
-        for part in path.relative_to(self.root).parts:
+        root = root or self.root
+        cur = root
+        for part in path.relative_to(root).parts:
             if part not in os.listdir(cur):
                 return False
             cur = cur / part
@@ -740,6 +1020,13 @@ class ModuleIndex:
         m = self.module(module)
         if m is None:
             return self._ext(f"{module}.{name}")
+        if m.lib is not None and self.partial_lib(module) is not None:
+            from .libmap import canonical
+
+            if self.libs.mapped(canonical(f"{module}.{name}")):
+                # a name the library map covers, of a library read from source for the others: the map's object,
+                # inside the library as well (`raise SMTPException(...)` raises the class `except` clauses name)
+                return Ext(f"{module}.{name}")
         if scope is not None:
             local = function_imports(scope, m.package)
             if name in local:

@@ -9,6 +9,8 @@ use super::v::*;
 pub struct BytesIO {
     buf: Mutex<Vec<u8>>,
     pos: Mutex<usize>,
+    /// close() or the end of its `with` block: every method but close then raises ValueError
+    closed: std::sync::atomic::AtomicBool,
 }
 
 pub struct Upload {
@@ -20,7 +22,7 @@ pub struct Upload {
 }
 
 pub fn bytesio(data: Vec<u8>) -> V {
-    V::native(Native::BytesIO(BytesIO { buf: Mutex::new(data), pos: Mutex::new(0) }))
+    V::native(Native::BytesIO(BytesIO { buf: Mutex::new(data), pos: Mutex::new(0), closed: Default::default() }))
 }
 
 /// `io.BytesIO(initial_bytes=b"")`
@@ -78,6 +80,13 @@ pub fn bytesio_lines(b: &BytesIO) -> Vec<V> {
 }
 
 pub fn bytesio_method(b: &BytesIO, name: &str, args: &[V]) -> R {
+    if name == "close" {
+        b.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(V::None);
+    }
+    if b.closed.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Exc::value_error("I/O operation on closed file."));
+    }
     match name {
         "read" => {
             let buf = b.buf.lock();

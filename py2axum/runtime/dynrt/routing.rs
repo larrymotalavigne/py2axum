@@ -535,6 +535,29 @@ pub async fn method(cx: &Cx, o: &Arc<RObj>, name: &str, args: Vec<V>, kwargs: Ve
 }
 
 /// a route added by `app.add_route` matching `path`: (route, full match)
+/// `app.include_router(<library router>)` left to Python: the routes added from here on come after the library's
+/// in Starlette's order (they are tried only if none of its unknown routes matches)
+static BARRIER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub fn lib_barrier() {
+    let _ = BARRIER.set(ADDED.read().len());
+}
+
+/// `added_match` among the routes the binary may answer: those added before a library router left to Python
+pub fn added_match_native(path: &str, method: &str) -> Option<(Arc<Added>, bool)> {
+    let n = BARRIER.get().copied().unwrap_or(usize::MAX);
+    let mut partial = None;
+    for a in ADDED.read().iter().take(n) {
+        if a.re.is_match(path) {
+            if a.methods.iter().any(|m| m == method) {
+                return Some((a.clone(), true));
+            }
+            partial.get_or_insert_with(|| a.clone());
+        }
+    }
+    partial.map(|a| (a, false))
+}
+
 pub fn added_match(path: &str, method: &str) -> Option<(Arc<Added>, bool)> {
     let mut partial = None;
     for a in ADDED.read().iter() {

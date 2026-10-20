@@ -1,9 +1,11 @@
-//! Password and second-factor libraries: pyca/bcrypt 5.0 (itself built on the `bcrypt` crate: same
-//! salt parsing, same errors) and pyotp 2.9 (TOTP), with `base64.b32decode` as CPython has it.
+//! Password and second-factor libraries: pyca/bcrypt 4.3 and 5.0 (itself built on the `bcrypt` crate: same
+//! salt parsing, same errors), passlib 1.7.4's CryptContext of bcrypt over it, and pyotp 2.9 (TOTP), with
+//! `base64.b32decode` as CPython has it.
 use base64::Engine as _;
 
 use super::ops;
 use super::v::*;
+use super::Cx;
 
 fn kw<'a>(kwargs: &'a [(String, V)], name: &str) -> Option<&'a V> {
     kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
@@ -46,7 +48,9 @@ fn invalid_salt() -> Exc {
     Exc::value_error("Invalid salt")
 }
 
-fn hashpw(password: &[u8], salt: &[u8]) -> R<Vec<u8>> {
+/// pyca/bcrypt's `hashpw`: 5.0 refuses a password over 72 bytes, 4.x hashes its first 72 bytes
+fn hashpw(password: &[u8], salt: &[u8], bcrypt5: bool) -> R<Vec<u8>> {
+    let password = if !bcrypt5 && password.len() > 72 { &password[..72] } else { password };
     if password.len() > 72 {
         return Err(Exc::value_error("password cannot be longer than 72 bytes, truncate manually if necessary (e.g. my_password[:72])"));
     }
@@ -70,8 +74,8 @@ fn hashpw(password: &[u8], salt: &[u8]) -> R<Vec<u8>> {
     Ok(hashed.format_for_version(version).into_bytes())
 }
 
-/// `bcrypt.gensalt` / `hashpw` / `checkpw`
-pub fn call(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+/// `bcrypt.gensalt` / `hashpw` / `checkpw` (`bcrypt5`: the locked release is 5.x)
+pub fn call(name: &str, bcrypt5: bool, args: &[V], kwargs: &[(String, V)]) -> R {
     match name {
         "gensalt" => {
             let names = ["rounds", "prefix"];
@@ -99,14 +103,14 @@ pub fn call(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             let pw = bytes_arg(arg(name, args, kwargs, 0, "password", &names)?, "password")?;
             let salt = bytes_arg(arg(name, args, kwargs, 1, "salt", &names)?, "salt")?;
             // CPU-bound for ~0.25 s at cost 12: off the loop worker, as pyca/bcrypt releases the GIL
-            Ok(V::Bytes(std::sync::Arc::from(&super::thread::blocking(|| hashpw(&pw, &salt))?[..])))
+            Ok(V::Bytes(std::sync::Arc::from(&super::thread::blocking(|| hashpw(&pw, &salt, bcrypt5))?[..])))
         }
         "checkpw" => {
             let names = ["password", "hashed_password"];
             let pw = bytes_arg(arg(name, args, kwargs, 0, "password", &names)?, "password")?;
             let hashed = bytes_arg(arg(name, args, kwargs, 1, "hashed_password", &names)?, "hashed_password")?;
             use subtle::ConstantTimeEq;
-            Ok(V::Bool(super::thread::blocking(|| hashpw(&pw, &hashed))?.ct_eq(&hashed).into()))
+            Ok(V::Bool(super::thread::blocking(|| hashpw(&pw, &hashed, bcrypt5))?.ct_eq(&hashed).into()))
         }
         _ => Err(Exc::attr_error(format!("module 'bcrypt' has no attribute '{name}'"))),
     }
@@ -497,4 +501,393 @@ corresponding hasher is enabled.");
     }
     let updated = if ok && argon2_needs_rehash(&h) { V::str(argon2_hash(&pw)?) } else { V::None };
     Ok(V::tuple(vec![V::Bool(ok), updated]))
+}
+
+// ---------------------------------------------------------------- passlib 1.7.4 (CryptContext of bcrypt)
+
+/// `passlib.context.CryptContext(schemes=["bcrypt"], deprecated="auto")` (the only configuration translated):
+/// its `bcrypt` handler over the `bcrypt` package. `bcrypt`: the locked pyca/bcrypt release, which decides how
+/// passlib loads it (4.1 and later no longer have `bcrypt.__about__`; 5.0's `hashpw` refuses the 255-byte
+/// password of passlib's self-test, so the backend never loads and every hash raises).
+pub struct PassCtx {
+    bcrypt: (u32, u32),
+    /// `CryptContext._dummy_hash` (a memoized property)
+    dummy: parking_lot::Mutex<Option<String>>,
+}
+
+/// passlib's `_BcryptBackend` is loaded once per process (`bcrypt.set_backend()`)
+static PASSLIB_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn passlib_context(bcrypt_version: &str) -> R {
+    let mut it = bcrypt_version.split('.').map(|x| x.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u32>().unwrap_or(0));
+    let bcrypt = (it.next().unwrap_or(5), it.next().unwrap_or(0));
+    Ok(V::native(Native::PassCtx(std::sync::Arc::new(PassCtx { bcrypt, dummy: parking_lot::Mutex::new(None) }))))
+}
+
+const BCRYPT64: &str = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const IDENTS: [&str; 5] = ["$2$", "$2a$", "$2x$", "$2y$", "$2b$"];
+/// `passlib.utils.MAX_PASSWORD_SIZE` (PASSLIB_MAX_PASSWORD_SIZE unset)
+const MAX_PASSWORD_SIZE: usize = 4096;
+
+/// `passlib.exc.type_name`: the module-qualified name of a value's class, but for builtins and None
+async fn passlib_type_name(cx: &Cx, v: &V) -> String {
+    match v {
+        V::None => "None".into(),
+        V::Inst(_) | V::Obj(_) | V::Native(_) => {
+            if let Ok(cls) = super::methods::getattr(cx, v, "__class__").await {
+                if let (Ok(V::Str(m)), Ok(V::Str(n))) =
+                    (super::methods::getattr(cx, &cls, "__module__").await, super::methods::getattr(cx, &cls, "__name__").await)
+                {
+                    if !m.is_empty() && &*m != "builtins" {
+                        return format!("{m}.{n}");
+                    }
+                    return n.to_string();
+                }
+            }
+            v.type_name().to_string()
+        }
+        _ => v.type_name().to_string(),
+    }
+}
+
+async fn expected_string(cx: &Cx, v: &V, param: &str) -> Exc {
+    Exc::type_error(format!("{param} must be unicode or bytes, not {}", passlib_type_name(cx, v).await))
+}
+
+fn password_value_error(msg: &str) -> Exc {
+    Exc::msg(&PASSLIB_PASSWORD_VALUE_ERROR, msg)
+}
+
+fn password_size_error() -> Exc {
+    let e = Exc::msg(&PASSLIB_PASSWORD_SIZE_ERROR, "password exceeds maximum allowed size");
+    e.0.attrs.lock().insert("max_size".into(), V::Int(MAX_PASSWORD_SIZE as i64));
+    e
+}
+
+/// `passlib.utils.handlers.validate_secret`
+async fn validate_secret(cx: &Cx, secret: &V) -> R<()> {
+    let n = match secret {
+        V::Str(s) => s.chars().count(),
+        V::Bytes(b) => b.len(),
+        o => return Err(expected_string(cx, o, "secret").await),
+    };
+    if n > MAX_PASSWORD_SIZE {
+        return Err(password_size_error());
+    }
+    Ok(())
+}
+
+fn unknown_hash() -> Exc {
+    let msg = "hash could not be identified";
+    let e = Exc::new(&PASSLIB_UNKNOWN_HASH_ERROR, vec![V::str(msg), V::None]);
+    let mut a = e.0.attrs.lock();
+    a.insert("message".into(), V::str(msg));
+    a.insert("value".into(), V::None);
+    drop(a);
+    e
+}
+
+/// `CryptContext._identify_record` (a single bcrypt record): the hash's type, then `bcrypt.identify`
+/// (`to_unicode_for_identify`: UTF-8, else Latin-1, then the ident prefixes)
+async fn identify(cx: &Cx, hash: &V, required: bool) -> R<bool> {
+    let s: String = match hash {
+        V::Str(s) => s.to_string(),
+        V::Bytes(b) => match std::str::from_utf8(b) {
+            Ok(s) => s.to_string(),
+            Err(_) => b.iter().map(|&c| c as char).collect(),
+        },
+        o => return Err(expected_string(cx, o, "hash").await),
+    };
+    if IDENTS.iter().any(|i| s.starts_with(i)) {
+        return Ok(true);
+    }
+    if required {
+        return Err(unknown_hash());
+    }
+    Ok(false)
+}
+
+/// `to_unicode(hash, "ascii", "hash")`
+async fn hash_text(cx: &Cx, hash: &V) -> R<String> {
+    match hash {
+        V::Str(s) => Ok(s.to_string()),
+        V::Bytes(b) => match b.iter().position(|&c| c >= 0x80) {
+            None => Ok(b.iter().map(|&c| c as char).collect()),
+            Some(i) => Err(Exc::new(&UNICODE_DECODE_ERROR, vec![V::str("ascii"), V::Bytes(b.clone()), V::Int(i as i64),
+                                                                 V::Int(i as i64 + 1), V::str("ordinal not in range(128)")])),
+        },
+        o => Err(expected_string(cx, o, "hash").await),
+    }
+}
+
+/// `bcrypt64.check_repair_unused`: the padding bits of the last character cleared (`mask`: 15 for a 22-char
+/// salt, 3 for a 31-char checksum)
+fn repair_unused(s: &str, mask: usize) -> String {
+    let mut chars: Vec<char> = s.chars().collect();
+    if let Some(last) = chars.last_mut() {
+        if let Some(i) = BCRYPT64.find(*last) {
+            *last = BCRYPT64.as_bytes()[i & !mask] as char;
+        }
+    }
+    chars.into_iter().collect()
+}
+
+/// Whether CPython's `int(s)` accepts `s` (base 10): surrounding whitespace, a sign, decimal digits with
+/// single underscores between them
+fn py_int_accepts(s: &str) -> bool {
+    let t = s.trim_matches(super::methods::py_space);
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let dec = |c: char| super::methods::str_class(c, |t| t.decimal, |c| c.is_ascii_digit());
+    !t.is_empty() && !t.starts_with('_') && !t.ends_with('_') && !t.contains("__") && t.chars().all(|c| c == '_' || dec(c))
+}
+
+struct BcryptHash {
+    ident: &'static str,
+    rounds: u32,
+    salt: String,
+    checksum: Option<String>,
+}
+
+/// `bcrypt.from_string(hash)` and the handler's constructor: the ident, the cost field, then the checksum, the
+/// salt and the rounds as the mixins normalize them (GenericHandler first)
+async fn parse_bcrypt(cx: &Cx, hash: &V) -> R<BcryptHash> {
+    let h = hash_text(cx, hash).await?;
+    let ident = *IDENTS.iter().find(|i| h.starts_with(**i)).ok_or_else(|| Exc::value_error("not a valid bcrypt hash"))?;
+    if ident == "$2x$" {
+        return Err(Exc::value_error("crypt_blowfish's buggy '2x' hashes are not currently supported"));
+    }
+    let tail = &h[ident.len()..];
+    let parts = super::ops::unpack(&V::list(tail.split('$').map(V::str).collect()), 2)?;
+    let (V::Str(rounds_str), V::Str(data)) = (&parts[0], &parts[1]) else { unreachable!() };
+    // `int(rounds_str)` then `rounds_str != "%02d" % rounds`
+    let canonical = {
+        let d = rounds_str.strip_prefix('-').unwrap_or(rounds_str);
+        let neg = d.len() != rounds_str.len();
+        !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+            && if neg { !d.starts_with('0') } else { d.len() == 2 || !d.starts_with('0') && d.len() > 2 }
+    };
+    if !canonical {
+        if py_int_accepts(rounds_str) {
+            return Err(Exc::value_error("malformed bcrypt hash (malformed cost field)"));
+        }
+        return Err(Exc::value_error(format!("invalid literal for int() with base 10: {}", super::ops::str_repr(rounds_str))));
+    }
+    let chars: Vec<char> = data.chars().collect();
+    let salt: String = chars.iter().take(22).collect();
+    let chk: String = chars.iter().skip(22).collect();
+    let checksum = if chk.is_empty() {
+        None
+    } else {
+        if chk.chars().count() != 31 {
+            return Err(Exc::value_error("malformed bcrypt hash (checksum must be exactly 31 chars)"));
+        }
+        if chk.chars().any(|c| !BCRYPT64.contains(c)) {
+            return Err(Exc::value_error("invalid characters in bcrypt checksum"));
+        }
+        // a checksum with padding bits set: repaired (with a PasslibHashWarning, not printed by the binary)
+        Some(repair_unused(&chk, 3))
+    };
+    if salt.chars().any(|c| !BCRYPT64.contains(c)) {
+        return Err(Exc::value_error("invalid characters in bcrypt salt"));
+    }
+    if salt.chars().count() < 22 {
+        return Err(Exc::value_error("salt too small (bcrypt requires exactly 22 chars)"));
+    }
+    let salt = repair_unused(&salt, 15);
+    let neg = rounds_str.starts_with('-');
+    let digits = rounds_str.trim_start_matches('-');
+    let small: Option<u32> = if neg { None } else { digits.parse().ok() };
+    match small {
+        Some(r) if (4..=31).contains(&r) => Ok(BcryptHash { ident, rounds: r, salt, checksum }),
+        Some(r) if r < 4 => Err(Exc::value_error(format!("bcrypt: rounds ({r}) is too low, must be at least 4"))),
+        _ if neg => Err(Exc::value_error(format!("bcrypt: rounds ({rounds_str}) is too low, must be at least 4"))),
+        _ => Err(Exc::value_error(format!("bcrypt: rounds ({digits}) is too large, cannot be more than 31"))),
+    }
+}
+
+impl PassCtx {
+    /// `_NoBackend._stub_requires_backend()`: loads the `bcrypt` backend the first time (its version read
+    /// from `bcrypt.__about__`, trapped and logged from bcrypt 4.1); bcrypt 5.0 fails passlib's wraparound
+    /// self-test (a 255-byte password), so it is retried, and fails, at every call
+    fn backend(&self) -> R<()> {
+        if PASSLIB_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        if self.bcrypt >= (4, 1) {
+            super::logging::emit_sync("passlib.handlers.bcrypt", super::logging::WARNING, "(trapped) error reading bcrypt version",
+                                      vec![], vec![], Some(Exc::attr_error("module 'bcrypt' has no attribute '__about__'")),
+                                      &super::logging::NO_LOC);
+        }
+        if self.bcrypt.0 >= 5 {
+            return Err(Exc::value_error("password cannot be longer than 72 bytes, truncate manually if necessary (e.g. my_password[:72])"));
+        }
+        PASSLIB_LOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `bcrypt._calc_checksum(secret)` of the `bcrypt` backend (`_norm_digest_args`, then `bcrypt.hashpw`)
+    async fn checksum(&self, cx: &Cx, secret: &V, ident: &'static str, rounds: u32, salt: &str) -> R<String> {
+        self.backend()?;
+        let mut pw: Vec<u8> = match secret {
+            V::Str(s) => s.as_bytes().to_vec(),
+            V::Bytes(b) => b.to_vec(),
+            o => return Err(expected_string(cx, o, "secret").await),
+        };
+        validate_secret(cx, &V::Bytes(std::sync::Arc::from(&pw[..]))).await?;
+        if pw.contains(&0) {
+            return Err(password_value_error("bcrypt does not allow NULL bytes in password"));
+        }
+        let mut ident = ident;
+        if ident == "$2$" {
+            // `$2$` is not supported by the `bcrypt` package: the password repeated up to 72 bytes, as `$2b$`
+            if !pw.is_empty() {
+                pw = pw.iter().cycle().take(72).copied().collect();
+            }
+            ident = "$2b$";
+        }
+        let config = format!("{ident}{rounds:02}${salt}");
+        let bcrypt5 = self.bcrypt.0 >= 5;
+        let out = super::thread::blocking(|| hashpw(&pw, config.as_bytes(), bcrypt5))?;
+        Ok(String::from_utf8_lossy(&out[out.len() - 31..]).into_owned())
+    }
+
+    /// `bcrypt.hash(secret)` (a new salt, cost 12, `$2b$`)
+    async fn hash(&self, cx: &Cx, secret: &V) -> R<String> {
+        validate_secret(cx, secret).await?;
+        let raw: [u8; 16] = rand::random();
+        let salt = bcrypt_b64().encode(raw);
+        let chk = self.checksum(cx, secret, "$2b$", 12, &salt).await?;
+        Ok(format!("$2b$12${salt}{chk}"))
+    }
+
+    /// `bcrypt.verify(secret, hash)` (the hash already identified)
+    async fn verify(&self, cx: &Cx, secret: &V, hash: &V) -> R<bool> {
+        validate_secret(cx, secret).await?;
+        let h = parse_bcrypt(cx, hash).await?;
+        let Some(chk) = &h.checksum else {
+            return Err(Exc::value_error("expected bcrypt hash, got bcrypt config string instead"));
+        };
+        let calc = self.checksum(cx, secret, h.ident, h.rounds, &h.salt).await?;
+        use subtle::ConstantTimeEq;
+        Ok(calc.as_bytes().ct_eq(chk.as_bytes()).into())
+    }
+
+    /// `bcrypt.needs_update(hash)`: a `$2a$` hash whose salt has padding bits set (passlib issue 25)
+    async fn needs_update(&self, cx: &Cx, hash: &V) -> R<bool> {
+        let h = match hash {
+            V::Bytes(_) => hash_text(cx, hash).await?,
+            V::Str(s) => s.to_string(),
+            o => return Err(expected_string(cx, o, "hash").await),
+        };
+        if h.starts_with("$2a$") {
+            let c = h.chars().nth(28).ok_or_else(|| Exc::msg(&INDEX_ERROR, "string index out of range"))?;
+            if !".Oeu".contains(c) {
+                return Ok(true);
+            }
+        }
+        parse_bcrypt(cx, hash).await?;
+        Ok(false)
+    }
+
+    /// `CryptContext.dummy_verify()`: verify against a memoized hash of "too many secrets"
+    async fn dummy_verify(&self, cx: &Cx) -> R<()> {
+        let secret = V::str("too many secrets");
+        let cached = self.dummy.lock().clone();
+        let h = match cached {
+            Some(h) => h,
+            None => {
+                let h = self.hash(cx, &secret).await?;
+                *self.dummy.lock() = Some(h.clone());
+                h
+            }
+        };
+        self.verify(cx, &secret, &V::str(h)).await?;
+        Ok(())
+    }
+}
+
+/// The methods of a CryptContext (passlib 1.7.4's signatures; `scheme`, `category` and handler keywords are
+/// refused)
+pub async fn passlib_method(cx: &Cx, c: &PassCtx, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    let params: &[&str] = match name {
+        "hash" => &["secret"],
+        "verify" | "verify_and_update" => &["secret", "hash"],
+        "needs_update" => &["hash"],
+        "identify" => &["hash"],
+        "dummy_verify" => &[],
+        "encrypt" | "genconfig" | "genhash" | "hash_needs_update" | "is_enabled" | "disable" | "enable" | "handler"
+        | "schemes" | "default_scheme" | "using" | "copy" | "replace" | "update" | "load" | "load_path" | "to_dict"
+        | "to_string" | "from_string" | "from_path" | "reset_min_verify_time" | "mvt_estimate_max_samples" => {
+            return Err(Exc::type_error(format!("py2axum: CryptContext.{name}() is not supported (hash, verify, verify_and_update, \
+needs_update, identify and dummy_verify are)")));
+        }
+        _ => return Err(Exc::attr_error(format!("'CryptContext' object has no attribute '{name}'"))),
+    };
+    // keyword-only extras that keep the default behaviour
+    let extra: &[&str] = match name {
+        "needs_update" => &["secret"],
+        "identify" => &["required"],
+        _ => &[],
+    };
+    if args.len() > params.len() {
+        return Err(Exc::type_error(format!("py2axum: CryptContext.{name}() with {} positional arguments is not supported", args.len())));
+    }
+    for (k, _) in kwargs {
+        if !params.contains(&k.as_str()) && !extra.contains(&k.as_str()) {
+            return Err(Exc::type_error(format!("py2axum: CryptContext.{name}({k}=) is not supported")));
+        }
+        if let Some(i) = params.iter().position(|p| p == k) {
+            if i < args.len() {
+                return Err(Exc::type_error(format!("CryptContext.{name}() got multiple values for argument '{k}'")));
+            }
+        }
+    }
+    let get = |i: usize| -> R<V> {
+        args.get(i).or_else(|| kw(kwargs, params[i])).cloned().ok_or_else(|| {
+            Exc::type_error(format!("CryptContext.{name}() missing 1 required positional argument: '{}'", params[i]))
+        })
+    };
+    match name {
+        "hash" => Ok(V::str(c.hash(cx, &get(0)?).await?)),
+        "verify" => {
+            let (secret, hash) = (get(0)?, get(1)?);
+            if hash.is_none() {
+                c.dummy_verify(cx).await?;
+                return Ok(V::Bool(false));
+            }
+            identify(cx, &hash, true).await?;
+            Ok(V::Bool(c.verify(cx, &secret, &hash).await?))
+        }
+        "verify_and_update" => {
+            let (secret, hash) = (get(0)?, get(1)?);
+            if hash.is_none() {
+                c.dummy_verify(cx).await?;
+                return Ok(V::tuple(vec![V::Bool(false), V::None]));
+            }
+            identify(cx, &hash, true).await?;
+            if !c.verify(cx, &secret, &hash).await? {
+                return Ok(V::tuple(vec![V::Bool(false), V::None]));
+            }
+            if c.needs_update(cx, &hash).await? {
+                return Ok(V::tuple(vec![V::Bool(true), V::str(c.hash(cx, &secret).await?)]));
+            }
+            Ok(V::tuple(vec![V::Bool(true), V::None]))
+        }
+        "needs_update" => {
+            let hash = get(0)?;
+            identify(cx, &hash, true).await?;
+            Ok(V::Bool(c.needs_update(cx, &hash).await?))
+        }
+        "identify" => {
+            let required = match kw(kwargs, "required") {
+                Some(v) => super::ops::truthy(v)?,
+                None => false,
+            };
+            Ok(if identify(cx, &get(0)?, required).await? { V::str("bcrypt") } else { V::None })
+        }
+        _ => {
+            c.dummy_verify(cx).await?;
+            Ok(V::Bool(false))
+        }
+    }
 }

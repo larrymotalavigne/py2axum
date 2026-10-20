@@ -42,7 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, mounted, reqbody, sqlmore, wsock
+from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, makerwrap, mounted, reqbody, sessforms, smsess, sqlmore, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -67,6 +67,7 @@ app.add_middleware(asgimw.ShortCircuit)
 app.add_middleware(asgimw.Boom)
 app.add_middleware(asgimw.HeaderStamp, name="outer")
 app.include_router(ddl.router)
+app.include_router(makerwrap.router)
 app.include_router(inherit.router)
 app.include_router(enumcols.router)
 app.include_router(composite.router)
@@ -82,6 +83,8 @@ app.include_router(asgimw.router)
 app.include_router(leaks.router)
 app.include_router(idict.router)
 app.include_router(greenlet.router)
+app.include_router(sessforms.router)
+app.include_router(smsess.router)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -829,7 +832,9 @@ async def archives_report(db: DbDep):
     """A @property read on the mapped class is the property object (`== True` is False: WHERE false);
     label references by name (`desc("n")`); a labelled expression in GROUP BY and ORDER BY."""
     flagged = (await db.execute(select(func.count(Archive.id)).where(Archive.short == True))).scalar()  # noqa: E712
-    day = func.date_trunc("day", Task.created_at).label("day")
+    # a millennium, not a day: the engine groups in Asia/Kolkata (midnight at 18:30 UTC) and each server plays the scenario
+    # on its own pass, so a run crossing that hour would count two days on one server and one on the other
+    day = func.date_trunc("millennium", Task.created_at).label("day")
     days = (await db.execute(select(day, func.count(Task.id).label("n")).group_by(day).order_by(day))).all()
     titles = (await db.execute(select(Task.title, func.count(Task.id).label("total")).group_by(Task.title)
                                .order_by(sa_desc("total"), sa_asc("title")))).all()
@@ -1225,13 +1230,14 @@ async def mail_filters(name: str = "Ada <&>", amount: float = 1234567.891):
 
 
 @app.get("/mail/build")
-async def mail_build(to: str = "ada@example.com"):
+async def mail_build(to: str = "ada@example.com", subject: str = "Votre reçu", name: str = "Équipe Easy"):
     # a non-ASCII address in a compat32 message (MIMEText...): encoded whole, on every Python (3.15's
     # HeaderWriteError is EmailMessage's, under the default policy)
     msg = MIMEMultipart("mixed")
-    msg["From"] = formataddr(("Équipe Easy", "noreply@example.com"))
+    msg["From"] = formataddr((name, "noreply@example.com"))
     msg["To"] = to
-    msg["Subject"] = "Votre reçu"
+    # a long non-ASCII subject: compat32 cuts its encoded words to the line (email.header._ValueFormatter)
+    msg["Subject"] = subject
     alt = MIMEMultipart("alternative")
     alt.attach(MIMEText("plain text", "plain"))
     alt.attach(MIMEText("<p>héllo</p>", "html", "utf-8"))

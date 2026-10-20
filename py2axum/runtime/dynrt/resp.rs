@@ -579,24 +579,32 @@ fn into_response_inner(r: &RespObj) -> R<Response> {
             }
             // a disk read: off the loop worker (Starlette reads in a thread)
             let data = super::thread::blocking(|| std::fs::read(path)).map_err(|e| Exc::runtime(format!("{e}")))?;
-            let mut h = vec![("content-type".to_string(), with_charset(r.media.as_deref().unwrap_or("text/plain"))), ("accept-ranges".to_string(), "bytes".to_string())];
+            // Starlette's order: the endpoint's headers, then content-type, accept-ranges and content-disposition
+            // (FileResponse.__init__) and the stat headers (set_stat_headers), each only when the endpoint did not
+            // set it (`setdefault`): an endpoint's own Content-Disposition replaces the one `filename=` makes
+            let mut h = std::mem::take(&mut headers);
+            fn setdefault(h: &mut Vec<(String, String)>, k: &str, v: impl FnOnce() -> String) {
+                if !h.iter().any(|(x, _)| x == k) {
+                    h.push((k.to_string(), v()));
+                }
+            }
+            setdefault(&mut h, "content-type", || with_charset(r.media.as_deref().unwrap_or("text/plain")));
+            setdefault(&mut h, "accept-ranges", || "bytes".to_string());
             if let Some(f) = filename {
                 let q = quote(f, "");
-                h.push(("content-disposition".into(), if &q != f { format!("{disposition}; filename*=utf-8''{q}") } else { format!("{disposition}; filename=\"{f}\"") }));
+                setdefault(&mut h, "content-disposition", || if &q != f { format!("{disposition}; filename*=utf-8''{q}") } else { format!("{disposition}; filename=\"{f}\"") });
             }
             let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
             let st_mtime = mtime.as_secs() as f64 + mtime.subsec_nanos() as f64 * 1e-9;
-            h.push(("content-length".into(), data.len().to_string()));
+            setdefault(&mut h, "content-length", || data.len().to_string());
             let lm = chrono::DateTime::from_timestamp(mtime.as_secs() as i64, 0).unwrap_or_default();
-            h.push(("last-modified".into(), lm.format("%a, %d %b %Y %H:%M:%S GMT").to_string()));
-            let etag = {
+            setdefault(&mut h, "last-modified", || lm.format("%a, %d %b %Y %H:%M:%S GMT").to_string());
+            setdefault(&mut h, "etag", || {
                 use md5::Digest;
-                let mut h = md5::Md5::new();
-                h.update(format!("{}-{}", ops::float_repr(st_mtime), data.len()).as_bytes());
-                format!("{:x}", h.finalize())
-            };
-            h.push(("etag".into(), format!("\"{etag}\"")));
-            h.extend(headers.drain(..));
+                let mut m = md5::Md5::new();
+                m.update(format!("{}-{}", ops::float_repr(st_mtime), data.len()).as_bytes());
+                format!("\"{:x}\"", m.finalize())
+            });
             headers = h;
             data
         }

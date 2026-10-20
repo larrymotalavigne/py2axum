@@ -130,6 +130,18 @@ fn writestr(z: &ZipW, args: &[V], kwargs: &[(String, V)]) -> R {
     // ZipInfo: the name stops at a NUL; a name ending in "/" is a directory
     let name = name.split('\0').next().unwrap_or("").to_string();
     let external: u32 = if name.ends_with('/') { (0o40775 << 16) | 0x10 } else { 0o600 << 16 };
+    add(z, &name, data, method, level, external)
+}
+
+/// A `ZipFile(target, "w", ZIP_DEFLATED)` for a library that writes its own members (dynrt/xlsx.rs).
+pub fn writer(target: V) -> ZipW {
+    ZipW { target, method: 8, level: -1, entries: Mutex::new(Vec::new()), closed: Mutex::new(false) }
+}
+
+/// One member, written at the local time of the call: `writestr` (`external` 0o600), or `write` of a
+/// file (its `st_mode`, as openpyxl's worksheets: a temporary file, 0o100600).
+pub fn add(z: &ZipW, name: &str, data: Vec<u8>, method: u16, level: i32, external: u32) -> R {
+    let name = name.to_string();
     if data.len() as f64 * 1.05 > ((1u64 << 31) - 1) as f64 {
         return Err(Exc::type_error("py2axum: a ZIP64 member (over 2 GiB) is not supported"));
     }
@@ -182,7 +194,7 @@ fn writestr(z: &ZipW, args: &[V], kwargs: &[(String, V)]) -> R {
     Ok(V::None)
 }
 
-fn close(z: &ZipW) -> R {
+pub fn close(z: &ZipW) -> R {
     {
         let mut c = z.closed.lock();
         if *c {

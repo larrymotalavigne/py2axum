@@ -300,7 +300,7 @@ async fn read_body(headers: &axum::http::HeaderMap, body: Body) -> Result<axum::
 
 /// hop-by-hop headers (RFC 9110 §7.6.1), never relayed in either direction, plus the ones the `Connection`
 /// header names; `content-length` is recomputed by the client from the buffered body
-fn relayed(headers: &axum::http::HeaderMap, extra: &[&str]) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+pub(crate) fn relayed(headers: &axum::http::HeaderMap, extra: &[&str]) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
     const HOP: [&str; 9] =
         ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "proxy-connection"];
     let named: Vec<String> = headers
@@ -384,6 +384,16 @@ pub async fn app(
     // a WebSocket handshake: the scope `websocket` (the HTTP middlewares let it through; never relayed
     // to the Python side)
     if super::ws::is_upgrade(&req) {
+        // a WebSocket route left to Python, or under a mount left there (the whole application relayed) that no
+        // translated WebSocket route matches: the Python process serves it, through the binary
+        let path = req.uri().path();
+        if python_side(path) || (under_mount(path) && !super::ws::has_route(ws_routes, path)) {
+            return match std::env::var("PY2AXUM_PYTHON_URL") {
+                Ok(up) => super::ws::relay(&up, req).await,
+                // no Python process: no route serves it (Starlette's `WebSocketClose()`, 403)
+                Err(_) => super::ws::no_route(&req),
+            };
+        }
         if let Err(e) = get_stack(stack_fn, routes).await {
             log_exc(&e);
             return plain_500();
@@ -514,7 +524,12 @@ fn chain<'a>(cx: &'a Cx, stack: &'a Arc<Stack>, i: usize, routes: &'static [Rout
         Some(Mw::Cors(c)) => Box::pin(c.call(cx, chain(cx, stack, i + 1, routes))),
         Some(Mw::Dispatch(f)) => Box::pin(async move {
             let next = V::native(Native::CallNext(Arc::new(Next { stack: stack.clone(), i: i + 1, routes })));
-            let ret = super::methods::call_value(cx, f, vec![super::request(cx), next], vec![]).await?;
+            // its own `_CachedRequest`
+            let _obj = super::ReqObj::enter(cx, web::REQ_MW + i as u32);
+            let ret = match super::methods::call_value(cx, f, vec![super::request(cx), next], vec![]).await {
+                Ok(v) => v,
+                Err(e) => return Err(collapsed(e)),
+            };
             to_response(&ret)
         }),
         Some(Mw::Asgi(inst, _)) => Box::pin(async move {
@@ -578,10 +593,48 @@ pub struct Next {
 /// `await call_next(request)`: the response of the inner stack; an exception escaping it is raised here.
 pub async fn call_next(cx: &Cx, n: &Next) -> R {
     let saved = super::sentry::context_enter(cx);
-    let r = chain(cx, &n.stack, n.i, n.routes).await;
+    let r = {
+        // the inner app builds its own Request objects; the dispatch's is back after
+        let _obj = super::ReqObj::enter(cx, web::REQ_ROUTE);
+        chain(cx, &n.stack, n.i, n.routes).await
+    };
     super::sentry::context_exit(cx, saved);
-    let r = r?;
+    let r = match r {
+        Ok(r) => r,
+        // `raise app_exc from app_exc.__cause__ or app_exc.__context__` (Starlette's call_next, from 1.3)
+        Err(e) if web::starlette() >= (1, 3) && !super::resp::is_drop(&e) => {
+            let mut a = e.0.attrs.lock();
+            let some = |k: &str| a.get(k).filter(|v| !matches!(v, V::None)).cloned();
+            let cause = some("__cause__").or_else(|| some("__context__")).unwrap_or(V::None);
+            a.insert("__cause__".into(), cause);
+            a.insert("__suppress_context__".into(), V::Bool(true));
+            drop(a);
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     Ok(super::resp::from_response(r))
+}
+
+/// An exception leaving a BaseHTTPMiddleware: from Starlette 1.3 its `__call__` runs `dispatch` in
+/// `create_collapsing_task_group()`, whose single exception is re-raised `from exc.__cause__ or context` while the
+/// anyio `ExceptionGroup` is handled (it becomes the `__context__`). Under a second such middleware, `call_next`
+/// turns that context into the cause: uvicorn then prints the group first (`trace::group`).
+fn collapsed(e: Exc) -> Exc {
+    if web::starlette() < (1, 3) || super::resp::is_drop(&e) {
+        return e;
+    }
+    let g = super::trace::task_group_error(&e);
+    let mut a = e.0.attrs.lock();
+    let some = |k: &str| a.get(k).filter(|v| !matches!(v, V::None)).cloned();
+    let suppressed = matches!(a.get("__suppress_context__"), Some(V::Bool(true)));
+    let context = if suppressed { None } else { some("__context__") };
+    let cause = some("__cause__").or(context).unwrap_or(V::None);
+    a.insert("__cause__".into(), cause);
+    a.insert("__suppress_context__".into(), V::Bool(true));
+    a.insert("__context__".into(), V::Exc(g));
+    drop(a);
+    e
 }
 
 pub fn to_response(v: &V) -> R<Response> {
@@ -621,7 +674,7 @@ async fn handle(cx: &Cx, stack: &Stack, e: Exc) -> R<Response> {
                 found = Some(h.clone());
                 break;
             }
-            if std::ptr::eq(c, &HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
+            if std::ptr::eq(c, &STARLETTE_HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
                 if super::sentry::active() {
                     super::sentry::handled_exception(cx, &e).await;
                 }
@@ -636,6 +689,9 @@ async fn handle(cx: &Cx, stack: &Stack, e: Exc) -> R<Response> {
             }
             // the handler runs while the exception is being handled: one it raises chains to it (`__context__`)
             let _handling = super::Handling::new(cx, &e);
+            // raised in a route (its endpoint, dependencies, body): the route's Request object (request_response
+            // wraps it); before any route (404, 405): ExceptionMiddleware's own
+            let _obj = super::ReqObj::enter(cx, if cx.route_def.get().is_some() { web::REQ_ROUTE } else { web::REQ_EXC });
             let ret = super::methods::call_value(cx, &h, vec![super::request(cx), V::Exc(e)], vec![]).await?;
             to_response(&ret)
         }
@@ -666,7 +722,7 @@ fn ws_handle(cx: &Cx, e: Exc) -> Pin<Box<dyn Future<Output = R<()>> + Send + '_>
                     found = Some(h.clone());
                     break;
                 }
-                if std::ptr::eq(c, &HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
+                if std::ptr::eq(c, &STARLETTE_HTTP_EXCEPTION) || std::ptr::eq(c, &REQUEST_VALIDATION_ERROR) {
                     let Some(s) = ws::session(cx) else { return Err(e) };
                     let handled = e.clone();
                     return ws::send_raw_response(&s, web::error_response(e)).await.map_err(|x| super::trace::with_context(x, &handled));
@@ -697,6 +753,7 @@ fn ws_handle(cx: &Cx, e: Exc) -> Pin<Box<dyn Future<Output = R<()>> + Send + '_>
 async fn server_error(cx: &Cx, stack: &Stack, e: Exc) -> (Response, Vec<Exc>) {
     if let Some(h) = &stack.server {
         let _handling = super::Handling::new(cx, &e);
+        let _obj = super::ReqObj::enter(cx, web::REQ_SERVER);
         let r = super::methods::call_value(cx, h, vec![super::request(cx), V::Exc(e.clone())], vec![]).await;
         return match r.and_then(|v| to_response(&v)) {
             Ok(r) => (r, vec![e]),
@@ -733,7 +790,7 @@ fn strs(v: &V, what: &str) -> R<Vec<String>> {
     match v {
         V::List(l) => l.lock().iter().map(ops::str_).collect(),
         V::Tuple(t) => t.iter().map(ops::str_).collect(),
-        V::Set(s) => s.lock().values().map(ops::str_).collect(),
+        V::Set(s) | V::Frozen(s) => s.lock().values().map(ops::str_).collect(),
         o => Err(Exc::type_error(format!("py2axum: CORSMiddleware({what}=) must be a list, not {}", o.type_name()))),
     }
 }

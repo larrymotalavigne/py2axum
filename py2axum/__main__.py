@@ -28,19 +28,20 @@ def main(argv: list[str] | None = None) -> int:
         return watch(argv[1:])
     from .versions import apply_python_flag
 
+    if removed_backend(argv):
+        return 2
     ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
+    from .modules import set_extra_roots
+
+    set_extra_roots(args.path)
     from .libsrc import apply_flags
 
     try:
         apply_flags(args)
     except ValueError as e:
         ap.error(str(e))
-    if args.backend == "typed":
-        print("error: --backend typed was removed in 0.4: use the default backend (drop --backend)", file=sys.stderr)
-        return 2
-    deprecated_backend(argv)
     from .versions import check_project
 
     bad = [] if args.allow_untested_versions else check_project(args.root or args.package.resolve().parent, args.package)
@@ -73,14 +74,20 @@ def main(argv: list[str] | None = None) -> int:
     python_side.discard("auto")
     from . import dyn
 
+    whole = False
     if auto:
         moved = auto_python_side(args.package, args.root, python_side)
         if moved is None:
             return 1
-        python_side |= moved
+        whole = "*" in moved
+        python_side |= moved - {"*"}
     try:
         fe = Frontend(args.package, args.root)
-        gzip = dyn.prepare(fe, python_side)
+        if whole:
+            dyn.prepare_relay(fe)
+            gzip = None
+        else:
+            gzip = dyn.prepare(fe, python_side)
         proj = dyn.generate_project(fe, args.out, str(args.package), crate, gzip=gzip, stream=not args.no_stream)
     except TranspileError as e:
         print(e.explain(), file=sys.stderr)
@@ -104,17 +111,14 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("-o", "--out", type=Path, help="output directory for the Rust project")
     ap.add_argument("--root", type=Path, default=None,
                     help="import root, like sys.path (default: parent of the package)")
-    ap.add_argument("--backend", choices=["auto", "typed", "dyn"], default="auto",
-                    help="deprecated, no effect: there is one backend (auto and dyn are accepted until 1.0; "
-                         "typed was removed in 0.4)")
+    ap.add_argument("--path", type=Path, action="append", default=[], metavar="DIR",
+                    help="experimental: one more import root, like an extra sys.path entry (repeatable): the sibling packages of a monorepo the application installs from its own checkout")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
                          "mount: the app's last app.mount() and include_router() of a library's router, which get every "
                          "request no translated route fully matches); "
                          "auto: every route that does not translate, and such mounts")
-    ap.add_argument("--report", type=Path, default=None,
-                    help="deprecated (internal tool, use `py2axum check --format json|markdown`): coverage report "
-                         "(Markdown + JSON) instead of generating")
+    ap.add_argument("--report", type=Path, default=None, help=argparse.SUPPRESS)  # internal tool, outside the contract
     ap.add_argument("--name", default=None, help="crate name (default: <package>_axum)")
     ap.add_argument("--no-stream", action="store_true", help="buffer list responses instead of streaming them")
     ap.add_argument("--allow-untested-versions", action="store_true",
@@ -127,37 +131,43 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
-def deprecated_backend(argv: list[str]) -> None:
-    """`--backend auto|dyn` still works and has no effect: say it (docs/reference/versioning.md)."""
+def removed_backend(argv: list[str]) -> bool:
+    """`--backend` is gone (1.0): an error that says so, rather than argparse's `unrecognized arguments`."""
     if any(a == "--backend" or a.startswith("--backend=") for a in argv):
-        print("warning[deprecated]: --backend has no effect since 0.4 and will be removed in 1.0: drop it",
+        print("error: --backend was removed in 1.0 (it has had no effect since 0.4: there is one backend): drop it",
               file=sys.stderr)
+        return True
+    return False
 
 
 def auto_python_side(package: Path, root: Path | None, python_side: set[str]) -> set[str] | None:
-    """The paths of the routes that do not translate (`--python-side auto`), each reported with its first
-    error; None when an error concerns the whole application (a route cannot be moved around it)."""
+    """What --python-side auto leaves to Python (fallback.py), each part printed with its first error: the paths of
+    the routes that do not translate, `lifespan`, or `*` for the whole application; None when an error cannot be
+    left to Python (the generation fails)."""
+    from .fallback import plan
     from .report import collect_dyn
 
     fe, per_route = collect_dyn(package, root, python_side, auto=True)
-    if fe.global_errors:
-        for e in fe.global_errors:
+    pl = plan(fe, per_route)
+    if pl.refused:
+        for e in pl.refused:
             print(e.explain(), file=sys.stderr)
-        print("error: --python-side auto only moves routes; the errors above concern the whole application",
-              file=sys.stderr)
+        print("error: --python-side auto cannot leave the errors above to Python", file=sys.stderr)
         return None
-    moved: dict[str, tuple[str, TranspileError]] = {p: ("raw route", e) for p, e in fe.auto_side.items()}
-    if fe.__dict__.get("mount_fallback"):
-        moved["mount"] = ("app.mount() or a library's router", None)
-    for info, errs in per_route:
-        if errs and info["path"] not in moved:
-            moved[info["path"]] = (f"{info['method'].upper()} {info['func']}", errs[0])
-    for path, (what, e) in sorted(moved.items()):
+    if pl.whole is not None:
+        e = pl.whole
+        print(f"python-side (auto): the whole application — {e.render()} [{e.code}]: the binary relays every request "
+              "to PY2AXUM_PYTHON_URL", file=sys.stderr)
+        return {"*"}
+    for path, (what, e) in sorted(pl.routes.items()):
         if e is None:
             print(f"python-side (auto): {what} — requests no translated route fully matches", file=sys.stderr)
         else:
             print(f"python-side (auto): {path} ({what}) — {e.render()} [{e.code}]", file=sys.stderr)
-    return set(moved)
+    if pl.lifespan is not None:
+        e = pl.lifespan
+        print(f"python-side (auto): lifespan — {e.render()} [{e.code}]", file=sys.stderr)
+    return set(pl.routes) | ({"lifespan"} if pl.lifespan is not None else set())
 
 
 if __name__ == "__main__":

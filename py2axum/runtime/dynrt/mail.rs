@@ -395,40 +395,104 @@ pub fn mime_new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     }
 }
 
-/// RFC 2047 encoded-word(s) for a non-ASCII header value (utf-8, base64), as compat32 writes them.
+/// email.quoprimime / email.base64mime: the length of `b` once Q- or base64-encoded (without the =?utf-8?.?...?= chrome)
+fn q_len(b: &[u8]) -> usize {
+    b.iter().map(|c| if c.is_ascii_alphanumeric() || b"-!*+/ ".contains(c) { 1 } else { 3 }).sum()
+}
+
+fn b64_len(n: usize) -> usize {
+    n / 3 * 4 + if n % 3 > 0 { 4 } else { 0 }
+}
+
+/// one RFC 2047 encoded word of `w`, in Q or base64
+fn encoded_word(w: &[u8], b64: bool) -> String {
+    if b64 {
+        return format!("=?utf-8?b?{}?=", base64::engine::general_purpose::STANDARD.encode(w));
+    }
+    let mut q = String::new();
+    for &byte in w {
+        match byte {
+            b' ' => q.push('_'),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'!' | b'*' | b'+' | b'/' => q.push(byte as char),
+            _ => q += &format!("={byte:02X}"),
+        }
+    }
+    format!("=?utf-8?q?{q}?=")
+}
+
+/// `Charset("utf-8").header_encode(s)`: a single encoded word, the SHORTEST of base64 and Q over the whole value
+/// (Q on a tie), as `email.utils.formataddr` writes a non-ASCII name
 fn encode_header(v: &str) -> String {
+    let b = v.as_bytes();
+    encoded_word(b, b64_len(b.len()) < q_len(b))
+}
+
+/// `Charset("utf-8").header_encode_lines(s, maxlengths)`: the value cut into encoded words, each as long as its line
+/// allows (`first`, then `next` columns, the 12 of the chrome included), the encoding chosen once for the whole value
+fn header_encode_lines(s: &str, first: i64, next: i64) -> Vec<Option<String>> {
+    let b64 = b64_len(s.len()) < q_len(s.as_bytes());
+    let len = |t: &str| if b64 { b64_len(t.len()) } else { q_len(t.as_bytes()) } as i64;
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut max = first - 12;
+    for c in s.chars() {
+        cur.push(c);
+        if len(&cur) > max {
+            cur.pop();
+            if lines.is_empty() && cur.is_empty() {
+                lines.push(None);
+            } else {
+                lines.push(Some(encoded_word(cur.as_bytes(), b64)));
+            }
+            cur = c.to_string();
+            max = next - 12;
+        }
+    }
+    lines.push(Some(encoded_word(cur.as_bytes(), b64)));
+    lines
+}
+
+/// compat32's `Header(value, header_name=name).encode(maxlinelen=maxlen)` for a non-ASCII value: the whole value in
+/// utf-8 encoded words, cut to the line (the first one after `name: `), continuation lines indented by one space
+/// (email.header._ValueFormatter). Lines joined by "\n": the SMTP flattening turns every "\n" into CRLF. `maxlen`:
+/// 78 when sent (the SMTP policy), 1 000 000 for `as_string()` (`maxheaderlen=0`: no folding)
+fn fold_header(name: &str, v: &str, maxlen: i64) -> String {
     if v.is_ascii() {
         return v.to_string();
     }
-    let mut words = Vec::new();
-    let mut chunk = String::new();
-    for c in v.chars() {
-        // 45 bytes of text -> 60 base64 chars: the word stays under 76 columns
-        if chunk.len() + c.len_utf8() > 45 {
-            words.push(std::mem::take(&mut chunk));
+    let mut lines: Vec<String> = Vec::new();
+    // the current line: its text and the columns already taken (the header's name on the first)
+    let (mut cur, mut taken) = (String::new(), name.chars().count() as i64 + 2);
+    fn flush(lines: &mut Vec<String>, cur: &mut String, taken: &mut i64) {
+        lines.push(std::mem::take(cur));
+        *taken = 0;
+    }
+    for (i, line) in v.lines().enumerate() {
+        let (fws, text) = if i == 0 { ("", line.to_string()) } else {
+            flush(&mut lines, &mut cur, &mut taken);
+            (" ", format!(" {}", line.trim_start()))
+        };
+        let mut words = header_encode_lines(&text, maxlen - taken - cur.chars().count() as i64, maxlen - 1);
+        let first = words.remove(0);
+        if let Some(w) = first {
+            cur += fws;
+            cur += &w;
         }
-        chunk.push(c);
-    }
-    if !chunk.is_empty() {
-        words.push(chunk);
-    }
-    // email.charset: utf-8 headers use the SHORTEST of base64 and Q (Q on a tie)
-    words
-        .iter()
-        .map(|w| {
-            let b = base64::engine::general_purpose::STANDARD.encode(w.as_bytes());
-            let mut q = String::new();
-            for byte in w.bytes() {
-                match byte {
-                    b' ' => q.push('_'),
-                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'!' | b'*' | b'+' | b'/' => q.push(byte as char),
-                    _ => q += &format!("={byte:02X}"),
-                }
+        if let Some(last) = words.pop() {
+            flush(&mut lines, &mut cur, &mut taken);
+            for w in words.into_iter().flatten() {
+                lines.push(format!(" {w}"));
             }
-            if b.len() < q.len() { format!("=?utf-8?b?{b}?=") } else { format!("=?utf-8?q?{q}?=") }
-        })
-        .collect::<Vec<_>>()
-        .join("\r\n ")
+            cur = format!(" {}", last.unwrap_or_default());
+        }
+    }
+    if v.lines().count() > 1 {
+        flush(&mut lines, &mut cur, &mut taken);
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines.join("\n")
 }
 
 /// header params: `name="value"`, or RFC 2231 for non-ASCII values
@@ -470,7 +534,7 @@ pub fn mime_method(m: &Arc<Mime>, name: &str, args: &[V], kwargs: &[(String, V)]
             if !args.is_empty() || !kwargs.is_empty() {
                 return Err(Exc::type_error(format!("py2axum: Message.{name}() with arguments is not supported")));
             }
-            let s = render(m);
+            let s = render(m)?;
             Ok(if name == "as_bytes" { V::Bytes(Arc::from(s.into_bytes())) } else { V::str(s) })
         }
         "get" => {
@@ -505,8 +569,36 @@ fn b64_lines(data: &[u8]) -> String {
     out
 }
 
-fn render(m: &Arc<Mime>) -> String {
+fn render(m: &Arc<Mime>) -> R<String> {
     render_with(m, false)
+}
+
+/// An ASCII header value holding line breaks, as compat32's generator writes it: `\n<name>:` raises
+/// HeaderParseError (an embedded header), the lines are folded (empty ones dropped), and a line that does not start
+/// with a space or a tab raises HeaderWriteError (CPython 3.12.5+, CVE-2024-6923): a header can never add another
+/// header or end the headers (`Subject: x\nBcc: ...`, `x\n\n<body>`)
+fn compat32_lines(k: &str, v: &str) -> R<Option<String>> {
+    if !v.is_ascii() || !v.contains(['\r', '\n']) {
+        return Ok(None);
+    }
+    let b = v.as_bytes();
+    let embedded = b.iter().enumerate().any(|(i, c)| {
+        *c == b'\n' && {
+            let rest = &b[i + 1..];
+            let n = rest.iter().take_while(|c| **c != b' ' && **c != b'\t' && **c != b':').count();
+            n > 0 && rest.get(n) == Some(&b':')
+        }
+    });
+    if embedded {
+        return Err(Exc::msg(&HEADER_PARSE_ERROR, format!("header value appears to contain an embedded header: {}", ops::str_repr(v))));
+    }
+    let lines: Vec<&str> = v.split("\r\n").flat_map(|l| l.split(['\r', '\n'])).filter(|l| !l.is_empty()).collect();
+    let joined = lines.join("\n");
+    if lines.iter().skip(1).any(|l| !l.starts_with([' ', '\t'])) {
+        let folded = format!("{k}: {joined}\n");
+        return Err(Exc::msg(&HEADER_WRITE_ERROR, format!("folded header contains newline: {}", ops::str_repr(&folded))));
+    }
+    Ok(Some(joined))
 }
 
 /// compat32 folding of a header line longer than 78 characters, at its "; " parameter separators
@@ -529,16 +621,19 @@ fn fold(line: String) -> String {
     out + &cur
 }
 
-fn render_with(m: &Arc<Mime>, folded: bool) -> String {
+fn render_with(m: &Arc<Mime>, folded: bool) -> R<String> {
     let boundary = match &m.kind {
         MimeKind::Multipart(_) => Some(format!("==============={:019}==", rand_u64() % 10_000_000_000_000_000_000)),
         _ => None,
     };
     let mut out = String::new();
-    for (k, v) in m.headers.lock().iter() {
+    let headers = m.headers.lock().clone();
+    for (k, v) in headers.iter() {
+        let lines = compat32_lines(k, v)?;
+        let v = lines.as_deref().unwrap_or(v);
         let v = match (&boundary, k.eq_ignore_ascii_case("content-type")) {
             (Some(b), true) => format!("{v}; boundary=\"{b}\""),
-            _ => encode_header(v),
+            _ => fold_header(k, v, if folded { 78 } else { 1_000_000 }),
         };
         let line = format!("{k}: {v}");
         out += &if folded { fold(line) } else { line };
@@ -560,7 +655,7 @@ fn render_with(m: &Arc<Mime>, folded: bool) -> String {
                     },
                     _ => None,
                 })
-                .collect();
+                .collect::<R<Vec<String>>>()?;
             if parts.is_empty() {
                 out += &format!("\n--{b}\n\n--{b}--\n");
             } else {
@@ -570,16 +665,17 @@ fn render_with(m: &Arc<Mime>, folded: bool) -> String {
                 out += &format!("\n--{b}--\n");
             }
         }
-        MimeKind::Text { charset, body, .. } if charset == "us-ascii" => out += body,
+        // email.generator._write_lines: the payload's \r\n and lone \r written as line ends
+        MimeKind::Text { charset, body, .. } if charset == "us-ascii" => out += &body.replace("\r\n", "\n").replace('\r', "\n"),
         MimeKind::Text { body, .. } => out += &b64_lines(body.as_bytes()),
         MimeKind::App { data, .. } => out += &b64_lines(data),
         MimeKind::Base => match &*m.payload.lock() {
-            Some(V::Str(s)) => out += s,
+            Some(V::Str(s)) => out += &s.replace("\r\n", "\n").replace('\r', "\n"),
             Some(V::Bytes(b)) => out += &String::from_utf8_lossy(b),
             _ => {}
         },
     }
-    out
+    Ok(out)
 }
 
 fn rand_u64() -> u64 {
@@ -652,8 +748,9 @@ pub fn make_msgid(domain: Option<&V>) -> R {
         Some(v) if !v.is_none() => ops::str_(v)?,
         _ => hostname(),
     };
-    let t = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() / 100;
-    Ok(V::str(format!("<{t}.{}.{}@{d}>", std::process::id(), rand_u64() % 1_000_000_000_000_000_000)))
+    // CPython: int(time.time()*100), os.getpid(), random.getrandbits(64)
+    let t = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() / 10_000_000;
+    Ok(V::str(format!("<{t}.{}.{}@{d}>", std::process::id(), rand_u64())))
 }
 
 fn hostname() -> String {
@@ -754,7 +851,9 @@ pub async fn smtp_send(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     let envelope = lettre::address::Envelope::new(Some(parse(&from)?), rcpts.iter().map(|a| parse(a)).collect::<R<Vec<_>>>()?)
         .map_err(|e| smtp_err(e.to_string()))?;
     // aiosmtplib flattens with the SMTP policy: headers folded at 78 columns, CRLF
-    let raw = render_with(&msg, true).replace('\n', "\r\n");
+    // aiosmtplib's data(): every line break (\r\n, a lone \r or \n) becomes CRLF before the dots are doubled, so a
+    // lone \r never reaches the server (`\r.\r\n` taken by some for the end of DATA: SMTP smuggling)
+    let raw = render_with(&msg, true)?.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n");
     // lettre ends the DATA with CRLF "." CRLF itself
     let raw = raw.strip_suffix("\r\n").unwrap_or(&raw).to_string();
     let resp = transport.send_raw(&envelope, raw.as_bytes()).await.map_err(|e| smtp_err(e.to_string()))?;

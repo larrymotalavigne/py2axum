@@ -222,7 +222,9 @@ class DdlBuilder:
         return obj
 
     def real(self, dotted: str, node, module: str):
-        parts = dotted.split(".")
+        from .libmap import canonical
+
+        parts = canonical(dotted).split(".")  # `sqlmodel.String` is SQLAlchemy's
         if parts[0] not in REAL_ROOTS:
             raise self.err(f"`{dotted}` is not evaluated at translation time (only SQLAlchemy and type constructs)",
                            node, module)

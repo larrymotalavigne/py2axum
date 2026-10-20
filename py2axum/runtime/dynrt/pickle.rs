@@ -268,6 +268,21 @@ impl W {
                     self.out.push(0x90);
                 }
             }
+            V::Frozen(s) => {
+                self.keep.push(v.clone());
+                let k = MemoKey::Ptr(Arc::as_ptr(s) as *const () as usize);
+                if self.get(&k) {
+                    return Ok(());
+                }
+                // save_frozenset: MARK, the items, FROZENSET, then memoized
+                self.out.push(b'(');
+                let items: Vec<V> = s.lock().values().cloned().collect();
+                for x in &items {
+                    self.val(x)?;
+                }
+                self.out.push(0x91);
+                self.memoize(k);
+            }
             V::DateTime(d) => {
                 let mut st = date_bytes(d.wall.date()).to_vec();
                 st.extend(time_bytes(d.wall.time(), d.fold));
@@ -559,8 +574,10 @@ fn reduce(g: G, args: Vec<V>) -> R<Item> {
         (G::TzInfo, [V::Int(s)]) => V::Tz(if *s == 0 { Tz::Utc } else { Tz::Fixed(*s as i32) }),
         (G::Decimal, [s]) => super::decimal::new(&[s.clone()], &[])?,
         (G::ZoneInfo, [V::Str(k), ..]) => V::Tz(Tz::Zone(k.parse().map_err(|_| uerr(format!("No time zone found with key {k}")))?)),
-        (G::Set | G::Frozenset, [items]) => super::methods::b_set(&[items.clone()])?,
-        (G::Set | G::Frozenset, []) => super::methods::b_set(&[])?,
+        (G::Set, [items]) => super::methods::b_set(&[items.clone()])?,
+        (G::Set, []) => super::methods::b_set(&[])?,
+        (G::Frozenset, [items]) => super::methods::b_frozenset(&[items.clone()])?,
+        (G::Frozenset, []) => super::methods::b_frozenset(&[])?,
         (G::Class(c), [value]) if matches!(c.kind, ClassKind::Enum(_)) => {
             let ClassKind::Enum(e) = c.kind else { unreachable!() };
             (0..e.members.len() as u16)
@@ -827,7 +844,7 @@ pub fn loads(args: &[V], kwargs: &[(String, V)]) -> R {
             }
             0x91 => {
                 let items = pop_mark(&mut stack)?.into_iter().map(as_v).collect::<R<Vec<_>>>()?;
-                stack.push(Item::V(super::methods::b_set(&[V::list(items)])?));
+                stack.push(Item::V(super::methods::b_frozenset(&[V::list(items)])?));
             }
             b'c' => {
                 let m = r.line()?;

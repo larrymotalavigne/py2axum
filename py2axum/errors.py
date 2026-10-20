@@ -66,7 +66,8 @@ CLASSES: list[ErrorClass] = [
     E("P2A0201", "Library call not supported",
       (r"library call `([a-zA-Z0-9_]+)\.?[^`]*\(\)` is not supported", r"library function `([\w.]+)` cannot be used",
        r"py2axum maps sentry_sdk", r"string\.Formatter\(\)\.\w+\(\) is not supported",
-       r"^Formatter\(\)\.", r"is supported consumed whole only"),
+       r"^Formatter\(\)\.", r"is supported consumed whole only", r"^warnings\.\w+\(", r"^(passlib) CryptContext\.",
+       r"^(httpx)\.Request\.\w+ is not supported"),
       "The call goes to a library the binary has no equivalent for: py2axum maps a closed list of library "
       "functions to its runtime and never calls Python libraries from the binary.",
       "Use a supported library or the standard library for the same job (see Libraries and Standard library). "
@@ -82,7 +83,7 @@ CLASSES: list[ErrorClass] = [
       "Use a supported method of the value (see Python semantics), or check the receiver's type: it may be a "
       "value py2axum does not model. " + PY_SIDE,
       "reference/python.md", "méthode .\\1() absente du runtime (500 exécution)", "method .\\1() not in the runtime"),
-    E("P2A0204", "Attribute not provided by the runtime", r"attribute \.(\w+) is not provided by the runtime",
+    E("P2A0204", "Attribute not provided by the runtime", (r"attribute \.(\w+) is not provided by the runtime", r"attribute \.(\w+) of a Request"),
       "No value type of the runtime has this attribute, and no project class defines it.",
       "Read a supported attribute, or keep the value in a project class or a Pydantic model. " + PY_SIDE,
       "reference/python.md", "attribut .\\1 absent du runtime (500 exécution)", "attribute .\\1 not in the runtime"),
@@ -102,17 +103,20 @@ CLASSES: list[ErrorClass] = [
       "json_response=True)`. " + PY_SIDE,
       "advanced/mcp.md", "MCP", "MCP"),
 
-    E("P2A0208", "Logging construct not supported", (r"^logging `stacklevel=",),
-      "The binary reproduces the `logging` module as the applications use it (see Logging): a record carries "
-      "the call site itself, and only the standard handlers and formatters exist.",
+    E("P2A0208", "Logging construct not supported", (r"^logging `stacklevel=", r"^loguru "),
+      "The binary reproduces the `logging` module as the applications use it, and loguru's `logger` levels, "
+      "`add()` on a standard stream and `remove()` (see Logging): a record carries the call site itself, and only "
+      "the standard handlers and formatters exist.",
       "Log from the function whose location you want in the record (or drop `stacklevel=`); use "
-      "`StreamHandler`, `FileHandler`, `NullHandler` and `logging.Formatter` or python-json-logger. " + PY_SIDE,
+      "`StreamHandler`, `FileHandler`, `NullHandler` and `logging.Formatter` or python-json-logger; with loguru, "
+      "log without the exception (`logger.error(...)`) and add sinks on sys.stderr or sys.stdout. " + PY_SIDE,
       "advanced/logging.md", "logging", "logging"),
 
     # ------------------------------------------------------------------ 06xx project, versions
     E("P2A0601", "Library version outside the tested ranges",
       (r"is outside the range .* is tested on", r"excludes every version .* is tested on", r"^requires-python",
-       r": .* need \w+>=", r"is outside the Pythons py2axum supports", r"the project runs on Python \d+\.\d+: run py2axum"),
+       r": .* need \w+>=", r"is outside the Pythons py2axum supports", r"the project runs on Python \d+\.\d+: run py2axum",
+       r"cannot be read as text"),
       "The project locks a version of FastAPI, Starlette, Pydantic, SQLAlchemy or Python that py2axum is not "
       "tested against: the binary must behave like the version you run, and behaviour changes between versions.",
       "Use a version in the tested ranges, or pass `--allow-untested-versions` after checking the behaviour with "
@@ -136,9 +140,10 @@ CLASSES: list[ErrorClass] = [
     E("P2A0701", "Library licence not admitted",
       (r"has licence .* not admitted for translation",),
       "`--translate-libs` compiles a library's source into the binary, a derived work of the library: only "
-      "permissive licences are admitted by default (MIT, BSD, Apache-2.0, ISC, PSF, Unlicense). The licence is read "
-      "from the distribution's `License-Expression`, else its licence classifiers.",
-      "Check that the licence allows it for your binary and pass `--allow-license <SPDX>`, or leave the routes "
+      "permissive licences are admitted by default (MIT, BSD, Apache-2.0, ISC, PSF, Zlib, HPND, MPL-2.0, Unlicense). The licence "
+      "is read from the distribution's `License-Expression`, its `License` field when that is an SPDX expression, "
+      "its licence file when the field is free text (`BSD`), else its licence classifiers.",
+      "Check that the licence allows it for your binary and pass `--allow-license <SPDX>` (or the distribution's name when its licence was not recognised), or leave the routes "
       "that reach the library to Python. " + PY_SIDE,
       "advanced/libraries.md#licences", "licence de bibliothèque", "library licence"),
     E("P2A0702", "Library not pure Python",
@@ -163,12 +168,43 @@ CLASSES: list[ErrorClass] = [
       "Run py2axum on the project's Python (the minor its `.python-version` or `--python` names).",
       "advanced/libraries.md#the-standard-library", "stdlib d'un autre Python", "standard library source"),
 
+    E("P2A0705", "Library map and library source mixed",
+      (r"the map's objects and the\s+source's do not mix",),
+      "A library the library map covers in part (`jinja2.Environment`, `aiosmtplib.send`) has its other names "
+      "translated from its source (`--translate-libs`). One binary cannot use both: an object the map creates is no "
+      "instance of the source's classes, and the source's code does not take it. The map's exceptions are shared, "
+      "so `except` clauses mix.",
+      "Use only the library map's names of that library, or only names it does not cover, or leave the routes that "
+      "reach its source to Python. " + PY_SIDE,
+      "advanced/libraries.md#libraries-the-map-covers-in-part", "carte et source mêlées", "map and source mixed"),
+
     # ------------------------------------------------------------------ 03xx FastAPI / Starlette
+    E("P2A0318", "Endpoint decorator",
+      (r"decorator @.* on an endpoint is not supported", r"several route decorators on one function",
+       r"^route decorator @.* is not supported"),
+      "FastAPI registers the function its decorators produce: a decorator below the route decorator wraps every "
+      "call of the endpoint (authentication, cache, rate limit, transaction...), and every decorator runs at import. "
+      "The binary compiles the endpoint's own body: run without its decorator, the route would behave differently "
+      "in production. A second route decorator registers the function once more, which the binary does not do.",
+      "Move the decorator's logic into a dependency (`Depends(...)` on the endpoint or `dependencies=[...]`), define "
+      "one endpoint per route, or leave the route to Python with `--python-side '<path>'` (or `--python-side auto`).",
+      "tutorial/dependencies.md", "décorateur d'endpoint", "endpoint decorator"),
+    E("P2A0316", "Left to Python with the lifespan",
+      (r"which the lifespan \(left to Python\) sets", r"the lifespan cannot run in Python alone",
+       r"the lifespan is not a function of the project"),
+      "`--python-side auto` leaves a lifespan that does not translate to the Python process. Translated code "
+      "reading what it sets in the process (an `app.state` attribute, a module global) would not see it: such "
+      "a route goes to Python as well, and a middleware reading it, or a change py2axum cannot bound, leaves "
+      "the whole application to Python.",
+      "Keep what the binary's routes read out of the lifespan (compute it at module level, or store it in the "
+      "database or Redis), or make the lifespan translate.",
+      "getting-started/hybrid.md#what-auto-leaves-to-python", "lu du lifespan laissé à Python",
+      "set by the lifespan left to Python"),
     E("P2A0303", "Lifespan or startup event",
       (r"FastAPI\(lifespan=", r"lifespan state", r"on_event"),
       "Startup and shutdown code is compiled when it uses supported constructs; this form is not.",
       "Use `FastAPI(lifespan=...)` with an `@asynccontextmanager` and module globals, or leave it to Python with "
-      "`--python-side lifespan`.",
+      "`--python-side lifespan` (implied by `--python-side auto` when no translated code reads what it sets).",
       "tutorial/lifespan.md", "lifespan (à déclarer --python-side)", "lifespan"),
     E("P2A0310", "app.mount()", r"app\.mount\(",
       "A mounted sub-application is not compiled; as the app's last registrations, mounts can stay in Python.",
@@ -228,7 +264,7 @@ CLASSES: list[ErrorClass] = [
     E("P2A0309", "WebSocket route", (r"WebSocket", r"websocket"),
       "This WebSocket construct is not reproduced (the binary implements Starlette's WebSocket protocol).",
       "Use `@app.websocket(path)` with an `async def` endpoint and the parameters FastAPI provides on a WebSocket "
-      "route. WebSocket routes are never relayed to Python.",
+      "route, or leave the route to Python (`--python-side <path>` or `auto`: the binary relays its connections).",
       "tutorial/websockets.md", "WebSocket", "WebSocket"),
     E("P2A0308", "Security scheme", (r"security scheme", r"HTTPBasic\(", r"\(auto_error=\)", r"Depends\(security_scheme"),
       "Only OAuth2PasswordBearer, HTTPBearer and HTTPBasic are compiled, with literal options.",
@@ -258,9 +294,10 @@ CLASSES: list[ErrorClass] = [
       "tutorial/bigger-applications.md", "endpoint imbriqué", "nested endpoint"),
     E("P2A0307", "Dependency",
       (r"dependency `.*` must be a project function", r"generator dependencies", r"Depends\(", r"class dependency",
-       r"instance dependency", r"^dependency ", r"dependencies=\[", r"\.__call__: "),
-      "Dependencies are compiled when they are project functions (sync, async, generators with one `yield`), "
-      "Pydantic models, plain classes or instances with `__call__`.",
+       r"instance dependency", r"method dependency", r"^dependency ", r"dependencies=\[", r"\.__call__: "),
+      "Dependencies are compiled when they are project functions (sync, async, generators whose `yield` is reached "
+      "once), factories returning one, lambdas, Pydantic models, plain classes, their classmethods and staticmethods, "
+      "or instances with `__call__`.",
       "Wrap the library object in a project function: `def get_x(): return lib.X()` and `Depends(get_x)`.",
       "tutorial/dependencies.md", "dépendance", "dependency"),
 
@@ -379,7 +416,9 @@ CLASSES: list[ErrorClass] = [
        r"unsupported type annotation", r"^type `[^`]+` is not supported", r"bad string annotation", r"Literal",
        r"pydantic validates it differently", r"only dict\[str", r"only variable-length tuple", r"TypeAdapter",
        r"constraints on a union", r"^unsupported type ", r"generic model", r"type parameter", r"TypeVar",
-       r"variable tuple", r"of a class with bases", r"must mean the same in"),
+       r"variable tuple", r"of a class with bases", r"must mean the same in",
+       r"`: the item type is the one positional", r"`: keyword arguments only", r"`: [\w*]+= is not supported",
+       r"for the same generic model"),
       "The annotation decides validation and serialisation; this type has no equivalent in the runtime's "
       "port of pydantic-core.",
       "Use a supported type (see Models): builtins, `list`/`dict`/`tuple`, unions, `Literal`, enums, models, "
@@ -394,7 +433,8 @@ CLASSES: list[ErrorClass] = [
 
     # ------------------------------------------------------------------ 01xx Python language
     E("P2A0102", "global/nonlocal",
-      (r"`global`/`nonlocal`", r"`nonlocal`", r"^`nonlocal \w+`", r"^`global ", r"rebinds with `global`"),
+      (r"`global`/`nonlocal`", r"`nonlocal`", r"^`nonlocal \w+`", r"^`global ", r"rebinds with `global`",
+       r"declares the module global `\w+` without a value"),
       "Module state rebound from functions is reproduced for variables assigned at module level only; `nonlocal` "
       "rebinds a local variable of the enclosing function, not one of its parameters.",
       "Assign the variable at module level and rebind it with `global` in the module that defines it; for "
@@ -437,7 +477,7 @@ CLASSES: list[ErrorClass] = [
        r"^no method", r"object\.__(init|setattr)__", r"BaseException\.__init__", r"^base class `",
        r"class variables", r"method \w+ is not supported",
        r"unsupported statement in class", r"a decorated __new__", r"as a class attribute is not supported",
-       r"only staticmethod\(f\)"),
+       r"only staticmethod\(f\)", r"the class keyword `"),
       "Project classes are compiled when they are models, schemas, exceptions, dataclasses, enums or plain "
       "classes with plain methods; this member or form is not reproduced.",
       "Keep the class to `__init__`, plain methods and properties, or turn it into a dataclass or a model.",
@@ -453,7 +493,7 @@ CLASSES: list[ErrorClass] = [
       whole_app=True),
     E("P2A0105", "Unknown name or import",
       (r"unknown name", r"is not defined", r"cannot be imported", r"module .* has no attribute", r"import \*",
-       r"importlib"),
+       r"importlib", r"^sys\.modules"),
       "py2axum resolves every name statically, over the project and the libraries it knows; this one does not "
       "resolve.",
       "Import the name from a module of the project or of a supported library, with a literal import.",

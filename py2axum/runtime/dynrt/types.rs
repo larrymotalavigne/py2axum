@@ -33,6 +33,7 @@ pub fn isinstance(v: &V, t: &V) -> R<bool> {
                 "sqlalchemy.ext.asyncio.AsyncConnection" => false,
                 "sqlalchemy.ext.asyncio.AsyncEngine" => matches!(v, V::Native(m) if matches!(&**m, Native::Engine(false))),
                 "types.GenericAlias" => matches!(v, V::Native(m) if matches!(&**m, Native::TypeExpr(..))),
+                p if p.starts_with("collections.abc.") => abc_isinstance(v, &p["collections.abc.".len()..]),
                 p if p.starts_with("prometheus_client.") => super::prom::isinstance(v, &p["prometheus_client.".len()..]),
                 p if p.starts_with("starlette.") || p.starts_with("fastapi.") => super::routing::isinstance(v, p),
                 other => return Err(Exc::type_error(format!("py2axum: isinstance(x, {other}) is not supported"))),
@@ -42,6 +43,21 @@ pub fn isinstance(v: &V, t: &V) -> R<bool> {
         },
         V::None => Err(Exc::type_error("isinstance() arg 2 must be a type, a tuple of types, or a union")),
         _ => Err(Exc::type_error("isinstance() arg 2 must be a type, a tuple of types, or a union")),
+    }
+}
+
+/// `isinstance(v, collections.abc.<name>)` for the values the runtime makes: the builtin containers, deque, the named
+/// tuples and result rows (a project class cannot derive from an ABC here, and registers none)
+fn abc_isinstance(v: &V, name: &str) -> bool {
+    let tuple_like = || matches!(v, V::Tuple(_)) || matches!(v, V::Inst(i) if i.desc.x.ntuple)
+        || matches!(v, V::Native(n) if matches!(&**n, Native::Row(..) | Native::Record(..)));
+    let deque = || matches!(v, V::Native(n) if matches!(&**n, Native::Deque(_)));
+    match name {
+        "Mapping" | "MutableMapping" => matches!(v, V::Dict(_)),
+        "Sequence" => matches!(v, V::Str(_) | V::Bytes(_) | V::List(_)) || tuple_like() || deque(),
+        "MutableSequence" => matches!(v, V::List(_)) || deque(),
+        "Set" | "MutableSet" => matches!(v, V::Set(_)),
+        _ => false,
     }
 }
 
@@ -98,10 +114,10 @@ impl Truth for V {
     }
 }
 
-static NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None };
+static NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false };
 static NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false };
-static TD_INT: TD = TD::Int(NumC { ge: None, gt: None, le: None, lt: None, mul: None });
-static TD_FLOAT: TD = TD::Float(NumC { ge: None, gt: None, le: None, lt: None, mul: None });
+static TD_INT: TD = TD::Int(NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false });
+static TD_FLOAT: TD = TD::Float(NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false });
 static TD_STR: TD = TD::Str(StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false });
 static TD_BOOL: TD = TD::Bool;
 static TD_ANY: TD = TD::Any;

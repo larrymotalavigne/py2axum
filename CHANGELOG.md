@@ -5,6 +5,279 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-10-20
+
+Patch release: security fixes (rustls-webpki and the webpki root stores, constant-time Stripe signatures, mail header
+injection and SMTP smuggling, subprocess arguments, openpyxl styles), native `asyncio.create_subprocess_exec`, loguru,
+passlib, pgpy, qrcode, reportlab, openpyxl and stripe-python, SQLModel tables and relationships, dependencies and routers
+written in the shapes real applications use, `--python-side auto` that no longer stops on a refusal outside the routes,
+endpoint decorators refused instead of ignored, and `--backend` removed.
+
+### Security
+
+- `asyncio.create_subprocess_exec`: NUL bytes and illegal environment names raise as asyncio (or end the value,
+  as uvloop does); `kill()` never signals a pid tokio has already reaped. docs: Security § Outgoing mail,
+  subprocesses and documents (with the SMTP TLS risks kept as in aiosmtplib).
+- `email.mime` (compat32) messages: a header value with line breaks raises CPython's HeaderParseError /
+  HeaderWriteError when written instead of being sent with an injected header; the SMTP payload normalises lone
+  `\r` as aiosmtplib does (SMTP smuggling).
+- openpyxl: styles indexed by hash (one style per row was quadratic under the book's lock); a numeric sheet-title
+  suffix past 64 bits no longer wraps to a duplicate title.
+- `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382), `webpki-roots` and `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0381, RUSTSEC-2026-0383: distrusted emSign roots) in the shipped lock file; `tools/cargo_audit.sh` is green again.
+- Stripe webhook signatures compared in constant time (as `hmac.compare_digest`); a plain comparison let a client
+  time its guesses of the signature of a forged event.
+
+### Added
+
+- Background jobs started by a lifespan translate (such a lifespan was refused, so `--python-side auto` left the whole application to
+  Python): `fcntl.flock` with `LOCK_SH`/`LOCK_EX`/`LOCK_NB`/`LOCK_UN` and `BlockingIOError`;
+  `sqlalchemy.exc.InterfaceError` and `DBAPIError.connection_invalidated` (supported.md); `request.scope.get()` of the
+  keys only a middleware sets (`session`, `user`, `auth`: absent without one, on both sides).
+- `asyncio.create_subprocess_exec` natively (dynrt/subproc.rs): `PIPE`/`DEVNULL`/`STDOUT`, `cwd=`, `env=`,
+  `Process.communicate()`, `wait()`, `returncode`, `pid`, `kill()`, `terminate()`, `send_signal()`, cancellation by
+  `wait_for`, and the `OSError` of a failed spawn with asyncio's or uvloop's message; `ProcessLookupError`,
+  `NotADirectoryError` (also from `pathlib` calls on a path whose parent is a file). Fixture `fixtures/subprocapp`.
+  docs: Python reference § asyncio.
+
+- `--python-side auto` no longer stops on a refusal outside the routes (py2axum/fallback.py, docs: Hybrid mode §
+  What auto leaves to Python): module code of a library translated from source moves the routes using the library;
+  a lifespan or `@app.on_event` handler that does not translate runs in the Python process alone, with each
+  translated route reading what it sets in the process (`app.state`, a module global, a class attribute); a
+  middleware, an exception handler, module code of the project or an app option leaves the whole application to
+  Python (the binary relays every request). Refused as before: syntax errors, and the whole application with
+  WebSocket routes. Error code P2A0316. `py2axum check --python-side auto` reports the same (route reasons, notes).
+- Tests that `py2axum check` and generation agree: with `--python-side auto` (route, lifespan, whole application) the
+  routes `check` reports python-side are exactly those the generated binary relays, and native + python-side covers
+  every route; `--python-side lifespan` alone is accepted by both.
+- `--translate-libs` reads a licence written as free text (`License: BSD`, `BSD-like`) from the distribution's
+  licence file, compared word for word with the canonical MIT, BSD-2/3/4-Clause, ISC, 0BSD, Zlib, HPND, Unlicense
+  and Apache-2.0 texts (`py2axum/licenses.py`); a modified licence, an unknown one or an extra grant is refused with
+  the text found, and `--allow-license <distribution>` admits a distribution whose licence was not recognised.
+  Zlib and HPND are admitted by default, and by decision of the project BSD-4-Clause (xlrd), MPL-2.0 (tqdm) and
+  the passlib 1.7 distribution (BSD-3-Clause plus code derived from Beer-ware/UnixCrypt/jBCrypt); LGPL stays refused. Vague classifiers (`Other/Proprietary`, `DFSG approved`) defer to the file.
+- Standard-library names the libraries translated from their source (`--translate-libs`) reach (fixtures/stdmapapp):
+  `errno.E*` (the numbers glibc and macOS share), `sys.byteorder/maxunicode/warnoptions`, `collections.abc.Mapping/
+  MutableMapping/Sequence/MutableSequence/Set/MutableSet` as `isinstance` targets, the `Warning` classes,
+  `warnings.warn` of a category the default filters ignore (and `simplefilter/filterwarnings("ignore")`,
+  `catch_warnings()`), `bisect` and `insort` (`lo`, `hi`, `key`, the messages of each Python), chained comparisons of
+  `sys.version_info` folded at translation, `str.join(chain(...))`, `importlib.import_module("literal")` of an
+  installed module. A warning CPython would print (stderr, module path) or raise, `dir()`, `inspect.*`, `xml.*`,
+  `array.*` are refused with what to do instead (`py2axum/libmap.py` `STDLIB_HINTS`, `tests/test_rejects_stdmap.py`).
+- Class protocols of libraries translated from source (`--translate-libs`): `metaclass=ABCMeta` on a plain class (as
+  `ABC`), `__str__`/`__repr__`/`__bool__` of an exception class (`str()`, f-strings, `%s`, tracebacks and logs use
+  `__str__`), chained `sys.version_info` comparisons (`(3, 8) <= sys.version_info < (3, 10)`) folded in class bodies
+  and modules; copy/pickle methods (`__getstate__`...) kept when no translated code reaches `copy`/`pickle` (was: any
+  module importing them). aiosmtpd, apscheduler, loguru, validators now reach their next refusal.
+  fixtures/protoapp/klass.py.
+- Decorators on methods of plain classes (the path `--translate-libs` takes for libraries): a property's setter
+  (`@name.setter`, run by `obj.name = v` and `obj.name += v`; a property without one raises CPython's
+  `AttributeError: property 'x' of 'C' object has no setter`, a class attribute can still be shadowed by the
+  instance), `functools.cached_property` (stored in the instance, which then shadows it), `contextlib.contextmanager`
+  (on methods and functions: `_GeneratorContextManager`, CPython's `RuntimeError` messages), and any function
+  decorator (`@functools.wraps` wrappers, decorator factories) read as the function it returns and bound to the
+  instance. `typing.final`/`override`/`no_type_check` are markers. A redefinition in a class body keeps the last def.
+  Refused with a message: a property deleter, a decorator that is a class (descriptor protocol), `@classmethod` or
+  `@staticmethod` beside a function decorator. fixtures/langapp/decoprops.py.
+- Silently wrong values made exact, or refused at generation (found 17/10/2026 behind a production gap):
+  `frozenset` is its own type (it was a `set`: `type()`, `repr`, `isinstance`, mutators, `set | frozenset` takes the
+  left operand's type, hashable as a dict key or set member, pickled as FROZENSET, `frozenset[T]` fields give a
+  frozenset); `str()` of the ValidationError of a `TypeAdapter` carries pydantic-core's validator name
+  (`1 validation error for list[int]`, a type whose name is not reproduced raises instead); a model field given a
+  non-dict fails as `model_type` unless `from_attributes` is on (it said `model_attributes_type`);
+  `bytes.decode(errors=)` takes `ignore`, `replace` and `backslashreplace` for utf-8 and ascii, `str.encode(errors=)`
+  also `backslashreplace`, `xmlcharrefreplace`, `surrogateescape`/`surrogatepass` (a literal handler outside these is
+  refused at generation); on a parameter annotated `Request`, an attribute the runtime does not provide (`session`,
+  `user`, `auth`, `close`, `stream`, the Mapping over the scope: `request[...]`, `in`, `keys()`, `sorted(request)`,
+  `request.x = ...`) is refused at generation, with file and line (P2A0204). `set ^ set` is implemented.
+
+- `@abstractmethod` on a class without ABCMeta made `C()` raise TypeError (CPython instantiates it). A class with a
+  class keyword or decorator that was not otherwise recognised was compiled as an exception class (keywords and
+  decorators ignored); it is now refused with its reason.
+
+- Starlette's Request objects reproduced for `request._body` (Starlette's body cache): one per BaseHTTPMiddleware
+  (`request._body = data` there is what the inner app reads, with `request._receive`), the route's, ExceptionMiddleware's
+  on a 404/405 and ServerErrorMiddleware's `Request(scope)` (its `body()` raises "Receive channel has not been made
+  available"); `form()` leaves no cache ("Stream consumed"). fixtures/bodyapp, fixtures/bodycrash.
+- A library's router left to Python (`app.include_router(<library router>)`) no longer has to be the app's last
+  registration when what follows is a function given the app that adds routes at startup (`setup(app)` ->
+  `app.add_route(...)`): those routes come after the library's in Starlette's order, so the binary relays them.
+- `gzip.compress(data, compresslevel=, mtime=)`: zlib's stream (the system zlib, like CPython), the header each
+  Python writes (3.12: its own unless `mtime=0`; 3.13: zlib's XFL, OS 255; 3.14: `mtime=0` by default).
+  `pydantic_core.PydanticSerializationError` as a class (`except`, `isinstance`).
+- Alias generators written as project functions of several statements (`if`, `for`, assignments with `*rest`, `not`/`and`/`or`/`in`, generator expressions over the name) are evaluated at translation time; anything else stays refused with file:line.
+- `model_config` built from another model's: `ConfigDict(**Base.model_config, ...)` (`or {}` included), `{**Base.model_config, ...}`, and `alias_generator=Other.model_config["alias_generator"]`; a key given twice to `ConfigDict()` is refused like Python's TypeError.
+- `hide_input_in_errors=True`: `str()` of the model's `ValidationError` leaves out `input_value`/`input_type`, as pydantic does (`errors()` and 422 bodies keep the input).
+- pydantic-settings `env_ignore_empty=True`: an empty environment variable is as if unset (the field keeps its default).
+- `model_config` `allow_inf_nan=False` (every float of the model, in its containers too, rejects inf/nan with `finite_number`) and `validate_default=False` (the default); the other values are refused.
+- pydantic-settings: a validation error shows as input only what was read (environment, then init keywords), not the defaults.
+- Pydantic's strict and constrained annotation aliases are native: `StrictStr`/`StrictInt`/`StrictFloat`/`StrictBool`/`StrictBytes`, `PositiveInt`/`NegativeInt`/`NonNegativeInt`/`NonPositiveInt` and the `*Float` ones, and the call forms `constr(...)`, `conint(...)`, `confloat(...)`, `condecimal(...)`, `conlist(T, ...)`, `conset(T, ...)`; `pathlib.Path` fields (`path_type` error, strict mode, JSON dump as `str`).
+- Dependency forms of public applications translated natively: a `yield` under `with`/`async with`/`if`/nested `try` blocks (several only in exclusive `if` branches), a class dependency inheriting `__init__` from a plain base (its signature read in the base's module), `Depends(Cls.classmethod)` and `Depends(Cls.staticmethod)` (found along the bases; `Sub.make()` of a base's classmethod gets `Sub`), dependency factories with `*roles` and factories returning another factory's call, `Depends(lambda: ...)`. fixtures/depapp.
+- Refused at their line instead: a `yield` in a loop or two on one path, a base other than `ABC`/`object`/one plain class, `__new__` on a class dependency, an instance method read on its class.
+- A dependency that is a library's object, or a global built by calling one (`get_current_user = fastapi_users.current_user()`, an instance of a subclass of a library class), is refused with the library named: FastAPI reads the signature of what the library makes (fastapi-users builds it at run time with makefun).
+- Dependencies and `Annotated` aliases bound in the application factory (`Auth = Annotated[Claims, Depends(claims_from_request)]` inside `create_app()`), read by the endpoints defined there, in their parameters or in `dependencies=[...]`: compiled with the factory's locals. Refused when bound twice or after the endpoint (Python's NameError).
+- Pydantic's DSN types are native: `PostgresDsn`, `MongoDsn` (multi-host types, one host here: `hosts()`, no `host`/`port`), `CockroachDsn`, `AmqpDsn`, `KafkaDsn`, `MySQLDsn`, `MariaDBDsn`.
+- Experimental `--path DIR` (repeatable, generation and `check`): extra import roots for the sibling packages of a monorepo the application installs from its own checkout (`oasst_shared`, `lfx`, `titiler.core`).
+- httpx: the rest of its exception hierarchy (`ReadError`, `RemoteProtocolError`, `ProtocolError`, `WriteTimeout`,
+  `PoolTimeout`, `ProxyError`, `StreamError`...) usable in `except`/`isinstance`; the client raises `RemoteProtocolError`
+  and `ReadError` as httpx does, every error carrying `.request`; timeouts' messages are now empty, as httpx's.
+- A lifespan the app factory defines (`create_app()` -> `async def lifespan(app)` under `if not settings.TESTING:`): native, with the factory's locals, used only when the `if`s around `FastAPI(lifespan=...)` hold at startup; with `--python-side auto`, left to Python alone when it does not translate (it sent the whole application to Python: "the lifespan is not a function of the project"), and `check` judges the routes without it, as the generation does. A `state` attribute the lifespan only initialises, read with that value as `getattr`'s default, no longer moves its readers (or the application) to Python.
+- loguru 0.7 native (dynrt/loguru.rs): the default handler on stderr (format, call site, colours as loguru decides them on a terminal or a CI, `LOGURU_LEVEL`/`LOGURU_COLORIZE`/`LOGURU_AUTOINIT`), the level methods and `log()`, `add(sys.stderr | sys.stdout, level=, format=, colorize=)` with a literal format compiled at translation, `remove()`; fixture `fixtures/loguruapp`, compared with the logs. Refused at translation: `exception()`, `opt`, `bind`, `contextualize`, `catch`, file and callable sinks, `serialize`, `enqueue`, `filter`.
+- A project class wrapping engine and `async_sessionmaker` (one instance per pool) called outside a dependency (`get_worker_session()` -> `WRAPPER()`): a session of its own, its engine's `connect_args` options set in each of its transactions (`set_config(..., true)`). fixtures/dynapp/makerwrap.py.
+- passlib 1.7.4: `CryptContext(schemes=["bcrypt"], deprecated="auto")` native (`hash`, `verify`, `verify_and_update`,
+  `needs_update`, `identify`, `dummy_verify`), over bcrypt 4.3 or 5.0 as passlib loads it (with 5.0 every hash raises,
+  as in Python); `passlib.exc` errors. bcrypt 4.3 joins the tested range (its `hashpw` hashes the first 72 bytes).
+- `pathlib.Path.cwd()` and `os.getcwd()`: the process's current directory, as CPython (FileNotFoundError when it was removed); fixture `fixtures/pdfmergeapp`.
+- pgpy 0.6.0's `PGPKey.from_blob()` natively (dynrt/pgpy.rs, pgpycore.rs; fixture `fixtures/pgpyapp`): the armor
+  as pgpy's regex finds it, base64 and CRC-24 (its warning), every packet and subpacket type with the bytes pgpy
+  reads of it, v4 keys of every algorithm with their fingerprint, signatures, user ids and attributes in pgpy's
+  order, text that is not ASCII parsed as binary, every exception pgpy lets out with its message, the warnings on
+  stderr as CPython prints them. `PGPKey`'s `is_public`, `is_primary`, `fingerprint` (a str: `keyid`, `shortid`,
+  pgpy's `==`), `userids`, `userattributes`, `subkeys`; `PGPUID`'s `name`, `comment`, `email`, `userid`, `is_uid`,
+  `is_ua`, `is_primary`. Any other pgpy call is refused at transpile time. Supported versions: pgpy 0.6.0 with
+  pyasn1 0.6.4. Differences: supported.md § pgpy (bzip2 blocks, warning addresses, `OrderedDict`).
+- qrcode 8.2 natively with Pillow's default image (dynrt/qr.rs): `QRCode(...)`, `add_data`, `make`, `make_image()`
+  in black on white, `qrcode.make`, `image.save(io.BytesIO(), format="PNG")`; the encoder is a port of qrcode's (data
+  modes, version fit, mask choice, exceptions) and the PNG is Pillow 12.3's byte for byte (row filters of
+  ZipEncode.c, zlib-ng's deflate through zlib-rs, IDAT chunks). `image_factory=` is refused. Fixture `fixtures/qrapp`.
+- The synchronous redis client (`redis.Redis`, `redis.from_url`, `Redis.from_url`) is translated on the same runtime as
+  `redis.asyncio`, with `ConnectionPool.from_url` + `Redis(connection_pool=)` for both, pipelines (`pipeline(transaction=)`,
+  `execute()`), hash, list, set and sorted-set commands, and `with` / `async with` on a client.
+- reportlab 4.4.5 natively (dynrt/rl/, bound in dynrt/rlbind.rs; docs: Generated documents § PDF): `SimpleDocTemplate`
+  into an `io.BytesIO` with page callbacks and their canvas, `Paragraph` and its markup, `ParagraphStyle`,
+  `getSampleStyleSheet()`, `Spacer`, `PageBreak`, `HRFlowable`, `Table`/`TableStyle`, the shapes of
+  `reportlab.graphics`, colours, units, page sizes; the PDF byte for byte but its instants. The paragraph markup
+  follows the `html.parser` of the project's Python patch release (probed on the transpiler's); `rl_accel` or
+  `rl_renderPM` in the lock refuses the calls that build documents. Fixture `fixtures/docapp` (`pdfs.py`).
+- `include_router` under a module-level `if` read from the settings or the environment (`if settings.FASTAPI_ENV == "development":`, `if os.getenv(...)`, `else` branches, nested `if`s): each test is evaluated once at startup and the routes of a branch that is off are not matched (404, no 307 to them); other tests stay refused. `app.routes` still lists them (documented).
+- A project function given the app that registers routers (`def add_routers(app): app.include_router(...)`, called once with the app, in the factory or at module level) is native: its routers are registered where it is called, prefixes from its parameters as the call passes them (or their literal defaults) or from module globals (read at startup).
+- `for r in ROUTERS: app.include_router(r)` over a literal tuple (or a list never changed) of the module is unrolled.
+- `APIRouter(default_response_class=...)` (JSONResponse, ORJSONResponse, HTMLResponse, PlainTextResponse): the route's own router, else the nearest router including it, as FastAPI fixes it on the route.
+- A project function without parameters that only builds a router from routers (`def build(): r = APIRouter(...); r.include_router(...); return r`) is a router: `app.include_router(build())` is native (each call makes the same router).
+- Routers in the project's modules outside the translated directory (src/ layout, `--root` above it) are found through the app's imports, factory imports included.
+- An import guard on the project's own code (`try: from app.api import x / except ImportError: x = None`) is decided as CPython decides it when the module is absent: `if x is not None: app.include_router(x.router)` never runs and `if FLAG:` keeps one branch.
+- `secrets.randbelow`, `secrets.randbits` (up to 63 bits), `secrets.token_bytes` and `secrets.DEFAULT_ENTROPY`; `secrets.token_*` take a bool or None as CPython does and raise its `TypeError` for anything else (it was a py2axum message).
+- `secrets.choice`/`random.choice` follow `Random.choice`: `len(seq)` then `seq[i]` (a set, a generator or a dict now raise or index as in CPython instead of picking among their elements).
+- More shapes of the session dependency are native (they sent the routes to Python as "session or engine", P2A0505, on the real-application bench): `s = maker()` annotated or inside the `try` with `finally: [await] s.close()` (async too), `raise exc` of the caught exception, a maker read into a local from a cached factory (`factory = get_session_factory()`), a maker returned by a project function (`SessionLocal = make_sessionmaker(engine)`), and the maker a module instance of a project class keeps (`db_manager.session_maker()`), set once in `__init__` or by a method the lifespan calls before its `yield`; set any other way, it is refused at its line.
+- SQLModel's `AsyncSession` (`sqlmodel.ext.asyncio.session`) is the session type like SQLAlchemy's, and a maker created inside the dependency (`maker = sessionmaker(engine, class_=AsyncSession, ...)` then `async with maker() as s:`) is read like a module one.
+- A SQLModel table whose base without a table is in another module of the project (`class User(UserBase, table=True)`, `UserBase` imported): its inherited fields are columns, when every name they read means the same in both modules (else the table stays refused). An Enum-annotated field is SQLModel's `Enum(...)` column. `session.exec()` of `text(...)`, `update(...)`, `delete(...)` or `insert(...)` returns the Result, as SQLModel does.
+- SQLModel columns of type `EmailStr` (VARCHAR, like `str`) and `datetime` when the project locks SQLModel < 0.0.45 (a naive TIMESTAMP, as SQLModel maps it there; from 0.0.45 its `UTCDateTime` stays refused). The SQLModel version is read from uv.lock or an `==` pin in requirements*.txt / pyproject.toml.
+- `session.exec(stmt)` where the statement is refined before (`stmt = select(Hero)`, then `stmt = stmt.where(...)` under an `if`): read as the `select()` it started from (it was refused: `.exec()` not implemented).
+- SQLModel `Relationship(back_populates=, cascade_delete=, passive_deletes=, sa_relationship_kwargs=)` on a table class (FastAPI's relationships tutorial): rewritten as SQLModel's metaclass builds it, `relationship("Target", ...)` with `cascade="all, delete-orphan"` for `cascade_delete=True`, and left out of the table's Pydantic fields (the whole class was refused). `link_model=` stays refused.
+- SQLModel `Field(sa_column=Column(...))`: the Column as SQLModel takes it (its type, nullability and defaults; the Field's column options ignored, its default kept as the instance's), and the SQLAlchemy names `sqlmodel` re-exports as they are (`from sqlmodel import Column, DateTime, JSON, func`) read as SQLAlchemy's, also by `create_all`.
+- A SQLModel table class used by the routes of another module (`from app.models import Song`, then `response_model=list[Song]`, a `Song` body or `Song.model_validate(...)`): those routes see it as SQLModel does, as in its own module (it was refused: "not a Pydantic model or an enum").
+- `str.format_map(mapping)`: each field read through `mapping[key]` (a `defaultdict` fills and keeps its default),
+  a positional field refused with CPython's ValueError.
+- `sys.modules` with a literal key for a module the project's Python cannot import (PEP 594, 3.13+: an `imghdr`
+  stub put there before importing a library), and `types.ModuleType(name, doc=None)`; any other use of
+  `sys.modules` is refused (P2A0105).
+- `tempfile.TemporaryDirectory(suffix, prefix, dir, ignore_cleanup_errors, delete=)` natively: `with ... as path`, `.name`, `cleanup()`, removal with its content at the block's end or when the object goes (dynrt/pathio.rs; docs: Generated documents § Temporary files).
+- `traceback.format_exc()`: the handled exception's chain, project frames only (as the logs). Before Python 3.13 a
+  chain is followed only from a true exception (one whose `__bool__` is false shows alone, in tracebacks and logs
+  too); from 3.13 always, as TracebackException tests `is not None` there.
+- WebSocket routes can be left to Python (`--python-side '/ws/{room}'`, or moved by `--python-side auto`, for instance when they read what a lifespan left to Python sets), and a whole application relayed may have WebSocket routes: the binary relays their connections to `PY2AXUM_PYTHON_URL`, handshake first (the client gets the Python application's 101 with its subprotocol and headers, or its rejection), then messages and close frames unchanged. fixtures/wsrelayapp.
+- stripe-python 14.0–14.4 translated natively (dynrt/stripe.rs): every resource classmethod of the release
+  (`stripe.Customer.create(...)`, `stripe.checkout.Session.create(...)`, `stripe.Invoice.list(...).auto_paging_iter()`),
+  the request options, the module configuration (`stripe.api_key = ...` at module level or in a function),
+  `stripe.Webhook.construct_event` and `WebhookSignature.verify_header`. Requests (form encoding, headers, retries),
+  objects (a dict subclass with attribute access, list objects) and errors (`stripe.error.*`, messages and
+  attributes) as stripe-python's; tables generated from the release (`tools/gen_stripe.py`). The `*_async` methods,
+  `StripeClient` and the instance methods of an object stay refused. Conformance fixture `fixtures/stripeapp`
+  against a fake Stripe API (`tests/stripe_stub.py`). The binary reads `STRIPE_LOG` as stripe-python does.
+  Differences: docs/supported.md § stripe.
+- openpyxl 3.1 translated natively (dynrt/xlsx.rs, docs: Generated documents): `Workbook()`, worksheets, cells,
+  `Font`/`PatternFill`/`Border`/`Side`/`Alignment`, a merged range, column widths, `save()` into a `BytesIO`, the
+  bytes openpyxl writes without lxml. With lxml in the project's lock, the routes building a workbook are refused
+  (or left to Python by `--python-side auto`), not the whole application.
+- `tempfile.NamedTemporaryFile(mode, suffix, prefix, dir, delete)` (w/w+ modes) and `tempfile.gettempdir()`
+  translated natively; `f.name` of an open file. Leaving `with` on a file now closes it the way `close()` does.
+
+### Changed
+
+- orjson accepted from 3.12.0 (was 3.13.0): 3.12.0 answers the 738 orjson conformance cases byte for byte like 3.13.0;
+  the CI `versions` job's lower end now installs it.
+- **Breaking:** `--backend` (generation and `py2axum check`) and the key `backend` of the JSON of `check`, deprecated since 0.4 and
+  0.8 (they had no effect: one backend): passing `--backend` is now an error, `error: --backend was removed in 1.0 (it has had no effect since 0.4: there is one
+  backend): drop it` (exit status 2), the key is no longer emitted nor in `check-schema.json`. `--report` is hidden from `--help` and the reference
+  (an internal tool, still prints its deprecation warning). Decided 2026-10-19 for 1.0.
+- pydantic-settings accepted up to 2.16 (range `>=2.11.0,<2.17`, tested at 2.16.0: marketing's 293 conformance cases and the settings cases of the reference apps).
+- A class of the project (an Enum) as a key of a declarative base's `type_annotation_map`: refused at each column annotated with it (it refused every mapped class of the base, hence the whole application).
+
+### Fixed
+
+- The binary coerces the legacy C locale at startup as CPython does (PEP 538): with LC_ALL unset and a C
+  LC_CTYPE, `LC_CTYPE=C.UTF-8` is set in its environment, read by `os.environ` and inherited by the processes of
+  `asyncio.create_subprocess_exec` (their messages were in the C locale; `PYTHONCOERCECLOCALE=0`/`warn` honoured).
+
+- The router's 404 and 405 and FastAPI's body errors are Starlette's HTTPException: a handler registered for
+  `fastapi.HTTPException` no longer handles them (it did, dropping the 405's `allow` header).
+- A generated crate could fail to compile (E0061) although the generation succeeded: the stub of a generator
+  function that does not translate (raising if ever called, never reached by a route) lacked the yielder parameter
+  its callers pass (seen with `--translate-libs auto` on et_xmlfile), and a generator method called through its
+  method wrapper (`obj.gen()` resolved at run time, `@classmethod` generators) was called without it. A test now
+  generates such a crate and runs `cargo check` on it (tests/test_generated_compiles.py); conformance cases for
+  generators iterating generators, generator methods and a generator handed to an `@asynccontextmanager`
+  (fixtures/libsrcapp/gens.py).
+- `--translate-libs` reads from source the names the library map does not cover of a library it covers in part
+  (`jinja2.Template`, `aiosmtplib.SMTP`, `requests.utils`, `pywebpush.WebPusher`; refused before as "not in the
+  py2axum library map", whatever the library's licence or code). The map's names stay native, in the library's own
+  code too: its exceptions derive from the map's classes. A binary that would use both a map's object and the
+  library's source refuses the routes reaching the source (P2A0705; `--python-side auto` leaves them to Python).
+  `h11` and `certifi` are no longer kept from translation (the map has none of their names). docs: Libraries
+  translated from source § Libraries the map covers in part.
+- A project module adopted because the package imports it (outside the package dir) no longer contributes its own
+  `FastAPI()` app: its middlewares were added to the served app.
+- An exception escaping a route under two or more BaseHTTPMiddleware layers (`add_middleware` of a subclass,
+  `@app.middleware("http")`) is logged as uvicorn logs it with Starlette 1.3+: the inner layer's anyio
+  `ExceptionGroup` first, then "The above exception was the direct cause of the following exception:" and the
+  exception (Starlette's `create_collapsing_task_group` and `call_next` re-raise it `from` its cause or context).
+  The binary printed the exception alone.
+- `py2axum check` and the generation crashed (StopIteration, AttributeError) on a function given the application whose result is kept or that is called in a nested function, and on a router prefix read at startup that does not translate next to a project middleware class: they are refused with their file:line.
+- A route decorator's path given as `path="/x"` is read (IndexError before; a decorator with no path is refused); a `requirements*.txt` is decoded as pip does (BOM: `pip freeze` under PowerShell writes UTF-16; a `coding` line; else UTF-8, an undecodable file refused with its name); modules are decoded by their PEP 263 coding line; a module global declared by its annotation only (`X: int`) then rebound with `global` is refused with its file:line (all crashed `py2axum check`).
+- compat32 e-mail headers (`MIMEText`, `MIMEMultipart`...): a non-ASCII value is cut into encoded words where
+  `email.header` cuts it (to the 78-column line when sent, one word in `as_string()`), Q or base64 chosen once for
+  the whole value; a continuation line sent over SMTP no longer carried a stray CR. `formataddr` encodes a non-ASCII
+  name as a single word; `make_msgid` stamps hundredths of a second and 64 random bits, as CPython.
+- A decorator on an endpoint besides its route decorator (`@app.get(...)` over `@require_admin`, `@lru_cache`, a
+  library decorator, or a decorator above the route decorator) was silently ignored: the binary served the bare
+  function, skipping what the decorator does in FastAPI (authentication, cache, rate limit, transaction...). It is
+  now refused at the decorator's line (P2A0318); `--python-side auto` leaves such a route to Python.
+- Two route decorators on one function (`@app.get` over `@app.post`) served only one route; refused (P2A0318).
+- `@app.api_route`, `@app.head`, `@app.options`, `@app.trace` and `@app.route` (and the same on routers) left the
+  function unregistered: the binary answered 404/405 where FastAPI served the route. Refused (P2A0318).
+- `FileResponse(headers=...)`: the endpoint's own `Content-Disposition` (or `ETag`, `Last-Modified`...) replaces the
+  one Starlette makes (`setdefault`) instead of going out as a second header beside it; headers in Starlette's order.
+- A generic model specialized in another module than the one that declares it (`Response[Role]` with `Response` and `Role` imported from different modules, `Page[List[Item]]`) is translated instead of refused with "must mean the same in ...": the arguments are bound under names of the generic's module.
+- `gzip.compress(mtime=)` outside 0..2**32-1 (negative, beyond 32 bits, nan, inf) writes an mtime of 0 on Python 3.15 and still raises `struct.error` before it.
+- `--translate-libs`: a library whose guarded imports (`try: import x / except ImportError:`) form a cycle (structlog's
+  `from structlog import twisted`, reportlab) made `check` and generation crash with a RecursionError. A module whose
+  imports are being decided is importable, as CPython finds it in `sys.modules` partially initialised.
+- `pathlib.Path` fields: Python 3.13 alone names the class `pathlib._local.Path` in the `path_type` error message, as pydantic prints it; the other versions keep `pathlib.Path`.
+- qrcode's PNG on Linux: Pillow's manylinux wheels compress with zlib 1.3.1, not zlib-ng (their macOS wheels): the
+  binary built for Linux now compresses with classic zlib (libz-sys, static), so its IDAT bytes are Pillow's there too
+  (they differed on Linux, measured on x86_64; macOS was already identical).
+- `redis.asyncio`: `hgetall()` returned a flat list instead of redis-py's dict, and an error reply's message carried the
+  Rust client's wording instead of redis-py's (`WRONGTYPE Operation against a key holding the wrong kind of value`).
+- `include_router(prefix="/v1", router=r)` (the router as a keyword) was skipped without an error: its routes were never served (404). It is read like the positional form.
+- Routes are tried in registration order: an `include_router` takes its place among its owner's routes, instead of the order the modules were walked in (a router included first could be shadowed by an overlapping route of another module, and `router.include_router(nested)` placed before `@router.get("/{id}")` lost to it).
+- A failed flush (`commit()`, `flush()`, a savepoint's `commit()`) rolls the transaction or savepoint back at once and leaves the session raising SQLAlchemy's PendingRollbackError on every statement, flush and commit until the matching `rollback()` (the savepoint's for a failed savepoint commit, after which the outer transaction is usable), as SQLAlchemy 2.x; before, the next statement met PostgreSQL's aborted transaction. `async with session.begin_nested()` ends that state at its exit.
+- A statement abandoned mid-flight (`asyncio.wait_for(session.execute(...), timeout)` expired) invalidates the transaction as asyncpg/psycopg under SQLAlchemy: PendingRollbackError ("Can't reconnect until invalid transaction is rolled back") until `rollback()`; the pool's connection comes back clean.
+- `session.in_transaction()`, `session.in_nested_transaction()` and `sp.is_active` natively.
+- `async with session.begin_nested() [as sp]:` and `async with session.begin():` (`with` on a synchronous Session) natively, as SQLAlchemy's SessionTransaction: RELEASE / COMMIT at a normal exit, ROLLBACK TO / ROLLBACK when the body raises, an IntegrityError of the exit's flush rolled back with the outer transaction still usable, nothing when the block was already ended; `begin()` on a begun session raises InvalidRequestError. Both were a TypeError at run time (a 500 on every decision insert of an application using them).
+- `with`/`async with` on the value of a SQLAlchemy session, connection or result method (`execute()`, `scalar()`, `commit()`...) is refused at generation with its file:line (a TypeError in Python, a 500 before).
+- `with io.StringIO()` (a TypeError before) and `with io.BytesIO()` close the buffer at the block's end; a closed buffer's methods raise CPython's ValueError.
+- `--translate-libs` with `--python-side auto`: a library mixed from the map and from its source (P2A0705) next to a
+  middleware class of the project made `check` and generation crash with an AttributeError while the stack's errors
+  were collected (a real application with `--translate-libs auto`).
+- `str.format()` / `format_map()` of a string ending in a lone `{`: CPython's `Single '{' encountered in format
+  string`, not `expected '}' before end of string`.
+- `except stripe.error.X` with stripe 14.0.0 locked (where `stripe.error` does not exist): translated instead of refused, raising the bare `AttributeError` of stripe's module `__getattr__` (its `KeyError('error')` context, the suggestion `traceback` prints on Python 3.12) only when an exception is tested against the clause, as CPython does; `stripe.error.X` as a value raises it when evaluated.
+
+### Tests
+
+- Python 3.15 timestamp functions py2axum does not translate (`time.localtime`, `time.gmtime`, `date.fromtimestamp`) are pinned as refused (P2A0201, `file:line`) by a reject test.
+- Conformance compares PDF and OOXML documents byte for byte, masking only their instants and the PDF's `/ID`
+  (tests/docmask.py); fixture `fixtures/docapp`.
+
 ## [0.9.1] — 2026-10-18
 
 Patch release: an ammonia security update, fixes for differences seen in production (request bodies validated from

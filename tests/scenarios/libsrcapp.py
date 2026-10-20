@@ -18,6 +18,10 @@ STEPS += [("GET", f"/hum/clamp/{x}?fmt={f}&floor=0.01", None) for x in ("0.001",
 STEPS += [("GET", "/hum/list" + q, None) for q in ("", "?item=a", "?item=a&item=b", "?item=a&item=b&item=c",
                                                     "?item=&item=", "?item=%C3%A9&item=x&item=y&item=z")]
 
+URIS = ["http://a b/~x", "x%zz%41", "%", "%2", "a%2Gb", "a%41%2fb%7e", "http://h/%C3%A9?q=%20 ", "é", "", "a%%41"]
+STEPS += [("GET", f"/rq/{w}?u={u.replace('%', '%25').replace(' ', '%20').replace('?', '%3F')}", None)
+          for w in ("requote", "unquote") for u in URIS]
+
 
 def reset(db: str) -> None:
     pass
@@ -39,3 +43,10 @@ STEPS += [("GET", f"/std/gettext/{m}" + q, None) for m in ("file", "%C3%A9t%C3%A
 STEPS += [("GET", f"/std/color?r={r}&g={g}&b={b}", None) for r, g, b in ((0, 0, 0), (1, 1, 1), (1, 0, 0), (0.2, 0.4, 0.6),
                                                                           (0.5, 0.5, 0.5), (0.9, 0.1, 0.3), (2, -1, 0.5))]
 STEPS += [("GET", f"/std/kw/{w}", None) for w in ("if", "match", "_", "type", "case", "foo", "None", "async")]
+
+# generators that call generators (fixtures/libsrcapp/gens.py)
+STEPS += [("GET", f"/gens/doubled/{n}", None) for n in ("0", "1", "3", "4", "6", "-1", "x")]
+STEPS += [("GET", "/gens/bag" + q, None) for q in ("", "?w=x", "?w=", "?w=%C3%A9t%C3%A9,b,c")]
+STEPS += [("GET", f"/gens/drained/{n}", None) for n in ("0", "3")]
+STEPS += [("GET", "/gens/lines" + q, None) for q in ("", "?w=a", "?w=")]
+STEPS += [("GET", f"/gens/streamed/{n}", None) for n in ("0", "5")]

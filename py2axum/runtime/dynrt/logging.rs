@@ -2093,9 +2093,12 @@ pub async fn emit(cx: &Cx, logger: &str, level: i64, msg: &str, args: Vec<V>, ex
     if !lg.enabled_for(level) {
         return;
     }
-    let info = match &exc {
-        Some(e) => exc_tuple(e),
-        None => V::None,
+    // `logger.error(msg, exc_info=exc)` (uvicorn): an exception whose `__bool__` is false stays as given,
+    // and no handler formats it (Logger._log and Formatter.format test `if exc_info`)
+    let (info, exc) = match exc {
+        Some(e) if !ops::truthy(&V::Exc(e.clone())).unwrap_or(true) => (V::Exc(e), None),
+        Some(e) => (exc_tuple(&e), Some(e)),
+        None => (V::None, None),
     };
     let extra = if extra.is_empty() { None } else { V::dict_from(extra.into_iter().map(|(k, v)| (V::str(k), v)).collect()).ok() };
     let Ok(rec) = make_record(cx, logger, level, loc, V::str(msg), args, info, exc, extra, V::None) else { return };

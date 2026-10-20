@@ -325,6 +325,161 @@ async def savepoint(db: DbDep):
     return {"out": out, "name": owner.name, "projects": n, "good": good.id is not None}
 
 
+@router.post("/savepoint-ctx")
+async def savepoint_ctx(db: DbDep):
+    """`async with session.begin_nested()`: RELEASE at a normal exit, ROLLBACK TO when the body raises; the
+    IntegrityError of the exit's flush rolls the savepoint back and propagates, the outer transaction usable (the
+    de-duplication of an application's insert_unique)."""
+    owner = Owner(name="spc")
+    db.add(owner)
+    await db.flush()
+    out = []
+    try:
+        async with db.begin_nested():
+            db.add(Project(name="bad", owner_id=999999))
+        out.append("committed")
+    except IntegrityError as e:
+        out.append(["IntegrityError", "violates foreign key constraint" in str(e)])
+    async with db.begin_nested() as sp:
+        db.add(Project(name="ok1", owner_id=owner.id))
+    out.append(type(sp).__name__)
+    try:
+        async with db.begin_nested():
+            db.add(Project(name="gone", owner_id=owner.id))
+            await db.flush()
+            raise ValueError("boom")
+    except ValueError as e:
+        out.append(str(e))
+    async with db.begin_nested() as sp:
+        db.add(Project(name="ok2", owner_id=owner.id))
+        await sp.commit()
+    async with db.begin_nested():
+        async with db.begin_nested():
+            db.add(Project(name="inner", owner_id=owner.id))
+        try:
+            async with db.begin_nested():
+                db.add(Project(name="bad2", owner_id=999999))
+        except IntegrityError:
+            out.append("inner refused")
+    out.append(sorted((await db.scalars(select(Project.name).where(Project.owner_id == owner.id))).all()))
+    try:
+        async with db.begin():
+            pass
+    except Exception as e:  # noqa: BLE001
+        out.append([type(e).__name__, str(e)])
+    return out
+
+
+@router.post("/begin-ctx")
+async def begin_ctx(db: DbDep, fail: bool = False):
+    """`async with session.begin():` on a session not begun: committed at the block's end, rolled back when it
+    raises."""
+    try:
+        async with db.begin():
+            db.add(Owner(name="bctx"))
+            if fail:
+                raise ValueError("no")
+    except ValueError as e:
+        return {"err": str(e), "n": await db.scalar(select(func.count()).select_from(Owner).where(Owner.name == "bctx"))}
+    return {"n": await db.scalar(select(func.count()).select_from(Owner).where(Owner.name == "bctx"))}
+
+
+@router.get("/io-with")
+async def io_with():
+    """`with io.StringIO() / io.BytesIO() as buf`: the buffer inside the block, closed after it (its methods then
+    raise ValueError, flush() of a StringIO excepted)."""
+    import io
+
+    out = []
+    with io.StringIO() as s:
+        s.write("abc")
+        out.append(s.getvalue())
+    with io.BytesIO(b"xyz") as b:
+        out.append(b.read().decode())
+    calls = [("s.getvalue", lambda: s.getvalue()), ("s.read", lambda: s.read()), ("s.tell", lambda: s.tell()),
+             ("s.flush", lambda: s.flush()), ("s.close", lambda: s.close()), ("b.getvalue", lambda: b.getvalue()),
+             ("b.read", lambda: b.read()), ("b.flush", lambda: b.flush()), ("b.close", lambda: b.close())]
+    for n, call in calls:
+        try:
+            call()
+            out.append([n, "ok"])
+        except ValueError as e:
+            out.append([n, str(e)])
+    return out
+
+
+async def _usable(db) -> list:
+    """The session after a failure: usable, or SQLAlchemy's PendingRollbackError (its message's start)."""
+    try:
+        return ["usable", (await db.execute(text("SELECT 1"))).scalar(), db.in_transaction(), db.in_nested_transaction()]
+    except Exception as e:  # noqa: BLE001
+        return [type(e).__name__, str(e)[:70]]
+
+
+@router.post("/session-fail/{case}")
+async def session_fail(case: str, db: DbDep):
+    """A failed savepoint commit, a failed commit, an execute cancelled by wait_for: the session refuses every
+    statement (PendingRollbackError) until the matching rollback, then is usable again (SQLAlchemy 2.x)."""
+    import asyncio
+
+    out = []
+    if case == "savepoint":
+        owner = Owner(name="sf")
+        db.add(owner)
+        await db.flush()
+        sp = await db.begin_nested()
+        bad = Project(name="bad", owner_id=999999)
+        db.add(bad)
+        try:
+            await sp.commit()
+        except IntegrityError:
+            out.append(["IntegrityError", sp.is_active, bad in db])
+        out.append(await _usable(db))
+        await sp.rollback()
+        out.append(await _usable(db))
+        db.add(Project(name="after", owner_id=owner.id))
+        await db.commit()
+        out.append(sorted((await db.scalars(select(Project.name).where(Project.owner_id == owner.id))).all()))
+    elif case == "commit":
+        bad = Project(name="bad", owner_id=999999)
+        db.add(bad)
+        try:
+            await db.commit()
+        except IntegrityError:
+            out.append("IntegrityError")
+        out.append(await _usable(db))
+        try:
+            await db.commit()
+        except Exception as e:  # noqa: BLE001
+            out.append([type(e).__name__, str(e)[:40]])
+        await db.rollback()
+        out.append([bad in db, bad.id])
+        out.append(await _usable(db))
+        db.add(Owner(name="sf-commit"))
+        await db.commit()
+        out.append(await db.scalar(select(func.count()).select_from(Owner).where(Owner.name == "sf-commit")) > 0)
+    else:
+        try:
+            await asyncio.wait_for(db.execute(text("SELECT pg_sleep(1)")), 0.2)
+        except TimeoutError:
+            out.append("TimeoutError")
+        out.append(await _usable(db))
+        await db.rollback()
+        out.append(await _usable(db))
+    return out
+
+
+@router.get("/session-fail/pool")
+async def session_fail_pool(db: DbDep):
+    """After the cancelled statement: the pool's connections answer, none left idle in a transaction."""
+    import asyncio
+
+    await asyncio.sleep(1.2)  # the cancelled pg_sleep(1) has ended on the server
+    idle = await db.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                                "AND state = 'idle in transaction' AND pid <> pg_backend_pid()"))
+    return {"one": (await db.execute(text("SELECT 1"))).scalar(), "idle_in_tx": idle}
+
+
 # ---- Enum methods, _missing_ (also used by Pydantic validation), match statements
 from pydantic import BaseModel  # noqa: E402
 

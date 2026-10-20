@@ -153,6 +153,203 @@ fn parse_addr(v: &V) -> R<IpAddr> {
     }
 }
 
+fn ave(msg: String) -> Exc {
+    Exc::new(&ADDRESS_VALUE_ERROR, vec![V::str(msg)])
+}
+
+fn v4_octet(o: &str) -> Result<u32, String> {
+    if o.is_empty() {
+        return Err("Empty octet not permitted".into());
+    }
+    if !o.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(format!("Only decimal digits permitted in {}", ops::str_repr(o)));
+    }
+    if o.len() > 3 {
+        return Err(format!("At most 3 characters permitted in {}", ops::str_repr(o)));
+    }
+    if o != "0" && o.starts_with('0') {
+        return Err(format!("Leading zeros are not permitted in {}", ops::str_repr(o)));
+    }
+    let n: u32 = o.parse().unwrap_or(0);
+    if n > 255 {
+        return Err(format!("Octet {n} (> 255) not permitted"));
+    }
+    Ok(n)
+}
+
+/// `_BaseV4._ip_int_from_string`
+fn v4_int(s: &str) -> R<u32> {
+    if s.is_empty() {
+        return Err(ave("Address cannot be empty".into()));
+    }
+    let octets: Vec<&str> = s.split('.').collect();
+    if octets.len() != 4 {
+        return Err(ave(format!("Expected 4 octets in {}", ops::str_repr(s))));
+    }
+    let mut n = 0u32;
+    for o in octets {
+        n = (n << 8) | v4_octet(o).map_err(|e| ave(format!("{e} in {}", ops::str_repr(s))))?;
+    }
+    Ok(n)
+}
+
+fn v6_hextet(h: &str) -> Result<u128, String> {
+    if !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("Only hex digits permitted in {}", ops::str_repr(h)));
+    }
+    if h.len() > 4 {
+        return Err(format!("At most 4 characters permitted in {}", ops::str_repr(h)));
+    }
+    Ok(u128::from_str_radix(h, 16).unwrap_or(0))
+}
+
+/// `_BaseV6._ip_int_from_string`
+fn v6_int(s: &str) -> R<u128> {
+    let r = ops::str_repr(s);
+    if s.is_empty() {
+        return Err(ave("Address cannot be empty".into()));
+    }
+    let n = s.chars().count();
+    if n > 45 {
+        let shown = if n > 100 {
+            let c: Vec<char> = s.chars().collect();
+            format!("{}({} chars elided){}", c[..45].iter().collect::<String>(), n - 90, c[n - 45..].iter().collect::<String>())
+        } else {
+            s.to_string()
+        };
+        return Err(ave(format!("At most 45 characters expected in {}", ops::str_repr(&shown))));
+    }
+    let mut parts: Vec<String> = s.splitn(10, ':').map(str::to_string).collect();
+    if parts.len() < 3 {
+        return Err(ave(format!("At least 3 parts expected in {r}")));
+    }
+    if parts.last().is_some_and(|p| p.contains('.')) {
+        let last = parts.pop().unwrap_or_default();
+        let v4 = v4_int(&last).map_err(|e| ave(format!("{} in {r}", e.message())))?;
+        parts.push(format!("{:x}", (v4 >> 16) & 0xFFFF));
+        parts.push(format!("{:x}", v4 & 0xFFFF));
+    }
+    if parts.len() > 9 {
+        return Err(ave(format!("At most 8 colons permitted in {r}")));
+    }
+    let mut skip = None;
+    for i in 1..parts.len() - 1 {
+        if parts[i].is_empty() {
+            if skip.is_some() {
+                return Err(ave(format!("At most one '::' permitted in {r}")));
+            }
+            skip = Some(i);
+        }
+    }
+    let (hi, lo, skipped) = match skip {
+        Some(k) => {
+            let mut hi = k;
+            let mut lo = parts.len() - k - 1;
+            if parts[0].is_empty() {
+                hi -= 1;
+                if hi > 0 {
+                    return Err(ave(format!("Leading ':' only permitted as part of '::' in {r}")));
+                }
+            }
+            if parts[parts.len() - 1].is_empty() {
+                lo -= 1;
+                if lo > 0 {
+                    return Err(ave(format!("Trailing ':' only permitted as part of '::' in {r}")));
+                }
+            }
+            let skipped = 8i64 - (hi + lo) as i64;
+            if skipped < 1 {
+                return Err(ave(format!("Expected at most 7 other parts with '::' in {r}")));
+            }
+            (hi, lo, skipped as u32)
+        }
+        None => {
+            if parts.len() != 8 {
+                return Err(ave(format!("Exactly 8 parts expected without '::' in {r}")));
+            }
+            if parts[0].is_empty() {
+                return Err(ave(format!("Leading ':' only permitted as part of '::' in {r}")));
+            }
+            if parts[7].is_empty() {
+                return Err(ave(format!("Trailing ':' only permitted as part of '::' in {r}")));
+            }
+            (8, 0, 0)
+        }
+    };
+    let mut ip: u128 = 0;
+    let bad = |e: String| ave(format!("{e} in {r}"));
+    for p in &parts[..hi] {
+        ip = (ip << 16) | v6_hextet(p).map_err(bad)?;
+    }
+    ip = if skipped >= 8 { 0 } else { ip << (16 * skipped) };
+    for p in &parts[parts.len() - lo..] {
+        ip = (ip << 16) | v6_hextet(p).map_err(bad)?;
+    }
+    Ok(ip)
+}
+
+/// `ipaddress.IPv4Address(address)` / `IPv6Address(address)`: an int, packed bytes or a string, CPython's
+/// AddressValueError messages; an IPv6 scope id (`%eth0`) is refused
+pub fn ip_typed(v6: bool, args: &[V]) -> R {
+    let [x] = args else {
+        return Err(Exc::type_error(format!("__init__() takes 2 positional arguments but {} were given", args.len() + 1)));
+    };
+    let (ver, bits, width) = if v6 { (6, 128u32, 16usize) } else { (4, 32u32, 4usize) };
+    let as_int = match x {
+        V::Bool(b) => Some(*b as i64),
+        V::Int(i) => Some(*i),
+        _ => None,
+    };
+    let n: u128 = match (as_int, x) {
+        (Some(i), _) => {
+            if i < 0 {
+                return Err(ave(format!("{i} (< 0) is not permitted as an IPv{ver} address")));
+            }
+            if !v6 && i > u32::MAX as i64 {
+                return Err(ave(format!("{i} (>= 2**{bits}) is not permitted as an IPv{ver} address")));
+            }
+            i as u128
+        }
+        (None, V::Bytes(b)) => {
+            if b.len() != width {
+                return Err(ave(format!("{} (len {} != {width}) is not permitted as an IPv{ver} address", ops::repr(x)?, b.len())));
+            }
+            b.iter().fold(0u128, |a, c| (a << 8) | *c as u128)
+        }
+        _ => {
+            let s = ops::str_(x)?;
+            if s.contains('/') {
+                return Err(ave(format!("Unexpected '/' in {}", ops::repr(x)?)));
+            }
+            if v6 {
+                if let Some((_, scope)) = s.split_once('%') {
+                    if scope.is_empty() || scope.contains('%') {
+                        return Err(ave(format!("Invalid IPv6 address: \"{}\"", ops::str_repr(&s))));
+                    }
+                    return Err(Exc::type_error("py2axum: an IPv6 address with a scope id (%...) is not supported"));
+                }
+                v6_int(&s)?
+            } else {
+                v4_int(&s)? as u128
+            }
+        }
+    };
+    Ok(V::native(Native::IpAddr(if v6 { IpAddr::V6(n.into()) } else { IpAddr::V4((n as u32).into()) })))
+}
+
+/// the attributes of an IPv4Address/IPv6Address the runtime has (others: AttributeError, refused where read)
+pub fn addr_attr(a: &IpAddr, name: &str) -> Option<V> {
+    Some(match (name, a) {
+        ("version", IpAddr::V4(_)) => V::Int(4),
+        ("version", IpAddr::V6(_)) => V::Int(6),
+        ("max_prefixlen", IpAddr::V4(_)) => V::Int(32),
+        ("max_prefixlen", IpAddr::V6(_)) => V::Int(128),
+        ("packed", IpAddr::V4(x)) => V::Bytes(std::sync::Arc::from(&x.octets()[..])),
+        ("packed", IpAddr::V6(x)) => V::Bytes(std::sync::Arc::from(&x.octets()[..])),
+        _ => return None,
+    })
+}
+
 /// `ipaddress.ip_address(x)`
 pub fn ip_address(args: &[V]) -> R {
     let [x] = args else {

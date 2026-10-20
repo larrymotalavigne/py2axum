@@ -59,6 +59,8 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0313](#p2a0313) | Exception handler |
 | [P2A0314](#p2a0314) | Nested endpoint |
 | [P2A0315](#p2a0315) | Router of a library |
+| [P2A0316](#p2a0316) | Left to Python with the lifespan |
+| [P2A0318](#p2a0318) | Endpoint decorator |
 | [P2A0401](#p2a0401) | Type annotation |
 | [P2A0402](#p2a0402) | Field option |
 | [P2A0403](#p2a0403) | Pydantic validator |
@@ -85,6 +87,7 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0702](#p2a0702) | Library not pure Python |
 | [P2A0703](#p2a0703) | Library installation differs from the lock |
 | [P2A0704](#p2a0704) | Standard library source of another Python |
+| [P2A0705](#p2a0705) | Library map and library source mixed |
 | [P2A0901](#p2a0901) | Internal transpiler error |
 | [P2A0999](#p2a0999) | Not supported |
 
@@ -356,9 +359,9 @@ See [MCP servers](../advanced/mcp.md).
 
 **Logging construct not supported**
 
-The binary reproduces the `logging` module as the applications use it (see Logging): a record carries the call site itself, and only the standard handlers and formatters exist.
+The binary reproduces the `logging` module as the applications use it, and loguru's `logger` levels, `add()` on a standard stream and `remove()` (see Logging): a record carries the call site itself, and only the standard handlers and formatters exist.
 
-**What to do:** Log from the function whose location you want in the record (or drop `stacklevel=`); use `StreamHandler`, `FileHandler`, `NullHandler` and `logging.Formatter` or python-json-logger. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+**What to do:** Log from the function whose location you want in the record (or drop `stacklevel=`); use `StreamHandler`, `FileHandler`, `NullHandler` and `logging.Formatter` or python-json-logger; with loguru, log without the exception (`logger.error(...)`) and add sinks on sys.stderr or sys.stdout. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
 
 See [advanced/logging.md](../advanced/logging.md).
 
@@ -410,7 +413,7 @@ See [Middleware](../tutorial/middleware.md).
 
 Startup and shutdown code is compiled when it uses supported constructs; this form is not.
 
-**What to do:** Use `FastAPI(lifespan=...)` with an `@asynccontextmanager` and module globals, or leave it to Python with `--python-side lifespan`.
+**What to do:** Use `FastAPI(lifespan=...)` with an `@asynccontextmanager` and module globals, or leave it to Python with `--python-side lifespan` (implied by `--python-side auto` when no translated code reads what it sets).
 
 See [Lifespan events](../tutorial/lifespan.md).
 
@@ -448,7 +451,7 @@ See [Parameters](../tutorial/parameters.md).
 
 **Dependency**
 
-Dependencies are compiled when they are project functions (sync, async, generators with one `yield`), Pydantic models, plain classes or instances with `__call__`.
+Dependencies are compiled when they are project functions (sync, async, generators whose `yield` is reached once), factories returning one, lambdas, Pydantic models, plain classes, their classmethods and staticmethods, or instances with `__call__`.
 
 **What to do:** Wrap the library object in a project function: `def get_x(): return lib.X()` and `Depends(get_x)`.
 
@@ -470,7 +473,7 @@ See [Security](../tutorial/security.md).
 
 This WebSocket construct is not reproduced (the binary implements Starlette's WebSocket protocol).
 
-**What to do:** Use `@app.websocket(path)` with an `async def` endpoint and the parameters FastAPI provides on a WebSocket route. WebSocket routes are never relayed to Python.
+**What to do:** Use `@app.websocket(path)` with an `async def` endpoint and the parameters FastAPI provides on a WebSocket route, or leave the route to Python (`--python-side <path>` or `auto`: the binary relays its connections).
 
 See [WebSockets](../tutorial/websockets.md).
 
@@ -533,6 +536,26 @@ The routes of a router defined in a library are not translated (py2axum reads on
 **What to do:** Include the library's router last (`app.include_router(...)` on the app, unconditionally, with a literal prefix or none, nothing registering routes after it) and pass `--python-side mount` (implied by `--python-side auto`).
 
 See [Bigger applications](../tutorial/bigger-applications.md#routers-of-libraries).
+
+### P2A0316
+
+**Left to Python with the lifespan**
+
+`--python-side auto` leaves a lifespan that does not translate to the Python process. Translated code reading what it sets in the process (an `app.state` attribute, a module global) would not see it: such a route goes to Python as well, and a middleware reading it, or a change py2axum cannot bound, leaves the whole application to Python.
+
+**What to do:** Keep what the binary's routes read out of the lifespan (compute it at module level, or store it in the database or Redis), or make the lifespan translate.
+
+See [Hybrid mode](../getting-started/hybrid.md#what-auto-leaves-to-python).
+
+### P2A0318
+
+**Endpoint decorator**
+
+FastAPI registers the function its decorators produce: a decorator below the route decorator wraps every call of the endpoint (authentication, cache, rate limit, transaction...), and every decorator runs at import. The binary compiles the endpoint's own body: run without its decorator, the route would behave differently in production. A second route decorator registers the function once more, which the binary does not do.
+
+**What to do:** Move the decorator's logic into a dependency (`Depends(...)` on the endpoint or `dependencies=[...]`), define one endpoint per route, or leave the route to Python with `--python-side '<path>'` (or `--python-side auto`).
+
+See [Dependencies](../tutorial/dependencies.md).
 
 ## Pydantic
 
@@ -766,9 +789,9 @@ See [python-versions.md](../python-versions.md).
 
 **Library licence not admitted**
 
-`--translate-libs` compiles a library's source into the binary, a derived work of the library: only permissive licences are admitted by default (MIT, BSD, Apache-2.0, ISC, PSF, Unlicense). The licence is read from the distribution's `License-Expression`, else its licence classifiers.
+`--translate-libs` compiles a library's source into the binary, a derived work of the library: only permissive licences are admitted by default (MIT, BSD, Apache-2.0, ISC, PSF, Zlib, HPND, MPL-2.0, Unlicense). The licence is read from the distribution's `License-Expression`, its `License` field when that is an SPDX expression, its licence file when the field is free text (`BSD`), else its licence classifiers.
 
-**What to do:** Check that the licence allows it for your binary and pass `--allow-license <SPDX>`, or leave the routes that reach the library to Python. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+**What to do:** Check that the licence allows it for your binary and pass `--allow-license <SPDX>` (or the distribution's name when its licence was not recognised), or leave the routes that reach the library to Python. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
 
 See [Libraries translated from source](../advanced/libraries.md#licences).
 
@@ -801,6 +824,16 @@ A few pure-Python modules of the standard library (`gettext`, `html.entities`, `
 **What to do:** Run py2axum on the project's Python (the minor its `.python-version` or `--python` names).
 
 See [Libraries translated from source](../advanced/libraries.md#the-standard-library).
+
+### P2A0705
+
+**Library map and library source mixed**
+
+A library the library map covers in part (`jinja2.Environment`, `aiosmtplib.send`) has its other names translated from its source (`--translate-libs`). One binary cannot use both: an object the map creates is no instance of the source's classes, and the source's code does not take it. The map's exceptions are shared, so `except` clauses mix.
+
+**What to do:** Use only the library map's names of that library, or only names it does not cover, or leave the routes that reach its source to Python. If the construct is essential, leave the route to Python: `--python-side auto` (or `--python-side '<path>'`) keeps it in a Python process next to the binary.
+
+See [Libraries translated from source](../advanced/libraries.md#libraries-the-map-covers-in-part).
 
 ## Other
 

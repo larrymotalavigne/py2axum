@@ -11,7 +11,11 @@ python -m py2axum app -o out --translate-libs auto        # every eligible distr
 python -m py2axum app -o out --translate-libs humanize,python-slugify
 ```
 
-`--translate-libs` is off (`none`) by default. It is accepted by generation, `py2axum check` and `py2axum watch`.
+`--translate-libs` is off (`none`) by default, and **experimental** in 1.0: it is outside the
+[stability guarantees](../reference/versioning.md#what-does-not-count-as-a-breaking-change) (it may change in a minor
+release, and the release notes say so), because only a minority of pure-Python libraries translate so far
+(`py2axum check --translate-libs auto` tells you which of yours do). It is accepted by generation, `py2axum check`
+and `py2axum watch`, with `--venv` and `--allow-license`.
 
 ## What is translated from source
 
@@ -38,6 +42,21 @@ A distribution is translated from source only when all of these hold, and refuse
 
 The library's own code then follows the same subset as project code: a construct outside it is refused at its
 `file:line` inside the library, and `py2axum check` lists the library's functions it reached.
+
+## Libraries the map covers in part
+
+The library map translates some names of a few libraries natively (`jinja2.Environment`, `aiosmtplib.send`,
+`pywebpush.webpush`, the exceptions of `requests`). The names it does not cover (`jinja2.Template`,
+`aiosmtplib.SMTP`, `requests.utils.requote_uri`) are read from the library's source, under the same conditions
+as any distribution; the names it covers stay native everywhere, the library's own code included: an exception the
+source raises (`requests.exceptions.InvalidURL`) derives from the map's class (`requests.RequestException`), so
+the project's `except` clauses catch it as in Python.
+
+One binary never holds both a non-exception name of the map and the source of the same library: an `Environment`
+the map creates is no instance of the source's class, and the source's code does not take it. When a route that
+translates uses the map's names, the routes reaching the library's source are refused
+([P2A0705](../reference/errors.md#p2a0705)); with `--python-side auto` they run in Python and the others stay
+native.
 
 ## The environment
 
@@ -71,11 +90,30 @@ and `if name in __all__: return importlib.import_module("." + name, __name__)`.
 ## Licences
 
 The translation of a library is a derived work compiled into your binary. The licences admitted by default are
-MIT, BSD (0BSD, BSD-2-Clause, BSD-3-Clause), Apache-2.0, ISC, PSF-2.0 and Unlicense. The licence is read from the
-distribution's `License-Expression`, else from its older `License` field when that holds an SPDX expression
-(`BSD-2-Clause`, never free text), else from its licence classifiers; an `OR` expression is admitted when one
-alternative is, an `AND` expression when all terms are. Anything else, an unknown licence included, is refused
-unless you admit it explicitly after checking it allows your use:
+MIT, BSD (0BSD, BSD-2-Clause, BSD-3-Clause, BSD-4-Clause), Apache-2.0, ISC, PSF-2.0, Zlib, HPND, MPL-2.0 and Unlicense.
+Three of these are the project's choice, made per licence: **BSD-4-Clause** (its advertising clause obliges the
+binary's documentation to acknowledge the library's author), **MPL-2.0** (file-level copyleft: changes to the
+library's own files stay under the MPL) and, per distribution, **passlib 1.7** (BSD-3-Clause, with a few functions
+derived from Beer-ware, UnixCrypt and jBCrypt sources, whose licences py2axum does not recognise: no other
+distribution benefits from it). The LGPL and GPL remain refused.
+ py2axum reads the
+licence, in this order:
+
+1. the distribution's `License-Expression` (PEP 639);
+2. its older `License` field, when it holds an SPDX expression of known identifiers (`BSD-2-Clause`);
+3. when that field is free text (`BSD`, `BSD-like`: nothing a program can trust), the **licence file** shipped in the
+   distribution's `.dist-info`, compared word for word with the canonical texts (MIT, BSD-2/3/4-Clause, ISC, 0BSD,
+   Zlib, HPND, Unlicense; Apache-2.0 by the hash of its terms). Only holder names, copyright lines and
+   punctuation may differ. A file holding several licences must have every one recognised; a modified licence
+   (a rider such as "no commercial use"), a licence py2axum does not know
+   (GPL, LGPL, Creative Commons, a bespoke permission) leaves text that nothing explains, and the library is refused;
+4. the licence classifiers (a `License :: Other/Proprietary License` or `DFSG approved` classifier names no licence:
+   the file then decides). With no `License` field, the classifiers come first, then the file.
+
+An `OR` expression is admitted when one alternative is, an `AND` expression when all terms are. Anything else, an
+unknown licence included, is refused with the text that was found, unless you admit it explicitly after checking it
+allows your use: `--allow-license <SPDX>` for a recognised expression, `--allow-license <distribution>` for a
+distribution whose licence could not be recognised:
 
 ```bash
 python -m py2axum app -o out --translate-libs auto --allow-license MPL-2.0

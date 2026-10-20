@@ -12,7 +12,9 @@ path = "mod.rs"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
+# the client side of a WebSocket relayed to the Python process (ws::relay): the version axum's "ws" already uses
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util", "process"] }
 futures-util = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "json", "uuid"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +36,8 @@ base64 = "0.22"
 subtle = "2"
 hmac = "0.12"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
+# zlib-ng's deflate (Pillow's wheels): qrcode's PNG byte for byte (qr.rs)
+zlib-rs = "0.6"
 aes = "0.8"
 multer = "3"
 fancy-regex = "0.14"
@@ -60,3 +64,8 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp", 
 lapin = "4"
 ammonia = "4.2.4"
 zmij = "1"
+
+# qrcode's PNG on Linux: the classic zlib of Pillow's manylinux wheels (dynrt/qr.rs), built here (static: one version
+# everywhere; flate2's zlib is the same library, its deflate output unchanged)
+[target.'cfg(target_os = "linux")'.dependencies]
+libz-sys = { version = "1", features = ["static"] }

@@ -250,6 +250,15 @@ pub fn url(args: &[V]) -> R {
     Ok(V::native(Native::HttpUrl(s)))
 }
 
+/// `httpx.Request` as an exception or a response carries it: its method and URL
+pub fn req_attr(r: &(String, String), name: &str) -> R {
+    match name {
+        "method" => Ok(V::str(&r.0)),
+        "url" => Ok(V::native(Native::HttpUrl(r.1.clone()))),
+        _ => Err(Exc::attr_error(format!("'Request' object has no attribute '{name}'"))),
+    }
+}
+
 pub fn url_attr(u: &str, name: &str) -> R {
     let parsed = reqwest::Url::parse(u).ok();
     Ok(match name {
@@ -263,6 +272,83 @@ pub fn url_attr(u: &str, name: &str) -> R {
 
 fn exc(class: &'static Class, msg: String) -> Exc {
     Exc::msg(class, msg)
+}
+
+/// The request an httpx exception carries (`exc.request`): httpx.Request's method and URL
+/// (httpx's mapping of httpcore's exceptions: `raise mapped_exc(message) from exc`, the httpcore exception as cause)
+fn httpx_error(class: &'static Class, msg: String, method: &str, url: &str) -> Exc {
+    let core: Option<&'static Class> = [
+        (&HTTPX_CONNECT_ERROR, &HTTPCORE_CONNECT_ERROR), (&HTTPX_CONNECT_TIMEOUT, &HTTPCORE_CONNECT_TIMEOUT),
+        (&HTTPX_READ_TIMEOUT, &HTTPCORE_READ_TIMEOUT), (&HTTPX_READ_ERROR, &HTTPCORE_READ_ERROR),
+        (&HTTPX_REMOTE_PROTOCOL_ERROR, &HTTPCORE_REMOTE_PROTOCOL_ERROR), (&HTTPX_NETWORK_ERROR, &HTTPCORE_NETWORK_ERROR),
+    ].iter().find(|(x, _)| std::ptr::eq(*x, class)).map(|(_, c)| *c);
+    let e = exc(class, msg.clone());
+    let mut a = e.0.attrs.lock();
+    a.insert("request".into(), V::native(Native::HttpReq(Arc::new((method.to_string(), url.to_string())))));
+    if let Some(c) = core {
+        let cause = exc(c, msg);
+        cause.0.attrs.lock().insert("__suppress_context__".into(), V::Bool(true));
+        a.insert("__cause__".into(), V::Exc(cause));
+        a.insert("__suppress_context__".into(), V::Bool(true));
+    }
+    drop(a);
+    e
+}
+
+/// What failed under reqwest, as httpcore names it: the server closed the connection before a complete message
+/// (hyper's IncompleteMessage, or an unexpected end of the stream), or reset it
+fn closed_early(e: &reqwest::Error) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::UnexpectedEof {
+                return true;
+            }
+        }
+        if s.to_string().contains("connection closed before message completed") {
+            return true;
+        }
+        src = s.source();
+    }
+    false
+}
+
+fn reset(e: &reqwest::Error) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            if matches!(io.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) {
+                return true;
+            }
+        }
+        src = s.source();
+    }
+    false
+}
+
+/// httpx 0.28 over httpcore and anyio: a timeout's message is empty (anyio's TimeoutError), a connection refused
+/// or unreachable is ConnectError("All connection attempts failed"), the server closing before the response
+/// RemoteProtocolError, a reset ReadError (anyio's BrokenResourceError: empty)
+fn httpx_send_error(e: &reqwest::Error, method: &str, url: &str) -> Exc {
+    let (class, msg): (&'static Class, &str) = if e.is_timeout() && e.is_connect() {
+        (&HTTPX_CONNECT_TIMEOUT, "")
+    } else if e.is_timeout() {
+        (&HTTPX_READ_TIMEOUT, "")
+    } else if e.is_connect() {
+        (&HTTPX_CONNECT_ERROR, "All connection attempts failed")
+    } else if e.is_redirect() {
+        (&HTTPX_TOO_MANY_REDIRECTS, "Exceeded maximum allowed redirects.")
+    } else if reset(e) {
+        (&HTTPX_READ_ERROR, "")
+    } else if closed_early(e) {
+        (&HTTPX_REMOTE_PROTOCOL_ERROR, "Server disconnected without sending a response.")
+    } else if e.is_request() || e.is_body() || e.is_decode() {
+        // a response hyper cannot parse: h11's message is not reproduced (docs/supported.md)
+        return httpx_error(&HTTPX_REMOTE_PROTOCOL_ERROR, e.to_string(), method, url);
+    } else {
+        return httpx_error(&HTTPX_NETWORK_ERROR, e.to_string(), method, url);
+    };
+    httpx_error(class, msg.to_string(), method, url)
 }
 
 fn request_error(k: Kind, e: &reqwest::Error, url: &str) -> Exc {
@@ -424,7 +510,10 @@ pub async fn send(c: &Client, method: &str, args: &[V], kwargs: &[(String, V)]) 
         // per-request redirect policies are not available in reqwest: refused rather than ignored
         return Err(Exc::type_error("py2axum: a per-request redirect option is not supported (set it on the client)"));
     }
-    let resp = rb.send().await.map_err(|e| request_error(c.kind, &e, &final_url))?;
+    let resp = rb.send().await.map_err(|e| match c.kind {
+        Kind::Httpx => httpx_send_error(&e, method, &final_url),
+        _ => request_error(c.kind, &e, &final_url),
+    })?;
     let status = resp.status().as_u16();
     let url_out = resp.url().to_string();
     let headers: Vec<(String, String)> = resp
@@ -432,10 +521,34 @@ pub async fn send(c: &Client, method: &str, args: &[V], kwargs: &[(String, V)]) 
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().iter().map(|&b| b as char).collect()))
         .collect();
-    let body = resp.bytes().await.map_err(|e| request_error(c.kind, &e, &final_url))?.to_vec();
+    let body = if c.kind == Kind::Httpx {
+        // read chunk by chunk: a body cut short is reported with the bytes received, as h11 does
+        let expected = resp.content_length();
+        let chunked = headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked"));
+        let mut resp = resp;
+        let mut body = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(b)) => body.extend_from_slice(&b),
+                Ok(None) => break,
+                Err(e) if !e.is_timeout() && !reset(&e) && closed_early(&e) => {
+                    let why = match expected {
+                        Some(n) if !chunked => format!("received {} bytes, expected {n}", body.len()),
+                        _ => "incomplete chunked read".to_string(),
+                    };
+                    return Err(httpx_error(&HTTPX_REMOTE_PROTOCOL_ERROR,
+                                           format!("peer closed connection without sending complete message body ({why})"), method, &final_url));
+                }
+                Err(e) => return Err(httpx_send_error(&e, method, &final_url)),
+            }
+        }
+        body
+    } else {
+        resp.bytes().await.map_err(|e| request_error(c.kind, &e, &final_url))?.to_vec()
+    };
     let body = decode_body(&headers, body).map_err(|e| match c.kind {
         Kind::Aiohttp => exc(&AIO_CLIENT_ERROR, format!("400, message='Can not decode content-encoding: {e}'")),
-        _ => exc(&HTTPX_DECODING_ERROR, e),
+        _ => httpx_error(&HTTPX_DECODING_ERROR, e, method, &final_url),
     })?;
     let reason = super::status_phrase(status).unwrap_or("").to_string();
     Ok(V::native(Native::HttpResp(Arc::new(Resp { kind: c.kind, status, reason, headers, body, url: url_out, method: method.to_string() }))))
@@ -604,6 +717,7 @@ pub fn resp_attr(r: &Resp, name: &str) -> R {
         (Kind::Httpx, "is_success") => V::Bool((200..300).contains(&r.status)),
         (Kind::Httpx, "is_error") => V::Bool(r.status >= 400),
         (Kind::Aiohttp, "ok") => V::Bool(r.status < 400),
+        (Kind::Httpx, "request") => V::native(Native::HttpReq(Arc::new((r.method.clone(), r.url.clone())))),
         (_, "url") => V::str(&r.url),
         (_, "headers") => r.headers_v()?,
         (Kind::Aiohttp, "content_type") => V::str(r.header("content-type").unwrap_or("application/octet-stream").split(';').next().unwrap_or("").trim()),
@@ -703,7 +817,7 @@ pub fn resp_method(r: &Arc<Resp>, recv: &V, name: &str, args: &[V], kwargs: &[(S
                 }
             }
             msg += &format!("For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{}", r.status);
-            let e = exc(&HTTPX_STATUS_ERROR, msg);
+            let e = httpx_error(&HTTPX_STATUS_ERROR, msg, &r.method, &r.url);
             e.0.attrs.lock().insert("response".into(), recv.clone());
             Err(e)
         }

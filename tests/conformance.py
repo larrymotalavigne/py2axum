@@ -39,6 +39,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import docmask  # noqa: E402
 import logcmp  # noqa: E402
 
 DB = os.environ.get("DATABASE_URL", "postgresql://postgres@127.0.0.1/poc")
@@ -223,10 +224,18 @@ def observe(r: httpx.Response, base: str, scenario, method: str, path: str, sent
     """What is compared of one response (corpus/ compares the official FastAPI tests' requests with it too)."""
     normalize = getattr(scenario, "normalize", lambda body: body)
     ctype = r.headers.get("content-type", "").split(";")[0]
-    try:
-        body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
-    except ValueError:
-        body = getattr(scenario, "normalize_text", lambda text: text)(r.text)
+    # a PDF served under another type (a stored file named without its extension: application/octet-stream)
+    dtype = "application/pdf" if not docmask.kind(ctype) and r.content[:5] == b"%PDF-" else ctype
+    if docmask.kind(dtype) and r.content:
+        # a PDF or an OOXML package: its bytes, but for its instants and random id (tests/docmask.py); the
+        # scenario's `mask_document(path, ctype, data)` masks what the document prints of the clock
+        data = scenario.mask_document(path, dtype, r.content) if hasattr(scenario, "mask_document") else r.content
+        body = docmask.digest(dtype, data)
+    else:
+        try:
+            body = (normalize(r.json(), path) if normalize.__code__.co_argcount == 2 else normalize(r.json())) if r.content else None
+        except ValueError:
+            body = getattr(scenario, "normalize_text", lambda text: text)(r.text)
     if (method not in ("GET", "HEAD") if settle is None else settle) and getattr(scenario, "SETTLE", 0):
         # FastAPI commits a `yield` session dependency after sending the response: let it land
         # before the next request reads (the reference is racy otherwise, the binary is not); with the
@@ -307,8 +316,26 @@ def no_encoding(r: dict) -> dict:
     return dict(r, encoding=None, mw=mw)
 
 
+def _near_int(x, y) -> bool:
+    x, y = (int(v) if isinstance(v, str) and v.isdigit() else v for v in (x, y))
+    return isinstance(x, int) and isinstance(y, int) and not isinstance(x, bool) and abs(x - y) <= 1
+
+
+def align_retry(a, b):
+    """b with every `retry_after` (JSON body) / `retry-after` (header) brought onto a's value when they differ
+    by one second at most: the two servers are called one after the other, a rate-limit window can end between
+    them (a login route answering 429: 59 against 60). Anything else is left as it is."""
+    if isinstance(a, dict) and isinstance(b, dict) and list(a) == list(b):
+        return {k: (a[k] if k in ("retry_after", "retry-after") and _near_int(a[k], b[k]) else align_retry(a[k], b[k]))
+                for k in b}
+    if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+        return [align_retry(x, y) for x, y in zip(a, b)]
+    return b
+
+
 def identical(a: dict, b: dict, ignore_encoding: bool = False) -> bool:
     ka, kb = (no_encoding(a), no_encoding(b)) if ignore_encoding else (a, b)
+    kb = align_retry(ka, kb)
     return json.dumps(ka, ensure_ascii=False) == json.dumps(kb, ensure_ascii=False)  # key order too
 
 

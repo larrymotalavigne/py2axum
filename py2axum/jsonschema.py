@@ -19,6 +19,7 @@ SCALARS = {
     "datetime.time": {"format": "time", "type": "string"},
     "datetime.timedelta": {"format": "duration", "type": "string"},
     "uuid.UUID": {"format": "uuid", "type": "string"},
+    "pathlib.Path": {"format": "path", "type": "string"},
 }
 CONSTRAINTS = {
     "string": {"min_length": "minLength", "max_length": "maxLength", "pattern": "pattern"},

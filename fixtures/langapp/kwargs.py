@@ -90,6 +90,10 @@ async def resp(kind: str):
         return HTMLResponse("<p>x</p>", 202)
     if kind == "redirect":
         return RedirectResponse("/kw/resp/text", 303, {"x-kw": "2"})
+    if kind == "filehdr":
+        # the endpoint's own Content-Disposition wins over the one `filename=` makes (Starlette's setdefault)
+        return FileResponse("fixtures/integapp/test_alembic.ini", media_type="application/pdf", filename="réglages.txt",
+                            headers={"Content-Disposition": 'attachment; filename="reglages.txt"', "ETag": '"fixe"'})
     return FileResponse("fixtures/integapp/test_alembic.ini", 200, None, None, None, "réglages.txt")
 
 

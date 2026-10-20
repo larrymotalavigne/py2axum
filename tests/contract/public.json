@@ -37,17 +37,13 @@
    },
    {
     "flags": [
-     "--backend"
+     "--path"
     ],
-    "action": "StoreAction",
+    "action": "AppendAction",
     "nargs": null,
-    "choices": [
-     "auto",
-     "typed",
-     "dyn"
-    ],
-    "default": "auto",
-    "metavar": null,
+    "choices": null,
+    "default": [],
+    "metavar": "DIR",
     "required": false
    },
    {
@@ -175,16 +171,13 @@
    },
    {
     "flags": [
-     "--backend"
+     "--path"
     ],
-    "action": "StoreAction",
+    "action": "AppendAction",
     "nargs": null,
-    "choices": [
-     "auto",
-     "dyn"
-    ],
-    "default": "auto",
-    "metavar": null,
+    "choices": null,
+    "default": [],
+    "metavar": "DIR",
     "required": false
    },
    {
@@ -532,10 +525,24 @@
   "migrate --sql"
  ],
  "environment": [
+  "APPVEYOR",
+  "CI",
+  "CIRCLECI",
   "DATABASE_URL",
   "DB_POOL_SIZE",
   "FORWARDED_ALLOW_IPS",
+  "GITHUB_ACTIONS",
+  "GITLAB_CI",
   "HOST",
+  "LC_ALL",
+  "LOGURU_AUTOINIT",
+  "LOGURU_BACKTRACE",
+  "LOGURU_CATCH",
+  "LOGURU_COLORIZE",
+  "LOGURU_DIAGNOSE",
+  "LOGURU_ENQUEUE",
+  "LOGURU_LEVEL",
+  "LOGURU_SERIALIZE",
   "PORT",
   "PROMETHEUS_DISABLE_CREATED_SERIES",
   "PROMETHEUS_MULTIPROC_DIR",
@@ -559,6 +566,11 @@
   "PY2AXUM_STREAM_CHUNK",
   "PY2AXUM_STREAM_MIN_ROWS",
   "PY2AXUM_TARGET_PYTHON",
+  "PYCHARM_HOSTED",
+  "PYTHONCOERCECLOCALE",
+  "SOURCE_DATE_EPOCH",
+  "STRIPE_LOG",
+  "TRAVIS",
   "TZ",
   "UVICORN_ACCESS_LOG",
   "UVICORN_FORWARDED_ALLOW_IPS",
@@ -615,6 +627,8 @@
   "P2A0313",
   "P2A0314",
   "P2A0315",
+  "P2A0316",
+  "P2A0318",
   "P2A0401",
   "P2A0402",
   "P2A0403",
@@ -641,6 +655,7 @@
   "P2A0702",
   "P2A0703",
   "P2A0704",
+  "P2A0705",
   "P2A0901",
   "P2A0999"
  ],

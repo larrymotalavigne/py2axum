@@ -12,10 +12,11 @@ pub fn not_implemented() -> V {
 }
 
 /// A type's fully qualified name as CPython 3.15's messages write it (`%T`: the module, unless `builtins`)
-fn qualified(v: &V) -> String {
-    match class_of(v) {
-        Some(c) => c.qualname.to_string(),
-        None => v.type_name().to_string(),
+pub fn qualified(v: &V) -> String {
+    match (class_of(v), v) {
+        (Some(c), _) => c.qualname.to_string(),
+        (None, V::Exc(e)) => e.0.class.qualname.to_string(),
+        _ => v.type_name().to_string(),
     }
 }
 
@@ -24,7 +25,7 @@ fn is_not_impl(v: &V) -> bool {
 }
 
 fn is_inst(v: &V) -> bool {
-    matches!(v, V::Inst(_) | V::Obj(_))
+    matches!(v, V::Inst(_) | V::Obj(_) | V::Exc(_))
 }
 
 fn class_of(v: &V) -> Option<&'static Class> {

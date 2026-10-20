@@ -124,6 +124,7 @@ nav:
       - Graceful shutdown: advanced/shutdown.md
       - Database migrations: advanced/migrations.md
       - Libraries from source: advanced/libraries.md
+      - Generated documents: advanced/documents.md
       - Logging: advanced/logging.md
       - Large list responses: advanced/streaming.md
       - Sentry: advanced/sentry.md

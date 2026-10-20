@@ -16,6 +16,10 @@ for port in $REF_PORT $CAND_PORT; do pid=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -n
 TLS_SMTP=${INTEG_TLS_SMTP_PORT:-8026}
 lsof -tiTCP:$TLS_SMTP -sTCP:LISTEN >/dev/null || { nohup python tests/smtp_sink.py $TLS_SMTP - --tls > "$LOG/tls-sink.log" 2>&1 & sleep 1; }
 export INTEG_TLS_SMTP_PORT=$TLS_SMTP
+# a misbehaving HTTP server (fixtures/integapp/httpxerr.py: httpx's exceptions)
+BAD_HTTP=${INTEG_BAD_HTTP_PORT:-8028}
+lsof -tiTCP:$BAD_HTTP -sTCP:LISTEN >/dev/null || { nohup python tests/bad_http.py $BAD_HTTP > "$LOG/bad-http.log" 2>&1 & sleep 1; }
+export INTEG_BAD_HTTP_PORT=$BAD_HTTP
 lsof -tiTCP:8299 -sTCP:LISTEN >/dev/null || {
 # web push sink (tests/push_sink.py): pywebpush blocks the server that calls it, so its own process
 nohup uvicorn tests.push_sink:app --port 8299 --log-level warning > "$LOG/push-sink.log" 2>&1 & }

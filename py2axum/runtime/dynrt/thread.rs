@@ -477,6 +477,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         if let Native::Suppress(_) = &**n {
             return Ok(V::None);
         }
+        if let Native::Gcm(g) = &**n {
+            return super::agen::gcm_enter(g).await;
+        }
         // `with var.set(x):` (Python 3.14): the token, reset when the block ends
         if let Native::CtxToken(..) = &**n {
             if super::python() < (3, 14) {
@@ -487,6 +490,18 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
         if let Native::Socket(_) | Native::ZipW(_) = &**n {
             return Ok(v.clone());
         }
+        // `with redis.Redis(...) as r` / `with r.pipeline() as pipe`
+        if matches!(&**n, Native::Redis(c) if c.sync) || matches!(&**n, Native::RPipe(p) if p.client.sync) {
+            return Ok(v.clone());
+        }
+        // `with session.begin_nested()` / `session.begin()` of a synchronous Session (an AsyncSession's needs
+        // `async with`, as in SQLAlchemy)
+        if let Native::Savepoint(s, _) = &**n {
+            if s.is_sync() {
+                return super::aio::aenter(cx, v).await;
+            }
+            return Err(super::aio::cm_error("AsyncSessionTransaction", false, true));
+        }
     }
     super::pathio::ctx_enter(v)
 }
@@ -494,6 +509,9 @@ pub async fn enter(cx: &Cx, v: &V) -> R {
 /// leaving `with v`: `exc` when the body raised; a true result suppresses it
 pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
     if let V::Session(_) = v {
+        return super::aio::aexit(cx, v, exc).await;
+    }
+    if matches!(v, V::Native(n) if matches!(&**n, Native::Savepoint(..))) {
         return super::aio::aexit(cx, v, exc).await;
     }
     if let Some(f) = super::ops::dunder(v, "__exit__") {
@@ -507,6 +525,9 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         if let Native::TLock(l) = &**n {
             return lock_method(l, "__exit__", &[], &[]);
         }
+        if let Native::Gcm(g) = &**n {
+            return super::agen::gcm_exit(g, exc).await;
+        }
         if let Native::Prom(p) = &**n {
             return super::prom::exit(p, exc.as_ref());
         }
@@ -515,6 +536,11 @@ pub async fn exit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
         }
         if let Native::Socket(s) = &**n {
             return super::net::sock_method(s, "__exit__");
+        }
+        if matches!(&**n, Native::Redis(c) if c.sync) || matches!(&**n, Native::RPipe(p) if p.client.sync) {
+            let name = if matches!(&**n, Native::Redis(_)) { "close" } else { "reset" };
+            super::methods::call_method(cx, v, name, vec![], vec![]).await?;
+            return Ok(V::Bool(false));
         }
         if let Native::ZipW(z) = &**n {
             super::zipw::method(z, "close", &[], &[])?;

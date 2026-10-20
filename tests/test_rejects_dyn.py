@@ -89,7 +89,7 @@ def test_relationship_rejected(tmp_path, capsys, rel, message):
     (pkg / "__init__.py").write_text("")
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", rel))
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "models.py:" in err
@@ -126,7 +126,7 @@ def test_many_to_many_rejected(tmp_path, capsys, rel, message):
     (pkg / "__init__.py").write_text("")
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", rel) + M2M_TABLES)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
 
@@ -138,7 +138,7 @@ def test_many_to_many_translates(tmp_path):
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace(
         "{rel}", 'members: Mapped[list["User"]] = relationship(secondary=team_users)') + M2M_TABLES)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 SESSION_MAIN = '''
@@ -171,6 +171,14 @@ async def team(team_id: int, s: AsyncSession = Depends(db)):
         ("", "    async with Session() as s:\n        try:\n            yield s\n        except Exception:\n            pass",
          "session dependency db: only"),
         (", info={'a': 1}", "    async with Session() as s:\n        yield s", "async_sessionmaker(info=) is not supported"),
+        # `raise` of another exception than the caught one: not the endpoint's error any more
+        ("", "    s = Session()\n    try:\n        yield s\n    except Exception as exc:\n        await s.rollback()\n"
+             "        raise RuntimeError(exc)\n    finally:\n        await s.close()", "session dependency db: only"),
+        # the session assigned, its close forgotten
+        ("", "    s: AsyncSession = Session()\n    try:\n        yield s\n    finally:\n        pass",
+         "session dependency db: only"),
+        # a factory called with arguments
+        ("", "    factory = Session\n    async with factory(bind=engine) as s:\n        yield s", "session dependency db: only"),
     ],
 )
 def test_session_dependency_rejected(tmp_path, capsys, opts, body, message):
@@ -179,7 +187,73 @@ def test_session_dependency_rejected(tmp_path, capsys, opts, body, message):
     (pkg / "__init__.py").write_text("")
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
     (pkg / "main.py").write_text(SESSION_MAIN.format(opts=opts, body=body))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+MANAGER_MAIN = '''
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from .models import Team
+
+engine = create_async_engine("postgresql+psycopg://x/y")
+
+
+class Manager:
+    def __init__(self):
+        self.maker = None
+
+{methods}
+
+
+manager = Manager()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+{life}
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def db():
+    async with manager.maker() as s:
+        yield s
+
+
+@app.get("/teams/{{team_id}}")
+async def team(team_id: int, s: AsyncSession = Depends(db)):
+    return {{"name": (await s.get(Team, team_id)).name}}
+'''
+
+INIT = "    async def init(self):\n        self.maker = async_sessionmaker(engine)"
+
+
+@pytest.mark.parametrize(
+    "methods, life, message",
+    [
+        (INIT, "    pass", "set by Manager.init(), which the application's lifespan does not call before its yield"),
+        ("    async def init(self, on=True):\n        if on:\n            self.maker = async_sessionmaker(engine)",
+         "    await manager.init()", "set conditionally in Manager.init"),
+        (INIT + "\n\n    def other(self):\n        self.maker = async_sessionmaker(engine, expire_on_commit=False)",
+         "    await manager.init()", "set more than once in its class"),
+        (INIT, "    await manager.init()\n    manager.maker = None", "assigned outside its class"),
+    ],
+)
+def test_instance_session_maker_rejected(tmp_path, capsys, methods, life, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    (pkg / "main.py").write_text(MANAGER_MAIN.format(methods=methods, life=life))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -222,6 +296,12 @@ def team(team_id: int, {param}):
          "sessionmaker(info=) is not supported"),
         ("sessionmaker(bind=engine)", "def db():\n    with Maker() as s:\n        yield s", "s: Session",
          "s: a synchronous Session parameter needs Depends(<session dependency>)"),
+        # the exception swallowed (FastAPI then answers otherwise)
+        ("sessionmaker(bind=engine)", "def db():\n    try:\n        s = Maker()\n        yield s\n    except Exception as e:\n"
+         "        print(e)\n    finally:\n        s.close()", "s: Session = Depends(db)", "session dependency db: only"),
+        # a maker built by a project function from its parameter: its options are not known
+        ("make(False)\n\n\ndef make(flush):\n    return sessionmaker(bind=engine, autoflush=flush)",
+         "def db():\n    with Maker() as s:\n        yield s", "s: Session = Depends(db)", "expected a literal value here"),
     ],
 )
 def test_sync_session_dependency_rejected(tmp_path, capsys, maker, dep, param, message):
@@ -230,7 +310,7 @@ def test_sync_session_dependency_rejected(tmp_path, capsys, maker, dep, param, m
     (pkg / "__init__.py").write_text("")
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
     (pkg / "main.py").write_text(SYNC_MAIN.format(maker=maker, dep=dep, param=param))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -269,7 +349,7 @@ def test_model_declaration_rejected(tmp_path, capsys, decl, message):
         "from sqlalchemy.ext.hybrid import hybrid_property")
     (pkg / "models.py").write_text(models)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "models.py:" in err
@@ -298,7 +378,7 @@ def test_joined_inheritance_construct_rejected(tmp_path, capsys, stmt, message):
                                              "from sqlalchemy.orm import aliased, selectin_polymorphic, with_polymorphic\nfrom .models import Team, Squad")
     main_src = main_src.replace("    t = await s.get(Team, team_id)\n", f"    {stmt}\n    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_src)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -334,7 +414,7 @@ def test_inheritance_rejected(tmp_path, capsys, base_extra, sub, message):
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", base_extra) + "\n\n" + sub + "\n")
     (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace("from .models import Team", "from .models import Team, Squad")
                                  .replace("s.get(Team, team_id)", "s.get(Squad, team_id)"))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "models.py:" in err
@@ -359,7 +439,7 @@ def test_column_type_factory_rejected(tmp_path, capsys, factory, use, message):
     models = textwrap.dedent(MODELS).replace("{rel}", f"code: Mapped[str] = mapped_column({use})")
     (pkg / "models.py").write_text(models + "\n\n" + factory + "\n")
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "models.py:" in err
@@ -375,7 +455,7 @@ def test_column_type_factory_other_module(tmp_path, capsys):
     (pkg / "models.py").write_text(models.replace("from sqlalchemy import ForeignKey, String",
                                                   "from sqlalchemy import ForeignKey, String\nfrom .kinds import kind"))
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "`String` in kind() does not mean the same" in err
     assert "kinds.py:5" in err
@@ -409,7 +489,7 @@ def test_python_semantics_rejected(tmp_path, capsys, body, message):
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n" + body + "\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -429,7 +509,7 @@ def test_exception_attributes_set_by_the_runtime_accepted(tmp_path, body):
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n" + body + "\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 @pytest.mark.parametrize(
@@ -454,7 +534,7 @@ def test_execute_with_parameters_rejected(tmp_path, capsys, call, message):
                                             "from .models import Team")
     main_py = main_py.replace("    t = await s.get(Team, team_id)\n", f"    {call}\n    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -487,7 +567,7 @@ def test_loader_option_arguments_rejected(tmp_path, capsys, call, message):
                                             "from .models import Team")
     main_py = main_py.replace("    t = await s.get(Team, team_id)\n", f"    {call}\n    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -511,7 +591,7 @@ def test_model_table_core_use_rejected(tmp_path, capsys, body, message):
     (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom sqlalchemy import select\nfrom .models import Squad, Team\n\n"
                                  "app = FastAPI()\n\n\ndef helper(t):\n    return t\n\n\n"
                                  "@app.get('/x')\nasync def x():\n" + body + "\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     assert message in capsys.readouterr().err
 
 
@@ -524,7 +604,7 @@ def test_session_in_endpoint_options_rejected(tmp_path, capsys):
                                             "    async with AsyncSession(engine, info={}) as s2:\n        pass\n"
                                             "    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "AsyncSession() is supported with the engine" in err and "P2A0505" in err
 
@@ -554,7 +634,7 @@ def test_hybrid_rejected(tmp_path, capsys, extra, message):
                             + HYBRID + extra, 1)
     (pkg / "models.py").write_text(models)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     assert message in capsys.readouterr().err
 
 
@@ -568,7 +648,7 @@ def test_execute_text_with_parameters_translates(tmp_path):
                               "    stmt = text('SELECT 1 WHERE 1 = :x')\n    await s.execute(stmt, {'x': 1})\n"
                               "    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 @pytest.mark.parametrize("imp, base", [("from sqlalchemy.ext import hybrid", "hybrid.Comparator"),
@@ -588,7 +668,7 @@ def test_hybrid_comparator_translates(tmp_path, capsys, imp, base):
     main_py = main_py.replace("    t = await s.get(Team, team_id)\n", "    await s.execute(select(Team).filter_by(label='x'))\n"
                               "    t = await s.get(Team, team_id)\n")
     (pkg / "main.py").write_text(main_py)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
     assert "not implemented by the runtime" not in (tmp_path / "out" / "src" / "gen.rs").read_text()
 
 
@@ -621,7 +701,7 @@ def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
         async def x(body: In):
             return body
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert 'validate_assignment=True with @model_validator(mode="before") is not supported' in err
     assert "main.py:" in err
@@ -653,6 +733,12 @@ def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
         ("    p: Cat | Plain = Field(discriminator='kind')", "Plain.kind must be a Literal[...] of strings"),
         ("    p: Cat | Num = Field(discriminator='kind')", "Num.kind tags other than strings are not supported"),
         ("    p: Cat | Cat2 = Field(discriminator='kind')", "tag 'c' is in two members"),
+        ("    model_config = ConfigDict(alias_generator=Dog.model_config['alias_generator'])\n    a: int",
+         "`Dog.model_config['alias_generator']`: that model has no alias generator"),
+        ("    model_config = ConfigDict(**{'strict': True})\n    a: int", "model_config: `{'strict': True}` is not supported"),
+        ("    model_config = {**dict(strict=True)}\n    a: int", "model_config: `dict(strict=True)` is not supported"),
+        ("    model_config = ConfigDict(allow_inf_nan=True)\n    a: float", "allow_inf_nan= other than False is not supported"),
+        ("    model_config = ConfigDict(validate_default=True)\n    a: float = 1", "validate_default=True is not supported"),
     ],
 )
 def test_schema_declaration_rejected(tmp_path, capsys, body, message):
@@ -667,7 +753,35 @@ def test_schema_declaration_rejected(tmp_path, capsys, body, message):
         "class Dog(BaseModel):\n    kind: Literal['d']\n\n\nclass Plain(BaseModel):\n    kind: str\n\n\n"
         "class Num(BaseModel):\n    kind: Literal[1]\n\n\n"
         f"class In(BaseModel):\n{body}\n\n\n@app.post('/x')\nasync def x(b: In):\n    return b\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "prelude, config, message",
+    [
+        ("", "ConfigDict(**Base.model_config, strict=False)",
+         "ConfigDict() got multiple values for keyword argument 'strict'"),
+        ("def gen(name):\n    while name:\n        return name\n    return 'x'\n", "ConfigDict(alias_generator=gen)",
+         "cannot be evaluated at translation time"),
+        ("def gen(name):\n    return helper(name)\n", "ConfigDict(alias_generator=gen)", "cannot be evaluated at translation time"),
+        ("G = 'g'\n\n\ndef gen(name):\n    global G\n    return G + name\n", "ConfigDict(alias_generator=gen)",
+         "cannot be evaluated at translation time"),
+    ],
+)
+def test_config_from_project_rejected(tmp_path, capsys, prelude, config, message):
+    """`**Other.model_config`, generators of several statements: what cannot be exact is refused"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "from fastapi import FastAPI\nfrom pydantic import BaseModel, ConfigDict\n\napp = FastAPI()\n\n\n" + prelude
+        + "\n\nclass Base(BaseModel):\n    model_config = ConfigDict(strict=True)\n\n\n"
+        f"class In(BaseModel):\n    model_config = {config}\n    some_field: int\n\n\n"
+        "@app.post('/x')\nasync def x(b: In):\n    return b\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -689,7 +803,7 @@ def test_plain_class_inheritance_rejected(tmp_path, capsys, classes, message):
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text("from fastapi import FastAPI\n\napp = FastAPI()\n\n\n" + classes
                                  + "\n\n@app.get('/x')\nasync def x():\n    c = C()\n    return {'m': c.m() if hasattr(c, 'm') else 0}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -703,7 +817,7 @@ def test_imported_rebound_global_rejected(tmp_path, capsys):
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\nfrom .state import bump, count\n\napp = FastAPI()\n\n\n"
         "@app.get('/x')\nasync def x():\n    bump()\n    return {'n': count}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "copies a variable that a function rebinds" in err
     assert "main.py:" in err
@@ -727,7 +841,7 @@ def test_dataclass_rejected(tmp_path, capsys, decl, message):
     (pkg / "main.py").write_text(
         "from dataclasses import dataclass, field\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n" + decl
         + "\n\n@app.get('/x')\nasync def x():\n    return {'c': C(1)}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -756,7 +870,7 @@ def test_type_decorator_rejected(tmp_path, capsys, body, message):
     (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace("from .models import Team", "from .models import Team, User")
                                  + "\n\n@app.get('/users/{uid}')\nasync def user(uid: int, s: AsyncSession = Depends(db)):\n"
                                    "    u = await s.get(User, uid)\n    return {'secret': u.secret}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "models.py:" in err
@@ -775,7 +889,7 @@ def test_generator_dependency_scope_rejected(tmp_path, capsys, dep_kw, message):
         "    yield 1\n\n\n"
         f"async def outer(i: int = Depends(inner, {dep_kw})):\n    yield i\n\n\n"
         "@app.get('/x')\nasync def x(v: int = Depends(outer)):\n    return {'v': v}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -788,7 +902,7 @@ def test_form_in_dependency_rejected(tmp_path, capsys):
     (pkg / "main.py").write_text(
         "from fastapi import Depends, FastAPI, Form\n\napp = FastAPI()\n\n\nasync def dep(x: str = Form(...)):\n    return x\n\n\n"
         "@app.post('/x')\nasync def x(v: str = Depends(dep)):\n    return {'v': v}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "Form()/File() parameters of a dependency are not supported" in err
 
@@ -825,7 +939,7 @@ def test_middleware_stack_rejected(tmp_path, capsys, code, message):
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\nfrom fastapi.middleware.cors import CORSMiddleware\n\napp = FastAPI()\n"
         + code + "\n\n@app.get('/x')\nasync def x():\n    return {}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -838,7 +952,7 @@ def test_unknown_async_with_rejected(tmp_path, capsys):
     (pkg / "main.py").write_text(
         "import contextlib\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n"
         "    async with contextlib.AsyncExitStack() as stack:\n        return {'ok': True}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "contextlib.AsyncExitStack()" in err and "not supported" in err
     assert "main.py:" in err
@@ -852,9 +966,35 @@ def test_mixed_decorators_rejected(tmp_path, capsys):
         "from functools import lru_cache\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n"
         "def deco(f):\n    return f\n\n\n@deco\n@lru_cache\ndef conf():\n    return 1\n\n\n"
         "@app.get('/x')\nasync def x():\n    return {'v': conf()}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "@lru_cache combined with @deco is not supported" in err
+    assert "main.py:" in err
+
+
+METHOD_DECOS = [
+    # a property's deleter, a setter without its property, a decorator class (descriptor), the plain decorators beside a value one
+    ("    @property\n    def x(self):\n        return 1\n\n    @x.deleter\n    def x(self):\n        pass\n",
+     "main.py:12: C.x: decorator @x.deleter is not supported"),
+    ("    @x.setter\n    def x(self, v):\n        pass\n", "decorator @x.setter is not supported without a `@property def x`"),
+    ("    @Descr\n    def x(self):\n        return 1\n", "decorator @Descr is not supported (it is a class: a descriptor"),
+    ("    @classmethod\n    @deco\n    def x(cls):\n        return 1\n", "@classmethod combined with @deco is not supported"),
+    ("    @functools.cached_property\n    @deco\n    def x(self):\n        return 1\n", "decorator @cached_property is not supported beside another decorator"),
+]
+
+
+@pytest.mark.parametrize("body,message", METHOD_DECOS)
+def test_method_decorators_rejected(tmp_path, capsys, body, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "import functools\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n"
+        "def deco(f):\n    return f\n\n\nclass Descr:\n    def __init__(self, f):\n        pass\n\n\n"
+        "class C:\n" + body + "\n\n@app.get('/x')\nasync def x():\n    return {'v': C().x}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message.replace("main.py:12: ", "") in err
     assert "main.py:" in err
 
 
@@ -877,7 +1017,7 @@ async def m(name: str):
     "arg, message",
     [
         ("name", "importlib.import_module() of a computed name is not supported"),
-        ('"json"', "importlib.import_module('json'): only modules of the project are supported"),
+        ('"json"', "importlib.import_module('json'): the module is neither a module of the project nor installed"),
     ],
 )
 def test_import_module_rejected(tmp_path, capsys, arg, message):
@@ -885,7 +1025,7 @@ def test_import_module_rejected(tmp_path, capsys, arg, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(IMPORT_MAIN.format(arg=arg))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:11" in err
@@ -919,7 +1059,7 @@ def test_collections_rejected(tmp_path, capsys, expr, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(COLLS_MAIN.format(expr=expr))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:12" in err
@@ -951,7 +1091,7 @@ def test_tenacity_options_rejected(tmp_path, capsys, opt):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(TENACITY_MAIN.format(opt=opt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert f"tenacity.retry({opt.split('=')[0]}=) is not supported" in err
     assert "main.py:10" in err
@@ -982,7 +1122,7 @@ def test_prometheus_outside_subset_rejected(tmp_path, capsys, stmt, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(PROM_MAIN.format(stmt=stmt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert "main.py:11" in err
@@ -1019,7 +1159,7 @@ def test_pyjwt_outside_subset_rejected(tmp_path, capsys, stmt, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(PYJWT_MAIN.format(stmt=stmt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert "main.py:11" in err
@@ -1044,7 +1184,7 @@ except ValueError:
 async def l():
     return {"limit": LIMIT}
 """)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "the module variable `LIMIT` is bound by several module-level statements (lines 5, 6): not supported" in err
     assert "main.py:6" in err
@@ -1072,7 +1212,7 @@ app = create_app()
 
 
 @pytest.mark.parametrize("stmt, msg", [
-    ("app.include_router(r)", "configure(): `app.include_router(...)` on the application passed to a function is not supported"),
+    # (a single `configure(app)` that includes routers is native: test_router_configure_function)
     ("app.add_middleware(CORSMiddleware, allow_origins=['*'])",
      "add_middleware(CORSMiddleware) outside the app factory is not supported"),
 ])
@@ -1082,7 +1222,7 @@ def test_configure_function_registrations_rejected(tmp_path, capsys, stmt, msg):
     (pkg / "__init__.py").write_text("")
     (pkg / "router.py").write_text("from fastapi import APIRouter\n\nr = APIRouter()\n\n\n@r.get('/x')\nasync def x():\n    return {}\n")
     (pkg / "main.py").write_text(CONFIGURE_MAIN.format(stmt=stmt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert "main.py:9" in err
@@ -1108,7 +1248,7 @@ async def p():
     patch()
     return {}
 """)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "assigning `aiohttp.ClientSession.get` (a library attribute) is not supported" in err
     assert "main.py:9" in err
@@ -1139,10 +1279,200 @@ def create_app() -> FastAPI:
 
 app = create_app()
 """)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "include_router(prefix=<non-literal>) inside a function (app factory) is not supported" in err
     assert "main.py:16" in err
+
+
+ROUTER_GUARD = """
+import os
+
+from fastapi import APIRouter, FastAPI
+
+try:
+    from proj import opt
+except ImportError:
+    opt = None
+
+app = FastAPI()
+r = APIRouter()
+
+
+@r.get("/x")
+async def x():
+    return {}
+
+
+if %s:
+    app.include_router(%s)
+"""
+
+
+@pytest.mark.parametrize("present,test,arg,message,line", [
+    # the project's own module, absent: ImportError decided statically, the guarded registration never runs
+    (False, "opt is not None", "opt.router", None, None),
+    (False, "opt is None", "r", None, None),
+    (True, "opt is not None", "opt.router", None, None),
+    (True, "opt", "opt.router", None, None),
+    # read once at startup (module level, the environment and the settings)
+    (False, 'os.environ.get("X")', "r", None, None),
+    (False, 'os.environ.get("X", "a").lower() == "b" and opt is None', "r", None, None),
+    # a test that calls the project's code (or anything else): refused
+    (False, "x()", "r", "include_router(...) under an `if` is not supported", 16),
+])
+def test_router_import_guard(tmp_path, capsys, present, test, arg, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    if present:
+        (pkg / "opt.py").write_text('from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n@router.get("/o")\n'
+                                    'async def o():\n    return {}\n')
+    (pkg / "main.py").write_text(ROUTER_GUARD % (test, arg))
+    rc = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert rc == 0, err
+        return
+    assert rc == 1
+    assert message in err and f"main.py:{line}" in err
+
+
+ROUTER_CONFIGURE = """
+from fastapi import APIRouter, FastAPI
+
+a = APIRouter()
+b = APIRouter()
+
+
+@a.get("/a")
+async def ra():
+    return {}
+
+
+@b.get("/b")
+async def rb():
+    return {}
+
+
+ROUTERS = %s
+
+
+def add_routers(app):
+    for r in ROUTERS:
+        app.include_router(r)
+
+
+app = FastAPI()
+%s
+"""
+
+
+@pytest.mark.parametrize("routers,calls,message,line", [
+    ("(a, b)", "add_routers(app)", None, None),
+    ("[a, b]", "add_routers(app)", None, None),
+    ("[a, b]\nROUTERS.append(a)", "add_routers(app)", "include_router: cannot resolve `r` to an APIRouter", 24),
+    ("(a, b)", "add_routers(app)\nadd_routers(app)", "on the application passed to a function is not supported", 23),
+    ("(a, b)", "add_routers(app=app)\nother = FastAPI()\nadd_routers(other)", "on the application passed to a function is not supported", 23),
+])
+def test_router_configure_function(tmp_path, capsys, routers, calls, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(ROUTER_CONFIGURE % (routers, calls))
+    rc = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert rc == 0, err
+        return
+    assert rc == 1
+    assert message in err and f"main.py:{line}" in err, err
+
+
+def test_router_default_response_class_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+from fastapi import APIRouter, FastAPI
+from fastapi.responses import RedirectResponse
+
+r = APIRouter(default_response_class=RedirectResponse)
+
+
+@r.get("/x")
+async def x():
+    return "/y"
+
+
+app = FastAPI()
+app.include_router(r)
+""")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "APIRouter(default_response_class=RedirectResponse) is not supported" in err
+    assert "main.py:5" in err
+
+
+@pytest.mark.parametrize("body,message,line", [
+    ("    r = APIRouter()\n    r.include_router(a)\n    return r\n", None, None),
+    # a route declared on the local router, or anything else built in the function: not a router factory
+    ("    r = APIRouter()\n\n    @r.get('/z')\n    async def z():\n        return {}\n    return r\n",
+     "include_router: cannot resolve `build()` to an APIRouter", 18),
+    ("    r = APIRouter()\n    r.include_router(a)\n    print(r)\n    return r\n",
+     "include_router: cannot resolve `build()` to an APIRouter", 18),
+])
+def test_router_factory_function(tmp_path, capsys, body, message, line):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+from fastapi import APIRouter, FastAPI
+
+a = APIRouter()
+
+
+@a.get("/a")
+async def ra():
+    return {}
+
+
+def build():
+%s
+
+app = FastAPI()
+app.include_router(build())
+""" % body)
+    rc = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    if message is None:
+        assert rc == 0, err
+        return
+    assert rc == 1
+    assert message in err, err
+
+
+def test_router_as_keyword(tmp_path, capsys):
+    """`include_router(prefix=..., router=r)`: its routes are registered (they were skipped without an error)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+from fastapi import APIRouter, FastAPI
+
+a = APIRouter()
+
+
+@a.get("/a")
+async def ra():
+    return {}
+
+
+app = FastAPI()
+app.include_router(prefix="/kw", router=a)
+""")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+    assert 'pattern: "^/kw/a$"' in (tmp_path / "out" / "src" / "gen.rs").read_text()
 
 
 def test_model_method_decorator_rejected(tmp_path, capsys):
@@ -1153,7 +1483,7 @@ def test_model_method_decorator_rejected(tmp_path, capsys):
                                              "    @functools.cache\n    def cached(self):\n        return 2")
     (pkg / "models.py").write_text("import functools\n" + models)
     (pkg / "main.py").write_text(textwrap.dedent(MAIN))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "decorator @functools.cache is not supported (only @property, @staticmethod and @classmethod)" in err
     assert "models.py:" in err
@@ -1168,7 +1498,7 @@ def test_attribute_read_allowed_when_project_computes_attributes(tmp_path):
         "from fastapi import FastAPI\n\napp = FastAPI()\n\n\nclass Bag:\n    def __init__(self, **kw):\n"
         "        for k, v in kw.items():\n            setattr(self, k, v)\n\n\n@app.get('/x')\nasync def x():\n"
         "    return {'a': Bag(frobnicated=1).frobnicated}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 @pytest.mark.parametrize(
@@ -1220,7 +1550,7 @@ def test_lifespan_rejected(tmp_path, capsys, decl, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(f"from fastapi import FastAPI\n\n{decl}\n\n\n@app.get('/x')\nasync def x():\n    return {{}}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -1316,7 +1646,7 @@ def test_mcp_rejected(tmp_path, capsys, server_kw, tool, app_kw, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(MCP_APP.format(server_kw=server_kw, tool=tool, app_kw=app_kw))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -1357,7 +1687,7 @@ def test_union_member_with_validators_rejected(tmp_path, capsys):
         async def x(body: In):
             return body
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "a Union containing A (validators, which would make Pydantic try the next member" in err
     assert "main.py:24" in err
@@ -1368,7 +1698,7 @@ def test_mcp_accepted(tmp_path):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(MCP_APP.format(server_kw=", title='T', instructions='i'", tool=TOOL, app_kw=OK_APP_KW))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "MCP_TOOL_" in gen and '\\"title\\":\\"t1Arguments\\"' in gen
 
@@ -1380,7 +1710,7 @@ def test_raw_asgi_class_endpoint_rejected(tmp_path, capsys):
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\n\n\nclass Ep:\n    async def __call__(self, scope, receive, send):\n        pass\n\n\n"
         "app = FastAPI()\napp.add_route('/raw', Ep)\n\n\n@app.get('/x')\nasync def x():\n    return {}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "add_route() with a class endpoint" in err and "main.py:10" in err
 
@@ -1436,19 +1766,22 @@ def test_websocket_rejected(tmp_path, capsys, extra, message, line):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(WS_APP.format(extra="\n\n" + extra))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err and f"main.py:{line}" in err, err
 
 
-def test_websocket_python_side_rejected(tmp_path, capsys):
+def test_websocket_python_side_relayed(tmp_path, capsys):
+    """A WebSocket route declared --python-side: not compiled, its path relayed to the Python process (ws::relay)"""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
-    (pkg / "main.py").write_text(WS_APP.format(extra='\n\n@app.websocket("/w")\nasync def w(websocket: WebSocket):\n    await websocket.accept()\n'))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "/w", "-o", str(tmp_path / "out")]) == 1
+    (pkg / "main.py").write_text(WS_APP.format(extra='\n\n@app.websocket("/w")\nasync def w(websocket: WebSocket):\n    import ujson\n    await websocket.accept()\n'))
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "/w", "-o", str(tmp_path / "out")]) == 0
     err = capsys.readouterr().err
-    assert "WebSocket route /w cannot be declared --python-side" in err and "main.py:22" in err, err
+    assert "WEBSOCKET /w declared Python-side" in err, err
+    main_rs = "".join((tmp_path / "out" / "src" / "main.rs").read_text().split())
+    assert 'set_python_side(&["/w"],' in main_rs, main_rs
 
 
 def test_websocket_accepted(tmp_path):
@@ -1472,7 +1805,7 @@ async def w(websocket: WebSocket, room: str, n: int = 1):
 
 app.include_router(router)
 '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "/// WEBSOCKET /r/w/{room}" in gen and "WsRouteDef" in gen and "Node::Ws" in gen
 
@@ -1531,7 +1864,7 @@ def test_model_json_schema_rejected(tmp_path, capsys, other, body, message, line
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(JSON_SCHEMA_APP.format(other=other, body=body))
-    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")])
+    code = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
     err = capsys.readouterr().err
     if message is None:
         assert code == 0, err
@@ -1557,7 +1890,7 @@ def test_library_options_rejected(tmp_path, capsys, body, message):
     (pkg / "main.py").write_text(
         "import json\nimport unicodedata\n\nfrom fastapi import FastAPI\nfrom sqlalchemy import inspect\n\n"
         f"app = FastAPI()\n\n\n@app.get('/x')\nasync def x(x: str = 'a'):\n    {body}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err and "main.py:12" in err
 
@@ -1630,7 +1963,7 @@ def test_builtin_keywords_rejected(tmp_path, capsys, expr, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(f"from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x(x: str = 'ab'):\n    return {expr}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err and "main.py:8" in err
 
@@ -1642,7 +1975,7 @@ def test_custom_response_class_rejected(tmp_path, capsys):
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\nfrom fastapi.responses import UJSONResponse\n\napp = FastAPI()\n\n\n"
         "@app.get('/x', response_class=UJSONResponse)\nasync def x():\n    return {}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "response_class=UJSONResponse is not supported" in err and "main.py:7" in err
 
@@ -1656,7 +1989,7 @@ def test_uuid_as_str_column_rejected(tmp_path, capsys):
         "class Base(DeclarativeBase):\n    pass\n\n\nclass T(Base):\n    __tablename__ = 't'\n"
         "    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True)\n")
     (pkg / "main.py").write_text(MAIN.replace("from .models import Team", "from .models import T as Team"))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "Uuid(as_uuid=False) is not supported" in err and "models.py:11" in err
 
@@ -1668,7 +2001,7 @@ def test_http_basic_realm_must_be_literal(tmp_path, capsys):
     (pkg / "main.py").write_text(
         "from fastapi import Depends, FastAPI\nfrom fastapi.security import HTTPBasic\n\nREALM = 'x'\n"
         "basic = HTTPBasic(realm=REALM)\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x(c=Depends(basic)):\n    return {}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "HTTPBasic(realm=) must be a literal string" in err and "main.py:5" in err
 
@@ -1709,14 +2042,14 @@ def _version_project(tmp_path, name):
 @pytest.mark.parametrize("name, expected", [('"FastAPI"', '"0.142.2"'), ('"requests"', "PACKAGE_NOT_FOUND")])
 def test_distribution_version_from_pyproject_and_lock(tmp_path, name, expected):
     pkg = _version_project(tmp_path, name)
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert 'V::str("1.2.3")' in gen and expected in gen
 
 
 def test_distribution_version_needs_literal(tmp_path, capsys):
     pkg = _version_project(tmp_path, "__name__")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "importlib.metadata.version() needs one literal distribution name" in err and "main.py:16" in err
 
@@ -1729,7 +2062,7 @@ def test_app_wrapped_in_asgi_class_rejected(tmp_path, capsys):
         "from fastapi import FastAPI\n\n\nclass Quota:\n    def __init__(self, app):\n        self.app = app\n\n"
         "    async def __call__(self, scope, receive, send):\n        await self.app(scope, receive, send)\n\n\n"
         "api = FastAPI()\n\n\n@api.get('/x')\nasync def x():\n    return {}\n\n\napp = Quota(api)\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "the application wrapped in an ASGI class (`Quota(api)`) is not supported" in err and "main.py:20" in err
 
@@ -1766,7 +2099,7 @@ def test_sentry_outside_subset_rejected(tmp_path, capsys, stmt, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(SENTRY_APP.format(stmt=stmt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err and "main.py:11" in err
 
@@ -1802,7 +2135,7 @@ def test_sentry_init_in_factory_not_translatable_rejected(tmp_path, capsys):
 
         app = create_app()
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "`nonlocal n` naming a parameter of the enclosing function is not supported" in err and "main.py:8" in err
 
@@ -1843,7 +2176,7 @@ def test_library_ports_rejected(tmp_path, capsys, body, msg, line):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(LIBS_MAIN.format(body=body))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert f"main.py:{line}" in err
@@ -1879,11 +2212,46 @@ def test_croniter_outside_subset_rejected(tmp_path, capsys, body, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(CRON_MAIN.format(body=body))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert "main.py:12" in err
 
+
+
+REDIS_MAIN = """
+import redis
+import redis.asyncio as aredis
+from fastapi import FastAPI
+
+app = FastAPI()
+OPTS = {{"decode_responses": True}}
+
+
+@app.get("/x")
+async def x():
+    r = redis.Redis.from_url("redis://127.0.0.1:6379/0")
+    return {body}
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ('redis.Redis.from_url("redis://h", ssl_cert_reqs=None)', "redis.Redis.from_url(): option ssl_cert_reqs= is not supported"),
+    ('redis.Redis("localhost", 6379)', "redis.Redis(): pass the address as keywords"),
+    ('aredis.Redis.from_url("redis://h", encoding="latin-1")', "encoding= other than a literal 'utf-8' is not supported"),
+    ('redis.ConnectionPool.from_url("redis://h", **OPTS)', "redis.ConnectionPool.from_url(): `**options` is not supported"),
+    ('aredis.Redis(connection_pool=None, unix_socket_path="/x")', "option unix_socket_path= is not supported"),
+    ('r.xread({"s": 0})', "method .xread() is not implemented by the runtime"),
+])
+def test_redis_outside_subset_rejected(tmp_path, capsys, body, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(REDIS_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:13" in err
 
 
 POPULAR_MAIN = """
@@ -1917,7 +2285,7 @@ def test_popular_libraries_rejected(tmp_path, capsys, body, msg, line):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(POPULAR_MAIN.format(body=body))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err, err
     assert f"main.py:{line}" in err
@@ -1952,7 +2320,7 @@ async def x():
         # a route after it would be shadowed in Python but served by the binary
         ('app.mount("/sub", sub)\n\n\n@app.get("/y")\nasync def y():\n    return {}',
          "", ["--python-side", "mount"], "`app.get(...)` at ", 16),
-        ('app.mount("/sub", sub)\napp.add_api_route("/y", x)', "", ["--python-side", "auto"], "`app.add_api_route(...)` at ", 16),
+        ('app.mount("/sub", sub)\napp.add_api_route("/y", x)', "", ["--python-side", "mount"], "`app.add_api_route(...)` at ", 16),
         ('def setup():\n    app.mount("/sub", sub)', "", ["--python-side", "mount"], "is in another function", 17),
         ('app.mount("/sub", sub)', "from fastapi import APIRouter\n\nfrom .main import app\n\n\n@app.get('/z')\nasync def z():\n"
          "    return {}\n", ["--python-side", "mount"], "is in another module", 16),
@@ -1964,7 +2332,7 @@ def test_mount_left_to_python(tmp_path, capsys, tail, other, flags, message, lin
     (pkg / "__init__.py").write_text("")
     (pkg / "other.py").write_text(other)
     (pkg / "main.py").write_text(MOUNT_APP.format(tail=tail))
-    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", *flags, "-o", str(tmp_path / "out")])
+    code = main([str(pkg), "--root", str(tmp_path), *flags, "-o", str(tmp_path / "out")])
     err = capsys.readouterr().err
     if message is None:
         assert code == 0, err
@@ -2006,10 +2374,9 @@ async def x():
         # Starlette tries the routes in order and the library's are unknown: nothing may register after it
         ('app.include_router(ext_router)\n\n\n@app.get("/y")\nasync def y():\n    return {}', ["--python-side", "mount"],
          "`app.get(...)` at ", 15),
-        ("def setup(a):\n    a.add_route('/m', x)\n\n\napp.include_router(ext_router)\nsetup(app)", ["--python-side", "mount"],
-         "registers routes after it (`a.add_route(...)` at ", 19),
-        ("def inner(b):\n    b.add_api_route('/m', x)\n\n\ndef setup(a):\n    inner(a)\n\n\napp.include_router(ext_router)\n"
-         "setup(app)", ["--python-side", "mount"], "registers routes after it (`b.add_api_route(...)` at ", 23),
+        # a route added after it at startup: relayed to Python, which tries the library's first (routing::lib_barrier)
+        ("async def m(request):\n    return None\n\n\ndef setup(a):\n    a.add_route('/m', m)\n\n\n"
+         "app.include_router(ext_router)\nsetup(app)", ["--python-side", "mount"], None, ['""']),
         ("if os.environ.get('LIB'):\n    app.include_router(ext_router)", ["--python-side", "mount"], "registered conditionally", 16),
         ("app.include_router(ext_router, prefix=os.environ['P'])", ["--python-side", "mount"], "must be a literal string", 15),
         ("r = APIRouter()\nr.include_router(ext_router)\napp.include_router(r)", ["--python-side", "mount"],
@@ -2022,7 +2389,7 @@ def test_library_router_left_to_python(tmp_path, capsys, tail, flags, message, l
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(LIB_ROUTER_APP.format(tail=tail))
-    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", *flags, "-o", str(tmp_path / "out")])
+    code = main([str(pkg), "--root", str(tmp_path), *flags, "-o", str(tmp_path / "out")])
     err = capsys.readouterr().err
     if message is None:
         assert code == 0, err
@@ -2067,7 +2434,7 @@ def test_model_construct_refusals(tmp_path, capsys, model, call, message):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(CONSTRUCT_APP.format(model=model, call=call))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err and "main.py:" in err, err
 
@@ -2121,7 +2488,7 @@ def test_class_attribute_functions(tmp_path, capsys, attr, use, message, line):
     (pkg / "__init__.py").write_text("")
     (pkg / "names.py").write_text("__all__ = ['LISTED', 'OK']\nLISTED = 1\nUNLISTED = 2\n_HIDDEN = 3\nOK = 4\n")
     (pkg / "main.py").write_text(CLASS_ATTR_APP.format(attr=attr, use=use))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err and f"main.py:{line}" in err, err
 
@@ -2161,7 +2528,7 @@ def test_parameter_markers_in_module_variables(tmp_path, capsys, globals_, a, b,
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(MARKER_APP.format(globals=globals_, a=a, b=b))
-    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")])
+    code = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
     err = capsys.readouterr().err
     if message is None:
         assert code == 0, err
@@ -2226,7 +2593,7 @@ def _ddl_project(tmp_path, extra="", call="await conn.run_sync(Base.metadata.cre
     (pkg / "main.py").write_text(DDL_MAIN.format(call=call))
     for name, src in (files or {}).items():
         (pkg / name).write_text(src)
-    return main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")])
+    return main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
 
 
 def test_create_all_compiles_sqlalchemy_ddl(tmp_path):
@@ -2370,7 +2737,7 @@ def test_factory_sentry_init_not_blamed_for_route_errors(tmp_path, capsys):
 
         app = create_app()
     '''))
-    code = main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--python-side", "auto", "-o", str(tmp_path / "out")])
+    code = main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")])
     err = capsys.readouterr().err
     assert code == 0, err
     assert "app factory statement" not in err
@@ -2399,7 +2766,7 @@ def _letters_project(tmp_path, letters: str, views: str):
     return pkg
 
 
-_STYLED = 'import reportlab.lib.styles\n\n\ndef styled():\n    return reportlab.lib.styles.ParagraphStyle("x")\n\n\n'
+_STYLED = 'import reportlab.platypus\n\n\ndef styled():\n    return reportlab.platypus.KeepTogether([])\n\n\n'
 
 
 @pytest.mark.parametrize("fill", [
@@ -2432,11 +2799,11 @@ def test_global_filled_with_untranslatable_function_blocks_readers(tmp_path, cap
         async def pdf():
             return {"s": str(GENERATORS["pdf"]())}
     ''')
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
-    assert "letters.py:5: library call `reportlab.lib.styles.ParagraphStyle()` is not supported" in err
+    assert "letters.py:5: library call `reportlab.platypus.KeepTogether()` is not supported" in err
     rep = tmp_path / "rep.md"
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "--report", str(rep)]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "--report", str(rep)]) == 0
     data = json.loads(rep.with_suffix(".json").read_text())
     status = {r["path"]: r["status"] for r in data["routes"]}
     # reading the global may call what it holds: both readers are blocked, as the build refuses them
@@ -2457,7 +2824,7 @@ def test_module_level_class_attribute_assignment_rejected(tmp_path, capsys):
         async def pdf():
             return GENERATORS
     ''')
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     assert "letters.py:5: assigning the class attribute `C.x` at module level is not supported" in capsys.readouterr().err
 
 
@@ -2481,7 +2848,7 @@ def test_module_level_assignment_to_an_unmapped_library_is_left_to_python(tmp_pa
         async def x():
             return {"ok": True}
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -2503,7 +2870,7 @@ def test_class_dependency_rejected(tmp_path, capsys, classes, param, message):
     (pkg / "main.py").write_text(
         "from fastapi import Depends, FastAPI\nfrom pydantic import BaseModel, Field, field_validator\n\napp = FastAPI()\n\n\n"
         f"{classes}\n\n@app.get('/x')\nasync def x({param}):\n    return p\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -2519,7 +2886,7 @@ def test_super_cls_cls_with_subclass_rejected(tmp_path, capsys):
         "class A(BaseModel):\n    n: int\n\n    @classmethod\n    def model_validate(cls, obj, **kw):\n"
         "        return super(cls, cls).model_validate(obj, **kw)\n\n\nclass B(A):\n    pass\n\n\n"
         "@app.post('/x')\nasync def x(body: dict):\n    return A.model_validate(body)\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "`super(cls, cls)` in A, which B subclass" in err
     assert "main.py:" in err
@@ -2544,7 +2911,7 @@ def test_module_attribute_assignment_accepted(tmp_path, capsys):
             conf.LIMIT = 2
             return {"limit": conf.LIMIT}
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 NET_MAIN = """
@@ -2581,7 +2948,7 @@ def test_network_and_archive_options_rejected(tmp_path, capsys, body, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(NET_MAIN.format(body=body))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert "main.py:13" in err
@@ -2617,7 +2984,7 @@ def test_before_validator_after_an_after_validator_rejected(tmp_path, capsys):
         async def x(body: In):
             return body
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert 'a mode="before" validator defined after a mode="after" validator of the same field is not supported' in err
     assert "main.py:" in err
@@ -2632,7 +2999,7 @@ def test_engine_libpq_options_rejected(tmp_path, capsys, opts, found):
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
     engine = f'engine = create_async_engine("postgresql+psycopg://x/y", connect_args={{"options": {opts!r}}})'
     (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace('engine = create_async_engine("postgresql+psycopg://x/y")', engine))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert f"main.py:7: connect_args options: only `-c name=value` and `--name=value` switches are supported (found {found})" in err
 
@@ -2645,7 +3012,7 @@ def test_engine_connect_args_generated(tmp_path):
     (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
     engine = 'engine = create_async_engine("postgresql+psycopg://x/y", connect_args={"options": "-c TimeZone=UTC"})'
     (pkg / "main.py").write_text(textwrap.dedent(MAIN).replace('engine = create_async_engine("postgresql+psycopg://x/y")', engine))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "engine_connect_args" in gen
     init = gen[gen.index("pub async fn init_globals"):]
@@ -2851,7 +3218,7 @@ def test_itsdangerous_outside_subset_rejected(tmp_path, capsys, stmt, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(ITS_MAIN.format(stmt=stmt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err
     assert "main.py:11" in err
@@ -2903,7 +3270,7 @@ def test_dropped_arguments_rejected(tmp_path, capsys, stmt, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(KW_MAIN.format(stmt=stmt))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err, err
     assert "main.py:20" in err
@@ -2929,7 +3296,7 @@ def test_json_path_index_rejected(tmp_path, capsys):
         async def path(s: AsyncSession = Depends(db)):
             return (await s.execute(select(Team.data[("a", "b")].as_string()))).scalars().all()
     '''))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "a JSON path index" in err and "main.py:" in err
     assert "/one" not in err
@@ -3070,6 +3437,10 @@ async def x(b: In):
     ("from pydantic import RootModel\n\n\nclass In(RootModel[list[int]]):\n    @field_validator('root')\n    @classmethod\n"
      "    def v(cls, x):\n        return x", "validators, serializers, extra= or aliases on a RootModel are not supported"),
     ("class In(BaseModel):\n    c: complex = Field(0, ge=1)", "constraints on `complex` are not supported"),
+    ("from pydantic import conlist\n\n\nclass In(BaseModel):\n    xs: conlist(int, unique_items=True)", "unique_items= is not supported"),
+    ("from pydantic import constr\n\n\nclass In(BaseModel):\n    s: constr(regex='a')", "regex= is not supported"),
+    ("from pydantic import confloat\n\n\nclass In(BaseModel):\n    f: confloat(allow_inf_nan=True)", "allow_inf_nan= is not supported"),
+    ("from pydantic import conlist\n\n\nclass In(BaseModel):\n    xs: conlist(int, 1)", "the item type is the one positional argument"),
 ])
 def test_pydantic_corpus_constructions_rejected(tmp_path, capsys, body, msg):
     pkg = tmp_path / "proj"
@@ -3199,7 +3570,47 @@ def test_logging_rejected(tmp_path, capsys, head, body, message):
     (pkg / "main.py").write_text(
         "import logging\nimport logging.config\nfrom fastapi import FastAPI\n\n" + head + "app = FastAPI()\nn = 2\n\n\n"
         "@app.get('/x')\nasync def x():\n" + body + "\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        ("    logger.exception('x')", "loguru `logger.exception()` is not supported"),
+        ("    logger.opt(exception=True).debug('x')", "loguru `logger.opt()` is not supported"),
+        ("    logger.bind(user=1).info('x')", "loguru `logger.bind()` is not supported"),
+        ("    with logger.contextualize(user=1):\n        pass", "loguru `logger.contextualize()` is not supported"),
+        ("    logger.add('app.log', rotation='00:00')", "loguru `logger.add('app.log')` is not supported"),
+        ("    logger.add(lambda m: None)", "is not supported: the binary writes to sys.stderr or sys.stdout only"),
+        ("    logger.add(sys.stderr, serialize=True)", "loguru `logger.add(serialize=...)` is not supported"),
+        ("    logger.add(sys.stderr, enqueue=True)", "loguru `logger.add(enqueue=...)` is not supported"),
+        ("    logger.add(sys.stderr, filter='app')", "loguru `logger.add(filter=...)` is not supported"),
+        ("    logger.add(sys.stderr, format=FMT)", "supported with a literal text only"),
+        ("    logger.add(sys.stderr, format='{extra[user]} {message}')", "the record field `{extra[user]}` is not reproduced"),
+        ("    logger.add(sys.stderr, format='<foo>{message}</foo>')", "color markups could not be parsed correctly"),
+        ("    logger.add(sys.stderr, format='{time:%G} {message}')", "the time directive `%G` is not reproduced"),
+        ("    logger.add(sys.stderr, format='{line:q}')", "the format spec of `{line:q}` fails"),
+        ("    logger.add(sys.stderr, format='{level!r}')", "`{level!r}` is not reproduced"),
+        ("    logger.add(sys.stderr, colour=True)", "loguru `logger.add(colour=...)` is not supported"),
+        ("    logger.remove(1, 2)", "loguru `logger.remove()` takes one argument"),
+        ("    logger.level('NOTICE', no=25)", "loguru `logger.level()` is not supported"),
+        ("    print(logger)", "library value `loguru.logger` is not supported"),
+        ("    f = logger.info\n    f('x')", "library value `loguru.logger.info` is not supported"),
+    ],
+)
+def test_loguru_rejected(tmp_path, capsys, body, message):
+    """docs/advanced/logging.md#loguru: what dynrt/loguru.rs does not reproduce is refused at translation, with
+    file:line (never at run time, where an application's `except Exception` would hide it)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "import sys\nfrom fastapi import FastAPI\nfrom loguru import logger\n\nFMT = '{message}'\napp = FastAPI()\n\n\n"
+        "@app.get('/x')\nasync def x():\n" + body + "\n    return {}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert message in err
     assert "main.py:" in err
@@ -3303,7 +3714,7 @@ def test_pyyaml_outside_subset_rejected(tmp_path, capsys, body, msg):
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(YAML_MAIN.format(body=body))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err, err
     assert "main.py:10" in err
@@ -3466,7 +3877,7 @@ def test_query_constructs_outside_subset_rejected(tmp_path, capsys, body, dep, f
     (pkg / "models.py").write_text(MODELS.format(rel=""))
     (pkg / "deps.py").write_text(QUERY_DEPS.format(factory=factory))
     (pkg / "main.py").write_text(QUERY_MAIN.format(body=body, dep=dep))
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert msg in err, err
     assert where in err, err
@@ -3670,7 +4081,7 @@ def test_integer_expressions_in_range_accepted(tmp_path, expr):
     (pkg / "__init__.py").write_text("")
     (pkg / "main.py").write_text(f"from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n"
                                  f"    return {{'a': {expr}}}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 0
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 @pytest.mark.parametrize("use", ["await H.am(H(), 1)", "await (H.am)(H(), 1)", "len([H.am])"])
@@ -3683,7 +4094,7 @@ def test_async_method_read_on_its_class_rejected(tmp_path, capsys, use):
     (pkg / "main.py").write_text(
         "from fastapi import FastAPI\n\napp = FastAPI()\n\n\nclass H:\n    async def am(self, n):\n        return n\n\n\n"
         f"@app.get('/x')\nasync def x():\n    return {{'a': {use}, 'b': await H().am(2)}}\n")
-    assert main([str(pkg), "--root", str(tmp_path), "--backend", "dyn", "-o", str(tmp_path / "out")]) == 1
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "the async method H.am read on its class is not supported" in err
     assert "P2A0101" in err and "main.py:13" in err
@@ -3976,9 +4387,19 @@ async def x():
 
 @pytest.mark.parametrize("imports, body, use, msg", [
     ("", "    def __hash__(self):\n        return 1", "len({K(): 1})", "class K: method __hash__ is not supported"),
-    ("import copy", "    def __deepcopy__(self, memo):\n        return self", "K() is not None",
+    ("import pickle", "    def __deepcopy__(self, memo):\n        return self", "len(pickle.dumps(K()))",
      "class K: method __deepcopy__ is not supported"),
     ("", "    def __getstate__(self):\n        return {}", "K().__getstate__()", "class K: method __getstate__ is not supported"),
+    # pickle reached after the class was compiled: refused once everything is compiled
+    ("import pickle", "    def __getstate__(self):\n        return {}", "[K(), pickle.loads(pickle.dumps(1))]",
+     "method __getstate__ is not supported (the application uses copy or pickle"),
+    # a class keyword other than metaclass=ABCMeta, a class decorator, a dunder an exception class does not dispatch
+    ("class M(type):\n    pass\n\n\nclass KM(metaclass=M):\n    pass", "", "KM()",
+     "class KM: the class keyword `metaclass=M` is not supported"),
+    ("import functools\n\n\n@functools.total_ordering\nclass KD:\n    pass", "", "KD()",
+     "class KD: decorator @functools.total_ordering is not supported"),
+    ("class E(Exception):\n    def __eq__(self, o):\n        return True", "", "E() == E()",
+     "exception class E: method __eq__ is not supported"),
     ("", "    def f(self, n=LIMIT):\n        return n\n    LIMIT = 4", "K().f()", "LIMIT__rebound_later_in_class_K"),
     ("", "    def __index__(self):\n        return 1", "[1, 2][K()]", "class K: method __index__ is not supported"),
 ])
@@ -3991,6 +4412,16 @@ def test_protocol_outside_subset_rejected(tmp_path, capsys, imports, body, use, 
     err = capsys.readouterr().err
     assert msg in err, err
     assert "main.py:" in err
+
+
+def test_copy_methods_kept_when_nothing_copies(tmp_path):
+    """`import copy` alone (a library pickling for multiprocessing): a class's copy methods are never called"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PROTO_APP.format(
+        imports="import copy", body="    def __deepcopy__(self, memo):\n        return self", use="K() is not None"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
 
 
 def test_module_function_attribute_rebound_rejected(tmp_path, capsys):
@@ -4129,3 +4560,833 @@ def test_cachetools_decorators_outside_subset_rejected(tmp_path, capsys):
         err = _reject(d, capsys, head + textwrap.dedent(src))
         assert msg in err, err
         assert f"main.py:{line}" in err, err
+
+
+REQUEST_APP = '''
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+
+@app.get('/x')
+async def x(request: Request):
+    {body}
+    return {{'a': 1}}
+'''
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("request.session", "attribute .session of a Request is not supported"),
+    ("request.user", "attribute .user of a Request is not supported"),
+    ("request.auth", "attribute .auth of a Request is not supported"),
+    ("await request.close()", "attribute .close of a Request is not supported"),
+    ("request.keys()", "attribute .keys of a Request is not supported"),
+    ("request.nope", "attribute .nope of a Request is not supported"),
+    ("request['type']", "attribute .__getitem__ of a Request"),
+    ("'type' in request", "attribute .__contains__ of a Request"),
+    ("sorted(request)", "attribute .__iter__ of a Request"),
+    ("request.custom = 1", "attribute .custom of a Request cannot be assigned"),
+    ("request.url_for('x')", "attribute .url_for of a Request is not supported"),
+    ("await request.send_push_promise('/a')", "attribute .send_push_promise of a Request is not supported"),
+])
+def test_request_outside_subset_rejected(tmp_path, capsys, body, msg):
+    """What Starlette's Request offers beyond the runtime's attributes: refused where the variable is a parameter
+    annotated Request (the runtime would fail with AttributeError, or answer another value)"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(REQUEST_APP.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+CODEC_APP = '''
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get('/x')
+async def x():
+    {body}
+    return {{'a': 1}}
+'''
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("b'a'.decode('utf-8', 'surrogateescape')", "got 'surrogateescape'"),
+    ("b'a'.decode(errors='xmlcharrefreplace')", "got 'xmlcharrefreplace'"),
+    ("b'a'.decode('ascii', errors='namereplace')", "got 'namereplace'"),
+    ("b'a'.decode(errors='nothandler')", "got 'nothandler'"),
+    ("'a'.encode('ascii', 'namereplace')", "got 'namereplace'"),
+])
+def test_codec_error_handlers_outside_subset_rejected(tmp_path, capsys, body, msg):
+    """errors= of decode / encode written as a literal: only the handlers the runtime renders as CPython does"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(CODEC_APP.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert "main.py:" in err
+
+
+TIMESTAMP_MAIN = """
+import datetime
+import time
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/t")
+async def t(x: float):
+    return {stmt}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("time.localtime(x)", "library call `time.localtime()` is not supported"),
+    ("time.gmtime(x)", "library call `time.gmtime()` is not supported"),
+    ("datetime.date.fromtimestamp(x).isoformat()", "library call `datetime.date.fromtimestamp()` is not supported"),
+])
+def test_real_timestamp_functions_rejected(tmp_path, capsys, stmt, msg):
+    # 3.15: les fonctions C à horodatage acceptent tout réel ; celles qu'on ne traduit pas restent refusées
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(TIMESTAMP_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:11" in err
+
+
+@pytest.mark.parametrize("body, message", [
+    # stripe-python 14 (dynrt/stripe.rs): the legacy resource API only
+    ("    import stripe\n    return await stripe.Customer.create_async(email='a@b.c')",
+     "library call `stripe.Customer.create_async()` is not supported"),
+    ("    import stripe\n    client = stripe.StripeClient('sk_test_x')\n    return client.v1.customers.list()",
+     "library call `stripe.StripeClient()` is not supported"),
+    ("    import stripe\n    stripe.default_http_client = None\n    return {}", "assigning `stripe.default_http_client`"),
+    ("    import stripe\n    stripe.proxy = 'http://proxy:3128'\n    return {}", "assigning `stripe.proxy`"),
+    ("    import stripe\n    return stripe.Customer.construct_from({'id': 'cus_1'}, 'sk_test_x')",
+     "library call `stripe.Customer.construct_from()` is not supported"),
+    # a resource's instance methods (refresh, save, instance_url...) are not translated
+    ("    import stripe\n    c = stripe.Customer.retrieve('cus_1')\n    return {'url': c.instance_url()}",
+     "method .instance_url() is not implemented by the runtime"),
+])
+def test_stripe_outside_the_legacy_api_rejected(tmp_path, capsys, body, message):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n" + body + "\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    assert "main.py:" in err
+
+
+def test_stripe_error_module_before_14_0_1(tmp_path, capsys):
+    """`stripe.error` appeared in 14.0.1: with 14.0.0 locked, `except stripe.error.StripeError` raises a bare
+    AttributeError when an exception is tested against it (fixtures/stripeapp /errors-legacy): translated as that
+    raise at `stripe.error`, never as the alias."""
+    (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "stripe"\nversion = "14.0.0"\n')
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(
+        "import stripe\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n"
+        "    try:\n        return stripe.Customer.retrieve('cus_1')\n    except stripe.error.StripeError:\n        return {}\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "stripe::no_error_module(cx, Some(" in gen and "STRIPE_ERROR" not in gen.split("no_error_module")[1][:200]
+    # from 14.0.1 on, stripe.error is stripe._error (`except stripe.error.CardError`)
+    (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "stripe"\nversion = "14.4.1"\n')
+    (pkg / "main.py").write_text((pkg / "main.py").read_text().replace("stripe.error.StripeError", "stripe.error.CardError"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "STRIPE_CARD_ERROR" in gen and "no_error_module" not in gen
+
+
+@pytest.mark.parametrize("body, message", [
+    ("    import secrets\n    return {'c': secrets.choice(x for x in 'ab')}", "library call `secrets.choice()` is not supported on a generator expression"),
+    ("    import random\n    return {'c': random.choice(x for x in 'ab')}", "library call `random.choice()` is not supported on a generator expression"),
+    ("    import tempfile\n    f = tempfile.NamedTemporaryFile(buffering=0)\n    return {}", "tempfile.NamedTemporaryFile(buffering=) is not supported"),
+    ("    import tempfile\n    f = tempfile.NamedTemporaryFile('wb')\n    return {}", "tempfile.NamedTemporaryFile() with positional arguments"),
+    ("    import tempfile\n    d = tempfile.TemporaryDirectory(mode=0o700)\n    return {}", "tempfile.TemporaryDirectory(mode=) is not supported"),
+    ("    import tempfile\n    d = tempfile.TemporaryDirectory('', 'p', None, False, 1)\n    return {}",
+     "tempfile.TemporaryDirectory() takes at most 4 positional arguments"),
+    ("    import tempfile\n    return {'a': tempfile.gettempdir(1)}", "tempfile.gettempdir() takes no argument"),
+])
+def test_tempfile_outside_surface_rejected(tmp_path, capsys, body, message):
+    test_python_semantics_rejected(tmp_path, capsys, body, message)
+
+
+@pytest.mark.parametrize("body, message", [
+    ("    from openpyxl import Workbook\n    wb = Workbook(write_only=True)\n    return {}", "openpyxl Workbook(write_only=) is not supported"),
+    ("    from openpyxl.styles import Font\n    f = Font(underline='single')\n    return {}", "openpyxl Font(underline=) is not supported"),
+    ("    from openpyxl.styles import Font\n    f = Font('Arial')\n    return {}", "openpyxl Font() with positional arguments"),
+    ("    from openpyxl.styles import PatternFill\n    f = PatternFill(fgColor='FF0000', patternType='solid', bogus=1)\n    return {}",
+     "openpyxl PatternFill(bogus=) is not supported"),
+    ("    from openpyxl.utils import get_column_letter\n    return {'a': get_column_letter(col_idx=3)}", "get_column_letter() takes the column index"),
+])
+def test_openpyxl_outside_surface_rejected(tmp_path, capsys, body, message):
+    test_python_semantics_rejected(tmp_path, capsys, body, message)
+
+
+@pytest.mark.parametrize("body, message", [
+    ("    from reportlab.platypus import Paragraph\n    p = Paragraph('x', None, bulletText='-')\n    return {}",
+     "reportlab Paragraph(bulletText=) is not supported"),
+    ("    from reportlab.lib.styles import ParagraphStyle\n    s = ParagraphStyle('a', underlineWidth=2)\n    return {}",
+     "reportlab ParagraphStyle(underlineWidth=) is not supported"),
+    ("    import io\n    from reportlab.platypus import SimpleDocTemplate\n    d = SimpleDocTemplate(io.BytesIO(), showBoundary=1)\n"
+     "    return {}", "reportlab SimpleDocTemplate(showBoundary=) is not supported"),
+    ("    from reportlab.platypus import Spacer\n    s = Spacer(1, 2, True)\n    return {}",
+     "reportlab Spacer() takes at most 2 positional arguments"),
+    ("    from reportlab.platypus import PageBreak\n    b = PageBreak('Later')\n    return {}",
+     "reportlab PageBreak() takes at most 0 positional arguments"),
+    ("    from reportlab.graphics.shapes import Rect\n    r = Rect(0, 0, 1, 1, fontName='x')\n    return {}",
+     "reportlab Rect(fontName=) is not supported"),
+    ("    from reportlab.platypus import KeepTogether\n    k = KeepTogether([])\n    return {}",
+     "library call `reportlab.platypus.KeepTogether()` is not supported"),
+    ("    from reportlab.pdfgen import canvas\n    c = canvas.Canvas('x.pdf')\n    return {}",
+     "library call `reportlab.pdfgen.canvas.Canvas()` is not supported"),
+    ("    from reportlab.lib.colors import CMYKColor\n    c = CMYKColor(0, 0, 0, 1)\n    return {}",
+     "library call `reportlab.lib.colors.CMYKColor()` is not supported"),
+])
+def test_reportlab_outside_surface_rejected(tmp_path, capsys, body, message):
+    test_python_semantics_rejected(tmp_path, capsys, body, message)
+
+
+def rl_accel_project(tmp_path):
+    (tmp_path / "requirements.txt").write_text("reportlab==4.4.5\nrl_accel==0.9.0\n")
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("import io\n\nfrom fastapi import FastAPI\nfrom reportlab.lib import colors\n"
+                                 "from reportlab.platypus import SimpleDocTemplate\n\napp = FastAPI()\n\n\n"
+                                 "@app.get('/x')\nasync def x():\n    SimpleDocTemplate(io.BytesIO())\n    return {}\n\n\n"
+                                 "@app.get('/y')\nasync def y():\n    return {'r': colors.red.red}\n")
+    return pkg
+
+
+def test_reportlab_with_rl_accel_rejected(tmp_path, capsys):
+    # rl_accel replaces reportlab's pure-Python fp_str, escapes and widths: the routes making documents are refused
+    pkg = rl_accel_project(tmp_path)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "reportlab SimpleDocTemplate() with rl-accel 0.9.0 installed is not supported" in err and "main.py:12" in err
+
+
+def test_reportlab_with_rl_accel_left_to_python(tmp_path, capsys):
+    pkg = rl_accel_project(tmp_path)
+    from py2axum.__main__ import main as cli
+    assert cli(["check", str(pkg), "--root", str(tmp_path), "--python-side", "auto", "--json"]) == 0
+    routes = {r["path"]: r for r in json.loads(capsys.readouterr().out)["routes"]}
+    assert routes["/x"]["status"] == "python-side" and "rl-accel 0.9.0" in routes["/x"]["reason"]
+    assert routes["/y"]["status"] == "native"
+
+
+def lxml_project(tmp_path):
+    (tmp_path / "requirements.txt").write_text("openpyxl==3.1.5\net-xmlfile==2.0.0\nlxml==6.0.2\n")
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from fastapi import FastAPI\nfrom openpyxl import Workbook\nfrom openpyxl.styles import Font\n\n"
+                                 "app = FastAPI()\n\n\n@app.get('/x')\nasync def x():\n    Workbook()\n    return {}\n\n\n"
+                                 "@app.get('/y')\nasync def y():\n    Font(bold=True)\n    return {}\n")
+    return pkg
+
+
+def test_openpyxl_with_lxml_rejected(tmp_path, capsys):
+    # openpyxl writes through lxml when it is installed: other bytes than the ElementTree writer dynrt/xlsx.rs
+    # follows. The routes building a workbook are refused (or left to Python), not the whole application.
+    pkg = lxml_project(tmp_path)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "openpyxl Workbook() with lxml 6.0.2 installed is not supported" in err and "main.py:10" in err
+
+
+def test_openpyxl_with_lxml_left_to_python(tmp_path, capsys):
+    pkg = lxml_project(tmp_path)
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 0
+    capsys.readouterr()
+    from py2axum.__main__ import main as cli
+    assert cli(["check", str(pkg), "--root", str(tmp_path), "--python-side", "auto", "--json"]) == 0
+    routes = {r["path"]: r for r in json.loads(capsys.readouterr().out)["routes"]}
+    assert routes["/x"]["status"] == "python-side" and "lxml 6.0.2" in routes["/x"]["reason"]
+    assert routes["/y"]["status"] == "native"
+
+
+MAKER_WRAP_APP = """
+import asyncio
+from collections import defaultdict
+
+from fastapi import Depends, FastAPI
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+
+class Wrap:
+    make_engine = staticmethod(create_async_engine)
+
+    def __init__(self, **kwargs):
+        self.params = {{"autoflush": kwargs.pop("autoflush", False),
+                       "expire_on_commit": kwargs.pop("expire_on_commit", False)}}
+        self.engine_params = kwargs
+        self.per = defaultdict(self.new)
+
+    def __call__(self):
+        return self.per[asyncio.get_running_loop()]()
+
+    def new(self):
+        return async_sessionmaker(bind=self.make_engine(**self.engine_params), **self.params)
+
+
+MAKER = Wrap(url="postgresql+psycopg://x/y", connect_args={connect_args})
+
+
+async def get_db():
+    async with MAKER() as db:
+        yield db
+
+
+app = FastAPI()
+
+
+@app.get("/x")
+async def x({param}):
+    {body}
+    return {{}}
+"""
+
+
+@pytest.mark.parametrize("connect_args, param, body, msg", [
+    # psycopg decodes timestamptz in each connection's zone: not a per-transaction setting
+    ('{"options": "-c TimeZone=UTC"}', "", "s = MAKER()", "a TimeZone in the connect_args of a session maker wrapper"),
+    # the request's session (a dependency) runs on the process pool as is
+    ('{"options": "-c statement_timeout=5s"}', "db: AsyncSession = Depends(get_db)", "pass",
+     "connect_args= of the session maker it calls is not supported"),
+])
+def test_session_maker_wrapper_options_rejected(tmp_path, capsys, connect_args, param, body, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(MAKER_WRAP_APP.format(connect_args=connect_args, param=param, body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err and "main.py:" in err, err
+
+
+@pytest.mark.parametrize("body, message", [
+    # pgpy: PGPKey.from_blob() only (dynrt/pgpy.rs)
+    ("    import pgpy\n    return {'a': str(pgpy.PGPMessage.from_blob('x'))}",
+     "library call `pgpy.PGPMessage.from_blob()` is not supported: of pgpy, only PGPKey.from_blob()"),
+    ("    import pgpy\n    key = pgpy.PGPKey()\n    return {}", "library call `pgpy.PGPKey()` is not supported"),
+    ("    import pgpy\n    key, _ = pgpy.PGPKey.new(1, 2048)\n    return {}", "library call `pgpy.PGPKey.new()` is not supported"),
+    ("    import pgpy\n    key, _ = pgpy.PGPKey.from_blob('x')\n    return {'a': key.frobnicate_pgp()}",
+     "method .frobnicate_pgp() is not implemented by the runtime"),
+    # sys.modules: only the key of a module the project's Python cannot import
+    ("    import sys\n    return {'a': 'json' in sys.modules}", "sys.modules['json'] is not supported"),
+    ("    import sys\n    return {'a': sys.modules.get('os')}", "sys.modules['os'] is not supported"),
+    ("    import sys\n    m = sys.modules\n    return {}", "sys.modules is only supported with a literal key"),
+])
+def test_pgpy_and_sys_modules_outside_surface_rejected(tmp_path, capsys, body, message):
+    test_python_semantics_rejected(tmp_path, capsys, body, message)
+
+
+@pytest.mark.parametrize("stmt, message", [
+    ("async with s.execute(select(Team)):\n        pass",
+     "`async with s.execute(select(Team))`: the value of .execute() of a session, connection or result is not an "
+     "asynchronous context manager"),
+    ("with s.scalar(select(Team)):\n        pass", "`with s.scalar(select(Team))`: the value of .scalar() of a session"),
+])
+def test_with_on_a_session_value_rejected(tmp_path, capsys, stmt, message):
+    """A `with` / `async with` on what a session method returns (a coroutine, a result): CPython's TypeError at run
+    time, refused at generation (a 500 otherwise); `session.begin()` / `begin_nested()` stay context managers."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "models.py").write_text(textwrap.dedent(MODELS).replace("{rel}", ""))
+    body = SESSION_MAIN.format(opts="", body="    async with Session() as s:\n        yield s")
+    body = body.replace("from fastapi import", "from sqlalchemy import select\nfrom fastapi import").replace(
+        "    t = await s.get(Team, team_id)\n", f"    {stmt}\n    async with s.begin_nested():\n        pass\n"
+        "    t = await s.get(Team, team_id)\n")
+    (pkg / "main.py").write_text(body)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and "main.py:" in err, err
+
+
+STACK_APP = '''
+from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
+{imports}
+
+
+class Mw(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        return await call_next(request)
+
+
+def setup(a):
+    a.state.ready = True
+    return 1
+
+
+app = FastAPI()
+app.add_middleware(Mw)
+{tail}
+
+
+@app.get("/x")
+async def x():
+    return {{"v": {read}}}
+'''
+
+
+@pytest.mark.parametrize("imports, tail, read, message", [
+    # a function given the application, its result kept (the transpiler raised StopIteration)
+    ("", "done = setup(app)", "1", "setup(app) inside `Assign` is not supported"),
+    ("", "def make_plugin():\n    def build():\n        sub = FastAPI()\n        setup(sub)\n        return sub\n"
+         "    return build", "1", "setup(sub) inside `FunctionDef` is not supported"),
+    # a router prefix read at startup that does not translate, next to a project middleware class
+    # (AttributeError: 'str' object has no attribute 'module' on its ("prefix", i) node)
+    ("import mysterylib_p2a\nfrom fastapi import APIRouter",
+     "router = APIRouter()\n\n\n@router.get('/y')\nasync def y():\n    return 1\n\n\n"
+     "app.include_router(router, prefix=mysterylib_p2a.prefix())", "1", "mysterylib_p2a"),
+])
+def test_stack_statements_refused_not_crashed(tmp_path, capsys, imports, tail, read, message):
+    """`py2axum check` and the generation refuse with file:line, never with a Python exception."""
+    from py2axum.check import main as check_main
+
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(STACK_APP.format(imports=imports, tail=tail, read=read))
+    (tmp_path / ".git").mkdir()
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err and "main.py:" in err, err
+    assert check_main([str(pkg), "--root", str(tmp_path)]) == 1
+    out = capsys.readouterr()
+    assert message in out.out + out.err and "Traceback" not in out.err
+
+
+def _bench_project(tmp_path, main_py: str, files: dict[str, bytes] | None = None):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_bytes(main_py.encode() if isinstance(main_py, str) else main_py)
+    for name, data in (files or {}).items():
+        (tmp_path / name).write_bytes(data)
+    (tmp_path / ".git").mkdir()
+    return pkg
+
+
+def test_route_path_given_as_keyword(tmp_path, capsys):
+    """`@router.post(path="/x")` (IndexError before): the path is read; a decorator without any path is refused."""
+    app = "from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.post(path=\"/x\", status_code=201)\nasync def x():\n    return 1\n"
+    pkg = _bench_project(tmp_path, app)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+    assert "/// POST /x" in (tmp_path / "out" / "src" / "gen.rs").read_text()
+    (pkg / "main.py").write_text(app.replace('path="/x", ', ""))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out2")]) == 1
+    assert "has no path" in capsys.readouterr().err
+
+
+def test_requirements_in_utf16_read_as_pip_does(tmp_path, capsys):
+    """`pip freeze > requirements.txt` under PowerShell writes UTF-16 with a BOM (UnicodeDecodeError before)."""
+    app = "from fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get(\"/\")\nasync def r():\n    return 1\n"
+    pkg = _bench_project(tmp_path, app, {"requirements.txt": "fastapi==0.1.0\r\n".encode("utf-16")})
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "fastapi" in err and "0.1.0" in err and "Traceback" not in err, err  # the pin, read, is out of range
+    (tmp_path / "requirements.txt").write_bytes(b"\xff\xfe\x00\xd8")  # a BOM then a lone surrogate
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out2")]) == 1
+    assert "cannot be read as text" in capsys.readouterr().err
+
+
+def test_module_with_a_pep263_coding_line(tmp_path, capsys):
+    """A module declared `# -*- coding: latin-1 -*-` is decoded as Python does (UnicodeDecodeError before)."""
+    app = ("# -*- coding: latin-1 -*-\nfrom fastapi import FastAPI\n\napp = FastAPI()\n\n\n@app.get(\"/\")\n"
+           "async def r():\n    return {\"v\": \"\xe9t\xe9\"}\n").encode("latin-1")
+    pkg = _bench_project(tmp_path, app)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0, capsys.readouterr().err
+
+
+def test_global_declared_by_its_annotation_only(tmp_path, capsys):
+    """`X: int` then `global X; X = ...` (AttributeError: 'NoneType' object has no attribute '_fields' before)."""
+    app = ("from fastapi import FastAPI\n\napp = FastAPI()\nCOUNT: int\n\n\ndef bump():\n    global COUNT\n    COUNT = 1\n\n\n"
+           "@app.get(\"/\")\nasync def r():\n    bump()\n    return COUNT\n")
+    pkg = _bench_project(tmp_path, app)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "declares the module global `COUNT` without a value" in err and "main.py:4" in err, err
+
+
+
+
+QR_MAIN = """
+import qrcode
+from qrcode.image.pure import PyPNGImage
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+def use():
+    {body}
+
+
+@app.get("/x")
+async def x():
+    return use()
+"""
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("return qrcode.QRCode(image_factory=PyPNGImage)", "library value `qrcode.image.pure.PyPNGImage` is not supported"),
+    ("return qrcode.QRCode(image_factory=dict)", "qrcode.QRCode(image_factory=) is not supported"),
+    ("return qrcode.QRCode(1, 0, 10, 4, dict)", "qrcode.QRCode(image_factory=) is not supported"),
+    ("return qrcode.make('x', image_factory=dict)", "qrcode.make(image_factory=) is not supported"),
+    ("return qrcode.QRCode(size=3)", "qrcode.QRCode(size=) is not supported"),
+    ("return qrcode.make('x', 'y')", "qrcode.make(data, **kwargs): the QRCode arguments by keyword"),
+    ("return qrcode.make('x', fit=True)", "qrcode.make(fit=) is not supported"),
+])
+def test_qrcode_options_rejected(tmp_path, capsys, body, msg):
+    """qrcode: another image factory than Pillow's PilImage (its own PNG, SVG...) is refused, with its line."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(QR_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:11" in err
+
+
+def test_qrcode_without_pillow_rejected(tmp_path, capsys):
+    """A uv.lock with qrcode but not Pillow: qrcode draws with PyPNGImage, whose PNG is not reproduced."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(QR_MAIN.format(body="return qrcode.QRCode()"))
+    (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "qrcode"\nversion = "8.2"\n')
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out"),
+                 "--allow-untested-versions"]) == 1
+    err = capsys.readouterr().err
+    assert "qrcode without Pillow" in err
+    assert "main.py:11" in err
+
+
+@pytest.mark.parametrize("body, message", [
+    ("    from pathlib import Path\n    return {'a': str(Path.cwd('x'))}", "Path.cwd() takes no arguments here"),
+    ("    import os\n    return {'a': os.getcwd(1)}", "os.getcwd() takes no arguments here"),
+])
+def test_cwd_outside_surface_rejected(tmp_path, capsys, body, message):
+    test_python_semantics_rejected(tmp_path, capsys, body, message)
+
+
+
+
+PASSLIB_MAIN = """
+from fastapi import FastAPI
+from passlib.context import CryptContext
+
+app = FastAPI()
+ctx = {stmt}
+
+
+@app.get("/h")
+async def h(pw: str):
+    return {{"h": ctx.hash(pw)}}
+"""
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("CryptContext(schemes=['argon2'])", "schemes must be the literal [\"bcrypt\"]"),
+    ("CryptContext(schemes=['bcrypt', 'sha256_crypt'], deprecated='auto')", "schemes must be the literal [\"bcrypt\"]"),
+    ("CryptContext()", "schemes must be the literal [\"bcrypt\"]"),
+    ("CryptContext(schemes=['bcrypt'], bcrypt__rounds=10)", "bcrypt__rounds= is not supported"),
+    ("CryptContext(schemes=['bcrypt'], deprecated=['bcrypt'])", "deprecated must be \"auto\""),
+    ("CryptContext(schemes=list(('bcrypt',)))", "schemes must be the literal [\"bcrypt\"]"),
+    ("CryptContext(**{'schemes': ['bcrypt']})", "`*`/`**` arguments are not supported"),
+])
+def test_passlib_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PASSLIB_MAIN.format(stmt=stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:6" in err
+
+
+@pytest.mark.parametrize("stmt, msg", [
+    ("ctx.using(rounds=5).hash(pw)", "CryptContext.using is not supported"),
+    ("ctx.hash(pw, scheme='bcrypt')", "CryptContext.hash(scheme=) is not supported"),
+    ("ctx.verify(pw, pw, 'bcrypt')", "CryptContext.verify() with 3 positional arguments is not supported"),
+    ("ctx.handler()", "CryptContext.handler is not supported"),
+    ("ctx.schemes", "CryptContext.schemes is not supported"),
+])
+def test_passlib_methods_outside_subset_rejected(tmp_path, capsys, stmt, msg):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(PASSLIB_MAIN.format(stmt="CryptContext(schemes=['bcrypt'])").replace("ctx.hash(pw)", stmt))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "main.py:11" in err
+
+
+def test_httpx_request_attribute_outside_subset_rejected(tmp_path, capsys):
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("""
+import httpx
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/c")
+async def c():
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.get("http://127.0.0.1:9/")
+        except httpx.RequestError as e:
+            return {"h": dict(e.request.headers)}
+""")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert "httpx.Request.headers is not supported" in err
+    assert "main.py:14" in err
+
+
+
+
+DEP_FORMS_MAIN = """from fastapi import Depends, FastAPI
+
+from .other import Other
+
+app = FastAPI()
+
+
+{defs}
+
+
+@app.get('/x')
+def x(v=Depends({dep})):
+    return 1
+"""
+
+
+@pytest.mark.parametrize("defs, dep, msg, line", [
+    # generator dependencies: yields reached at most once, as statements
+    ("def d():\n    for i in range(2):\n        yield i", "d", "a `yield` in a loop is not supported", 10),
+    ("def d():\n    yield 1\n    yield 2", "d", "two `yield`s on one path are not supported", 10),
+    ("def d():\n    try:\n        yield 1\n    except ValueError:\n        yield 2", "d", "two `yield`s on one path", 12),
+    ("def d(k: int = 0):\n    if k:\n        yield 1\n    yield 2", "d", "two `yield`s on one path", 11),
+    ("def d():\n    v = yield 1", "d", "the `yield` must be a statement, under `if`, `try` or `with` blocks only", 9),
+    ("def d():\n    yield from [1]", "d", "`yield from` is not supported", 9),
+    # class dependencies: the signature FastAPI reads must be one the translator reads too
+    ("class P(dict):\n    pass", "P", "a class dependency's bases may be `ABC`, `object` and one plain class", 8),
+    ("class B:\n    def __new__(cls, n: int = 1):\n        return object.__new__(cls)\n\n\nclass P(B):\n    pass", "P",
+     "B.__new__: a class dependency defining __new__ is not supported", 9),
+    ("class P:\n    __init__ = object.__init__", "P", "assigned in the class body of a class dependency", 9),
+    # methods: a classmethod or a staticmethod, found along the bases
+    ("class S:\n    def make(self, n: int = 1):\n        return n", "S.make", "must be a @classmethod or a @staticmethod", 9),
+    ("class S:\n    pass", "S.make", "S has no method `make`", 13),
+    ("class S:\n    @classmethod\n    def make(cls, *ns: int):\n        return ns", "S.make",
+     "*args, **kwargs, positional-only parameters or `yield` are not supported in a method dependency", 10),
+    ("class S:\n    @classmethod\n    def make(cls):\n        yield cls", "S.make", "in a method dependency", 10),
+    # a library's object (or a global built by calling one): FastAPI reads the signature of what it made
+    ("import secrets\n\nmake_token = secrets.token_hex", "make_token", "`secrets.token_hex`, of the library secrets: FastAPI "
+     "reads the signature of what the library makes", "main.py:"),
+    ("class Svc:\n    def current(self):\n        return 1\n\n\nsvc = Svc()", "svc.current",
+     "a method bound to an instance is not supported", "main.py:"),
+    # lambdas, factories
+    ("", "lambda *a: a", "Depends(lambda ...): *args, **kwargs or positional-only parameters", 12),
+    ("def f(**kw):\n    def g():\n        return kw\n    return g", "f(a=1)",
+     "a dependency factory must only define functions and return one of them", 8),
+])
+def test_dependency_forms_rejected(tmp_path, capsys, defs, dep, msg, line):
+    """Forms of Depends() met in public applications: what FastAPI would read differently is refused at its line."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "other.py").write_text("from fastapi import Query as Q\n\n\nclass Other:\n    def __init__(self, n: int = Q(1)):\n"
+                                  "        self.n = n\n\n    @classmethod\n    def build(cls, n: 'Q' = 1):\n        return cls(n)\n")
+    (pkg / "main.py").write_text(DEP_FORMS_MAIN.format(defs=defs, dep=dep))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err, err
+    assert (line if isinstance(line, str) else f"main.py:{line}") in err, err
+@pytest.mark.parametrize("body, msg", [
+    # bound after the endpoint reading it: Python's NameError when the factory runs
+    ("    @app.get('/x')\n    def x(v=Depends(dep)):\n        return v\n\n    def dep():\n        return 1\n",
+     "dependency `dep` must be a project function or class"),
+    # bound twice in the factory: which one an endpoint reads depends on the order
+    ("    def dep():\n        return 1\n\n    if flag:\n        def dep():\n            return 2\n\n"
+     "    @app.get('/x')\n    def x(v=Depends(dep)):\n        return v\n", "dependency `dep` must be a project function or class"),
+    ("    Auth = Annotated[int, Depends(lambda: 1)]\n    Auth = int\n\n    @app.get('/x')\n    def x(v: Auth):\n        return v\n",
+     "unsupported type annotation `Auth`"),
+])
+def test_factory_dependency_rejected(tmp_path, capsys, body, msg):
+    """A dependency or an Annotated alias of the application factory: bound once, before the endpoint reading it."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text("from typing import Annotated\n\nfrom fastapi import Depends, FastAPI\n\n\n"
+                                 "def create_app(flag: bool = False):\n    app = FastAPI()\n\n" + body + "\n    return app\n\n\n"
+                                 "app = create_app()\n")
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err and "main.py:" in err, err
+
+
+
+
+TAM_MAIN = '''
+import enum
+
+from fastapi import Depends, FastAPI
+from sqlalchemy import String
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Status(str, enum.Enum):
+    ON = "on"
+
+
+class Base(DeclarativeBase):
+    type_annotation_map = {{Status: String(16), str: String(80)}}
+
+
+class Item(Base):
+    __tablename__ = "items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+{extra}
+
+engine = create_async_engine("postgresql+psycopg://x/y")
+Session = async_sessionmaker(engine)
+app = FastAPI()
+
+
+async def db():
+    async with Session() as s:
+        yield s
+
+
+@app.get("/items/{{item_id}}")
+async def item(item_id: int, s: AsyncSession = Depends(db)):
+    return {{"name": (await s.get(Item, item_id)).name}}
+'''
+
+
+@pytest.mark.parametrize("extra, code", [("", 0), ("    status: Mapped[Status]", 1)])
+def test_type_annotation_map_project_class_key(tmp_path, capsys, extra, code):
+    """a project class (an Enum) as a key of the base's type_annotation_map: refused at the column annotated
+    with it, the other columns and classes of the base unaffected"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(TAM_MAIN.format(extra=extra))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == code
+    if code:
+        err = capsys.readouterr().err
+        assert "column status: the type_annotation_map of Base maps `Status`" in err
+        assert "main.py:" in err
+
+
+DECO_MAIN = '''
+import functools
+
+from fastapi import APIRouter, FastAPI, HTTPException, WebSocket
+
+app = FastAPI()
+router = APIRouter()
+
+
+def require_admin(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        raise HTTPException(403)
+    return wrapper
+
+
+@app.get("/ok")
+async def ok():
+    return {{"ok": True}}
+
+
+{endpoint}
+
+
+app.include_router(router)
+'''
+
+
+@pytest.mark.parametrize("endpoint, offset, message", [
+    # below the route decorator: FastAPI serves the wrapper (here, always 403)
+    ('@app.get("/x")\n@require_admin\nasync def x():\n    return {"x": 1}', 1,
+     "endpoint x: decorator @require_admin on an endpoint is not supported: FastAPI registers the decorated function"),
+    ('@router.post("/x")\n@functools.lru_cache(maxsize=8)\ndef x():\n    return {"x": 1}', 1,
+     "endpoint x: decorator @functools.lru_cache(maxsize=8) on an endpoint is not supported"),
+    # above: runs at import on the registered function
+    ('@require_admin\n@app.get("/x")\nasync def x():\n    return {"x": 1}', 0,
+     "decorator @require_admin on an endpoint is not supported: it runs at import"),
+    # a second route decorator registers the function once more
+    ('@app.get("/x")\n@app.post("/y")\nasync def x():\n    return {"x": 1}', 0, "several route decorators on one function"),
+    ('@router.get("/x")\n@router.put("/x")\nasync def x():\n    return {"x": 1}', 0, "several route decorators on one function"),
+    ('@app.websocket("/ws")\n@require_admin\nasync def x(ws: WebSocket):\n    await ws.accept()', 1,
+     "endpoint x: decorator @require_admin on an endpoint is not supported"),
+])
+def test_endpoint_decorator_rejected(tmp_path, capsys, endpoint, offset, message):
+    """a decorator on an endpoint besides its route decorator was ignored: the binary served the bare function
+    (an authentication decorator skipped in production). Refused at the decorator's line, P2A0318."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    src = DECO_MAIN.format(endpoint=endpoint)
+    (pkg / "main.py").write_text(src)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert message in err
+    first = src.splitlines().index(endpoint.splitlines()[0]) + 1  # the endpoint's first decorator
+    assert f"main.py:{first + offset}:" in err
+    assert "P2A0318" in err
+
+
+def test_endpoint_decorator_left_to_python(tmp_path):
+    """with --python-side auto the decorated route goes to Python, the others stay native"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(DECO_MAIN.format(endpoint='@app.get("/x")\n@require_admin\nasync def x():\n    return {"x": 1}'))
+    assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 0
+
+
+@pytest.mark.parametrize("decorator", ['@app.api_route("/x", methods=["GET", "POST"])', '@app.head("/x")',
+                                       '@router.options("/x")', '@app.trace("/x")', '@app.route("/x")'])
+def test_untranslated_route_decorator_rejected(tmp_path, capsys, decorator):
+    """route decorators outside get/post/put/patch/delete/websocket left the function unregistered: the binary
+    answered 404/405 where FastAPI served the route. Refused (P2A0318)."""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(DECO_MAIN.format(endpoint=f"{decorator}\nasync def x():\n    return {{\"x\": 1}}"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert f"route decorator {decorator.split('(')[0]}(...) is not supported" in err
+    assert "main.py:22:" in err and "P2A0318" in err

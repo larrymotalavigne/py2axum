@@ -28,6 +28,8 @@ pub enum V {
     Tuple(Arc<Vec<V>>),
     Dict(Arc<Mutex<IndexMap<Key, (V, V)>>>),
     Set(Arc<Mutex<IndexMap<Key, V>>>),
+    /// `frozenset`: the same table as a set, never changed after it is made
+    Frozen(Arc<Mutex<IndexMap<Key, V>>>),
     DateTime(DateTime),
     Date(chrono::NaiveDate),
     Time(chrono::NaiveTime),
@@ -61,7 +63,8 @@ pub struct ModDesc {
 }
 
 pub enum Native {
-    Request(Arc<web::ReqCell>),
+    /// the request, and which of Starlette's Request objects of it this is (web::REQ_*)
+    Request(Arc<web::ReqCell>, u32),
     /// Starlette's `WebSocket` (dynrt/ws.rs)
     WebSocket(Arc<super::ws::Session>),
     /// `websocket.iter_text()` / `iter_bytes()` / `iter_json()`: "text", "bytes" or "json"
@@ -88,6 +91,8 @@ pub enum Native {
     Totp(super::auth::Totp),
     /// `pwdlib.PasswordHash.recommended()`
     PwdHash,
+    /// `passlib.context.CryptContext(schemes=["bcrypt"])`
+    PassCtx(Arc<super::auth::PassCtx>),
     /// `asyncio.create_task(coro)`: runs on its own; `add_done_callback`
     Task(Arc<super::web::Task>),
     HttpClient(Arc<super::http::Client>),
@@ -95,6 +100,8 @@ pub enum Native {
     HttpTimeout(super::http::Timeout),
     /// `collections.deque`
     Deque(Arc<super::deque::Deque>),
+    /// `array.array` (dynrt/arr.rs)
+    Array(Arc<super::arr::Arr>),
     /// `string.Template(text)`
     Template(String),
     /// `dateutil.parser.isoparser(sep)`
@@ -109,6 +116,8 @@ pub enum Native {
     /// `httpx.BasicAuth(user, password)`: its `Authorization` header value
     HttpBasicAuth(String),
     HttpUrl(String),
+    /// `httpx.Request` (method, url): what httpx's exceptions and responses carry as `.request`
+    HttpReq(Arc<(String, String)>),
     /// a result row (`execute(select(...)).all()`): a tuple whose columns are also attributes
     Row(Arc<Vec<Arc<str>>>, Arc<Vec<V>>),
     /// `await session.begin_nested()`
@@ -200,6 +209,8 @@ pub enum Native {
     Gen(Arc<super::agen::AGen>),
     /// `@asynccontextmanager` called: `_AsyncGeneratorContextManager`
     Acm(Arc<super::agen::AGen>),
+    /// `@contextmanager`'s `_GeneratorContextManager` (the generator runs as an async generator)
+    Gcm(Arc<super::agen::AGen>),
     /// `contextlib.suppress(*excs)`
     Suppress(Vec<V>),
     /// `contextvars.ContextVar(name, default=...)`
@@ -227,6 +238,10 @@ pub enum Native {
     YamlMark(Arc<super::pyyaml::Mark>),
     /// `icalendar.Calendar()` / `Event()` / `Alarm()` (see `ical`)
     ICal(Arc<super::ical::Comp>),
+    /// openpyxl's workbook, worksheets, cells and styles (dynrt/xlsx.rs)
+    Xl(Arc<super::xlsx::Xl>),
+    /// reportlab's documents, flowables, styles, colours, shapes and callback canvas (dynrt/rlbind.rs)
+    Rl(Arc<super::rlbind::Rl>),
     /// `croniter.croniter(...)`, its all_next()/all_prev() generators and croniter_range() (see `croniter`)
     Cron(Arc<super::croniter::Cron>),
     CronGen(Arc<super::croniter::Gen>),
@@ -255,12 +270,17 @@ pub enum Native {
     /// `asyncio.Event`
     AEvent(Arc<super::aio::AEvt>),
     /// `async_sessionmaker(...)`/`sessionmaker(...)` built at run time: (expire_on_commit, autoflush, sync: `sessionmaker` rather than `async_sessionmaker`)
-    Maker(bool, bool, bool),
+    /// (expire_on_commit, autoflush, sync, the session parameters its engine's `connect_args` sets)
+    Maker(bool, bool, bool, std::sync::Arc<[(String, String)]>),
     /// `session.query(...)`: the session and the `select()` it runs
     Query(super::orm::Session, V),
     /// a `redis.asyncio` client (see `rds`), a `Retry` policy (its number of retries)
     Redis(Arc<super::rds::RClient>),
     RRetry(usize),
+    /// `ConnectionPool.from_url(...)` (`redis` or `redis.asyncio`)
+    RPool(Arc<super::rds::RPool>),
+    /// `r.pipeline()`
+    RPipe(Arc<super::rds::RPipe>),
     /// the items of an async iterator produced by the runtime (`scan_iter`), read by `async for`
     AsyncItems(Mutex<Option<Vec<V>>>),
     /// `yarl.URL`
@@ -300,12 +320,20 @@ pub enum Native {
     Stream(Arc<super::net::Stream>, bool),
     /// `zipfile.ZipFile(io.BytesIO(), "w")` (see `zipw`)
     ZipW(Arc<super::zipw::ZipW>),
+    /// `tempfile.TemporaryDirectory()` (see `pathio`)
+    TempDir(Arc<super::pathio::TempDir>),
     /// `socket.create_connection()` (see `net`)
     Socket(Arc<super::net::Sock>),
+    /// `asyncio.create_subprocess_exec()`: a child process, see `subproc`
+    Proc(Arc<super::subproc::Proc>),
     /// `...` used as a value (one object: `ops::ellipsis()`)
     Ellipsis,
     /// a `cryptography` RSA key, private or public (see `crypto`)
     Rsa(Arc<super::crypto::Key>),
+    /// pgpy's module, `PGPKey` class, PGPKey / PGPUID / Fingerprint objects (see `pgpy`)
+    Pgp(Arc<super::pgpy::Obj>),
+    /// qrcode's QRCode and its PilImage (see `qr`)
+    Qr(Arc<super::qr::Obj>),
 }
 
 pub struct PyFn {
@@ -358,6 +386,7 @@ impl V {
             V::Tuple(_) => "tuple",
             V::Dict(_) => "dict",
             V::Set(_) => "set",
+            V::Frozen(_) => "frozenset",
             V::DateTime(_) => "datetime",
             V::Date(_) => "date",
             V::Time(_) => "time",
@@ -375,7 +404,7 @@ impl V {
             V::Exc(e) => e.0.class.name,
             V::Decimal(_) => "decimal.Decimal",
             V::Native(n) => match &**n {
-                Native::Request(_) => "Request",
+                Native::Request(..) => "Request",
                 Native::WebSocket(_) => "WebSocket",
                 Native::WsIter(..) => "async_generator",
                 Native::Headers(_) => "Headers",
@@ -393,16 +422,19 @@ impl V {
                 Native::Address(..) => "Address",
                 Native::Totp(_) => "TOTP",
                 Native::PwdHash => "PasswordHash",
+                Native::PassCtx(_) => "CryptContext",
                 Native::Task(_) => "Task",
                 Native::HttpClient(_) => "AsyncClient",
                 Native::HttpResp(_) => "Response",
                 Native::HttpTimeout(_) => "Timeout",
                 Native::Deque(_) => "deque",
+                Native::Array(_) => "array.array",
                 Native::Template(_) => "Template",
                 Native::IpAddr(a) => if a.is_ipv4() { "IPv4Address" } else { "IPv6Address" },
                 Native::IpNet(a, _) => if a.is_ipv4() { "IPv4Network" } else { "IPv6Network" },
                 Native::HttpBasicAuth(_) => "BasicAuth",
                 Native::HttpUrl(_) => "URL",
+                Native::HttpReq(_) => "Request",
                 Native::Savepoint(..) => "AsyncSessionTransaction",
                 Native::WriteOnly(..) => "WriteOnlyCollection",
                 Native::SessConn(_) => "AsyncConnection",
@@ -457,6 +489,7 @@ impl V {
                 Native::ListStream(_) => "list",
                 Native::Gen(_) => "async_generator",
                 Native::Acm(_) => "_AsyncGeneratorContextManager",
+                Native::Gcm(_) => "_GeneratorContextManager",
                 Native::Suppress(_) => "suppress",
                 Native::CtxVar(_) => "ContextVar",
                 Native::CtxToken(..) => "Token",
@@ -469,6 +502,8 @@ impl V {
                 Native::Namespace(_) => "module",
                 Native::SaTable(_) | Native::SaColumns(_) | Native::SaColumn(_) | Native::SaType(_) => super::satable::type_name(n),
                 Native::ICal(c) => super::ical::type_name(c),
+                Native::Xl(x) => super::xlsx::type_name(x),
+                Native::Rl(x) => super::rlbind::type_name(x),
                 Native::YamlMark(_) => "Mark",
                 Native::Cron(_) => super::croniter::type_name(),
                 Native::IsoParser(_) => "isoparser",
@@ -501,9 +536,11 @@ impl V {
                 Native::FrameSummary(..) => "FrameSummary",
                 Native::Redis(_) => "Redis",
                 Native::RRetry(_) => "Retry",
+                Native::RPool(_) => "ConnectionPool",
+                Native::RPipe(_) => "Pipeline",
                 Native::AsyncItems(_) => "async_generator",
-                Native::Maker(_, _, false) => "async_sessionmaker",
-                Native::Maker(_, _, true) => "sessionmaker",
+                Native::Maker(_, _, false, _) => "async_sessionmaker",
+                Native::Maker(_, _, true, _) => "sessionmaker",
                 Native::Query(..) => "Query",
                 Native::TLock(l) => if l.reentrant { "RLock" } else { "lock" },
                 Native::TEvent(_) | Native::AEvent(_) => "Event",
@@ -517,8 +554,12 @@ impl V {
                 Native::Stream(_, w) => if *w { "StreamWriter" } else { "StreamReader" },
                 Native::Ellipsis => "ellipsis",
                 Native::Socket(_) => "socket",
+                Native::Proc(_) => "Process",
                 Native::ZipW(_) => "ZipFile",
+                Native::TempDir(_) => "TemporaryDirectory",
                 Native::Rsa(k) => if matches!(&**k, super::crypto::Key::Private(_)) { "RSAPrivateKey" } else { "RSAPublicKey" },
+                Native::Pgp(o) => super::pgpy::type_name(o),
+                Native::Qr(o) => super::qr::type_name(o),
             },
         }
     }
@@ -583,6 +624,9 @@ impl Key {
         })
     }
     pub fn of(v: &V) -> R<Key> {
+        if let Some(s) = super::pgpy::as_str(v) {
+            return Key::of(&s);
+        }
         Ok(match v {
             V::None => Key::None,
             V::Bool(b) => Key::Int(*b as i64),
@@ -614,6 +658,12 @@ impl Key {
                 super::pyd::HashKind::Unhashable => return Err(Exc::type_error(format!("unhashable type: '{}'", o.desc.name))),
             },
             V::Class(c) => Key::Ptr(*c as *const Class as usize),
+            // value semantics, whatever the order of the members
+            V::Frozen(s) => {
+                let mut parts = s.lock().keys().map(|k| format!("{k:?}")).collect::<Vec<_>>();
+                parts.sort();
+                Key::Str(Arc::from(format!("\u{0}frozenset:{}", parts.join("\u{0}"))))
+            }
             V::Native(n) if matches!(&**n, Native::Row(..)) => match &**n {
                 Native::Row(_, vals) => Key::Tuple(vals.iter().map(Key::of).collect::<R<Vec<_>>>()?),
                 _ => unreachable!(),
@@ -625,6 +675,7 @@ impl Key {
             },
             V::Decimal(d) => Key::Float(d.to_f64().to_bits()),
             V::Native(n) => match &**n {
+                Native::Array(_) => return Err(Exc::type_error("unhashable type: 'array.array'")),
                 // value semantics (a Path equals a Path, never a str)
                 Native::Path(p) => Key::Str(Arc::from(format!("\u{0}path:{p}"))),
                 Native::Uuid(u) => Key::Str(Arc::from(format!("\u{0}uuid:{u:032x}"))),
@@ -850,6 +901,8 @@ builtin_exc!(MCP_TOOL_ERROR, "ToolError", [EXCEPTION]);
 builtin_exc!(EXCEPTION, "Exception", [BASE_EXCEPTION]);
 builtin_exc!(EXCEPTION_GROUP, "ExceptionGroup", [EXCEPTION]);
 builtin_exc!(VALUE_ERROR, "ValueError", [EXCEPTION]);
+builtin_exc!(ADDRESS_VALUE_ERROR, "AddressValueError", [VALUE_ERROR]);
+builtin_exc!(NETMASK_VALUE_ERROR, "NetmaskValueError", [VALUE_ERROR]);
 builtin_exc!(TYPE_ERROR, "TypeError", [EXCEPTION]);
 builtin_exc!(ATTRIBUTE_ERROR, "AttributeError", [EXCEPTION]);
 builtin_exc!(PICKLE_ERROR, "PickleError", [EXCEPTION]);
@@ -881,6 +934,8 @@ builtin_exc!(UNPICKLING_ERROR, "UnpicklingError", [PICKLE_ERROR]);
 builtin_exc!(LOOKUP_ERROR, "LookupError", [EXCEPTION]);
 builtin_exc!(KEY_ERROR, "KeyError", [LOOKUP_ERROR]);
 builtin_exc!(INDEX_ERROR, "IndexError", [LOOKUP_ERROR]);
+builtin_exc!(OPENPYXL_ILLEGAL_CHARACTER, "IllegalCharacterError", [EXCEPTION]);
+builtin_exc!(RL_LAYOUT_ERROR, "LayoutError", [EXCEPTION]);
 builtin_exc!(NAME_ERROR, "NameError", [EXCEPTION]);
 builtin_exc!(UNBOUND_LOCAL_ERROR, "UnboundLocalError", [NAME_ERROR]);
 builtin_exc!(ARITHMETIC_ERROR, "ArithmeticError", [EXCEPTION]);
@@ -889,10 +944,25 @@ builtin_exc!(OVERFLOW_ERROR, "OverflowError", [ARITHMETIC_ERROR]);
 builtin_exc!(RUNTIME_ERROR, "RuntimeError", [EXCEPTION]);
 builtin_exc!(FASTAPI_ERROR, "FastAPIError", [RUNTIME_ERROR]);
 builtin_exc!(UNKNOWN_HASH_ERROR, "UnknownHashError", [VALUE_ERROR]);
+builtin_exc!(PASSLIB_UNKNOWN_HASH_ERROR, "UnknownHashError", [VALUE_ERROR]);
+builtin_exc!(PASSLIB_PASSWORD_VALUE_ERROR, "PasswordValueError", [VALUE_ERROR]);
+builtin_exc!(PASSLIB_PASSWORD_SIZE_ERROR, "PasswordSizeError", [PASSLIB_PASSWORD_VALUE_ERROR]);
 builtin_exc!(RECURSION_ERROR, "RecursionError", [RUNTIME_ERROR]);
 builtin_exc!(MEMORY_ERROR, "MemoryError", [EXCEPTION]);
 builtin_exc!(ASSERTION_ERROR, "AssertionError", [EXCEPTION]);
 builtin_exc!(NOT_IMPLEMENTED_ERROR, "NotImplementedError", [RUNTIME_ERROR]);
+builtin_exc!(WARNING, "Warning", [EXCEPTION]);
+builtin_exc!(USER_WARNING, "UserWarning", [WARNING]);
+builtin_exc!(DEPRECATION_WARNING, "DeprecationWarning", [WARNING]);
+builtin_exc!(PENDING_DEPRECATION_WARNING, "PendingDeprecationWarning", [WARNING]);
+builtin_exc!(SYNTAX_WARNING, "SyntaxWarning", [WARNING]);
+builtin_exc!(RUNTIME_WARNING, "RuntimeWarning", [WARNING]);
+builtin_exc!(FUTURE_WARNING, "FutureWarning", [WARNING]);
+builtin_exc!(IMPORT_WARNING, "ImportWarning", [WARNING]);
+builtin_exc!(UNICODE_WARNING, "UnicodeWarning", [WARNING]);
+builtin_exc!(BYTES_WARNING, "BytesWarning", [WARNING]);
+builtin_exc!(RESOURCE_WARNING, "ResourceWarning", [WARNING]);
+builtin_exc!(ENCODING_WARNING, "EncodingWarning", [WARNING]);
 builtin_exc!(OS_ERROR, "OSError", [EXCEPTION]);
 builtin_exc!(TIMEOUT_ERROR, "TimeoutError", [OS_ERROR]);
 builtin_exc!(CONNECTION_ERROR, "ConnectionError", [OS_ERROR]);
@@ -904,7 +974,11 @@ builtin_exc!(STOP_ITERATION, "StopIteration", [EXCEPTION]);
 builtin_exc!(STOP_ASYNC_ITERATION, "StopAsyncIteration", [EXCEPTION]);
 builtin_exc!(QUEUE_FULL, "QueueFull", [EXCEPTION]);
 builtin_exc!(QUEUE_EMPTY, "QueueEmpty", [EXCEPTION]);
-builtin_exc!(HTTP_EXCEPTION, "HTTPException", [EXCEPTION]);
+// starlette.exceptions.HTTPException (what Starlette and FastAPI's machinery raise: 404, 405, a body that does not
+// parse) and fastapi.exceptions.HTTPException, its subclass (what the application and FastAPI's security raise): a
+// handler registered for FastAPI's does not see Starlette's
+builtin_exc!(STARLETTE_HTTP_EXCEPTION, "HTTPException", [EXCEPTION]);
+builtin_exc!(HTTP_EXCEPTION, "HTTPException", [STARLETTE_HTTP_EXCEPTION]);
 // FastAPI: ValidationException(Exception) <- RequestValidationError, WebSocketRequestValidationError
 builtin_exc!(VALIDATION_EXCEPTION, "ValidationException", [EXCEPTION]);
 builtin_exc!(REQUEST_VALIDATION_ERROR, "RequestValidationError", [VALIDATION_EXCEPTION]);
@@ -928,10 +1002,12 @@ builtin_exc!(DATA_ERROR, "DataError", [DBAPI_ERROR]);
 builtin_exc!(PROGRAMMING_ERROR, "ProgrammingError", [DBAPI_ERROR]);
 builtin_exc!(INTERNAL_ERROR, "InternalError", [DBAPI_ERROR]);
 builtin_exc!(NOT_SUPPORTED_ERROR, "NotSupportedError", [DBAPI_ERROR]);
+builtin_exc!(INTERFACE_ERROR, "InterfaceError", [DBAPI_ERROR]);
 builtin_exc!(NO_RESULT_FOUND, "NoResultFound", [SQLALCHEMY_ERROR]);
 builtin_exc!(MULTIPLE_RESULTS_FOUND, "MultipleResultsFound", [SQLALCHEMY_ERROR]);
 builtin_exc!(MISSING_GREENLET, "MissingGreenlet", [SQLALCHEMY_ERROR]);
 builtin_exc!(INVALID_REQUEST_ERROR, "InvalidRequestError", [SQLALCHEMY_ERROR]);
+builtin_exc!(PENDING_ROLLBACK_ERROR, "PendingRollbackError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(OBJECT_DELETED_ERROR, "ObjectDeletedError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(UNMAPPED_INSTANCE_ERROR, "UnmappedInstanceError", [INVALID_REQUEST_ERROR]);
 builtin_exc!(STALE_DATA_ERROR, "StaleDataError", [SQLALCHEMY_ERROR]);
@@ -961,6 +1037,7 @@ builtin_exc!(PYTZ_AMBIGUOUS_TIME_ERROR, "AmbiguousTimeError", [PYTZ_INVALID_TIME
 builtin_exc!(PYTZ_NON_EXISTENT_TIME_ERROR, "NonExistentTimeError", [PYTZ_INVALID_TIME_ERROR]);
 // croniter 6.2 (dynrt/croniter.rs)
 builtin_exc!(CRONITER_ERROR, "CroniterError", [VALUE_ERROR]);
+builtin_exc!(QRCODE_DATA_OVERFLOW_ERROR, "DataOverflowError", [EXCEPTION]);
 builtin_exc!(CRONITER_BAD_TYPE_RANGE_ERROR, "CroniterBadTypeRangeError", [TYPE_ERROR]);
 builtin_exc!(CRONITER_BAD_CRON_ERROR, "CroniterBadCronError", [CRONITER_ERROR]);
 builtin_exc!(CRONITER_UNSUPPORTED_SYNTAX_ERROR, "CroniterUnsupportedSyntaxError", [CRONITER_BAD_CRON_ERROR]);
@@ -989,6 +1066,11 @@ builtin_exc!(EMAIL_MESSAGE_ERROR, "MessageError", [EXCEPTION]);
 builtin_exc!(HEADER_PARSE_ERROR, "HeaderParseError", [EMAIL_MESSAGE_ERROR]);
 builtin_exc!(HEADER_WRITE_ERROR, "HeaderWriteError", [EMAIL_MESSAGE_ERROR]);
 builtin_exc!(STRUCT_ERROR, "error", [EXCEPTION]);
+builtin_exc!(PGP_ERROR, "PGPError", [EXCEPTION]);
+builtin_exc!(PGP_EC_FORMAT_ERROR, "PGPIncompatibleECPointFormatError", [EXCEPTION]);
+builtin_exc!(PYASN1_ERROR, "PyAsn1Error", [EXCEPTION]);
+builtin_exc!(PYASN1_UNDERRUN, "SubstrateUnderrunError", [PYASN1_ERROR]);
+builtin_exc!(PYASN1_END_OF_STREAM, "EndOfStreamError", [PYASN1_UNDERRUN]);
 // dnspython 2.8 (dynrt/dnsres.rs)
 builtin_exc!(DNS_EXCEPTION, "DNSException", [EXCEPTION]);
 builtin_exc!(DNS_FORM_ERROR, "FormError", [DNS_EXCEPTION]);
@@ -1076,11 +1158,53 @@ builtin_exc!(HTTPX_TOO_MANY_REDIRECTS, "TooManyRedirects", [HTTPX_REQUEST_ERROR]
 builtin_exc!(HTTPX_DECODING_ERROR, "DecodingError", [HTTPX_REQUEST_ERROR]);
 builtin_exc!(HTTPX_STATUS_ERROR, "HTTPStatusError", [HTTPX_HTTP_ERROR]);
 builtin_exc!(HTTPX_INVALID_URL, "InvalidURL", [EXCEPTION]);
+// httpcore's, the cause of httpx's transport errors (only seen in tracebacks)
+builtin_exc!(HTTPCORE_CONNECT_ERROR, "ConnectError", [EXCEPTION]);
+builtin_exc!(HTTPCORE_CONNECT_TIMEOUT, "ConnectTimeout", [EXCEPTION]);
+builtin_exc!(HTTPCORE_READ_TIMEOUT, "ReadTimeout", [EXCEPTION]);
+builtin_exc!(HTTPCORE_READ_ERROR, "ReadError", [EXCEPTION]);
+builtin_exc!(HTTPCORE_REMOTE_PROTOCOL_ERROR, "RemoteProtocolError", [EXCEPTION]);
+builtin_exc!(HTTPCORE_NETWORK_ERROR, "NetworkError", [EXCEPTION]);
+builtin_exc!(HTTPX_WRITE_TIMEOUT, "WriteTimeout", [HTTPX_TIMEOUT_EXCEPTION]);
+builtin_exc!(HTTPX_POOL_TIMEOUT, "PoolTimeout", [HTTPX_TIMEOUT_EXCEPTION]);
+builtin_exc!(HTTPX_READ_ERROR, "ReadError", [HTTPX_NETWORK_ERROR]);
+builtin_exc!(HTTPX_WRITE_ERROR, "WriteError", [HTTPX_NETWORK_ERROR]);
+builtin_exc!(HTTPX_CLOSE_ERROR, "CloseError", [HTTPX_NETWORK_ERROR]);
+builtin_exc!(HTTPX_PROTOCOL_ERROR, "ProtocolError", [HTTPX_TRANSPORT_ERROR]);
+builtin_exc!(HTTPX_LOCAL_PROTOCOL_ERROR, "LocalProtocolError", [HTTPX_PROTOCOL_ERROR]);
+builtin_exc!(HTTPX_REMOTE_PROTOCOL_ERROR, "RemoteProtocolError", [HTTPX_PROTOCOL_ERROR]);
+builtin_exc!(HTTPX_PROXY_ERROR, "ProxyError", [HTTPX_TRANSPORT_ERROR]);
+builtin_exc!(HTTPX_COOKIE_CONFLICT, "CookieConflict", [EXCEPTION]);
+builtin_exc!(HTTPX_STREAM_ERROR, "StreamError", [RUNTIME_ERROR]);
+builtin_exc!(HTTPX_STREAM_CONSUMED, "StreamConsumed", [HTTPX_STREAM_ERROR]);
+builtin_exc!(HTTPX_STREAM_CLOSED, "StreamClosed", [HTTPX_STREAM_ERROR]);
+builtin_exc!(HTTPX_RESPONSE_NOT_READ, "ResponseNotRead", [HTTPX_STREAM_ERROR]);
+builtin_exc!(HTTPX_REQUEST_NOT_READ, "RequestNotRead", [HTTPX_STREAM_ERROR]);
 builtin_exc!(SOCKET_GAIERROR, "gaierror", [OS_ERROR]);
 // requests, pywebpush, py-vapid
 builtin_exc!(REQUESTS_EXCEPTION, "RequestException", [OS_ERROR]);
 builtin_exc!(REQUESTS_CONNECTION_ERROR, "ConnectionError", [REQUESTS_EXCEPTION]);
 builtin_exc!(WEBPUSH_EXCEPTION, "WebPushException", [EXCEPTION]);
+// stripe-python 14 (stripe/_error.py, stripe/oauth_error.py): see dynrt/stripe.rs
+builtin_exc!(STRIPE_ERROR, "StripeError", [EXCEPTION]);
+builtin_exc!(STRIPE_API_ERROR, "APIError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_API_CONNECTION_ERROR, "APIConnectionError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_ERROR_WITH_PARAM_CODE, "StripeErrorWithParamCode", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_CARD_ERROR, "CardError", [STRIPE_ERROR_WITH_PARAM_CODE]);
+builtin_exc!(STRIPE_IDEMPOTENCY_ERROR, "IdempotencyError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_INVALID_REQUEST_ERROR, "InvalidRequestError", [STRIPE_ERROR_WITH_PARAM_CODE]);
+builtin_exc!(STRIPE_AUTHENTICATION_ERROR, "AuthenticationError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_PERMISSION_ERROR, "PermissionError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_RATE_LIMIT_ERROR, "RateLimitError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_SIGNATURE_VERIFICATION_ERROR, "SignatureVerificationError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_TEMPORARY_SESSION_EXPIRED_ERROR, "TemporarySessionExpiredError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_OAUTH_ERROR, "OAuthError", [STRIPE_ERROR]);
+builtin_exc!(STRIPE_OAUTH_INVALID_CLIENT, "InvalidClientError", [STRIPE_OAUTH_ERROR]);
+builtin_exc!(STRIPE_OAUTH_INVALID_GRANT, "InvalidGrantError", [STRIPE_OAUTH_ERROR]);
+builtin_exc!(STRIPE_OAUTH_INVALID_REQUEST, "InvalidRequestError", [STRIPE_OAUTH_ERROR]);
+builtin_exc!(STRIPE_OAUTH_INVALID_SCOPE, "InvalidScopeError", [STRIPE_OAUTH_ERROR]);
+builtin_exc!(STRIPE_OAUTH_UNSUPPORTED_GRANT_TYPE, "UnsupportedGrantTypeError", [STRIPE_OAUTH_ERROR]);
+builtin_exc!(STRIPE_OAUTH_UNSUPPORTED_RESPONSE_TYPE, "UnsupportedResponseTypeError", [STRIPE_OAUTH_ERROR]);
 builtin_exc!(VAPID_EXCEPTION, "VapidException", [EXCEPTION]);
 // google-auth
 builtin_exc!(GOOGLE_AUTH_ERROR, "GoogleAuthError", [EXCEPTION]);
@@ -1106,8 +1230,11 @@ builtin_exc!(UNICODE_ENCODE_ERROR, "UnicodeEncodeError", [UNICODE_ERROR]);
 builtin_exc!(PYDANTIC_SERIALIZATION_ERROR, "PydanticSerializationError", [VALUE_ERROR]);
 builtin_exc!(FILE_NOT_FOUND_ERROR, "FileNotFoundError", [OS_ERROR]);
 builtin_exc!(FILE_EXISTS_ERROR, "FileExistsError", [OS_ERROR]);
+builtin_exc!(BLOCKING_IO_ERROR, "BlockingIOError", [OS_ERROR]);
 builtin_exc!(PERMISSION_ERROR, "PermissionError", [OS_ERROR]);
 builtin_exc!(IS_A_DIRECTORY_ERROR, "IsADirectoryError", [OS_ERROR]);
+builtin_exc!(PROCESS_LOOKUP_ERROR, "ProcessLookupError", [OS_ERROR]);
+builtin_exc!(NOT_A_DIRECTORY_ERROR, "NotADirectoryError", [OS_ERROR]);
 
 impl Exc {
     pub fn new(class: &'static Class, args: Vec<V>) -> Exc {
@@ -1128,9 +1255,19 @@ impl Exc {
     pub fn runtime(msg: impl AsRef<str>) -> Exc {
         Exc::msg(&RUNTIME_ERROR, msg)
     }
+    /// Starlette's HTTPException (the router's 404 and 405, the body parsing errors)
     pub fn http(status: u16, detail: V, headers: Vec<(String, String)>) -> Exc {
+        Exc::http_of(&STARLETTE_HTTP_EXCEPTION, status, detail, headers)
+    }
+
+    /// FastAPI's HTTPException (the application's `raise HTTPException(...)`, FastAPI's security classes)
+    pub fn http_fastapi(status: u16, detail: V, headers: Vec<(String, String)>) -> Exc {
+        Exc::http_of(&HTTP_EXCEPTION, status, detail, headers)
+    }
+
+    pub fn http_of(class: &'static Class, status: u16, detail: V, headers: Vec<(String, String)>) -> Exc {
         Exc(Arc::new(ExcObj {
-            class: &HTTP_EXCEPTION,
+            class,
             args: vec![V::Int(status as i64), detail.clone()],
             http: Some((status, detail, headers)),
             errors: None,
@@ -1162,15 +1299,29 @@ impl Exc {
         self.0.http.clone().or_else(|| self.0.http_late.lock().clone())
     }
 
-    /// `str(exc)`: the single argument, or the tuple of arguments, like CPython.
+    /// The text of the exception (tracebacks, logs, pydantic's "Value error, ..."): a project class's
+    /// `__str__` when it has one, which failing gives CPython's `<exception str() failed>` (traceback's
+    /// `_safe_string`); `str(exc)` itself raises instead (ops::str_).
     pub fn message(&self) -> String {
+        if let Some(ExcMember::Method(false, f)) = self.0.class.exc_lookup("__str__") {
+            return match super::ops::call_dunder(f, &V::Exc(self.clone()), vec![], "__str__") {
+                Ok(V::Str(s)) => s.to_string(),
+                _ => "<exception str() failed>".to_string(),
+            };
+        }
+        self.base_message()
+    }
+
+    /// `BaseException.__str__`: the single argument, or the tuple of arguments, like CPython.
+    pub fn base_message(&self) -> String {
         if let Some(errs) = &self.0.errors {
             if self.isinstance(&VALIDATION_EXCEPTION) {
                 return super::web::fastapi_validation_str(self, errs);
             }
             // the model's name, when the raiser knew it (pydantic's `ValidationError.title`)
-            if let Some(V::Str(t)) = self.0.attrs.lock().get("title") {
-                return super::pyd::error_str(t, errs);
+            let attrs = self.0.attrs.lock();
+            if let Some(V::Str(t)) = attrs.get("title") {
+                return super::pyd::error_str_hide(t, errs, matches!(attrs.get("__hide_input__"), Some(V::Bool(true))));
             }
             return format!("{} validation errors", errs.len());
         }
@@ -1181,6 +1332,9 @@ impl Exc {
             return s;
         }
         let args = self.args();
+        if let Some(m) = super::stripe::exc_str(self) {
+            return m;
+        }
         if std::ptr::eq(self.0.class, &WEBPUSH_EXCEPTION) {
             // WebPushException.__str__
             let msg = args.first().map(|a| super::ops::str_(a).unwrap_or_default()).unwrap_or_default();
@@ -1194,6 +1348,12 @@ impl Exc {
             // MissingRequiredClaimError.__str__
             if let Some(c) = self.0.attrs.lock().get("claim") {
                 return format!("Token is missing the \"{}\" claim", super::ops::str_(c).unwrap_or_default());
+            }
+        }
+        if std::ptr::eq(self.0.class, &PASSLIB_UNKNOWN_HASH_ERROR) {
+            // passlib.exc.UnknownHashError.__str__: its message
+            if let Some(V::Str(m)) = self.0.attrs.lock().get("message") {
+                return m.to_string();
             }
         }
         if std::ptr::eq(self.0.class, &PACKAGE_NOT_FOUND) && args.len() == 1 {
@@ -1272,7 +1432,13 @@ impl From<sqlx::Error> for Exc {
             out.0.attrs.lock().insert("__suppress_context__".into(), V::Bool(true));
             return out;
         }
-        Exc::msg(&OPERATIONAL_ERROR, format!("(psycopg.OperationalError) {e}"))
+        let out = Exc::msg(&OPERATIONAL_ERROR, format!("(psycopg.OperationalError) {e}"));
+        // the connection itself failed (refused, dropped, reset): SQLAlchemy's dialect sees a disconnect and
+        // invalidates the connection (`DBAPIError.connection_invalidated`)
+        if matches!(e, sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) | sqlx::Error::WorkerCrashed) {
+            out.0.attrs.lock().insert("connection_invalidated".into(), V::Bool(true));
+        }
+        out
     }
 }
 

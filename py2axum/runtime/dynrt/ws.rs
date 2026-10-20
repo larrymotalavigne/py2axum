@@ -628,6 +628,148 @@ pub async fn serve(app: Arc<super::AppState>, req: axum::extract::Request, route
     }
 }
 
+/// the first WebSocket route of the binary whose path matches (Starlette's router)
+pub fn has_route(routes: &'static [WsRouteDef], raw_path: &str) -> bool {
+    static RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let path = super::web::unquote(raw_path);
+    RES.get_or_init(|| routes.iter().map(|r| super::web::route_regex(r.pattern)).collect()).iter().any(|re| re.is_match(&path))
+}
+
+/// no route serves the WebSocket: Starlette's `WebSocketClose()` before accepting, uvicorn's 403
+pub fn no_route(req: &axum::extract::Request) -> Response {
+    let mut cell = super::web::ReqCell::from_parts("GET", req.uri(), req.headers(), vec![], Bytes::new());
+    cell.client = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| (c.0.ip().to_canonical().to_string(), c.0.port()));
+    super::uvicorn::ws_handshake(&cell, Some(403));
+    super::uvicorn::ws_response(403);
+    plain(403, "")
+}
+
+/// A WebSocket the Python process serves (its route left to Python, the whole application relayed): the
+/// handshake is made with it first, so the client gets its decision (101 with the subprotocol and headers it
+/// accepted with, or its rejection: 403, 500, a denial response), then every message and the close frames
+/// (code, reason) go through unchanged. Pings are answered on each side by the WebSocket layer, as uvicorn does.
+/// The binary logs what uvicorn would (`"WebSocket /path" [accepted]`, `connection open`), the Python process its own.
+pub async fn relay(upstream: &str, req: axum::extract::Request) -> Response {
+    use axum::extract::FromRequestParts;
+    use tokio_tungstenite::tungstenite::{self as tg, client::IntoClientRequest};
+    let client = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| (c.0.ip().to_canonical().to_string(), c.0.port()));
+    let (mut parts, _body) = req.into_parts();
+    let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(u) => u,
+        Err(rej) => return axum::response::IntoResponse::into_response(rej),
+    };
+    let mut cell = super::web::ReqCell::from_parts("GET", &parts.uri, &parts.headers, vec![], Bytes::new());
+    cell.client = client;
+    let pq = parts.uri.path_and_query().map(|x| x.as_str()).unwrap_or("/");
+    let base = upstream.trim_end_matches('/');
+    let url = match base.split_once("://") {
+        Some(("https", rest)) => format!("wss://{rest}{pq}"),
+        Some((_, rest)) => format!("ws://{rest}{pq}"),
+        None => format!("ws://{base}{pq}"),
+    };
+    let bad_gateway = |e: String| {
+        // the path only: a query string can carry a token
+        super::uvicorn::error(&format!("py2axum: python-side upstream {}: {}", parts.uri.path(), e));
+        Response::builder().status(502).header("content-type", "text/plain; charset=utf-8").body(Body::from("Bad Gateway")).unwrap()
+    };
+    let mut creq = match url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => return bad_gateway(e.to_string()),
+    };
+    // the client's headers (its Host, cookies, Origin, subprotocols...), not those of the handshake itself
+    const OWN: [&str; 4] = ["sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-accept"];
+    for (k, v) in super::asgi::relayed(&parts.headers, &OWN) {
+        if k == axum::http::header::HOST {
+            creq.headers_mut().insert(k, v);
+        } else {
+            creq.headers_mut().append(k, v);
+        }
+    }
+    let cfg = tg::protocol::WebSocketConfig::default().max_message_size(Some(MAX_SIZE)).max_frame_size(Some(MAX_SIZE));
+    match tokio_tungstenite::connect_async_with_config(creq, Some(cfg), true).await {
+        Ok((up, resp)) => {
+            super::uvicorn::ws_handshake(&cell, None);
+            super::uvicorn::ws_response(101);
+            let mut out = upgrade.max_message_size(MAX_SIZE).max_frame_size(MAX_SIZE).on_upgrade(move |socket| pump(socket, up));
+            let h = out.headers_mut();
+            const SKIP: [&str; 6] = ["sec-websocket-accept", "sec-websocket-extensions", "date", "server", "content-length", "sec-websocket-protocol"];
+            for (k, v) in super::asgi::relayed(resp.headers(), &SKIP) {
+                h.append(k, v);
+            }
+            if let Some(p) = resp.headers().get("sec-websocket-protocol") {
+                h.insert("sec-websocket-protocol", p.clone());
+            }
+            out
+        }
+        Err(tg::Error::Http(r)) => {
+            let status = r.status().as_u16();
+            super::uvicorn::ws_handshake(&cell, Some(status as i64));
+            super::uvicorn::ws_response(status);
+            let mut out = Response::builder().status(status);
+            for (k, v) in super::asgi::relayed(r.headers(), &["date", "server"]) {
+                out = out.header(k, v);
+            }
+            out.body(Body::from(r.into_body().unwrap_or_default())).unwrap_or_else(|_| plain(500, "Internal Server Error"))
+        }
+        Err(e) => bad_gateway(e.to_string()),
+    }
+}
+
+/// the frames of a relayed WebSocket, both ways, until one side ends (its close handshake done, or dropped:
+/// the other side is then dropped too, as uvicorn drops a connection whose application ended)
+async fn pump(client: WebSocket, up: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{self as tg, protocol::frame::coding::CloseCode};
+    let (mut cs, mut cr) = client.split();
+    let (mut us, mut ur) = up.split();
+    loop {
+        tokio::select! {
+            m = cr.next() => {
+                let m = match m {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+                let fwd = match m {
+                    Message::Text(t) => tg::Message::Text(t.as_str().into()),
+                    Message::Binary(b) => tg::Message::Binary(b),
+                    Message::Close(f) => tg::Message::Close(f.map(|f| tg::protocol::CloseFrame {
+                        code: CloseCode::from(f.code),
+                        reason: f.reason.as_str().into(),
+                    })),
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                };
+                if us.send(fwd).await.is_err() {
+                    break;
+                }
+            }
+            m = ur.next() => {
+                let m = match m {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+                let fwd = match m {
+                    tg::Message::Text(t) => Message::Text(t.as_str().into()),
+                    tg::Message::Binary(b) => Message::Binary(b),
+                    tg::Message::Close(f) => Message::Close(f.map(|f| CloseFrame {
+                        code: u16::from(f.code),
+                        reason: f.reason.as_str().into(),
+                    })),
+                    tg::Message::Ping(_) | tg::Message::Pong(_) | tg::Message::Frame(_) => continue,
+                };
+                if cs.send(fwd).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub type HandleFn = for<'a> fn(&'a Cx, Exc) -> std::pin::Pin<Box<dyn std::future::Future<Output = R<()>> + Send + 'a>>;
 
 // ---------------------------------------------------------------- Starlette's WebSocket

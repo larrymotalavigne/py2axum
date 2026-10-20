@@ -22,6 +22,7 @@ These variables and their defaults are a stable interface ([Versioning and depre
 | `PY2AXUM_SQL_DEBUG` | unset | set: a database error is logged with its SQL statement (not its bound values) |
 | `PY2AXUM_MAX_BODY` | unset | largest request body in bytes, 413 past it ([Security § Request input](../advanced/security.md#request-input)); unset: no limit, like uvicorn |
 | `PY2AXUM_STACK_SIZE` | `268435456` (256 MiB) | stack of the runtime threads, in bytes (reserved address space; [Security § Request input](../advanced/security.md#request-input)) |
+| `LC_ALL`, `LC_CTYPE`, `PYTHONCOERCECLOCALE` | | read at startup as CPython does (PEP 538): with `LC_ALL` unset or empty, a C `LC_CTYPE` and `PYTHONCOERCECLOCALE` other than `0`, the binary sets `LC_CTYPE=C.UTF-8` in its environment (`os.environ`, child processes); `PYTHONCOERCECLOCALE=warn` prints CPython's warning |
 | `PY2AXUM_DB_TIMEZONE` | discovered | the session `TimeZone` psycopg would get (sqlx forces UTC at connect, the runtime restores the server's); set it to skip the discovery |
 | `PY2AXUM_PYTHON_VERSION` | the patch recorded at generation | the patch release of CPython whose messages to reproduce where they changed inside a minor (e.g. `3.13.5`; see [Python versions](../python-versions.md)); generation records the one of `--python` or `.python-version`, else the transpiler's when it runs the project's minor, else the newest |
 | `PY2AXUM_STREAM_CHUNK` | `65536` | block size (bytes) of [large list responses](../advanced/streaming.md) streamed from the session |
@@ -30,6 +31,10 @@ These variables and their defaults are a stable interface ([Versioning and depre
 | `TZ` | | the local time zone, as dateutil's `tz.gettz()` (no name) reads it ([Libraries](libraries.md)) |
 | `PROMETHEUS_MULTIPROC_DIR` | | `prometheus_client`'s multiprocess mode, with the same files as CPython ([Prometheus metrics](../advanced/metrics.md#multiprocess-mode)) |
 | `PROMETHEUS_DISABLE_CREATED_SERIES` | | as in `prometheus_client` ([Prometheus metrics](../advanced/metrics.md)) |
+| `SOURCE_DATE_EPOCH` | | the instant reportlab records in a PDF (`/CreationDate`, `/ModDate`, `/ID`), as reportlab reads it ([Generated documents](../advanced/documents.md)) |
+| `STRIPE_LOG` | | `debug` or `info`: stripe-python's records also printed to stderr, as stripe-python does; the coding agents' variables stripe-python 14.4.1 looks for (`CLAUDECODE`, `CURSOR_AGENT`, `CODEX_CI`...) add `AIAgent/<name>` to its `User-Agent` ([Libraries](libraries.md)) |
+| `LOGURU_LEVEL`, `LOGURU_COLORIZE`, `LOGURU_AUTOINIT` | | loguru's default handler, as `import loguru` reads them; `LOGURU_BACKTRACE`, `LOGURU_DIAGNOSE`, `LOGURU_CATCH` are checked (a boolean), `LOGURU_ENQUEUE`/`LOGURU_SERIALIZE` true or another `LOGURU_*` variable stop the binary at startup ([Logging](../advanced/logging.md#loguru)) |
+| `CI` with `GITLAB_CI`, `GITHUB_ACTIONS`, `TRAVIS`, `CIRCLECI` or `APPVEYOR`; `PYCHARM_HOSTED` | | loguru's colours on sys.stdout / sys.stderr when they are not terminals, as loguru decides ([Logging](../advanced/logging.md#loguru)) |
 
 ## The recorder (Python side)
 

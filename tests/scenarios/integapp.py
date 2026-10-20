@@ -103,6 +103,10 @@ STEPS: list = [    *_pyjwt_cases(),
     ("GET", "/bg/misc", None),
     # bytes.startswith(tuple) (fixtures/integapp/small.py), then json.loads on malformed bodies: CPython's
     # messages and code-point positions, NaN/inf in a 422 (JSONResponse refuses them: 500), BOM, UTF-16
+    # security review 2: line breaks in a header value (fixtures/integapp/small.py /small/mime-header)
+    *[("POST", "/small/mime-header", {"subject": v}) for v in ["x\nBcc: y@z", "x\nfoo", "x\r\nfoo", "x\rfoo", "x\n foo",
+                                                              "x\n\nbody", "x\nBcc:y", "x\n", "x\r\n\tfoo", "ok"]],
+    ("POST", "/small/mime-header", {"subject": "s", "body": "a\rb.\r\nc\n.\n"}),
     ("POST", "/small/sniff", {"b64": "iVBORw0KGgo="}),
     ("POST", "/small/sniff", {"b64": "/9j/2Q=="}),
     *[("POST", "/small/sniff", body) for body in [
@@ -132,6 +136,14 @@ STEPS: list = [    *_pyjwt_cases(),
     ("POST", "/libs/push-errors", None),
     ("POST", "/libs/savepoint", None),
     ("POST", "/libs/savepoint", None),
+    *[("POST", f"/libs/session-fail/{c}", None) for c in ("savepoint", "commit", "timeout", "timeout")],
+    *[("GET", "/libs/session-fail/pool", None) for _ in range(3)],
+    ("POST", "/libs/savepoint-ctx", None),
+    ("POST", "/libs/savepoint-ctx", None),
+    ("POST", "/libs/begin-ctx", None),
+    ("GET", "/libs/io-with", None),
+    ("POST", "/libs/begin-ctx?fail=true", None),
+    ("POST", "/libs/begin-ctx", None),
     ("GET", "/libs/enum", None),
     ("GET", "/libs/enum?rank=high", None),
     ("GET", "/libs/enum?rank=Estar", None),
@@ -352,6 +364,59 @@ STEPS += [  # tests/smtp_sink.py --tls: a self-signed certificate for mail.other
     ("POST", "/small/mail-tls?validate=true", None),  # refused
 ]
 
+# ---- passlib 1.7.4 (fixtures/integapp/passlibx.py): CryptContext of bcrypt. Fresh hashes are random: normalize
+# checks their shape and verifies them with the bcrypt package (a hash of the binary checked by pyca/bcrypt)
+_SALT = "abcdefghijklmnopqrstuu"
+_PL_HASHES = [
+    "$2b$04$" + _SALT,  # a config string: no checksum
+    "$2b$04$abcdefghijklmnopqrst", "$2b$04$", "$2b$04$" + "!" * 22 + "a" * 31, "$2b$04$" + "é" * 53,
+    "$2b$04$" + _SALT + "a" * 30, "$2b$04$" + _SALT + "!" * 31, "$2b$04$" + _SALT + "a" * 32,
+    "$2b$04$" + _SALT + "a" * 31,  # checksum padding bits set: repaired, then compared
+    "$2b$04$abcdefghijklmnopqrstua" + "LZYjhNQAOdpbzt4WxWlUHjv1wsyH5DG",  # salt padding bits set
+    "$2a$04$abcdefghijklmnopqrstua" + "LZYjhNQAOdpbzt4WxWlUHjv1wsyH5DG",  # $2a$ with padding: needs_update
+    "$2a$04$abc", "$2a$04$abcdefghijklmnopqrstu",
+    "$2b$4$" + _SALT, "$2b$004$" + _SALT, "$2b$+4$" + _SALT, "$2b$ 04$" + _SALT, "$2b$x4$" + _SALT,
+    "$2b$$" + _SALT, "$2b$1_2$" + _SALT, "$2b$٠٤$" + _SALT, "$2b$-1$" + _SALT + "a" * 31,
+    "$2b$-0$" + _SALT, "$2b$03$" + _SALT + "a" * 31, "$2b$32$" + _SALT + "a" * 31,
+    "$2b$99999999999999999999$" + _SALT + "a" * 31, "$2b$04", "$2b$04$a$b", "$2x$04$" + _SALT + "a" * 31,
+    "$2$04$" + _SALT + "BwnQvEurWGYE7ZuLPCOGyVZxAr7zgvu", "$2y$04$" + _SALT + "LZYjhNQAOdpbzt4WxWlUHjv1wsyH5DG",
+    "$2b$05$" + _SALT + "LZYjhNQAOdpbzt4WxWlUHjv1wsyH5DG", "$argon2id$v=19$m=65536,t=3,p=4$abc$def", "plain",
+]
+STEPS += [("GET", "/passlib/known", None), ("GET", "/passlib/errors", None),
+          ("GET", "/passlib/fresh", None), ("GET", "/passlib/fresh?pw=%C3%A9t%C3%A9%20%F0%9F%8C%9E&ctx=legacy", None),
+          ("GET", "/passlib/fresh?pw=&ctx=plain", None), ("GET", "/passlib/fresh?pw=" + "y" * 80, None),
+          ("POST", "/passlib/signup", {"username": "ada", "password": "correct horse"}),
+          ("POST", "/passlib/login", {"username": "ada", "password": "correct horse"}),
+          ("POST", "/passlib/login", {"username": "ada", "password": "wrong"}),
+          ("POST", "/passlib/login", {"username": "bob", "password": "x"}),
+          ("GET", "/passlib/catch", None), ("GET", "/passlib/catch?h=%242b%2404%24abc", None),
+          ("GET", "/passlib/catch?h=" + urllib.parse.quote("$2b$04$" + _SALT + "LZYjhNQAOdpbzt4WxWlUHjv1wsyH5DG"), None),
+          ("GET", "/passlib/size", None),
+          ("GET", "/passlib/raw?h=nothash", None), ("GET", "/passlib/raw?h=%242b%2404%24abc", None),
+          ("GET", "/passlib/raw?h=" + urllib.parse.quote("$2b$04$" + _SALT + "LZYjhNQAOdpbzt4WxWlUHjv1wsyH5DG"), None)]
+STEPS += [("GET", "/passlib/check?h=" + urllib.parse.quote(h), None) for h in _PL_HASHES]
+STEPS += [("GET", "/passlib/check?pw=" + urllib.parse.quote(pw) + "&h=" + urllib.parse.quote(h), None) for pw, h in (
+    ("", "$2$04$" + _SALT + "byCG3zY1GIXMyxfivm.ClDiInHzxjiq"), ("x", "$2$04$" + _SALT + "byCG3zY1GIXMyxfivm.ClDiInHzxjiq"),
+    ("s3cret" * 13, "$2$04$" + _SALT + "BwnQvEurWGYE7ZuLPCOGyVZxAr7zgvu"))]
+
+# ---- httpx's exceptions against a misbehaving server (fixtures/integapp/httpxerr.py, tests/bad_http.py)
+STEPS += [("GET", f"/httpxerr/call/{w}", None) for w in ("ok", "close", "partial", "chunked", "reset", "slow", "s503", "refused")]
+STEPS += [("GET", f"/httpxerr/retry/{w}", None) for w in ("ok", "close", "s503")]
+STEPS += [("GET", f"/httpxerr/raw/{w}", None) for w in ("close", "partial")]
+
+def _passlib_fresh(body: dict) -> dict:
+    """a hash made by the server (random salt): its shape, and whether pyca/bcrypt verifies it"""
+    import re as _re
+
+    import bcrypt
+    h = body.pop("hash")
+    shape = _re.fullmatch(r"\$2b\$12\$[./A-Za-z0-9]{21}[.Oeu][./A-Za-z0-9]{30}[.CGKOSWaeimquy26]", h) is not None
+    pw = body["pw"].encode()[:72]
+    body["hash"] = {"shape": shape, "pyca_checks": bcrypt.checkpw(pw, h.encode())}
+    if isinstance(body.get("and_update"), list):
+        body["and_update"] = [body["and_update"][0], body["and_update"][1] is not None]
+    return body
+
 
 def _reset_broker() -> None:
     """Delete the test queues of fixtures/integapp/amqp.py; waits up to 60 s for the broker (CI service start)."""
@@ -395,8 +460,11 @@ def normalize_text(text: str) -> str:
 
 
 def normalize(body):
-    """prometheus_client texts (fixtures/integapp/prom.py, tracing.py): see normalize_text."""
+    """prometheus_client texts (fixtures/integapp/prom.py, tracing.py): see normalize_text; passlib's fresh hashes
+    (fixtures/integapp/passlibx.py): see _passlib_fresh."""
     import re as _re
+    if isinstance(body, dict) and "pw" in body and isinstance(body.get("hash"), str):
+        return _passlib_fresh(dict(body))
     if isinstance(body, dict) and "events" in body and "metrics" in body:
         body = dict(body, metrics=normalize_text(body["metrics"]))
     if isinstance(body, dict) and "texts" in body and "om" in body:
@@ -438,6 +506,10 @@ STEPS += [("DELETE", "/ext/notes", None), ("GET", "/ext/notes", None), ("POST", 
           ("POST", "/health", None), ("GET", "/health", None), ("PUT", "/health", None),
           ("GET", "/made/whoami", None), ("GET", "/made", None), ("GET", "/ext", None), ("GET", "/nowhere/at/all", None),
           ("DELETE", "/ext/notes", None)]
+# routes `app.add_route` adds before / after the library's routers (fixtures/integapp/addedroutes.py): the later
+# ones are tried after the library's (GET /ext/notes is the library's, not the added one)
+STEPS += [("GET", "/added/early", None), ("GET", "/added/late", None), ("GET", "/ext/notes", None),
+          ("POST", "/added/late", None), ("GET", "/added/nowhere", None)]
 
 # documented differences of the log conformance (tests/logcmp.py): records left out on both sides
 LOG_IGNORE = []

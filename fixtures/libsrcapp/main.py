@@ -6,12 +6,16 @@ Generated with `python -m py2axum fixtures/libsrcapp --root . --translate-libs a
 from typing import Annotated
 
 import humanize
+import requests
 from fastapi import FastAPI, Query
+from requests.utils import quote
 
+from .gens import router as gens_router
 from .stdsrc import router as std_router
 
 app = FastAPI()
 app.include_router(std_router)
+app.include_router(gens_router)
 
 
 @app.get("/health")
@@ -52,3 +56,19 @@ async def size_str(s: str):
 @app.get("/hum/words/{n}")
 async def words(n: int):
     return {"comma": humanize.intcomma(n), "ord": humanize.ordinal(n), "ap": humanize.apnumber(n)}
+
+
+# requests: the library map has its exceptions only, the rest comes from its source; the source's InvalidURL
+# derives from the map's RequestException (caught by the `except` below, as in Python)
+@app.get("/rq/requote")
+async def rq_requote(u: str):
+    return {"v": requests.utils.requote_uri(u), "q": quote(u, safe="")}
+
+
+@app.get("/rq/unquote")
+async def rq_unquote(u: str):
+    try:
+        return {"v": requests.utils.unquote_unreserved(u)}
+    except requests.RequestException as e:
+        return {"err": type(e).__name__, "msg": str(e), "base": isinstance(e, requests.exceptions.RequestException),
+                "value": isinstance(e, ValueError)}

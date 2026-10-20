@@ -89,11 +89,13 @@ def generate(pkg: Path, out: Path, stamp: str) -> str | None:
     return None
 
 
-def _write(path: Path, text: str) -> None:
-    """Only when it changes: cargo's incremental compilation keys on modification times too."""
-    if not path.exists() or path.read_text() != text:
+def _write(path: Path, text: str | bytes) -> None:
+    """Only when it changes: cargo's incremental compilation keys on modification times too.
+    bytes for the runtime's binary files (dateutil-zoneinfo.tgz, pytzdata.bin)."""
+    data = text if isinstance(text, bytes) else text.encode()
+    if not path.exists() or path.read_bytes() != data:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+        path.write_bytes(data)
 
 
 def _as_module(main_rs: str, ident: str) -> str:
@@ -118,11 +120,12 @@ def write_bundle(bundle: Path, gens: dict[str, Path]) -> None:
     src = bundle / "src"
     # the runtime's library crate (dynrt/, its path dependency), shared by every bundle's target directory
     rt = bundle / "dynrt"
-    for p in sorted((first / "dynrt").iterdir()):
-        _write(rt / p.name, p.read_text())
-    for p in list(rt.iterdir()):
-        if not (first / "dynrt" / p.name).exists():
-            p.unlink()
+    for p in sorted((first / "dynrt").rglob("*")):
+        if p.is_file():  # the runtime has sub-directories (rl/)
+            _write(rt / p.relative_to(first / "dynrt"), p.read_bytes())
+    for p in sorted(rt.rglob("*"), reverse=True):
+        if not (first / "dynrt" / p.relative_to(rt)).exists():
+            shutil.rmtree(p) if p.is_dir() else p.unlink()
     if (src / "dynrt").exists():
         shutil.rmtree(src / "dynrt")
     mods, arms = ["#[macro_use]", "extern crate dynrt;"], []
