@@ -2231,10 +2231,14 @@ pub fn defaultdict_template(template: V, init: V) -> R {
 /// a new dict with `src`'s factory (a defaultdict's copy, a Counter's): `init` is already a fresh dict
 pub fn defaultdict_like(src: &Arc<DictCell>, init: V) -> R {
     match default_factory(src) {
-        Some("<lambda>") => match TEMPLATES.lock().get(&(Arc::as_ptr(src) as usize)).map(|(_, t)| t.clone()) {
-            Some(t) => defaultdict_template(t, init),
-            None => Ok(init),
-        },
+        Some("<lambda>") => {
+            // the registry's lock released before defaultdict_template takes it again
+            let t = TEMPLATES.lock().get(&(Arc::as_ptr(src) as usize)).map(|(_, t)| t.clone());
+            match t {
+                Some(t) => defaultdict_template(t, init),
+                None => Ok(init),
+            }
+        }
         Some(f) => defaultdict(f, init),
         None => Ok(init),
     }
