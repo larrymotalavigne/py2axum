@@ -3,8 +3,10 @@
 //! `uuid4().hex`; with `validate` (the default) the value must parse as `uuid.UUID(value)`, else the
 //! middleware answers itself with the default error response (`Response(status_code=400)`: empty body,
 //! `content-length: 0`). On the way back, each plugin appends `key: value` to `http.response.start`
-//! (`MutableHeaders.append`, lower-cased name), in plugin order. `context` itself is not readable from the
-//! translated code (the library's `context` object is not mapped).
+//! (`MutableHeaders.append`, lower-cased name), in plugin order, the value read back from the context
+//! (`str(context.get(key))`: the endpoint may have changed it). `starlette_context.context` is the request's
+//! context dict (`_request_scope_context_storage`): `{plugin.key: value}` set by the middleware, kept with the
+//! request's ContextVars (the tasks it creates share it; never reset, the request's context ends with it).
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
@@ -20,6 +22,22 @@ pub struct Plugin {
 
 pub struct RawContext {
     pub plugins: Vec<Plugin>,
+}
+
+/// the slot of `_request_scope_context_storage` among the request's ContextVars (agen::CtxVar ids count up from 1)
+const STORE: usize = usize::MAX;
+
+/// `context.data` (and every use of `context` as a mapping): the dict itself, mutations included
+pub fn data(cx: &Cx) -> R {
+    cx.ctxvars.lock().get(&STORE).cloned().ok_or_else(|| {
+        Exc::msg(&CONTEXT_DOES_NOT_EXIST_ERROR, "You didn't use the required middleware or you're trying to access `context` \
+object outside of the request-response cycle.")
+    })
+}
+
+/// `context.exists()`
+pub fn exists(cx: &Cx) -> R {
+    Ok(V::Bool(cx.ctxvars.lock().contains_key(&STORE)))
 }
 
 /// `uuid.UUID(s)` accepts it (version= only overwrites bits): `urn:`/`uuid:` removed, `{}` stripped at
@@ -77,11 +95,18 @@ impl RawContext {
                 // MiddleWareValidationError: the default error response, sent by the middleware itself
                 return Ok(Response::builder().status(400).header("content-length", "0").body(Body::empty()).unwrap());
             }
-            values.push((p.key.to_ascii_lowercase(), v));
+            values.push((V::str(p.key), V::str(v)));
         }
+        // request_cycle_context(context): a dict of its own for this request
+        let store = V::dict_from(values)?;
+        cx.ctxvars.lock().insert(STORE, store.clone());
         let mut r = next.await?;
-        for (k, v) in values {
-            let k = HeaderName::from_bytes(k.as_bytes()).map_err(|e| Exc::value_error(e.to_string()))?;
+        for p in &self.plugins {
+            // enrich_response: str(context.get(self.key))
+            let key = V::str(p.key);
+            let v = if super::ops::contains(&store, &key)? { super::ops::getitem(&store, &key)? } else { V::None };
+            let v = super::ops::str_(&v)?;
+            let k = HeaderName::from_bytes(p.key.to_ascii_lowercase().as_bytes()).map_err(|e| Exc::value_error(e.to_string()))?;
             let v = HeaderValue::from_str(&v).map_err(|e| Exc::value_error(e.to_string()))?;
             r.headers_mut().append(k, v);
         }

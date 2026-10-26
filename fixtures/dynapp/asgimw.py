@@ -8,6 +8,8 @@ import zlib
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette_context import context
+from starlette_context.errors import ContextDoesNotExistError, StarletteContextError
 
 router = APIRouter(prefix="/mw")
 
@@ -287,6 +289,52 @@ async def ctx(request: Request):
 async def ctx_change():
     REQUEST_ID.set(REQUEST_ID.get() + "+endpoint")
     return {"var": REQUEST_ID.get()}
+
+
+def context_user():
+    """read from a plain function: the request's context, wherever the code runs in the request"""
+    try:
+        return context.get("user", "anonymous")
+    except ContextDoesNotExistError:
+        return "no context"
+
+
+# starlette_context's `context` (RawContextMiddleware in main.py): the plugins' values, and keys the endpoint sets
+@router.get("/sctx")
+async def sctx(rid: bool = False):
+    before = context_user()
+    context["user"] = "u1"
+    context.setdefault("hits", 0)
+    context["hits"] += 1
+    out = {"before": before, "after": context_user(), "keys": sorted(context), "n": len(context),
+           "has_user": "user" in context, "missing": "nope" not in context, "exists": context.exists(),
+           "hits": context.data["hits"], "copy_is_dict": type(context.copy()).__name__}
+    if rid:
+        out["rid"] = context["X-Request-ID"]
+        out["items"] = sorted((k, v) for k, v in context.items() if k != "X-Correlation-ID")
+    return out
+
+
+@router.get("/sctx/rewrite")
+async def sctx_rewrite():
+    # the plugins add the response headers from the context: these values, not the request's
+    context["X-Request-ID"] = "rewritten"
+    context.update({"X-Correlation-ID": 12})
+    return {"ok": True}
+
+
+@router.get("/sctx/delete")
+async def sctx_delete():
+    del context["X-Correlation-ID"]
+    return {"left": [k for k in context], "popped": context.pop("X-Request-ID") is not None}
+
+
+@router.get("/sctx/missing")
+async def sctx_missing():
+    try:
+        return {"v": context["nope"]}
+    except KeyError as e:
+        return {"key_error": str(e), "is_ctx_error": isinstance(e, StarletteContextError)}
 
 
 @router.get("/nolength")

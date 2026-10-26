@@ -84,7 +84,16 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   an alias keeps it, the generator fills the others, as pydantic does); anything else is refused. A configuration
   may spread another model's: `ConfigDict(**Base.model_config, ...)`, `{**Base.model_config, ...}`.
 - `allow_inf_nan=False` in `model_config` (every float of the model, in its containers too: `finite_number`);
-  `validate_default=False`.
+  `validate_default=True`/`False` (every field without its own `Field(validate_default=)`, inherited by
+  subclasses; with `True`, a computed default — a lambda or function `default_factory` — is refused).
+  `defer_build`, `cache_strings`, `validate_return` and `use_attribute_docstrings` are accepted: they change
+  nothing the binary does (`model_json_schema()` refuses such a model).
+- Pydantic v1's methods, deprecated but still on v2 models: `Model.parse_obj(obj)`, `Model.validate(value)`,
+  `Model.from_orm(obj)` (`PydanticUserError` without `from_attributes=True`), `Model.construct(_fields_set,
+  **values)`, `Model.schema()` (no arguments), `Model.parse_raw(str | bytes)` (JSON; a decoding error is a
+  `ValidationError` at `__root__`, as pydantic reports it), `Model.update_forward_refs()`, `.dict(...)`,
+  `.json(...)` (`model_dump_json` with `by_alias=False`) and `.copy(update=, deep=)`. `parse_file`,
+  `parse_raw(content_type=, proto=)` and `.copy(include=, exclude=)` are refused.
 - `hide_input_in_errors=True`: `str()` of the model's `ValidationError` without `input_value`/`input_type`
   (`errors()` and the 422 body keep the input, as in pydantic).
 - `Field(exclude=True)` (never dumped), `repr=False`, `frozen=True` (an assignment raises `frozen_field`),

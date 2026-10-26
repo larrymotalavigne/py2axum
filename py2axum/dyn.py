@@ -589,7 +589,12 @@ class Project:
 
             mods = list(self.ix.modules.items())
             sites = [(name, n) for name, m in mods for n in ast.walk(m.tree)
-                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "model_json_schema"]
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and (
+                         n.func.attr == "model_json_schema"
+                         # pydantic v1's `Model.schema()` (deprecated): model_json_schema() on a model named here
+                         or n.func.attr == "schema" and not n.args and not n.keywords
+                         and isinstance(n.func.value, (ast.Name, ast.Attribute))
+                         and self.resolve(name, n.func.value) in self.fe.schema_syms)]
             done, errors, bad_syms = {}, {}, {}
 
             def schema_of(t: Sym):
@@ -4330,7 +4335,7 @@ class Project:
                 if parent.__dict__.get("init") is not None:
                     info.__dict__["init"] = parent.__dict__["init"]
                 for k in ("strip", "lower", "upper", "smin", "smax", "strict", "field_sers", "model_ser", "root", "enum_values", "validate_assignment", "populate_by_name", "post_init",
-                          "alias_gen", "validate_by_alias", "ser_by_alias", "hide_input", "env_ignore_empty", "finite"):
+                          "alias_gen", "validate_by_alias", "ser_by_alias", "hide_input", "env_ignore_empty", "finite", "validate_default"):
                     if k in parent.__dict__:
                         info.__dict__[k] = parent.__dict__[k]
                 # the merged `model_config` (pydantic updates it from each base in order): `**Base.model_config`
@@ -4393,10 +4398,16 @@ class Project:
                 if "default_factory" in opts:
                     f["default"] = self.default_spec(opts["default_factory"], module, True)
                 self.field_aliases(f, opts, module)
-                if "validate_default" in opts and self.const(opts["validate_default"], module):
+                if "validate_default" in opts:
+                    # explicit: wins over model_config's validate_default
+                    f["vd_explicit"] = bool(self.const(opts["validate_default"], module))
+                    f.pop("vd_config", None)
+                if f.get("vd_explicit"):
                     if f["default"].startswith(("Dyn(", "Data(")):
                         raise self.err("Field(validate_default=True) with a computed default is not supported", opts["validate_default"], module)
                     f["validate_default"] = True
+                elif "vd_explicit" in f:
+                    f.pop("validate_default", None)
                 f["cons"] = cons
                 f.setdefault("ann", (ann, module))
                 fields = self.put_field(fields, f)
@@ -4523,6 +4534,17 @@ class Project:
                 self.config_class(info, stmt, module)
             else:
                 raise self.err(f"unsupported statement in schema {sym.name}", stmt, module)
+        # model_config validate_default (inherited, or the class's own): every field that does not set its own
+        for f in fields:
+            if "vd_explicit" in f:
+                continue
+            if info.__dict__.get("validate_default"):
+                if f.get("default", "Required").startswith(("Dyn(", "Data(")):
+                    raise self.err(f"schema {sym.name}.{f['name']}: model_config validate_default=True with a computed "
+                                   "default is not supported", node, module)
+                f["validate_default"] = f["vd_config"] = True
+            elif f.pop("vd_config", None):
+                f.pop("validate_default", None)
         for f in fields:
             if f.get("validate_default") and any(f["name"] in names for names, _ in info.__dict__.get("before", [])):
                 raise self.err(f"schema {sym.name}.{f['name']}: validate_default=True with a mode='before' validator "
@@ -5129,6 +5151,10 @@ class Project:
             elif kw.arg in {"env_file", "env_file_encoding",
                             "arbitrary_types_allowed", "protected_namespaces", "json_schema_extra", "title"}:
                 pass
+            elif kw.arg in {"defer_build", "cache_strings", "validate_return", "use_attribute_docstrings"}:
+                # when the validator is built, pydantic-core's string cache, `@validate_call` only, the JSON schema's
+                # descriptions (model_json_schema() refuses a model_config beyond from_attributes/extra): no effect here
+                pass
             elif kw.arg == "str_strip_whitespace":
                 info.__dict__["strip"] = bool(v)  # the subclass's own config wins over the inherited one
             elif kw.arg == "str_to_lower":
@@ -5150,8 +5176,7 @@ class Project:
                     raise self.err("model_config allow_inf_nan= other than False is not supported", kw, module)
                 info.__dict__["finite"] = True  # every float the model validates rejects inf/nan (finite_number)
             elif kw.arg == "validate_default":
-                if v is not False:
-                    raise self.err("model_config validate_default=True is not supported (Field(validate_default=True) is)", kw, module)
+                info.__dict__["validate_default"] = bool(v)  # applied to the fields without their own
             elif kw.arg == "hide_input_in_errors":
                 info.__dict__["hide_input"] = bool(v)  # str(ValidationError) only: errors() keep their input
             elif kw.arg in {"val_json_bytes", "ser_json_bytes"}:
@@ -6865,6 +6890,8 @@ class FnCompiler:
             self.note_native(ref.dotted, node)
             if ref.dotted == "sys.modules":
                 self.check_sys_modules(node)
+            if ref.dotted in STARLETTE_CONTEXT or ref.dotted.removesuffix(".data") in STARLETTE_CONTEXT:
+                return self.starlette_context(ref.dotted, node)
             if ref.dotted in libmap.VALUES:
                 return libmap.VALUES[ref.dotted]
             if ref.dotted == "datetime.datetime":
@@ -6941,6 +6968,50 @@ class FnCompiler:
     # the standard-library modules PEP 594 removed in Python 3.13 (`sys.stdlib_module_names` of 3.12 minus 3.13's)
     REMOVED_IN_313 = {"aifc", "audioop", "cgi", "cgitb", "chunk", "crypt", "imghdr", "mailcap", "msilib", "nis",
                       "nntplib", "ossaudiodev", "pipes", "sndhdr", "spwd", "sunau", "telnetlib", "uu", "xdrlib"}
+
+    def starlette_context(self, dotted: str, node: ast.AST) -> str:
+        """`starlette_context.context`, a UserDict over the request's context dict (dynrt/ctxmw.rs): `context.data`
+        is the dict itself; `context` is read as that dict where the UserDict behaves the same (`context[k]`, `k in
+        context`, `len()`, iteration, a test, `dict()`/`list()`/`str()`, `**context`). Anywhere else (a value handed
+        on, `repr()`, `isinstance`, JSON) the UserDict differs from a dict: refused."""
+        data = self.q(f"{RT}::ctxmw::data(cx)")
+        if dotted.endswith(".data"):
+            return data
+        par = self.p.fe._parents(self.module)
+        p = par.get(node)
+        if isinstance(p, ast.Subscript) and p.value is node:
+            return data
+        if isinstance(p, ast.Compare) and node in p.comparators \
+                and isinstance(p.ops[p.comparators.index(node)], (ast.In, ast.NotIn)):
+            return data
+        if isinstance(p, (ast.For, ast.AsyncFor, ast.comprehension)) and p.iter is node:
+            return data
+        if isinstance(p, (ast.If, ast.While, ast.IfExp)) and p.test is node \
+                or isinstance(p, ast.comprehension) and node in p.ifs or isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+            return data
+        if isinstance(p, ast.Dict) and any(k is None and v is node for k, v in zip(p.keys, p.values)):
+            return data
+        if isinstance(p, ast.Call) and p.args == [node] and not p.keywords \
+                and self.static_ref(p.func) in {("builtin", n) for n in ("len", "dict", "list", "str", "bool", "sorted", "set", "tuple")}:
+            return data
+        raise self.err("library value `starlette_context.context` is not supported here: it is supported as a mapping "
+                       "(`context[key]`, `key in context`, `context.get(...)`, `len()`, iteration, `context.data`), not "
+                       "handed on as the UserDict object itself; use `context.data`", node)
+
+    def starlette_context_call(self, meth: str, node: ast.Call) -> str:
+        """`context.get(...)`, `context.exists()`...: UserDict's methods, those of the request's context dict (the same
+        behaviour) except `popitem` (MutableMapping's pops the first key, dict's the last) and `exists`."""
+        if meth == "exists":
+            if node.args or node.keywords:
+                raise self.err("context.exists() takes no arguments", node)
+            return self.q(f"{RT}::ctxmw::exists(cx)")
+        if meth not in self.CONTEXT_METHODS:
+            raise self.err(f"library call `starlette_context.context.{meth}()` is not supported (of the context's "
+                           f"methods: {', '.join(sorted(self.CONTEXT_METHODS | {'exists'}))})", node)
+        args, kwargs = self.dyn_args(node)
+        return self.q(f"{RT}::methods::call_method(cx, &{self.q(f'{RT}::ctxmw::data(cx)')}, {rs(meth)}, {args}, {kwargs}).await")
+
+    CONTEXT_METHODS = {"get", "setdefault", "pop", "update", "keys", "values", "items", "clear", "copy"}
 
     def check_sys_modules(self, node: ast.AST) -> None:
         """`sys.modules` with a literal key the project's Python cannot import (a module PEP 594 removed, on 3.13+,
@@ -8717,6 +8788,8 @@ class FnCompiler:
                            "object of type 'generator' has no len()); pass a list", node.args[0])
         tmpl = libmap.CALLS.get(name)
         recv, _, meth = name.rpartition(".")
+        if recv in STARLETTE_CONTEXT:
+            return self.starlette_context_call(meth, node)
         if tmpl is None and self.object_value(recv, values=False) is not None:
             # a method of a library object (`REGISTRY.register(c)`): dispatched at run time like any value's
             obj = self.object_value(recv, values=False)
@@ -12412,6 +12485,8 @@ def _route_path(fe: Frontend, e: TranspileError):
         return None
 
 
+# starlette_context's `context` (a UserDict over the request's context dict, dynrt/ctxmw.rs)
+STARLETTE_CONTEXT = {"starlette_context.context", "starlette_context.ctx.context"}
 MW_CONTEXT = {"starlette_context.middleware.RawContextMiddleware",
               "starlette_context.middleware.raw_middleware.RawContextMiddleware"}
 # starlette_context plugins the runtime ports (dynrt/ctxmw.rs): class -> header key

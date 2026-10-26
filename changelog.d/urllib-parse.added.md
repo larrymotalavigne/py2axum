@@ -1,0 +1,1 @@
+- `urllib.parse.urlunsplit`, `urlunparse`, `urljoin` and `SplitResult._replace()`, with each Python's rules.

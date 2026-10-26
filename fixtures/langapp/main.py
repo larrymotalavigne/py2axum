@@ -10,7 +10,7 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import colls, construct, corpusx, decoprops, decos, docsx, dunders, edges, extras, kwargs, ormx, pk, procx, pydcorpus, pydmore, pyver, rds, realworld, sec, silent, stdmore
+from . import colls, construct, cp, corpusx, decoprops, decos, docsx, dunders, edges, extras, kwargs, ormx, pk, procx, pydcorpus, pydmore, pydv1, pyver, rds, realworld, sec, silent, stdmore
 
 app = FastAPI()
 app.include_router(decos.router)
@@ -18,6 +18,8 @@ app.include_router(procx.router)
 app.include_router(decoprops.router)
 app.include_router(dunders.router)
 app.include_router(pk.router)
+app.include_router(cp.router)
+app.include_router(pydv1.router)
 app.include_router(rds.router)
 app.include_router(colls.router)
 app.include_router(sec.router)

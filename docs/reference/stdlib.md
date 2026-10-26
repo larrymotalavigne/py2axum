@@ -12,7 +12,7 @@ Python 3.7+; `pos`/`endpos` of a compiled pattern's methods refused), `csv` (sim
 `os.environ`/`os.getenv` (read-only), `os.path`, `os.remove`/`os.unlink` (str or Path; `OSError`s carry
 `errno`, `strerror`, `filename`), `fcntl.flock` (an `open()` file or a descriptor number; `LOCK_SH`/`LOCK_EX`/`LOCK_NB`/`LOCK_UN`;
 a lock held elsewhere with `LOCK_NB` raises `BlockingIOError`), `math`, `random` (OS-seeded), `secrets` (`choice`, `randbelow`, `randbits` up to 63 bits, `token_bytes`/`token_hex`/`token_urlsafe`, `compare_digest`, `DEFAULT_ENTROPY`; `SystemRandom` refused), `hashlib`,
-`hmac`, `base64`, `urllib.parse` (`urlsplit`'s netloc checks and their `ValueError`s: brackets, IPvFuture, NFKC; `parse_qs`/`parse_qsl` of a str with their options, utf-8 and errors='replace' only), `array.array` (typecodes b B h H i I l L q Q f d with CPython's OverflowError for each, `itemsize`, `tolist`, `tobytes`/`frombytes`, `append`/`extend`, indexing, `bisect` over it; 'u'/'w' and slicing refused), `mimetypes.guess_type`/`guess_file_type` (3.13+)/`guess_extension`/`guess_all_extensions` (`strict=`; CPython's built-in tables of the project's Python, then the host's `mime.types` files in `mimetypes.knownfiles` order, as `mimetypes.init()` reads them; `add_type`, `init`, `read` and the module's tables are refused), `string` constants, `time.time/monotonic/perf_counter`,
+`hmac`, `base64`, `urllib.parse` (`urlsplit`'s netloc checks and their `ValueError`s: brackets, IPvFuture, NFKC; `urlparse`/`urlsplit` with `scheme=` and `allow_fragments=`, `._replace()`, `.geturl()`; `urlunsplit`, `urlunparse` and `urljoin` with each Python's rules (3.12.4's `urlunsplit`, 3.14's `urljoin` keeping empty components); `parse_qs`/`parse_qsl` of a str with their options, utf-8 and errors='replace' only; str arguments only), `array.array` (typecodes b B h H i I l L q Q f d with CPython's OverflowError for each, `itemsize`, `tolist`, `tobytes`/`frombytes`, `append`/`extend`, indexing, `bisect` over it; 'u'/'w' and slicing refused), `mimetypes.guess_type`/`guess_file_type` (3.13+)/`guess_extension`/`guess_all_extensions` (`strict=`; CPython's built-in tables of the project's Python, then the host's `mime.types` files in `mimetypes.knownfiles` order, as `mimetypes.init()` reads them; `add_type`, `init`, `read` and the module's tables are refused), `string` constants, `time.time/monotonic/perf_counter`,
 `statistics.median`, `operator.index`, `sys.maxsize`, `threading.local()` (one state for the whole process: uvicorn runs
 every `async` endpoint on one thread, but FastAPI runs a `def` endpoint in a thread pool, where CPython gives each
 thread its own state), `logging` (loggers, handlers, formatters, filters, `basicConfig`, `dictConfig`,
@@ -59,3 +59,15 @@ Python workers). Supported: scalars, str/bytes, containers (shared references ke
 time zones, `Decimal`, `UUID`, enums, project class instances (`__dict__` or `__slots__`), dataclasses,
 Pydantic models. Refused: mapped (ORM) objects, other globals, out-of-band buffers. Integers beyond 64 bits
 read back as integral `Decimal`s.
+
+## copy
+
+`copy.copy(x)` and `copy.deepcopy(x)` follow CPython's `copy` module. Immutable values come back as they
+are, and so does a tuple whose items deep-copy to the same objects. Lists, dicts, sets, `defaultdict`,
+`Counter` and `deque` are rebuilt (a `defaultdict` keeps its factory, a deque its `maxlen`). `deepcopy` keeps
+a memo by identity, so shared and cyclic references are copied once. Pydantic models follow
+`BaseModel.__copy__`/`__deepcopy__` (fields, extra fields, `model_fields_set`). Dataclasses and plain class
+instances are rebuilt with their `__dict__`, shallow or deep. A project class that defines `__copy__`,
+`__deepcopy__`, `__reduce__` or `__getstate__` is refused at translation, so its method is never skipped.
+`deepcopy(x, memo)` is refused. At run time, copying a mapped (ORM) object, an exception or a runtime handle
+(request, client, session) raises `TypeError`.

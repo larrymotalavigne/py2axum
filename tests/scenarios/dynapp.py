@@ -774,6 +774,12 @@ STEPS += [
     ("GET", "/tasks/1", None, {"x-request-id": "a_" + "b" * 30}),
     ("GET", "/tasks/1", None, {"x-request-id": "g" * 32}),
     ("GET", "/mw/inflight", None),
+    ("GET", "/mw/sctx", None),
+    ("GET", "/mw/sctx?rid=1", None, {"x-request-id": _U1}),
+    ("GET", "/mw/sctx/rewrite", None),
+    ("GET", "/mw/sctx/rewrite", None, {"x-request-id": _U1}),
+    ("GET", "/mw/sctx/delete", None, {"x-request-id": _U1}),
+    ("GET", "/mw/sctx/missing", None),
 ]
 # gzip.decompress: members, padding, header flags, truncated/corrupted inputs
 _GZ = __import__("gzip").compress(b"hello gzip " * 50, mtime=0)

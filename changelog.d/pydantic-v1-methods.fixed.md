@@ -1,0 +1,1 @@
+- `.json()` and `.copy()` on a Pydantic v2 model were translated but raised `AttributeError` at run time.

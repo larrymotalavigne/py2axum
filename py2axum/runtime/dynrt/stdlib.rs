@@ -1367,8 +1367,43 @@ pub fn urllib(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
             Ok(V::str(out.join("&")))
         }
         "urlparse" | "urlsplit" => {
-            let url = ops::str_(up_arg(name, args, kwargs, 0, "url", &["url", "scheme", "allow_fragments"])?.ok_or_else(|| Exc::type_error("missing 'url'"))?)?;
-            Ok(V::native(Native::UrlParts(Arc::new(url_split(&url, name == "urlparse")?))))
+            let names = ["url", "scheme", "allow_fragments"];
+            let url = up_arg(name, args, kwargs, 0, "url", &names)?
+                .ok_or_else(|| Exc::type_error(format!("{name}() missing 1 required positional argument: 'url'")))?;
+            let url = url_text(name, url)?;
+            let scheme = match up_arg(name, args, kwargs, 1, "scheme", &names)? {
+                None => String::new(),
+                Some(V::Str(s)) => s.to_string(),
+                Some(o) if !ops::truthy(o)? => String::new(),
+                Some(_) => return Err(Exc::type_error("Cannot mix str and non-str arguments")),
+            };
+            let frag = up_arg(name, args, kwargs, 2, "allow_fragments", &names)?.map(ops::truthy).transpose()?.unwrap_or(true);
+            Ok(V::native(Native::UrlParts(Arc::new(url_split_with(&url, name == "urlparse", &scheme, frag)?))))
+        }
+        "urlunsplit" | "urlunparse" => {
+            let names = ["components"];
+            let c = up_arg(name, args, kwargs, 0, "components", &names)?
+                .ok_or_else(|| Exc::type_error(format!("{name}() missing 1 required positional argument: 'components'")))?;
+            if args.len() > 1 {
+                return Err(Exc::type_error(format!("{name}() takes 1 positional argument but {} were given", args.len())));
+            }
+            let c = url_components(name, c, if name == "urlunsplit" { 5 } else { 6 })?;
+            Ok(V::str(if name == "urlunsplit" { unsplit(&c[0], &c[1], &c[2], &c[3], &c[4]) } else { unparse(&c[0], &c[1], &c[2], &c[3], &c[4], &c[5]) }))
+        }
+        "urljoin" => {
+            let names = ["base", "url", "allow_fragments"];
+            let get = |i, k| up_arg(name, args, kwargs, i, k, &names);
+            let base = get(0, "base")?.ok_or_else(|| Exc::type_error("urljoin() missing 2 required positional arguments: 'base' and 'url'"))?;
+            let url = get(1, "url")?.ok_or_else(|| Exc::type_error("urljoin() missing 1 required positional argument: 'url'"))?;
+            // `if not base: return url` / `if not url: return base`, before any type check
+            if !ops::truthy(base)? {
+                return Ok(url.clone());
+            }
+            if !ops::truthy(url)? {
+                return Ok(base.clone());
+            }
+            let frag = get(2, "allow_fragments")?.map(ops::truthy).transpose()?.unwrap_or(true);
+            Ok(V::str(urljoin(&url_text(name, base)?, &url_text(name, url)?, frag)?))
         }
         _ => Err(Exc::attr_error(format!("module 'urllib.parse' has no attribute '{name}'"))),
     }
@@ -1389,52 +1424,261 @@ pub struct UrlParts {
 const USES_PARAMS: [&str; 16] = ["", "ftp", "hdl", "prospero", "http", "imap", "https", "shttp", "rtsp", "rtsps", "rtspu", "sip",
     "sips", "mms", "sftp", "tel"];
 
-/// `_urlsplit` (+ `_splitparams` for `urlparse`): the WHATWG C0 controls and spaces stripped on the left, tabs and
-/// newlines removed, then the netloc's checks (brackets, NFKC), with their ValueErrors
-pub fn url_split(url: &str, parse: bool) -> R<UrlParts> {
+/// `urllib.parse.uses_netloc` / `uses_relative` (3.12 to 3.15)
+const USES_NETLOC: [&str; 27] = ["", "ftp", "http", "gopher", "nntp", "telnet", "imap", "wais", "file", "mms", "https", "shttp",
+    "snews", "prospero", "rtsp", "rtsps", "rtspu", "rsync", "svn", "svn+ssh", "sftp", "nfs", "git", "git+ssh", "ws", "wss",
+    "itms-services"];
+const USES_RELATIVE: [&str; 20] = ["", "ftp", "http", "gopher", "nntp", "imap", "wais", "file", "https", "shttp", "mms", "prospero",
+    "rtsp", "rtsps", "rtspu", "sftp", "svn", "svn+ssh", "ws", "wss"];
+
+/// `_urlsplit(url, scheme, allow_fragments)` (3.14): a component absent from the URL is None (the scheme: the
+/// default given)
+pub struct Split {
+    pub scheme: Option<String>,
+    pub netloc: Option<String>,
+    pub path: String,
+    pub query: Option<String>,
+    pub fragment: Option<String>,
+}
+
+/// the WHATWG C0 controls and spaces stripped on the left (both ends for the default scheme), tabs and newlines
+/// removed, then the netloc's checks (brackets, NFKC), with their ValueErrors
+pub fn split_raw(url: &str, default_scheme: Option<&str>, allow_fragments: bool) -> R<Split> {
     let url = url.trim_start_matches(|c: char| c <= ' ');
     let url: String = url.chars().filter(|c| !matches!(c, '\t' | '\r' | '\n')).collect();
     let mut rest = url.as_str();
-    let mut scheme = String::new();
+    let mut scheme = default_scheme.map(|d| d.trim_matches(|c: char| c <= ' ').chars().filter(|c| !matches!(c, '\t' | '\r' | '\n')).collect());
     if let Some(i) = rest.find(':') {
         let cand = &rest[..i];
         if !cand.is_empty() && cand.chars().next().unwrap().is_ascii_alphabetic() && cand.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) {
-            scheme = cand.to_ascii_lowercase();
+            scheme = Some(cand.to_ascii_lowercase());
             rest = &rest[i + 1..];
         }
     }
-    let mut netloc = String::new();
+    let mut netloc = None;
     if let Some(r) = rest.strip_prefix("//") {
         let end = r.find(['/', '?', '#']).unwrap_or(r.len());
-        netloc = r[..end].to_string();
+        let n = r[..end].to_string();
         rest = &r[end..];
-        if netloc.contains('[') != netloc.contains(']') {
+        if n.contains('[') != n.contains(']') {
             return Err(Exc::value_error("Invalid IPv6 URL"));
         }
-        if netloc.contains('[') {
-            check_bracketed_netloc(&netloc)?;
+        if n.contains('[') {
+            check_bracketed_netloc(&n)?;
         }
+        netloc = Some(n);
     }
-    let (rest, fragment) = match rest.split_once('#') {
-        Some((a, b)) => (a, b.to_string()),
-        None => (rest, String::new()),
+    let (rest, fragment) = match rest.split_once('#').filter(|_| allow_fragments) {
+        Some((a, b)) => (a, Some(b.to_string())),
+        None => (rest, None),
     };
     let (path, query) = match rest.split_once('?') {
-        Some((a, b)) => (a.to_string(), b.to_string()),
-        None => (rest.to_string(), String::new()),
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (rest.to_string(), None),
     };
-    check_netloc(&netloc)?;
-    let (path, params) = if parse && USES_PARAMS.contains(&scheme.as_str()) && path.contains(';') {
-        // params of the last segment only
-        let seg = path.rfind('/').map(|i| i + 1).unwrap_or(0);
-        match path[seg..].find(';') {
-            Some(j) => (path[..seg + j].to_string(), path[seg + j + 1..].to_string()),
-            None => (path.clone(), String::new()),
-        }
+    check_netloc(netloc.as_deref().unwrap_or(""))?;
+    Ok(Split { scheme, netloc, path, query, fragment })
+}
+
+/// `_splitparams`: the params of the last segment
+fn split_params(path: &str) -> (String, Option<String>) {
+    let seg = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match path[seg..].find(';') {
+        Some(j) => (path[..seg + j].to_string(), Some(path[seg + j + 1..].to_string())),
+        None => (path.to_string(), None),
+    }
+}
+
+/// `urlsplit` / `urlparse(url, scheme='', allow_fragments=True)` (+ `_splitparams` for `urlparse`)
+pub fn url_split_with(url: &str, parse: bool, default_scheme: &str, allow_fragments: bool) -> R<UrlParts> {
+    let s = split_raw(url, Some(default_scheme), allow_fragments)?;
+    let scheme = s.scheme.unwrap_or_default();
+    let (path, params) = if parse && USES_PARAMS.contains(&scheme.as_str()) && s.path.contains(';') {
+        let (p, q) = split_params(&s.path);
+        (p, q.unwrap_or_default())
     } else {
-        (path, String::new())
+        (s.path, String::new())
     };
-    Ok(UrlParts { parse, scheme, netloc, path, params, query, fragment })
+    Ok(UrlParts { parse, scheme, netloc: s.netloc.unwrap_or_default(), path, params, query: s.query.unwrap_or_default(),
+                  fragment: s.fragment.unwrap_or_default() })
+}
+
+pub fn url_split(url: &str, parse: bool) -> R<UrlParts> {
+    url_split_with(url, parse, "", true)
+}
+
+/// `urlunsplit` before CPython 3.12.4: an empty netloc written `//` for every scheme of uses_netloc (probed)
+fn unsplit_old() -> bool {
+    super::python_feature("urlunsplit_new").map(|b| !b).unwrap_or_else(|| super::python() == (3, 12) && super::python_patch() < 4)
+}
+
+/// `_urlunsplit(scheme, netloc, url, query, fragment)` (3.14; the components None when absent)
+fn unsplit_none(scheme: Option<&str>, netloc: Option<&str>, url: &str, query: Option<&str>, fragment: Option<&str>) -> String {
+    let mut url = url.to_string();
+    if let Some(n) = netloc {
+        if !url.is_empty() && !url.starts_with('/') {
+            url.insert(0, '/');
+        }
+        url = format!("//{n}{url}");
+    } else if url.starts_with("//") {
+        url = format!("//{url}");
+    }
+    if let Some(s) = scheme.filter(|s| !s.is_empty()) {
+        url = format!("{s}:{url}");
+    }
+    if let Some(q) = query {
+        url = format!("{url}?{q}");
+    }
+    if let Some(f) = fragment {
+        url = format!("{url}#{f}");
+    }
+    url
+}
+
+/// `urlunsplit((scheme, netloc, url, query, fragment))` of strings
+pub fn unsplit(scheme: &str, netloc: &str, url: &str, query: &str, fragment: &str) -> String {
+    let some = |s: &str| Some(s.to_string()).filter(|s| !s.is_empty());
+    if unsplit_old() {
+        let mut url = url.to_string();
+        if !netloc.is_empty() || (!scheme.is_empty() && USES_NETLOC.contains(&scheme) && !url.starts_with("//")) {
+            if !url.is_empty() && !url.starts_with('/') {
+                url.insert(0, '/');
+            }
+            url = format!("//{netloc}{url}");
+        }
+        if !scheme.is_empty() {
+            url = format!("{scheme}:{url}");
+        }
+        if !query.is_empty() {
+            url = format!("{url}?{query}");
+        }
+        if !fragment.is_empty() {
+            url = format!("{url}#{fragment}");
+        }
+        return url;
+    }
+    let netloc = if !netloc.is_empty() {
+        Some(netloc)
+    } else if !scheme.is_empty() && USES_NETLOC.contains(&scheme) && (url.is_empty() || url.starts_with('/')) {
+        Some("")
+    } else {
+        None
+    };
+    unsplit_none(some(scheme).as_deref(), netloc, url, some(query).as_deref(), some(fragment).as_deref())
+}
+
+/// `urlunparse((scheme, netloc, url, params, query, fragment))`: from 3.14 the netloc rule sees the path without
+/// its params
+pub fn unparse(scheme: &str, netloc: &str, url: &str, params: &str, query: &str, fragment: &str) -> String {
+    let joined = if params.is_empty() { url.to_string() } else { format!("{url};{params}") };
+    if super::python() < (3, 14) {
+        return unsplit(scheme, netloc, &joined, query, fragment);
+    }
+    let some = |s: &str| Some(s.to_string()).filter(|s| !s.is_empty());
+    let netloc = if !netloc.is_empty() {
+        Some(netloc)
+    } else if !scheme.is_empty() && USES_NETLOC.contains(&scheme) && (url.is_empty() || url.starts_with('/')) {
+        Some("")
+    } else {
+        None
+    };
+    unsplit_none(some(scheme).as_deref(), netloc, &joined, some(query).as_deref(), some(fragment).as_deref())
+}
+
+/// the dot segments of `urljoin` (RFC 3986 5.2.4, as CPython writes it)
+fn join_path(bpath: &str, path: &str) -> String {
+    let mut base_parts: Vec<&str> = bpath.split('/').collect();
+    if base_parts.last() != Some(&"") {
+        base_parts.pop();
+    }
+    let segments: Vec<&str> = if path.starts_with('/') {
+        path.split('/').collect()
+    } else {
+        let mut s: Vec<&str> = base_parts;
+        s.extend(path.split('/'));
+        // segments[1:-1] = filter(None, segments[1:-1])
+        if s.len() > 2 {
+            let last = s.len() - 1;
+            let mid: Vec<&str> = s[1..last].iter().copied().filter(|x| !x.is_empty()).collect();
+            let mut out = vec![s[0]];
+            out.extend(mid);
+            out.push(s[last]);
+            out
+        } else {
+            s
+        }
+    };
+    let mut resolved: Vec<&str> = Vec::new();
+    for seg in &segments {
+        match *seg {
+            ".." => {
+                resolved.pop();
+            }
+            "." => {}
+            s => resolved.push(s),
+        }
+    }
+    if matches!(segments.last(), Some(&".") | Some(&"..")) {
+        resolved.push("");
+    }
+    let j = resolved.join("/");
+    if j.is_empty() { "/".to_string() } else { j }
+}
+
+/// `urljoin(base, url, allow_fragments=True)`: through urlparse and its empty components until 3.13, through
+/// `_urlsplit` with absent components None from 3.14
+pub fn urljoin(base: &str, url: &str, allow_fragments: bool) -> R<String> {
+    if base.is_empty() {
+        return Ok(url.to_string());
+    }
+    if url.is_empty() {
+        return Ok(base.to_string());
+    }
+    if super::python() >= (3, 14) {
+        let b = split_raw(base, None, allow_fragments)?;
+        let u = split_raw(url, None, allow_fragments)?;
+        let scheme = u.scheme.clone().or(b.scheme.clone());
+        if scheme != b.scheme || scheme.as_deref().is_some_and(|s| !USES_RELATIVE.contains(&s)) {
+            return Ok(url.to_string());
+        }
+        let mut netloc = u.netloc.clone();
+        if scheme.is_none() || USES_NETLOC.contains(&scheme.as_deref().unwrap()) {
+            if u.netloc.as_deref().is_some_and(|n| !n.is_empty()) {
+                return Ok(unsplit_none(scheme.as_deref(), u.netloc.as_deref(), &u.path, u.query.as_deref(), u.fragment.as_deref()));
+            }
+            netloc = b.netloc.clone();
+        }
+        if u.path.is_empty() {
+            let (mut query, mut fragment) = (u.query.clone(), u.fragment.clone());
+            if query.is_none() {
+                query = b.query.clone();
+                if fragment.is_none() {
+                    fragment = b.fragment.clone();
+                }
+            }
+            return Ok(unsplit_none(scheme.as_deref(), netloc.as_deref(), &b.path, query.as_deref(), fragment.as_deref()));
+        }
+        let path = join_path(&b.path, &u.path);
+        return Ok(unsplit_none(scheme.as_deref(), netloc.as_deref(), &path, u.query.as_deref(), u.fragment.as_deref()));
+    }
+    let b = url_split_with(base, true, "", allow_fragments)?;
+    let u = url_split_with(url, true, &b.scheme, allow_fragments)?;
+    if u.scheme != b.scheme || !USES_RELATIVE.contains(&u.scheme.as_str()) {
+        return Ok(url.to_string());
+    }
+    let mut netloc = u.netloc.clone();
+    if USES_NETLOC.contains(&u.scheme.as_str()) {
+        if !u.netloc.is_empty() {
+            return Ok(unparse(&u.scheme, &u.netloc, &u.path, &u.params, &u.query, &u.fragment));
+        }
+        netloc = b.netloc.clone();
+    }
+    if u.path.is_empty() && u.params.is_empty() {
+        let query = if u.query.is_empty() { &b.query } else { &u.query };
+        return Ok(unparse(&u.scheme, &netloc, &b.path, &b.params, query, &u.fragment));
+    }
+    let path = join_path(&b.path, &u.path);
+    Ok(unparse(&u.scheme, &netloc, &path, &u.params, &u.query, &u.fragment))
 }
 
 /// `_check_bracketed_netloc` / `_check_bracketed_host`
@@ -1539,31 +1783,77 @@ pub fn url_parts_tuple(u: &UrlParts) -> Vec<V> {
 }
 
 pub fn url_parts_geturl(u: &UrlParts) -> String {
-    let mut s = String::new();
-    if !u.scheme.is_empty() {
-        s += &u.scheme;
-        s.push(':');
+    if u.parse {
+        unparse(&u.scheme, &u.netloc, &u.path, &u.params, &u.query, &u.fragment)
+    } else {
+        unsplit(&u.scheme, &u.netloc, &u.path, &u.query, &u.fragment)
     }
-    if !u.netloc.is_empty() || u.scheme == "http" || u.scheme == "https" || u.path.starts_with("//") {
-        if !u.netloc.is_empty() || !u.path.is_empty() && u.path.starts_with("//") {
-            s += "//";
-            s += &u.netloc;
+}
+
+/// `SplitResult._replace(**kwargs)` / `ParseResult._replace(...)`: the fields given, as strings
+pub fn url_parts_replace(u: &UrlParts, args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error(format!("{}._replace() takes 1 positional argument but {} were given",
+                                           if u.parse { "ParseResult" } else { "SplitResult" }, args.len() + 1)));
+    }
+    let mut n = UrlParts { parse: u.parse, scheme: u.scheme.clone(), netloc: u.netloc.clone(), path: u.path.clone(),
+                           params: u.params.clone(), query: u.query.clone(), fragment: u.fragment.clone() };
+    let mut bad = Vec::new();
+    for (k, v) in kwargs {
+        let slot = match k.as_str() {
+            "scheme" => &mut n.scheme,
+            "netloc" => &mut n.netloc,
+            "path" => &mut n.path,
+            "params" if u.parse => &mut n.params,
+            "query" => &mut n.query,
+            "fragment" => &mut n.fragment,
+            _ => {
+                bad.push(V::str(k));
+                continue;
+            }
+        };
+        match v {
+            V::Str(x) => *slot = x.to_string(),
+            o => return Err(Exc::type_error(format!("py2axum: {}._replace({k}=) with a '{}' value is not supported (a str only)",
+                                                    if u.parse { "ParseResult" } else { "SplitResult" }, o.type_name()))),
         }
     }
-    s += &u.path;
-    if u.parse && !u.params.is_empty() {
-        s.push(';');
-        s += &u.params;
+    if !bad.is_empty() {
+        return Err(Exc::value_error(format!("Got unexpected field names: {}", ops::repr(&V::list(bad))?)));
     }
-    if !u.query.is_empty() {
-        s.push('?');
-        s += &u.query;
+    Ok(V::native(Native::UrlParts(Arc::new(n))))
+}
+
+/// a URL argument: str only (the bytes forms of urllib.parse are not supported)
+fn url_text(f: &str, v: &V) -> R<String> {
+    match v {
+        V::Str(s) => Ok(s.to_string()),
+        V::Bytes(_) => Err(Exc::type_error(format!("py2axum: urllib.parse.{f}() of bytes is not supported (str only)"))),
+        o => Err(Exc::type_error(format!("py2axum: urllib.parse.{f}() of a '{}' is not supported (str only)", o.type_name()))),
     }
-    if !u.fragment.is_empty() {
-        s.push('#');
-        s += &u.fragment;
+}
+
+/// the components given to urlunsplit / urlunparse: `n` strings of an iterable
+fn url_components(f: &str, v: &V, n: usize) -> R<Vec<String>> {
+    let items = match v {
+        V::Native(x) if matches!(&**x, Native::UrlParts(_)) => {
+            let Native::UrlParts(u) = &**x else { unreachable!() };
+            url_parts_tuple(u)
+        }
+        o => ops::iter(o)?,
+    };
+    if items.len() != n {
+        let msg = if items.len() > n { format!("too many values to unpack (expected {})", n + 1) } else {
+            format!("not enough values to unpack (expected {}, got {})", n + 1, items.len() + 1)
+        };
+        return Err(Exc::value_error(msg));
     }
-    s
+    items.iter().map(|x| match x {
+        V::Str(s) => Ok(s.to_string()),
+        // `_coerce_args` decodes falsy non-str components as ''
+        V::None => Ok(String::new()),
+        o => Err(Exc::type_error(format!("py2axum: urllib.parse.{f}() with a '{}' component is not supported (str only)", o.type_name()))),
+    }).collect()
 }
 
 // ---------------------------------------------------------------- base64

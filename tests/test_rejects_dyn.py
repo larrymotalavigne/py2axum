@@ -739,7 +739,8 @@ def test_validate_assignment_with_model_before_rejected(tmp_path, capsys):
         ("    model_config = ConfigDict(**{'strict': True})\n    a: int", "model_config: `{'strict': True}` is not supported"),
         ("    model_config = {**dict(strict=True)}\n    a: int", "model_config: `dict(strict=True)` is not supported"),
         ("    model_config = ConfigDict(allow_inf_nan=True)\n    a: float", "allow_inf_nan= other than False is not supported"),
-        ("    model_config = ConfigDict(validate_default=True)\n    a: float = 1", "validate_default=True is not supported"),
+        ("    model_config = ConfigDict(validate_default=True)\n    a: float = Field(default_factory=lambda: 1)",
+         "validate_default=True with a computed default is not supported"),
     ],
 )
 def test_schema_declaration_rejected(tmp_path, capsys, body, message):

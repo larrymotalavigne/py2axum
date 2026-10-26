@@ -503,6 +503,8 @@ EXCEPTIONS: dict[str, str] = {
     "decimal.InvalidOperation": "DECIMAL_INVALID_OPERATION",
     "decimal.DivisionByZero": "DECIMAL_DIVISION_BY_ZERO",
     "pywebpush.WebPushException": "WEBPUSH_EXCEPTION",
+    **{f"starlette_context{m}.{n}": c for m in ("", ".errors") for n, c in (
+        ("StarletteContextError", "STARLETTE_CONTEXT_ERROR"), ("ContextDoesNotExistError", "CONTEXT_DOES_NOT_EXIST_ERROR"))},
     **{f"google.auth.exceptions.{n}": f"GOOGLE_{c}" for n, c in (
         ("GoogleAuthError", "AUTH_ERROR"), ("TransportError", "TRANSPORT_ERROR"),
         ("DefaultCredentialsError", "DEFAULT_CREDENTIALS_ERROR"), ("MalformedError", "MALFORMED_ERROR"),
@@ -811,6 +813,14 @@ def set_python(version: tuple[int, int]) -> None:
         EXCEPTIONS["re.PatternError"] = re_cls
     else:
         EXCEPTIONS.pop("re.PatternError", None)
+
+
+def _arg1(name: str, a, kw, pname: str) -> str:
+    """A function of one argument given positionally or by name (`copy.deepcopy(x)`; its memo= is refused)."""
+    v = _bind(name.rpartition(".")[2], a, kw, [pname], {pname})
+    if pname not in v:
+        raise ValueError(f"{name}() missing 1 required positional argument: '{pname}'")
+    return v[pname]
 
 
 def _no_kw(name: str, kw, refused) -> str:
@@ -1357,10 +1367,18 @@ CALLS = {
                                                 or _mimetypes("guess_file_type", ["path"], ("strict",))(a, kw)),
     "mimetypes.guess_extension": _mimetypes("guess_extension", ["type", "strict"]),
     "mimetypes.guess_all_extensions": _mimetypes("guess_all_extensions", ["type", "strict"]),
+    # copy (dynrt/copymod.rs): a class's own __copy__/__deepcopy__/__reduce__ is refused (Project.copies_objects)
+    "copy.copy": lambda a, kw: f"{RT}::copymod::copy(&{_arg1('copy.copy', a, kw, 'x')})",
+    "copy.deepcopy": lambda a, kw: f"{RT}::copymod::deepcopy(&{_arg1('copy.deepcopy', a, kw, 'x')})",
     # urllib.parse
     **{f"urllib.parse.{f}": (lambda f: lambda a, kw: _no_kw(f, kw, ("missing_as_none",))
                              or f"{RT}::stdlib::urllib(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
-       for f in ("quote", "quote_plus", "unquote", "unquote_plus", "urlencode", "urlparse", "urlsplit", "parse_qs", "parse_qsl")},
+       for f in ("quote", "quote_plus", "unquote", "unquote_plus", "urlencode", "urlparse", "urlsplit", "parse_qs", "parse_qsl",
+                 "urljoin")},
+    # urlunsplit/urlunparse: Python 3.15's keep_empty= is refused
+    **{f"urllib.parse.{f}": (lambda f: lambda a, kw: _no_kw(f, kw, ("keep_empty",))
+                             or f"{RT}::stdlib::urllib(\"{f}\", &{_argv(a)}, &{_kwvec(kw)})")(f)
+       for f in ("urlunsplit", "urlunparse")},
     # bcrypt 4.3 / 5.0 (5.0 refuses a password over 72 bytes), pyotp 2.9
     **{f"bcrypt.{f}": (lambda f: lambda a, kw: f"{RT}::auth::call(\"{f}\", {str(_bcrypt5()).lower()}, &{_argv(a)}, &{_kwvec(kw)})")(f)
        for f in ("gensalt", "hashpw", "checkpw")},

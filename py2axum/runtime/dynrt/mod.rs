@@ -6,6 +6,7 @@ pub mod aio;
 pub mod asgi;
 pub mod complex;
 pub mod mimetab;
+pub mod copymod;
 pub mod ctxmw;
 pub mod fraction;
 pub mod gcmod;

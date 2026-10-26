@@ -257,11 +257,11 @@ class SchemaGen:
                 out.append((st.target.id, st.annotation, st.value if st.value is not None else _MISSING))
             elif isinstance(st, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "model_config" for t in st.targets):
                 ok = isinstance(st.value, ast.Call) and all(
-                    k.arg in {"from_attributes", "str_strip_whitespace"}
+                    k.arg in {"from_attributes", "str_strip_whitespace", "populate_by_name", "validate_by_name"}
                     or k.arg == "extra" and isinstance(k.value, ast.Constant) and k.value.value in EXTRA
                     for k in st.value.keywords)
                 if not ok:
-                    raise self.err(f"{sym.name}.model_config other than from_attributes, extra=", st, sym.module)
+                    raise self.err(f"{sym.name}.model_config other than from_attributes, populate_by_name, extra=", st, sym.module)
                 for k in st.value.keywords:
                     if k.arg == "extra":
                         self._extra[sym] = k.value.value

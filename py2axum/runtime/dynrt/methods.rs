@@ -108,6 +108,147 @@ fn bound(f: pyd::MethodFn, recv: V) -> V {
     V::native(Native::Bound(f, recv))
 }
 
+/// pydantic 2's deprecated v1 class methods (pydantic/main.py): `parse_obj`/`validate`/`from_orm` are
+/// `model_validate`, `construct` is `model_construct(_fields_set=...)`, `schema()` `model_json_schema()`,
+/// `parse_raw` decodes JSON first (its errors become a ValidationError at `__root__`)
+async fn pyd_v1_class_method(cx: &Cx, recv: &V, s: &'static pyd::SchemaDesc, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    let one = |pname: &str| -> R<V> {
+        let given = args.len() + kwargs.len();
+        if given != 1 || (args.is_empty() && kwargs[0].0 != pname) {
+            return Err(if given == 0 {
+                Exc::type_error(format!("BaseModel.{name}() missing 1 required positional argument: '{pname}'"))
+            } else if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != pname) {
+                Exc::type_error(format!("BaseModel.{name}() got an unexpected keyword argument '{k}'"))
+            } else {
+                Exc::type_error(format!("BaseModel.{name}() takes 2 positional arguments but {} were given", given + 1))
+            });
+        }
+        Ok(args.first().cloned().unwrap_or_else(|| kwargs[0].1.clone()))
+    };
+    match name {
+        "parse_obj" | "validate" | "from_orm" => {
+            let obj = one(match name { "parse_obj" => "obj", "validate" => "value", _ => "obj" })?;
+            if name == "from_orm" && !s.from_attributes {
+                let class = if super::pydantic_before(2, 13) { &PYDANTIC_USER_ERROR_212 } else { &PYDANTIC_USER_ERROR };
+                return Err(Exc::msg(class, "You must set the config attribute `from_attributes=True` to use from_orm"));
+            }
+            call_method(cx, recv, "model_validate", vec![obj], vec![]).await
+        }
+        "construct" => {
+            if args.len() > 1 {
+                return Err(Exc::type_error(format!("BaseModel.construct() takes from 1 to 2 positional arguments but {} were given", args.len() + 1)));
+            }
+            let mut kw = kwargs;
+            if let Some(f) = args.into_iter().next() {
+                kw.insert(0, ("_fields_set".into(), f));
+            }
+            pyd::model_construct(cx, s, vec![], kw).await
+        }
+        "schema" => {
+            if !args.is_empty() || !kwargs.is_empty() {
+                return Err(Exc::type_error("py2axum: BaseModel.schema() is supported without arguments only"));
+            }
+            call_method(cx, recv, "model_json_schema", vec![], vec![]).await
+        }
+        "update_forward_refs" => {
+            if !args.is_empty() {
+                return Err(Exc::type_error(format!("BaseModel.update_forward_refs() takes 1 positional argument but {} were given", args.len() + 1)));
+            }
+            if !kwargs.is_empty() {
+                return Err(Exc::type_error("`localns` arguments are not longer accepted."));
+            }
+            // model_rebuild(force=True): the schema was built at translation time
+            Ok(V::None)
+        }
+        _ => {
+            // parse_raw(b, *, content_type=None, encoding='utf8', proto=None, allow_pickle=False): JSON only
+            if let Some((k, _)) = kwargs.iter().find(|(k, v)| k != "b" && !(k == "content_type" && v.is_none()) && !(k == "encoding" && matches!(v, V::Str(e) if &**e == "utf8" || &**e == "utf-8"))) {
+                return Err(Exc::type_error(format!("py2axum: BaseModel.parse_raw({k}=) is not supported")));
+            }
+            let b = match (args.as_slice(), kwargs.iter().find(|(k, _)| k == "b")) {
+                ([b], None) => b.clone(),
+                ([], Some((_, b))) => b.clone(),
+                ([], None) => return Err(Exc::type_error("BaseModel.parse_raw() missing 1 required positional argument: 'b'")),
+                _ => return Err(Exc::type_error(format!("BaseModel.parse_raw() takes 2 positional arguments but {} were given", args.len() + 1))),
+            };
+            let loaded = async {
+                let text = match &b {
+                    V::Bytes(_) => call_method(cx, &b, "decode", vec![V::str("utf8")], vec![]).await?,
+                    _ => b.clone(),
+                };
+                super::libs::json_loads(&text)
+            }
+            .await;
+            match loaded {
+                Ok(obj) => call_method(cx, recv, "model_validate", vec![obj], vec![]).await,
+                Err(e) if e.isinstance(&VALUE_ERROR) || e.isinstance(&TYPE_ERROR) => {
+                    let kind = if e.isinstance(&UNICODE_DECODE_ERROR) {
+                        "value_error.unicodedecode"
+                    } else if e.isinstance(&JSON_DECODE_ERROR) {
+                        "value_error.jsondecode"
+                    } else if e.isinstance(&VALUE_ERROR) {
+                        "value_error"
+                    } else {
+                        "type_error"
+                    };
+                    let msg = ops::str_(&V::Exc(e))?;
+                    Err(Exc::validation_titled(&VALIDATION_ERROR, vec![pyd::ErrDetail { kind, loc: vec![V::str("__root__")], msg, input: b,
+                                                                                         ctx: None, custom: true }], s.name))
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// pydantic 2's deprecated `.json(...)` (`model_dump_json` with by_alias=False) and `.copy(update=, deep=)`
+async fn pyd_v1_method(cx: &Cx, recv: &V, i: &Arc<pyd::Inst>, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error(format!("BaseModel.{name}() takes 1 positional argument but {} were given", args.len() + 1)));
+    }
+    if name == "json" {
+        for (k, _) in &kwargs {
+            match k.as_str() {
+                "encoder" => return Err(Exc::type_error("The `encoder` argument is no longer supported; use field serializers instead.")),
+                "models_as_dict" => return Err(Exc::type_error("The `models_as_dict` argument is no longer supported; use a model serializer instead.")),
+                "include" | "exclude" | "by_alias" | "exclude_unset" | "exclude_defaults" | "exclude_none" => {}
+                _ => return Err(Exc::type_error("`dumps_kwargs` keyword arguments are no longer supported.")),
+            }
+        }
+        let mut kw = kwargs;
+        if !kw.iter().any(|(k, _)| k == "by_alias") {
+            kw.push(("by_alias".into(), V::Bool(false)));
+        }
+        return call_method(cx, recv, "model_dump_json", vec![], kw).await;
+    }
+    // copy(*, include=None, exclude=None, update=None, deep=False): the copied values (update included) deep-copied
+    // with deep=True
+    let mut kw = Vec::new();
+    let mut deep = false;
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "deep" => {
+                deep = ops::truthy(&v)?;
+                kw.push((k, v));
+            }
+            "update" if v.is_none() => {}
+            "update" => kw.push((k, v)),
+            "include" | "exclude" if v.is_none() => {}
+            "include" | "exclude" => return Err(Exc::type_error(format!("py2axum: BaseModel.copy({k}=) is not supported (update= and deep= only)"))),
+            _ => return Err(Exc::type_error(format!("BaseModel.copy() got an unexpected keyword argument '{k}'"))),
+        }
+    }
+    if deep {
+        for (k, v) in kw.iter_mut() {
+            if k == "update" {
+                *v = super::copymod::deepcopy(v)?;
+            }
+        }
+    }
+    let _ = i;
+    call_method(cx, recv, "model_copy", vec![], kw).await
+}
+
 /// `copy.deepcopy` of validated data (lists, dicts, sets, model instances; immutable values shared).
 fn deepcopy(v: &V) -> R {
     super::stack_guard()?;
@@ -1382,6 +1523,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 }
                 Box::pin(call_method(cx, recv, "model_dump", args, kwargs)).await
             }
+            // pydantic v1's `.json()` / `.copy()`, still on v2 models (deprecated)
+            "json" | "copy" if !i.desc.dataclass && !i.desc.open && find_method(i.desc.methods, name).is_none() => {
+                Box::pin(pyd_v1_method(cx, recv, i, name, args, kwargs)).await
+            }
             // a class method read on an instance
             "model_construct" if !i.desc.open && !i.desc.dataclass && find_method(i.desc.methods, "model_construct").is_none() => pyd::model_construct(cx, i.desc, args, kwargs).await,
             "model_dump" | "model_dump_json" => {
@@ -1519,6 +1664,12 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 pyd::construct_mode(cx, s, obj, !from_attrs).await
             }
             (ClassKind::Schema(s), "model_construct") => pyd::model_construct(cx, s, args, kwargs).await,
+            // pydantic v1's class methods, still on v2 models (deprecated: their warning is filtered by default)
+            (ClassKind::Schema(s), "parse_obj" | "validate" | "from_orm" | "construct" | "schema" | "parse_raw" | "update_forward_refs")
+                if !s.dataclass && !s.open && find_method(s.methods, name).is_none() =>
+            {
+                Box::pin(pyd_v1_class_method(cx, recv, s, name, args, kwargs)).await
+            }
             (ClassKind::Schema(s), "model_json_schema") => match s.json_schema {
                 Some(j) => pyd::loads(j),
                 None => Err(Exc::type_error(format!("py2axum: {}.model_json_schema() was not computed", s.name))),
@@ -1685,6 +1836,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::Row(names, vals) if name == "_asdict" => V::dict_from(names.iter().zip(vals.iter()).map(|(k, x)| (V::str(k), x.clone())).collect()),
             Native::Row(_, vals) if name == "_tuple" => Ok(V::tuple(vals.to_vec())),
             Native::UrlParts(u) if name == "geturl" => Ok(V::str(super::stdlib::url_parts_geturl(u))),
+            Native::UrlParts(u) if name == "_replace" => super::stdlib::url_parts_replace(u, &args, &kwargs),
             Native::Task(t) => web::task_method(cx, t, recv, name, &args).await,
             Native::Gen(g) => super::agen::method(g, recv, name, &args).await,
             Native::CtxVar(var) => super::agen::ctxvar_method(cx, var, name, &args),

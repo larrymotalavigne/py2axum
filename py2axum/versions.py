@@ -415,6 +415,8 @@ PROBES = {
     # a C timeout or timestamp out of range: one message for float and int from 3.13.15 / 3.14.7
     # urlsplit accepts an IPvFuture host written `[V...]` (only `[v...]` before; mimetypes.guess_type too)
     "ipvfuture_upper": "import urllib.parse\ntry:\n urllib.parse.urlsplit('http://[V1.x]/')\n r=True\nexcept ValueError:\n r=False",
+    # urlunsplit: an empty netloc no longer written `//` before a relative path (3.12.4)
+    "urlunsplit_new": "from urllib.parse import urlunsplit\nr=urlunsplit(('http', '', 'x', '', ''))=='http:x'",
     "pytime_range": "import socket\ntry:\n socket.socket().settimeout(1e20)\n r=False\nexcept OverflowError as e:\n r='C PyTime_t' in str(e)",
     # the email header folder (dynrt/emailhdr.rs), changed in security releases (3.12.13, 3.13.12-14, 3.14.3-6)
     "email_ws_fix": "from email import _header_value_parser as p\nr=not p.WhiteSpaceTerminal('', 'fws').startswith_fws()",

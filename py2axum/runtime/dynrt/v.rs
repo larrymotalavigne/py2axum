@@ -1005,6 +1005,9 @@ builtin_exc!(CLIENT_DISCONNECTED, "ClientDisconnected", [OS_ERROR]);
 builtin_exc!(VALIDATION_ERROR, "ValidationError", [VALUE_ERROR]);
 builtin_exc!(PYDANTIC_CUSTOM_ERROR, "PydanticCustomError", [VALUE_ERROR]);
 builtin_exc!(PYDANTIC_USE_DEFAULT, "PydanticUseDefault", [EXCEPTION]);
+// PydanticUserError: a TypeError until pydantic 2.12, a RuntimeError from 2.13
+builtin_exc!(PYDANTIC_USER_ERROR, "PydanticUserError", [RUNTIME_ERROR]);
+builtin_exc!(PYDANTIC_USER_ERROR_212, "PydanticUserError", [TYPE_ERROR]);
 builtin_exc!(SQLALCHEMY_ERROR, "SQLAlchemyError", [EXCEPTION]);
 builtin_exc!(DBAPI_ERROR, "DBAPIError", [STATEMENT_ERROR]);
 builtin_exc!(INTEGRITY_ERROR, "IntegrityError", [DBAPI_ERROR]);
@@ -1198,6 +1201,9 @@ builtin_exc!(SOCKET_GAIERROR, "gaierror", [OS_ERROR]);
 builtin_exc!(REQUESTS_EXCEPTION, "RequestException", [OS_ERROR]);
 builtin_exc!(REQUESTS_CONNECTION_ERROR, "ConnectionError", [REQUESTS_EXCEPTION]);
 builtin_exc!(WEBPUSH_EXCEPTION, "WebPushException", [EXCEPTION]);
+// starlette-context 0.5 (starlette_context/errors.py)
+builtin_exc!(STARLETTE_CONTEXT_ERROR, "StarletteContextError", [EXCEPTION]);
+builtin_exc!(CONTEXT_DOES_NOT_EXIST_ERROR, "ContextDoesNotExistError", [RUNTIME_ERROR, STARLETTE_CONTEXT_ERROR]);
 // stripe-python 14 (stripe/_error.py, stripe/oauth_error.py): see dynrt/stripe.rs
 builtin_exc!(STRIPE_ERROR, "StripeError", [EXCEPTION]);
 builtin_exc!(STRIPE_API_ERROR, "APIError", [STRIPE_ERROR]);

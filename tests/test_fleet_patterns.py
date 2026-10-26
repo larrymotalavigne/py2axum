@@ -276,3 +276,91 @@ def test_many_to_many_back_populates_through_a_mapped_table(tmp_path, capsys, ex
     assert rc == (0 if ok else 1)
     if not ok:
         assert "changed in memory" in capsys.readouterr().err
+
+
+CONTEXT_MAIN = '''
+from fastapi import FastAPI
+from starlette_context import context, plugins
+from starlette_context.errors import ContextDoesNotExistError
+from starlette_context.middleware import RawContextMiddleware
+
+app = FastAPI()
+app.add_middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(),))
+
+
+def user_id():
+    try:
+        return context.get("user_id")
+    except ContextDoesNotExistError:
+        return None
+
+
+@app.get("/c")
+async def c():
+    {body}
+'''
+
+
+@pytest.mark.parametrize("body", [
+    'context["user_id"] = 7\n    return {"rid": context["X-Request-ID"], "user": user_id(), "n": len(context)}',
+    'return {"has": "user_id" in context, "keys": sorted(context), "data": context.data, "exists": context.exists()}',
+    'context.update(a=1)\n    context.setdefault("b", 2)\n    del context["a"]\n    return {**context, "b": context.pop("b")}',
+    'return [k for k in context if context]',
+])
+def test_starlette_context_as_a_mapping(tmp_path, body):
+    """starlette_context's `context`: the request's context dict, read and written by the endpoints."""
+    pkg = project(tmp_path, CONTEXT_MAIN.format(body=body))
+    generate(tmp_path, pkg)
+    assert "ctxmw::data(cx)" in (tmp_path / "out" / "src" / "gen.rs").read_text()
+
+
+@pytest.mark.parametrize("body, msg", [
+    ("return context", "not handed on as the UserDict object itself"),
+    ("return repr(context)", "not handed on as the UserDict object itself"),
+    ("return context.popitem()", "`starlette_context.context.popitem()` is not supported"),
+])
+def test_starlette_context_refused(tmp_path, capsys, body, msg):
+    pkg = project(tmp_path, CONTEXT_MAIN.format(body=body))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    err = capsys.readouterr().err
+    assert msg in err and "main.py:" in err and ("P2A0201" in err or "P2A0202" in err)
+
+
+COPY_MAIN = '''
+import copy
+from copy import deepcopy
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+class Cfg:
+    def __init__(self):
+        self.opts = {{"a": [1]}}
+{extra}
+
+DEFAULTS = {{"limits": [1, 2]}}
+
+
+@app.get("/c")
+async def c():
+    d = deepcopy(DEFAULTS)
+    d["limits"].append(3)
+    return {{"d": d, "s": copy.copy(Cfg()).opts, "x": copy.deepcopy(x=[1])}}
+'''
+
+
+def test_copy_module(tmp_path):
+    """copy.copy / copy.deepcopy (a module default copied per request): dynrt/copymod.rs."""
+    pkg = project(tmp_path, COPY_MAIN.format(extra=""))
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "copymod::deepcopy(" in gen and "copymod::copy(" in gen
+
+
+def test_copy_with_a_class_copy_method_refused(tmp_path, capsys):
+    """A class of its own `__deepcopy__`: copy would call it; refused, never ignored."""
+    pkg = project(tmp_path, COPY_MAIN.format(extra="\n    def __deepcopy__(self, memo):\n        return self\n"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "__deepcopy__" in capsys.readouterr().err

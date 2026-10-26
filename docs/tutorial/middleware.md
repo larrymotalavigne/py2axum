@@ -40,7 +40,12 @@ adding a header to every response. Like every example on this site, it is compil
 - `starlette_context` 0.5's `RawContextMiddleware(plugins=(RequestIdPlugin(), CorrelationIdPlugin()))`
   (plugin options `force_new_uuid`, `validate`, `version=4` as literals): the id read from its header or a new
   `uuid4().hex`, validated like `uuid.UUID(value)` (400 with an empty body otherwise), appended to the
-  response headers.
+  response headers from the context (`str(context.get(key))`: a value the endpoint changed or deleted shows).
+- `starlette_context`'s `context`, the request's context dict: `context[key]` (read, write, `del`),
+  `key in context`, `len(context)`, iteration, `if context`, `dict(context)`, `{**context}`, `context.data`,
+  `context.exists()`, `context.copy()` (a dict), and `get`, `setdefault`, `pop`, `update`, `keys`, `values`,
+  `items`, `clear`. Outside the middleware's requests it raises `ContextDoesNotExistError`. The tasks a request
+  creates share its context.
 - `request.cookies` (Starlette's parser), `request.client` (TCP peer), `request.url`, `request.headers`,
   `request.state`, `request.body()`/`json()`.
 - A project function given the application from the factory or the app's module (`configure(app)`) runs
@@ -58,7 +63,11 @@ adding a header to every response. Like every example on this site, it is compil
 
 - Raw ASGI middleware: `http.response.trailers`/`pathsend`/`zerocopy` messages and a rewritten `root_path`
   raise at run time.
-- The `context` object of `starlette_context` itself is not available.
+- `starlette_context`'s `context` handed on as an object (`return context`, `repr(context)`,
+  `isinstance(context, dict)`, JSON): refused, use `context.data`. `context.popitem()` is refused (the
+  UserDict pops the first key, a dict the last). `context.keys()`/`values()`/`items()` are a dict's views:
+  their `repr()` differs from the UserDict's `KeysView(...)`. `request_cycle_context()` and
+  `ContextMiddleware` (the `BaseHTTPMiddleware` one) are not supported.
 - In a `configure(app)` function, other registrations than those above are refused.
 - An application wrapped in a project ASGI class at module level (`app = Wrapper(api)`) is refused: see
   [Not supported](../supported.md#not-supported).
