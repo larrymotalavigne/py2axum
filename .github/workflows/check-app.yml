@@ -1,0 +1,124 @@
+# Reusable workflow: `py2axum check` of an application, its markdown report in the job summary and on the pull
+# request (one comment, updated), optionally the generation and `cargo build` of the crate. An application calls it:
+#
+#   jobs:
+#     py2axum:
+#       uses: larrymotalavigne/py2axum/.github/workflows/check-app.yml@main
+#       permissions: {contents: read, pull-requests: write}
+#       with:
+#         requirements: -r requirements.txt
+#         fail-under: "90"
+#         build: true
+#
+# The options of the application come from its `[tool.py2axum]` table in pyproject.toml (docs/reference/cli.md).
+name: py2axum check
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "directory py2axum runs from (where the pyproject.toml with [tool.py2axum] is, or below it)"
+        type: string
+        default: "."
+      python-version:
+        type: string
+        default: "3.13"
+      requirements:
+        description: "what `pip install` takes for the application's own dependencies (`-r requirements.txt`, `.`)"
+        type: string
+        default: ""
+      py2axum-version:
+        description: "a pip version specifier for py2axum (`==1.4.0`, `>=1.4`); empty for the latest release"
+        type: string
+        default: ""
+      args:
+        description: "more options of `py2axum check` and of the generation (`--python-side auto`...)"
+        type: string
+        default: ""
+      fail-under:
+        description: "fail below this share of native routes (percent); empty for no threshold"
+        type: string
+        default: ""
+      comment:
+        description: "post the report on the pull request (needs `pull-requests: write`)"
+        type: boolean
+        default: true
+      build:
+        description: "also generate the crate and `cargo build --release` it"
+        type: boolean
+        default: false
+    outputs:
+      native-pct:
+        description: "the share of native routes"
+        value: ${{ jobs.check.outputs.native-pct }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      native-pct: ${{ steps.check.outputs.native-pct }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      REQUIREMENTS: ${{ inputs.requirements }}
+      PY2AXUM_VERSION: ${{ inputs.py2axum-version }}
+      ARGS: ${{ inputs.args }}
+      FAIL_UNDER: ${{ inputs.fail-under }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: install py2axum and the application's dependencies
+        # $REQUIREMENTS split into words on purpose (`-r requirements.txt`)
+        run: pip install "py2axum${PY2AXUM_VERSION}" $REQUIREMENTS
+      - name: py2axum check
+        id: check
+        run: |
+          set +e
+          fail=()
+          [ -n "$FAIL_UNDER" ] && fail=(--fail-under "$FAIL_UNDER")
+          py2axum check --format markdown "${fail[@]}" $ARGS > "$RUNNER_TEMP/py2axum-report.md"
+          status=$?
+          py2axum check --format json $ARGS > "$RUNNER_TEMP/py2axum-report.json" 2>/dev/null
+          pct=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["summary"]["native_pct"])' \
+                "$RUNNER_TEMP/py2axum-report.json" 2>/dev/null)
+          echo "native-pct=$pct" >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/py2axum-report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: report on the pull request
+        if: inputs.comment && github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- py2axum-check -->";
+            const body = `${marker}\n${fs.readFileSync(`${process.env.RUNNER_TEMP}/py2axum-report.md`, "utf8")}`;
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number});
+            const mine = comments.find(c => c.body && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({owner, repo, comment_id: mine.id, body});
+            } else {
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+            }
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.build && steps.check.outputs.status == '0'
+      - name: generate and build the crate
+        if: inputs.build && steps.check.outputs.status == '0'
+        run: |
+          py2axum -o "$RUNNER_TEMP/py2axum-crate" $ARGS
+          cargo build --release --manifest-path "$RUNNER_TEMP/py2axum-crate/Cargo.toml"
+      - name: verdict
+        if: steps.check.outputs.status != '0'
+        run: |
+          echo "::error::py2axum check failed (generation would fail, or native routes under --fail-under): see the job summary"
+          exit 1

@@ -53,6 +53,27 @@ it is the only blocker.
 `--fail-under PCT` makes `check` fail in CI below a share of native routes: see
 [Command line](../reference/cli.md).
 
+## In CI
+
+The repository ships a reusable GitHub workflow that runs `check` with the options of the application's
+`[tool.py2axum]` table ([Command line](../reference/cli.md#options-in-pyprojecttoml)), writes the markdown
+report to the job summary and to one pull request comment (updated on each push), fails under `fail-under`, and
+optionally generates and builds the crate:
+
+```yaml
+jobs:
+  py2axum:
+    uses: larrymotalavigne/py2axum/.github/workflows/check-app.yml@main
+    permissions: {contents: read, pull-requests: write}
+    with:
+      requirements: -r requirements.txt   # the application's dependencies
+      fail-under: "90"
+      build: true                         # py2axum -o ... && cargo build --release
+```
+
+Its other inputs: `working-directory`, `python-version`, `py2axum-version` (a pip specifier), `args` (more
+options of `check` and of the generation) and `comment`; its output `native-pct` is the share of native routes.
+
 ## When something is refused
 
 Every refusal names the construct, its `file:line` and its [error code](../reference/errors.md). In order of
