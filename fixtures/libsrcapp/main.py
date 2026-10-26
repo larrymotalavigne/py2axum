@@ -10,12 +10,14 @@ import requests
 from fastapi import FastAPI, Query
 from requests.utils import quote
 
+from .caching import router as cache_router
 from .gens import router as gens_router
 from .stdsrc import router as std_router
 
 app = FastAPI()
 app.include_router(std_router)
 app.include_router(gens_router)
+app.include_router(cache_router)
 
 
 @app.get("/health")

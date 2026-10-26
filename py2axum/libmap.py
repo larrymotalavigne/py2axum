@@ -298,6 +298,9 @@ VALUES: dict[str, str] = {
     **{f"{m}.{n}": f"V::Int({v})" for m in ("subprocess", "asyncio.subprocess")
        for n, v in (("PIPE", -1), ("STDOUT", -2), ("DEVNULL", -3))},
     "sys.maxsize": "V::Int(i64::MAX)",  # CPython's on 64-bit platforms
+    # pickle protocols: the default is 5 from Python 3.14 (4 before)
+    "pickle.DEFAULT_PROTOCOL": f"V::Int(if {RT}::python() >= (3, 14) {{ 5 }} else {{ 4 }})",
+    "pickle.HIGHEST_PROTOCOL": "V::Int(5)",
     "datetime.UTC": f"V::Tz({RT}::dt::Tz::Utc)",
     # pytz 2026.5 (dynrt/pytzrt.rs)
     "pytz.utc": f"V::Tz({RT}::dt::Tz::PyUtc)",

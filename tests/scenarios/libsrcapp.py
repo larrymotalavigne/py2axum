@@ -50,3 +50,7 @@ STEPS += [("GET", "/gens/bag" + q, None) for q in ("", "?w=x", "?w=", "?w=%C3%A9
 STEPS += [("GET", f"/gens/drained/{n}", None) for n in ("0", "3")]
 STEPS += [("GET", "/gens/lines" + q, None) for q in ("", "?w=a", "?w=")]
 STEPS += [("GET", f"/gens/streamed/{n}", None) for n in ("0", "5")]
+
+# aiocache translated from its source (fixtures/libsrcapp/caching.py; Redis database 12)
+STEPS += [("GET", f"/cache/square/{n}", None) for n in ("3", "3", "4", "x", "3")]
+STEPS += [("POST", "/cache/mem", None), ("POST", "/cache/mem", None), ("POST", "/cache/redis", None)]

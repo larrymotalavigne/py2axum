@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fixtures/libsrcapp conformance servers: FastAPI reference on :8568, generated binary on :8599 (REF_PORT, CAND_PORT).
-# No database. Run from the repository root after building generated/libsrcapp_axum
+# Redis (aiocache, database 12), no SQL database. Run from the repository root after building generated/libsrcapp_axum
 # (python -m py2axum fixtures/libsrcapp --root . --translate-libs auto ...).
 cd "$(dirname "$0")"
 REF_PORT=${REF_PORT:-8568}; CAND_PORT=${CAND_PORT:-8599}
