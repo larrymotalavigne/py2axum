@@ -14518,7 +14518,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                         raise e
                     fe.global_errors.append(e)
                 if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in UNTRANSLATED_ROUTE_ATTRS
-                        and not (d.func.attr == "api_route" and fe._expand(d))
+                        and not (d.func.attr == "api_route" and fe._expand(d, m.name))
                         and (fe._is_app(m.name, d.func.value)
                              or fe.index.resolve_expr(m.name, d.func.value, frontend_enclosing_fn(fn, parents)) in fe.routers)):
                     # not a route of the translation: the binary would not serve it at all (404/405 where FastAPI answers)

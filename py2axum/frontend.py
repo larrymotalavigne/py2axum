@@ -824,7 +824,7 @@ class Frontend:
 
     # ------------------------------------------------------------------ routes
 
-    def _expand(self, d) -> list:
+    def _expand(self, d, module: str | None = None) -> list:
         """A route decorator as the per-method decorators it stands for: `@router.api_route(path, methods=[...])`
         (a literal list of HTTP methods, GET when omitted) is one `@router.<method>(path, ...)` per method, made
         once (the same nodes on every call); any other decorator is itself."""
@@ -834,11 +834,14 @@ class Frontend:
         if id(d) not in cache:
             kw = next((k for k in d.keywords if k.arg == "methods"), None)
             names = None
+            value = kw.value if kw is not None else None
+            if isinstance(value, ast.Name) and module is not None:
+                value = self._module_list(module, value)
             if kw is None:
                 names = ["get"]
-            elif isinstance(kw.value, (ast.List, ast.Tuple, ast.Set)) and all(
-                    isinstance(e, ast.Constant) and isinstance(e.value, str) for e in kw.value.elts):
-                names = list(dict.fromkeys(e.value.lower() for e in kw.value.elts))
+            elif isinstance(value, (ast.List, ast.Tuple, ast.Set)) and all(
+                    isinstance(e, ast.Constant) and isinstance(e.value, str) for e in value.elts):
+                names = list(dict.fromkeys(e.value.lower() for e in value.elts))
             out = []
             if names and all(n in HTTP_METHODS for n in names):
                 for n in names:
@@ -849,10 +852,29 @@ class Frontend:
             cache[id(d)] = (d, out)
         return cache[id(d)][1]
 
+    def _module_list(self, module: str, name: ast.Name):
+        """The literal a module-level name is bound to once and never mutated in its module (`METHODS = [...]`)."""
+        t = self.index.resolve_expr(module, name)
+        if not isinstance(t, Sym):
+            return None
+        m = self.index.module(t.module)
+        d = m.defs.get(t.name) if m is not None else None
+        if not (isinstance(d, (ast.Assign, ast.AnnAssign)) and d.value is not None and len(m.binders.get(t.name, [d])) <= 1):
+            return None
+        for n in ast.walk(m.tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == t.name \
+                    and n.attr in {"append", "extend", "insert", "remove", "pop", "clear", "add", "discard"}:
+                return None
+            if isinstance(n, (ast.AugAssign, ast.Subscript)) and isinstance(getattr(n, "target", getattr(n, "value", None)), ast.Name) \
+                    and getattr(getattr(n, "target", getattr(n, "value", None)), "id", None) == t.name \
+                    and (isinstance(n, ast.AugAssign) or isinstance(n.ctx, (ast.Store, ast.Del))):
+                return None
+        return d.value
+
     def _route_decorator(self, fn, module: str, parents) -> tuple[ast.Call, Sym | None] | None:
         """`@app.get(...)` -> (decorator, None); `@router.get(...)` -> (decorator, router)."""
         found = None
-        for d in [x for dd in fn.decorator_list for x in self._expand(dd)]:
+        for d in [x for dd in fn.decorator_list for x in self._expand(dd, module)]:
             if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS):
                 continue
             if self._is_app(module, d.func.value):
@@ -867,7 +889,7 @@ class Frontend:
         """Every HTTP route decorator of the function, in registration order (the lowest first: Python applies
         decorators bottom up, each registers the function once more)."""
         out = []
-        for d in [x for dd in reversed(fn.decorator_list) for x in self._expand(dd)]:
+        for d in [x for dd in reversed(fn.decorator_list) for x in self._expand(dd, module)]:
             if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS):
                 continue
             if self._is_app(module, d.func.value):
