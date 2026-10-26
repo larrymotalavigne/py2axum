@@ -100,3 +100,89 @@ def test_session_dependency_variants_refused(tmp_path, capsys, body):
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "session dependency db" in err and "main.py:" in err
+
+
+DEPS_MAIN = '''
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+
+
+async def auth():
+    raise HTTPException(status_code=401)
+
+
+async def admin():
+    return True
+
+{decl}
+router = APIRouter()
+
+
+@router.post("/x", dependencies={use})
+async def x():
+    return {{"ok": 1}}
+
+
+app = FastAPI()
+app.include_router(router)
+'''
+
+
+@pytest.mark.parametrize("decl, use", [
+    ("ADMIN = [Depends(auth), Depends(admin)]", "ADMIN"),
+    ("BASE = [Depends(auth)]\nADMIN = BASE + [Depends(admin)]", "ADMIN"),
+    ("BASE = (Depends(auth),)", "[*BASE]"),
+])
+def test_route_dependencies_from_a_constant_are_kept(tmp_path, decl, use):
+    """`dependencies=ADMIN_ONLY` (a module constant): its dependencies run, as in FastAPI; they were dropped."""
+    pkg = project(tmp_path, DEPS_MAIN.format(decl=decl, use=use))
+    if use.startswith("[*"):
+        assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+        return
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "f_proj_main__auth" in gen and "f_proj_main__admin" in gen
+
+
+@pytest.mark.parametrize("decl", [
+    "ADMIN = [Depends(auth)]\nADMIN.append(Depends(admin))",
+    "def make():\n    return [Depends(auth)]\nADMIN = make()",
+])
+def test_route_dependencies_not_static_refused(tmp_path, capsys, decl):
+    """Never served without them: a list changed after its definition, or built by a call, is refused."""
+    pkg = project(tmp_path, DEPS_MAIN.format(decl=decl, use="ADMIN"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "must be a list of Depends(...) read statically" in capsys.readouterr().err
+
+
+def test_object_getattribute_skips_getattr(tmp_path):
+    """`object.__getattribute__(obj, "_x")` (a proxy check): compiled, without the class's __getattr__ fallback."""
+    src = '''
+from fastapi import FastAPI
+
+
+class Proxy:
+    def __init__(self):
+        self._x = 1
+
+    def __getattr__(self, name):
+        return 42
+
+
+def has_x(o) -> bool:
+    try:
+        object.__getattribute__(o, "_y")
+    except AttributeError:
+        return False
+    return True
+
+
+app = FastAPI()
+
+
+@app.get("/p")
+async def p():
+    return {"y": has_x(Proxy()), "x": object.__getattribute__(Proxy(), "_x")}
+'''
+    pkg = project(tmp_path, src)
+    generate(tmp_path, pkg)
+    assert "methods::getattribute(cx" in (tmp_path / "out" / "src" / "gen.rs").read_text()

@@ -171,6 +171,16 @@ pub fn default_copy(v: &V) -> R {
 const NATIVE_METHODS: &[&str] = &["acquire", "release", "locked", "set", "clear", "is_set", "wait", "is_running", "is_closed",
     "call_soon", "call_soon_threadsafe", "run_forever", "stop", "close", "create_task", "run_in_executor"];
 
+tokio::task_local! {
+    /// set by `object.__getattribute__`: the lookup does not fall back to the class's `__getattr__`
+    static NO_GETATTR_FALLBACK: bool;
+}
+
+/// `object.__getattribute__(obj, name)`: `getattr` without `__getattr__` (a proxy's forwarding cannot answer)
+pub async fn getattribute(cx: &Cx, v: &V, name: &str) -> R {
+    NO_GETATTR_FALLBACK.scope(true, getattr(cx, v, name)).await
+}
+
 pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
     if let Some(r) = super::stripe::getattr(v, name) {
         return r;
@@ -297,7 +307,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 }
                 // __getattr__: only once the normal lookup failed
                 _ => match find_method(i.desc.methods, "__getattr__") {
-                    Some((false, f)) => f(cx, v.clone(), vec![V::str(name)]).await,
+                    Some((false, f)) if !NO_GETATTR_FALLBACK.try_with(|b| *b).unwrap_or(false) => f(cx, v.clone(), vec![V::str(name)]).await,
                     _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{}'", i.desc.name, name))),
                 },
             }

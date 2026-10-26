@@ -2649,6 +2649,12 @@ class Project:
             d = self.ix.definition(t) if isinstance(t, Sym) else None
             if isinstance(d, ast.Assign) and isinstance(d.value, ast.Call):
                 sym, stmt = t, d
+        if sym is None and isinstance(node, ast.Constant) and isinstance(node.value, str):
+            # the table of a mapped class (`class RequestResponse(Base): __tablename__ = "request_response"`): SQLAlchemy
+            # finds it by name in the metadata, as a Table
+            mapped = [ms for ms in self.fe.model_syms if self.model(ms).table == node.value]
+            if len(mapped) == 1:
+                return self.mapped_core_table(mapped[0], node, module)
         if sym is None or not (isinstance(stmt.value, ast.Call) and isinstance(self.resolve(sym.module, stmt.value.func), Ext)
                                and self.resolve(sym.module, stmt.value.func).dotted in {"sqlalchemy.Table", "sqlalchemy.schema.Table"}):
             raise self.err(f"relationship {where}: secondary= must name a module-level Table(...) (its variable or its "
@@ -7530,6 +7536,14 @@ class FnCompiler:
                 raise self.err("importlib.import_module() of a computed name is not supported (only a literal module "
                                "of the project)", node)
             return self.ref_value(self.static_ref(node), node)  # a literal project module, or refused
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__"
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "object"
+                and self.static_ref(node.func.value) in (None, ("builtin", "object"))):
+            # `object.__getattribute__(obj, name)`: the normal lookup, without the class's `__getattr__` fallback
+            if len(node.args) != 2 or node.keywords or any(isinstance(a, ast.Starred) for a in node.args):
+                raise self.err("object.__getattribute__(obj, name) takes two positional arguments", node)
+            obj, attr = self.expr(node.args[0]), self.expr(node.args[1])
+            return self.q(f"{RT}::methods::getattribute(cx, &{obj}, &{RT}::ops::str_(&{attr})?).await")
         return self.call(node, awaited=False)
 
     # ---------------------------------------------------------------- calls
@@ -9123,6 +9137,49 @@ class RouteBuilder:
         t = self.p.resolve(module, node, scope)
         return is_ext(t, *names)
 
+    def dependency_elements(self, value: ast.AST, module: str, file: str, depth: int = 0) -> list[tuple[ast.AST, str, str]]:
+        """The elements of a `dependencies=` value, each with the module and file it is resolved in: a list or tuple
+        literal, a module constant bound once to one and never changed (`SUPER_ADMIN_ONLY = [Depends(auth)]`), a
+        concatenation of those, or None. Anything else is refused: dropping a dependency would serve the route
+        without its authentication."""
+        if isinstance(value, ast.Constant) and value.value is None:
+            return []
+        if isinstance(value, (ast.List, ast.Tuple)):
+            if any(isinstance(e, ast.Starred) for e in value.elts):
+                raise TranspileError("dependencies=[*...]: unpacking is not supported", value, file)
+            return [(e, module, file) for e in value.elts]
+        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add) and depth < 8:
+            return (self.dependency_elements(value.left, module, file, depth + 1)
+                    + self.dependency_elements(value.right, module, file, depth + 1))
+        if isinstance(value, (ast.Name, ast.Attribute)) and depth < 8:
+            t = self.p.resolve(module, value)
+            m = self.p.ix.module(t.module) if isinstance(t, Sym) else None
+            d = m.defs.get(t.name) if m is not None else None
+            if (isinstance(d, (ast.Assign, ast.AnnAssign)) and d.value is not None
+                    and len(m.binders.get(t.name, [d])) <= 1 and not self._mutated_global(t)):
+                return self.dependency_elements(d.value, t.module, str(m.path), depth + 1)
+        raise TranspileError(f"dependencies={ast.unparse(value)[:60]}: must be a list of Depends(...) read statically "
+                             "(a literal, or a module constant bound once to one): the route would otherwise be served "
+                             "without these dependencies", value, file)
+
+    def _mutated_global(self, t: Sym) -> bool:
+        """`NAME.append(...)`, `NAME += ...`, `NAME[i] = ...`, `mod.NAME.extend(...)` anywhere in the package."""
+        for m in self.p.ix.package_modules():
+            parents = self.fe._parents(m.name)
+            for n in ast.walk(m.tree):
+                ref = ((isinstance(n, ast.Name) and n.id == t.name and m.name == t.module)
+                       or (isinstance(n, ast.Attribute) and n.attr == t.name and m.name != t.module))
+                if not ref:
+                    continue
+                up = parents.get(n)
+                if (isinstance(up, ast.Attribute) and up.attr in {"append", "extend", "insert", "remove", "pop", "clear",
+                                                                   "__setitem__", "__iadd__"}) \
+                        or (isinstance(up, ast.AugAssign) and up.target is n) \
+                        or (isinstance(up, ast.Subscript) and isinstance(up.ctx, (ast.Store, ast.Del))) \
+                        or (isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)):
+                    return True
+        return False
+
     SECURITY = {"OAuth2PasswordBearer": ("OAuth2Bearer", {"tokenUrl", "scheme_name", "scopes", "description", "refreshUrl"}),
                 "HTTPBearer": ("HttpBearer", {"bearerFormat", "scheme_name", "description"}),
                 "HTTPBasic": ("HttpBasic", {"scheme_name", "description"})}
@@ -10380,11 +10437,8 @@ class RouteBuilder:
             if kw.arg == "dependencies":
                 pre_deps.append((kw, src))
         pre_syms: list[Sym] = []
-        for node, file in pre_deps:
-            value = node.value
-            mod = self.p.ix.module_of(file).name
-            elts = value.elts if isinstance(value, (ast.List, ast.Tuple)) else []
-            for e in elts:
+        for node, nfile in pre_deps:
+            for e, mod, file in self.dependency_elements(node.value, self.p.ix.module_of(nfile).name, nfile):
                 if not (isinstance(e, ast.Call) and (dotted(e.func) or "").split(".")[-1] in {"Depends", "Security"} and e.args):
                     raise TranspileError("dependencies=[...] must contain Depends(function)", e, file)
                 t = self.p.resolve(mod, e.args[0])
@@ -10664,10 +10718,8 @@ class RouteBuilder:
                                      "provided by FastAPI on a WebSocket route", fn, src)
         lines: list[str] = []
         deps: list[Sym] = [p.dep for p in params if p.kind == "dep"]
-        for node, file in pre_deps:
-            mod = self.p.ix.module_of(file).name
-            elts = node.value.elts if isinstance(node.value, (ast.List, ast.Tuple)) else []
-            for e in elts:
+        for node, nfile in pre_deps:
+            for e, mod, file in self.dependency_elements(node.value, self.p.ix.module_of(nfile).name, nfile):
                 if not (isinstance(e, ast.Call) and (dotted(e.func) or "").split(".")[-1] in {"Depends", "Security"} and e.args):
                     raise TranspileError("dependencies=[...] must contain Depends(function)", e, file)
                 t = self.p.resolve(mod, e.args[0])
