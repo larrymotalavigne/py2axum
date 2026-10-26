@@ -53,6 +53,8 @@ pub struct ReqCell {
 pub const REQ_ROUTE: u32 = 1;
 pub const REQ_EXC: u32 = 2;
 pub const REQ_SERVER: u32 = 3;
+/// a `Request(scope)` built by translated code without a receive channel (a raw ASGI middleware reading headers)
+pub const REQ_NORECV: u32 = 4;
 pub const REQ_MW: u32 = 100;
 
 impl ReqCell {
@@ -92,7 +94,7 @@ impl ReqCell {
         if obj == REQ_ROUTE && self.form_read.load(Ordering::Relaxed) {
             return Err(Exc::runtime("Stream consumed"));
         }
-        if obj == REQ_SERVER {
+        if obj == REQ_SERVER || obj == REQ_NORECV {
             // ServerErrorMiddleware's `Request(scope)`: Starlette's `empty_receive`
             return Err(Exc::runtime("Receive channel has not been made available"));
         }
@@ -1344,7 +1346,7 @@ async fn run_route(cx: &Cx, run: RunFn) -> R<Response> {
         return Err(throw_teardowns(cx, e).await);
     }
     let session = match cx.session.get() {
-        Some(V::Session(s)) if cx.app.commit_after => Some(s.clone()),
+        Some(V::Session(s)) if super::commit_after(cx) => Some(s.clone()),
         _ => None,
     };
     // the dependencies' exit code (and `yield s; await s.commit()`): FastAPI (>= 0.121, scope "request")
@@ -1532,7 +1534,7 @@ pub async fn run_ws_route(cx: &Cx, run: super::ws::WsRunFn) -> R<()> {
     }
     run_teardowns(cx, true).await;
     if let Some(V::Session(s)) = cx.session.get() {
-        if cx.app.commit_after {
+        if super::commit_after(cx) {
             s.commit().await?;
         }
     }
@@ -2079,6 +2081,36 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
         }
     }
     Err(Exc::http(404, V::str("Not Found"), vec![]))
+}
+
+/// prometheus_fastapi_instrumentator's `get_route_name`: the template of the route matching the request (a full
+/// match, else the first path-only match), declared then added at run time; with no match, the path itself when
+/// it matches with or without its trailing slash (`redirect_slashes`); None otherwise.
+pub fn route_template(cx: &Cx, routes: &'static [RouteDef]) -> Option<String> {
+    let res = ROUTE_RES.get_or_init(|| routes.iter().map(|r| route_regex(r.pattern)).collect());
+    let lookup = |path: &str| -> Option<String> {
+        let mut partial: Option<String> = None;
+        for (i, (r, re)) in routes.iter().zip(res).enumerate() {
+            if route_off(i) || !re.is_match(path) {
+                continue;
+            }
+            if r.method == cx.req.method {
+                return Some(runtime_prefix(r.path));
+            }
+            partial.get_or_insert_with(|| runtime_prefix(r.path));
+        }
+        partial.or_else(|| super::routing::added_match(path, &cx.req.method).map(|(a, _)| a.path.clone()))
+    };
+    let full = unquote(&cx.req.path);
+    let path = route_path(&full).to_string();
+    if let Some(t) = lookup(&path) {
+        return Some(t);
+    }
+    let toggled = if let Some(p) = path.strip_suffix('/') { p.to_string() } else { format!("{path}/") };
+    if !toggled.is_empty() && toggled != path && lookup(&toggled).is_some() {
+        return Some(path);
+    }
+    None
 }
 
 /// A route that `route` would run (path and method): declared, then added at run time.

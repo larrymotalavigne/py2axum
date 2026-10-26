@@ -250,7 +250,7 @@ CLASSES: list[ErrorClass] = [
        r"^CORSMiddleware", r"TrustedHostMiddleware", r"HTTPSRedirectMiddleware", r"^GZipMiddleware",
        r"minimum_size must be", r"^RawContextMiddleware", r"^plugin", r"BaseHTTPMiddleware",
        r"wrapped in an ASGI class", r"^option \w+= is not supported \(only plugins=\)", r"pass plugins=",
-       r"plugins= must be", r"^raw ASGI middleware \S+ with WebSocket routes"),
+       r"plugins= must be", r"^raw ASGI middleware \S+ with WebSocket routes", r"^Instrumentator"),
       "Middlewares are compiled one by one: GZip, CORS, TrustedHost, HTTPSRedirect, project "
       "`BaseHTTPMiddleware` subclasses and raw ASGI middlewares of the project, with literal options.",
       "Use one of the supported middlewares with literal keyword options. A middleware of a library must stay "

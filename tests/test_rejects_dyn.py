@@ -1170,14 +1170,17 @@ def test_pyjwt_outside_subset_rejected(tmp_path, capsys, stmt, msg):
 
 
 def test_module_variable_bound_twice_rejected(tmp_path, capsys):
+    """Bound by several module-level statements: run in order from the first binding to the last; with a call
+    written as a statement among them, refused."""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
-    (pkg / "main.py").write_text("""
+    src = """
 from fastapi import FastAPI
 
 app = FastAPI()
 LIMIT = 10
+{between}
 try:
     LIMIT = int("20")
 except ValueError:
@@ -1186,12 +1189,14 @@ except ValueError:
 
 @app.get("/l")
 async def l():
-    return {"limit": LIMIT}
-""")
-    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    return {{"limit": LIMIT}}
+"""
+    (pkg / "main.py").write_text(src.format(between=""))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    (pkg / "main.py").write_text(src.format(between="print(LIMIT)"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out2")]) == 1
     err = capsys.readouterr().err
-    assert "the module variable `LIMIT` is bound by several module-level statements (lines 5, 6): not supported" in err
-    assert "main.py:6" in err
+    assert "bound by several module-level statements" in err
 
 
 CONFIGURE_MAIN = """

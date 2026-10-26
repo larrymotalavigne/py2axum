@@ -815,6 +815,25 @@ def set_python(version: tuple[int, int]) -> None:
         EXCEPTIONS.pop("re.PatternError", None)
 
 
+def _instr_version() -> str:
+    """prometheus_fastapi_instrumentator is ported from 8.x (7.x names partial and trailing-slash matches otherwise)."""
+    v = LIB_VERSIONS.get("prometheus-fastapi-instrumentator")
+    if v is not None and not v.startswith("8."):
+        raise ValueError(f"prometheus_fastapi_instrumentator is ported from 8.x (the project locks {v})")
+    return ""
+
+
+def _starlette_request(a, kw) -> str:
+    """`Request(scope, receive)` of the request being served; `Request(scope)` has no receive channel (its body
+    raises when read). `send=` is unused by a Request."""
+    v = _bind("Request", a, kw, ["scope", "receive", "send"], {"scope", "receive", "send"})
+    if "scope" not in v:
+        raise ValueError("Request() missing 1 required positional argument: 'scope'")
+    ev = "".join(f"let _ = {v[k]}; " for k in ("receive", "send") if k in v)
+    f = "request_from_scope" if "receive" in v else "request_from_scope_norecv"
+    return f"{{ {ev}{RT}::rawasgi::{f}(cx, &{v['scope']}) }}"
+
+
 def _arg1(name: str, a, kw, pname: str) -> str:
     """A function of one argument given positionally or by name (`copy.deepcopy(x)`; its memo= is refused)."""
     v = _bind(name.rpartition(".")[2], a, kw, [pname], {pname})
@@ -1367,6 +1386,11 @@ CALLS = {
                                                 or _mimetypes("guess_file_type", ["path"], ("strict",))(a, kw)),
     "mimetypes.guess_extension": _mimetypes("guess_extension", ["type", "strict"]),
     "mimetypes.guess_all_extensions": _mimetypes("guess_all_extensions", ["type", "strict"]),
+    # prometheus_fastapi_instrumentator (dynrt/instr.rs): .instrument(app) / .expose(app) are compiled by the
+    # translator (the app is the application itself)
+    **{n: (lambda a, kw: _instr_version() or f"{RT}::instr::new(&{_argv(a)}, &{_kwvec(kw)})") for n in (
+        "prometheus_fastapi_instrumentator.Instrumentator", "prometheus_fastapi_instrumentator.PrometheusFastApiInstrumentator",
+        "prometheus_fastapi_instrumentator.instrumentation.PrometheusFastApiInstrumentator")},
     # copy (dynrt/copymod.rs): a class's own __copy__/__deepcopy__/__reduce__ is refused (Project.copies_objects)
     "copy.copy": lambda a, kw: f"{RT}::copymod::copy(&{_arg1('copy.copy', a, kw, 'x')})",
     "copy.deepcopy": lambda a, kw: f"{RT}::copymod::deepcopy(&{_arg1('copy.deepcopy', a, kw, 'x')})",
@@ -1658,7 +1682,7 @@ CALLS = {
     # by the transpiler (dyn.mcp_tools)
     "mcp.server.mcpserver.MCPServer": lambda a, kw: _mcp_server(a, kw),
     # `Request(scope, receive)` inside a raw ASGI app (dynrt/rawasgi.rs): the request being served
-    "starlette.requests.Request": lambda a, kw: f"{{ let _ = {a[1]}; {RT}::rawasgi::request_from_scope(cx, &{a[0]}) }}",
+    "starlette.requests.Request": lambda a, kw: _starlette_request(a, kw),
     "fastapi.Request": lambda a, kw: f"{{ let _ = {a[1]}; {RT}::rawasgi::request_from_scope(cx, &{a[0]}) }}",
     "mcp.server.transport_security.TransportSecuritySettings": lambda a, kw: _mcp_security(a, kw),
     "contextvars.ContextVar": lambda a, kw: f"{RT}::agen::context_var(&{_argv(a)}, &{_kwvec(kw)})",

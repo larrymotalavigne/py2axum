@@ -780,6 +780,12 @@ STEPS += [
     ("GET", "/mw/sctx/rewrite", None, {"x-request-id": _U1}),
     ("GET", "/mw/sctx/delete", None, {"x-request-id": _U1}),
     ("GET", "/mw/sctx/missing", None),
+    ("POST", "/syncsess/owners/sync-a", None),
+    ("POST", "/syncsess/owners/sync-b?fail=1", None),
+    ("GET", "/syncsess/owners/sync-a", None),
+    ("GET", "/syncsess/owners/sync-b", None),
+    ("POST", "/smsess/owners/sync-c", None),
+    ("GET", "/syncsess/owners/sync-c", None),
 ]
 # gzip.decompress: members, padding, header flags, truncated/corrupted inputs
 _GZ = __import__("gzip").compress(b"hello gzip " * 50, mtime=0)

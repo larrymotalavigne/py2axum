@@ -982,6 +982,8 @@ pub fn is(a: &V, b: &V) -> bool {
         (V::Int(x), V::Int(y)) => x == y && (-5..=256).contains(x),
         (V::Str(x), V::Str(y)) => Arc::ptr_eq(x, y),
         (V::List(x), V::List(y)) => Arc::ptr_eq(x, y),
+        (V::Tuple(x), V::Tuple(y)) => Arc::ptr_eq(x, y),
+        (V::Set(x), V::Set(y)) | (V::Frozen(x), V::Frozen(y)) => Arc::ptr_eq(x, y),
         (V::Dict(x), V::Dict(y)) => Arc::ptr_eq(x, y),
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y),

@@ -110,6 +110,17 @@ fn translate(p: &str, flags: i64) -> R<String> {
     Ok(if prefix.is_empty() { out } else { format!("(?{prefix}){out}") })
 }
 
+/// `pattern.search(text) is not None` of a compiled pattern (False for anything else)
+pub fn pattern_search(p: &V, text: &str) -> bool {
+    match p {
+        V::Native(n) => match &**n {
+            Native::Pattern(p) => p.re.is_match(text).unwrap_or(false),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 pub fn compile(pattern: &V, flags: Option<&V>) -> R {
     if let V::Native(n) = pattern {
         if let Native::Pattern(_) = &**n {

@@ -439,6 +439,25 @@ fn add_route(args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
     Ok(V::None)
 }
 
+/// a route the runtime itself adds (prometheus_fastapi_instrumentator's `/metrics`), tried after the declared ones
+pub fn add_native_route(path: &str, methods: &[&str], name: &str, endpoint: V) -> R<()> {
+    let re = regex::Regex::new(&compile_path(path)?).map_err(|e| Exc::value_error(e.to_string()))?;
+    ADDED.write().push(Arc::new(Added { path: path.to_string(), re, methods: methods.iter().map(|m| m.to_string()).collect(), endpoint,
+                                        name: name.to_string() }));
+    Ok(())
+}
+
+/// `app.add_middleware(...)` of a layer the runtime builds (the instrumentator's), while the stack is being built
+pub fn push_built(mw: Mw) -> R<()> {
+    match BUILD.lock().as_mut() {
+        Some(v) => {
+            v.push(mw);
+            Ok(())
+        }
+        None => Err(Exc::runtime("Cannot add middleware after an application has started")),
+    }
+}
+
 fn getattr_name(f: &V) -> Option<String> {
     if let V::Native(n) = f {
         if let Native::PyFn(p) = &**n {
@@ -481,6 +500,10 @@ pub fn end_build() {
 }
 
 static HANDLERS: Mutex<Vec<(V, V)>> = Mutex::new(Vec::new());
+
+pub fn is_building() -> bool {
+    BUILD.lock().is_some()
+}
 
 fn building() -> R<()> {
     if BUILD.lock().is_none() {

@@ -738,17 +738,15 @@ class Project:
     def err(self, msg: str, node, module: str) -> TranspileError:
         return TranspileError(msg, node, self.src(module))
 
-    def use_session_dep(self, sym: Sym) -> None:
+    def use_session_dep(self, sym: Sym) -> tuple[bool, bool, bool, bool]:
         """The `AsyncSession` dependency of a route: its shape fixes the session options and whether
-        the request commits after the endpoint. One configuration per application."""
+        the request commits after the endpoint. The first one seen is the application's default; a route whose
+        dependency differs (a sync `Session` next to an `AsyncSession`) makes its session with its own."""
         cfg = self.session_config(sym)
-        cfgs = self.__dict__.setdefault("session_cfgs", {})
-        cfgs[sym] = cfg
-        if len(set(cfgs.values())) > 1:
-            fn = self.ix.definition(sym)
-            raise self.err(f"session dependency {sym.name}: the routes use session dependencies with different "
-                           f"behaviour ({', '.join(s.name for s in cfgs)})", fn, sym.module)
-        self.session_cfg = cfg
+        self.__dict__.setdefault("session_cfgs", {})[sym] = cfg
+        if not hasattr(self, "session_cfg"):
+            self.session_cfg = cfg
+        return cfg
 
     SESSION_SHAPE = ("only `async with maker() as s: yield s`, optionally inside `try:` with `await s.commit()` "
                      "after the yield, `except ...: await s.rollback(); raise` and `finally: await s.close()`; "
@@ -4534,6 +4532,12 @@ class Project:
                 self.config_class(info, stmt, module)
             else:
                 raise self.err(f"unsupported statement in schema {sym.name}", stmt, module)
+        # class keywords (`class M(BaseModel, extra="allow", frozen=True)`): configuration, applied after the
+        # body's model_config as pydantic merges them (ConfigWrapper.for_model)
+        cls_kw = [k for k in node.keywords if k.arg != "metaclass"]
+        if any(k.arg is None for k in cls_kw):
+            raise self.err(f"schema {sym.name}: `**` in the class keywords is not supported", node, module)
+        self.config_items(info, cls_kw, module)
         # model_config validate_default (inherited, or the class's own): every field that does not set its own
         for f in fields:
             if "vd_explicit" in f:
@@ -5217,10 +5221,58 @@ class Project:
             return found[-1]  # the last def of a name is the one the class keeps
         return self.ix.definition(sym)
 
+    SPAN_STMTS = (ast.Assign, ast.AnnAssign, ast.If, ast.Try, ast.For, ast.While, ast.With, ast.Pass)
+
+    def module_spans(self, module: str) -> list[tuple[int, int]]:
+        """Runs of module-level statements (indexes in the body, first and last included) from the first to the
+        last binding of a name bound by several statements (`X = os.getenv(...)` then `if not X: X = ...`), merged
+        when they overlap: run as one block at startup, in order, as CPython runs the module. Only plain assignments
+        to names and compound statements (no definitions, imports, calls as statements) may be in one; anything
+        else keeps the name refused."""
+        spans = self.__dict__.setdefault("_module_spans", {})
+        if module not in spans:
+            m = self.ix.module(module)
+            body = m.tree.body
+            found = []
+            for n, bs in m.binders.items():
+                if len(bs) < 2 or not all(any(b is st for st in body) for b in bs):
+                    continue
+                idx = [next(i for i, st in enumerate(body) if st is b) for b in bs]
+                found.append((min(idx), max(idx)))
+            found.sort()
+            merged: list[list[int]] = []
+            for a, b in found:
+                if merged and a <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], b)
+                else:
+                    merged.append([a, b])
+            ok = []
+            for a, b in merged:
+                stmts = body[a:b + 1]
+                if all(isinstance(st, self.SPAN_STMTS) and not import_guard(st) and not startup_skipped(st)
+                       and (not isinstance(st, ast.Assign) or all(isinstance(t, ast.Name) for t in st.targets))
+                       and not any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import,
+                                                  ast.ImportFrom, ast.Global, ast.Nonlocal)) for n in ast.walk(st))
+                       for st in stmts):
+                    ok.append((a, b))
+            spans[module] = ok
+        return spans[module]
+
+    def span_of(self, module: str, st: ast.AST) -> tuple[int, int] | None:
+        body = self.ix.module(module).tree.body
+        for a, b in self.module_spans(module):
+            if any(x is st for x in body[a:b + 1]):
+                return a, b
+        return None
+
     def stmt_runner(self, module: str, st: ast.stmt) -> str:
         """A module-level compound statement (`try`, `if`, `for`, `while`, `with`), run once at startup in its
-        place: a global holding the values of the names it binds (its locals), in `stmt_bindings` order."""
+        place: a global holding the values of the names it binds (its locals), in `stmt_bindings` order. A statement
+        of a span (module_spans) runs with the whole span."""
         runners = self.__dict__.setdefault("stmt_runners", {})
+        span = self.span_of(module, st)
+        stmts = self.ix.module(module).tree.body[span[0]:span[1] + 1] if span else [st]
+        st = stmts[0]
         key = (module, st.lineno)
         if key not in runners:
             name = f"ms_{mod_ident(module)}__{st.lineno}"
@@ -5228,16 +5280,17 @@ class Project:
             fc = FnCompiler(self, module, None, name)
             prev, self.cur = self.cur, ("modst", name)
             try:
-                bound = stmt_bindings(st)
+                bound = list(dict.fromkeys(n for x in stmts for n in stmt_bindings(x)))
                 m = self.ix.module(module)
                 for n in bound:
-                    if len(m.binders.get(n, [])) > 1:
+                    if len(m.binders.get(n, [])) > 1 and span is None:
                         raise fc.err(f"the module variable `{n}` is bound by several module-level statements "
-                                     f"(lines {', '.join(str(b.lineno) for b in m.binders[n])}): not supported", st)
-                fc.locals = set(stmt_bindings(st, handlers=True))
+                                     f"(lines {', '.join(str(b.lineno) for b in m.binders[n])}), with a definition, an "
+                                     "import or a call statement among them: not supported", st)
+                fc.locals = set(n for x in stmts for n in stmt_bindings(x, handlers=True))
                 for n in sorted(fc.locals):
                     fc.emit(f"let mut v_{ident(n)}: V = V::Unbound;")
-                fc.block([st])
+                fc.block(stmts)
             except TranspileError:
                 del runners[key]
                 raise
@@ -5273,11 +5326,13 @@ class Project:
         if sym not in self.globals:
             name = f"g_{mod_ident(sym.module)}__{ident(sym.name)}"
             node = self.ix.definition(sym)
-            if isinstance(node, (ast.Try, ast.If, ast.For, ast.While, ast.With)) and not import_guard(node):
+            span = self.span_of(sym.module, node) if node is not None else None
+            if span is not None or isinstance(node, (ast.Try, ast.If, ast.For, ast.While, ast.With)) and not import_guard(node):
                 runner = self.stmt_runner(sym.module, node)
                 self.edges.setdefault(("global", sym), set()).add(("modst", runner))
                 self.globals[sym] = name
-                i = stmt_bindings(node).index(sym.name)
+                stmts = self.ix.module(sym.module).tree.body[span[0]:span[1] + 1] if span else [node]
+                i = list(dict.fromkeys(n for x in stmts for n in stmt_bindings(x))).index(sym.name)
                 self.items.append(
                     f"static G_{name}: {RT}::Global = {RT}::Global::new();\n"
                     f"pub async fn {name}(cx: &Cx) -> R {{\n"
@@ -8112,6 +8167,13 @@ class FnCompiler:
         if fmt is not None:
             return fmt
         if isinstance(node.func, ast.Attribute):
+            if instr_call(self.p.fe, self.module, node, ("instrument", "expose")):
+                # prometheus_fastapi_instrumentator: `.instrument(app, ...)` / `.expose(app, ...)` (dynrt/instr.rs)
+                if len(node.args) != 1 or any(k.arg is None for k in node.keywords):
+                    raise self.err(f"Instrumentator.{node.func.attr}(app, ...) takes the application then keyword options", node)
+                recv = self.expr(node.func.value)
+                kw = ", ".join(f"({rs(k.arg)}.to_string(), {self.expr(k.value)})" for k in node.keywords)
+                return self.q(f"{RT}::instr::{node.func.attr}(&{recv}, vec![{kw}])")
             if node.func.attr == "add_middleware" and node.args:
                 # `app.add_middleware(Cls, ...)` in a function given the app: the instance is built now (the
                 # stack is being built), its `dispatch` registered
@@ -9953,11 +10015,14 @@ class RouteBuilder:
             if sync_sess and not (dep_call is not None and dep_call.args):
                 raise TranspileError(f"{name}: a synchronous Session parameter needs Depends(<session dependency>)", arg, src)
             if sync_sess or self.is_ext(amod, ann, ascope, "sqlalchemy.ext.asyncio.AsyncSession", "sqlalchemy.ext.asyncio.session.AsyncSession"):
+                cfg = None
                 if dep_call is not None and dep_call.args:
                     t = self.p.resolve(dmod, dep_call.args[0], dscope)
                     if isinstance(t, Sym):
-                        self.p.use_session_dep(t)
-                out.append(RParam(name, "session"))
+                        cfg = self.p.use_session_dep(t)
+                rp = RParam(name, "session")
+                rp.__dict__["session_cfg"] = cfg
+                out.append(rp)
                 continue
             if dep_call is not None and not dep_call.args and self.is_ext(
                     amod, ann, ascope, "fastapi.security.OAuth2PasswordRequestForm", "fastapi.security.oauth2.OAuth2PasswordRequestForm"):
@@ -10439,7 +10504,11 @@ class RouteBuilder:
             elif p.kind == "security_scopes":
                 lines.append(f"let p_{ident(p.name)} = {RT}::web::security_scopes(&[{', '.join(rs(x) for x in oauth)}]);")
             elif p.kind == "session":
-                lines.append(f"let p_{ident(p.name)} = {RT}::session(cx).await?;")
+                cfg = p.__dict__.get("session_cfg")
+                if cfg is None or len(set(self.p.__dict__.get("session_cfgs", {}).values())) < 2:
+                    lines.append(f"let p_{ident(p.name)} = {RT}::session(cx).await?;")
+                else:
+                    lines.append(f"let p_{ident(p.name)} = {RT}::session_with(cx, {', '.join(str(x).lower() for x in cfg)}).await?;")
             elif p.kind == "request":
                 lines.append(f"let p_{ident(p.name)} = {RT}::request(cx);")
             elif p.kind == "websocket":
@@ -12700,8 +12769,33 @@ def _stack_call(fe: Frontend, module: str, n: ast.AST) -> bool:
     `FastAPI(middleware=[...])`."""
     return isinstance(n, ast.Call) and bool(
         stack_node(fe, module, n) or configure_call(fe, module, n) or lib_router_include(fe, module, n)
+        or instr_call(fe, module, n, ("instrument",))
         or (isinstance(n.func, (ast.Name, ast.Attribute)) and dotted(n.func) in {"FastAPI", "fastapi.FastAPI"}
             and any(k.arg == "middleware" for k in n.keywords)))
+
+
+def instr_call(fe: Frontend, module: str, n: ast.AST, names: tuple) -> bool:
+    """`<instrumentator>.instrument(app, ...)` / `.expose(app, ...)` of prometheus_fastapi_instrumentator: the
+    receiver an `Instrumentator(...)` call (or such a chain), or a name bound to one."""
+    if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in names and n.args
+            and fe._is_app(module, n.args[0])):
+        return False
+    recv = n.func.value
+    for _ in range(4):
+        if isinstance(recv, ast.Call) and isinstance(recv.func, ast.Attribute) and recv.func.attr in ("instrument", "expose"):
+            recv = recv.func.value
+            continue
+        if isinstance(recv, ast.Call):
+            t = fe.index.resolve_expr(module, recv.func)
+            return isinstance(t, Ext) and t.dotted.startswith("prometheus_fastapi_instrumentator.")
+        if isinstance(recv, (ast.Name, ast.Attribute)):
+            t = fe.index.resolve_expr(module, recv)
+            d = fe.index.definition(t) if isinstance(t, Sym) else None
+            if isinstance(d, (ast.Assign, ast.AnnAssign)) and d.value is not None:
+                module, recv = t.module, d.value
+                continue
+        return False
+    return False
 
 
 def _stack_relevant(fe: Frontend, module: str, node: ast.AST) -> bool:
@@ -13457,6 +13551,8 @@ def module_statements(p: "Project", fe: Frontend) -> None:
                 f = st.value.func
                 if isinstance(f, ast.Attribute) and (f.attr in FRAMEWORK_CALLS or fe._is_app(m.name, f.value)):
                     continue
+                if any(instr_call(fe, m.name, n, ("instrument",)) for n in ast.walk(st)):
+                    continue  # run where the middleware stack is built
                 if configure_call(fe, m.name, st.value):
                     continue  # run by the middleware stack
                 t = p.resolve(m.name, f)
@@ -13714,6 +13810,19 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                         fc.__dict__["app_alias"] = saved
                 fc.emit(f"for __mw in {RT}::routing::take_built() {{ __st.add_middleware(__mw); }}")
                 fc.emit(f"for (__k, __h) in {RT}::routing::take_handlers() {{ __st.exception_handler(&__k, __h)?; }}")
+            elif isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign)) and any(
+                    instr_call(fe, module, n, ("instrument",)) for n in ast.walk(st)):
+                # `Instrumentator(...).instrument(app)...` (or `x = ...` of it): its middleware goes here in the stack
+                if isinstance(st, ast.Expr):
+                    fc.emit(f"let _ = {fc.expr(st.value)};")
+                else:
+                    target = st.targets[0] if isinstance(st, ast.Assign) else st.target
+                    if not (isinstance(target, ast.Name) and (not isinstance(st, ast.Assign) or len(st.targets) == 1)):
+                        raise TranspileError("Instrumentator().instrument(app) assigned to anything else than a name is "
+                                             "not supported", st, p.src(module))
+                    fc.emit(f"let _ = {fc.expr(ast.copy_location(ast.Name(target.id, ast.Load()), target))};")
+                fc.emit(f"for __mw in {RT}::instr::take_pending()? {{ __st.add_middleware(__mw); }}")
+                fc.emit(f"for __mw in {RT}::routing::take_built() {{ __st.add_middleware(__mw); }}")
             elif isinstance(st, ast.Expr) and lib_router_include(fe, module, st.value):
                 # the library's routes come here in Starlette's order: a route `configure(app)` adds after this
                 # point is tried after them, so only Python can answer it (asgi::under_mount)
@@ -14084,7 +14193,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     # functions that fail to translate become stubs that raise; the build fails only if a translated
     # route can reach one (below)
     proj.__dict__["defer_fn_errors"] = True
-    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt", "python-dotenv", "pyjwt"):
+    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt", "python-dotenv", "pyjwt", "prometheus-fastapi-instrumentator"):
         # stripe: the installed release when the project locks none (as the conformance fixtures run)
         v = locked_version(fe.index.root, lib) or (_installed_stripe() if lib == "stripe" else None)
         if v:

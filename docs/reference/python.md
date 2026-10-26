@@ -88,8 +88,10 @@ in [Standard library](stdlib.md), third-party libraries in [Libraries](libraries
   module-level `try`, `if`, `for`, `while` and `with` statements, whose bindings are module variables
   (`except E as e` names are deleted as in CPython). A `try` whose body only imports and assigns constants is an
   import fallback: its imports were resolved at compile time, so its `except` branches never run.
-  `if __name__ == "__main__":` and `if TYPE_CHECKING:` blocks are skipped. Refused: a module variable bound
-  by several module-level statements when one of them is compound (`X = 1` then `try: X = f()`).
+  `if __name__ == "__main__":` and `if TYPE_CHECKING:` blocks are skipped. A module variable bound by
+  several module-level statements (`X = os.getenv(...)` then `if not X: X = "..."`) is computed by running the
+  statements from its first binding to its last as one block, in order (a name read in between sees the earlier
+  value). Refused: such a run that contains a definition, an import or a call written as a statement.
   Attributes and methods of a library object such as `prometheus_client.REGISTRY` are resolved at run time.
   A module-level assignment to an attribute of a library the binary knows nothing of (`stripe.api_key = ...`)
   is left to the Python side: every read or call of that library is refused already.

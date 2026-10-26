@@ -9,7 +9,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from extroutes import views as ext_views
 
-from . import addedroutes, amqp, bgloop, httpxerr, libs, logs, markers, outbound, passlibx, prom, pyjwt_auth, retrying, small, tracing
+from . import addedroutes, amqp, bgloop, httpxerr, instr, libs, logs, markers, outbound, passlibx, prom, pyjwt_auth, retrying, small, tracing
 
 app = FastAPI()
 app.include_router(libs.router)
@@ -25,6 +25,7 @@ app.include_router(logs.router)
 app.include_router(markers.router)
 app.include_router(passlibx.router)
 app.include_router(httpxerr.router)
+app.include_router(instr.router)
 addedroutes.add_early(app)
 
 
@@ -37,6 +38,9 @@ async def http_exc_default(request, exc):
 @app.exception_handler(RequestValidationError)
 async def validation_default(request, exc):
     return await request_validation_exception_handler(request, exc)
+
+
+instr.instrumentator.instrument(app, metric_namespace="integ").expose(app, endpoint="/instr/metrics", include_in_schema=False)
 
 
 @app.get("/health")

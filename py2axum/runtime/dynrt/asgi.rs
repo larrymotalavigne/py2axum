@@ -30,6 +30,8 @@ pub enum Mw {
     Asgi(V, Arc<Slot>),
     /// starlette_context's RawContextMiddleware
     Context(super::ctxmw::RawContext),
+    /// prometheus_fastapi_instrumentator's PrometheusInstrumentatorMiddleware
+    Instrument(Arc<super::instr::Layer>),
     /// Starlette's HTTPSRedirectMiddleware
     HttpsRedirect,
     /// Starlette's TrustedHostMiddleware
@@ -537,6 +539,7 @@ fn chain<'a>(cx: &'a Cx, stack: &'a Arc<Stack>, i: usize, routes: &'static [Rout
             super::rawasgi::run(cx, inst, scope, cx.req.body.clone()).await
         }),
         Some(Mw::Context(c)) => Box::pin(c.call(cx, chain(cx, stack, i + 1, routes))),
+        Some(Mw::Instrument(l)) => Box::pin(l.call(cx, routes, chain(cx, stack, i + 1, routes))),
         // scope["scheme"] already https (X-Forwarded-Proto from a trusted proxy): no redirection
         Some(Mw::HttpsRedirect) if cx.req.scheme == "https" => chain(cx, stack, i + 1, routes),
         Some(Mw::HttpsRedirect) => Box::pin(std::future::ready(https_redirect(cx))),

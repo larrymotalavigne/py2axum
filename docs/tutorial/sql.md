@@ -249,8 +249,10 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   the SQL like SQLAlchemy's lazy loader (autoflush first; `ObjectDeletedError` when the row is gone),
   including while a `response_model` or a model built from ORM objects (`Page(items=rows)`) reads the
   attributes, `@property`s of the model included. Awaiting a synchronous session's method
-  (`await db.execute(...)`) runs it, then raises CPython's `TypeError`. An application uses one kind of
-  session dependency (sync or async), not both.
+  (`await db.execute(...)`) runs it, then raises CPython's `TypeError`. An application may use session
+  dependencies of several kinds (a sync `Session` next to an `AsyncSession`, with or without the commit after
+  the endpoint): each route's session is made with its own dependency's configuration. One request whose
+  dependencies would need two different sessions raises `TypeError`.
 
 The session dependency is described in [Dependencies](dependencies.md); large lists read straight from the
 session are streamed ([Large list responses](../advanced/streaming.md)). The binary does not run migrations:

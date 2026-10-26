@@ -338,6 +338,8 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::Rl(x) => return super::rlbind::attr(x, name),
             Native::File(f) if name == "name" => return Ok(super::pathio::file_name(f)),
             Native::TempDir(t) => return super::pathio::tempdir_attr(v, t, name),
+            // `deque.maxlen`: read-only, None when unbounded
+            Native::Deque(d) if name == "maxlen" => return Ok(d.maxlen.map(|n| V::Int(n as i64)).unwrap_or(V::None)),
             Native::CtCache(c) => {
                 if let Some(r) = super::ctools::attr(c, name) {
                     return r;

@@ -364,3 +364,94 @@ def test_copy_with_a_class_copy_method_refused(tmp_path, capsys):
     pkg = project(tmp_path, COPY_MAIN.format(extra="\n    def __deepcopy__(self, memo):\n        return self\n"))
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     assert "__deepcopy__" in capsys.readouterr().err
+
+
+SPAN_MAIN = '''
+import os
+
+from fastapi import FastAPI
+
+HOST = os.getenv("HOST")
+SEEN = HOST
+{between}
+if not HOST:
+    HOST = "localhost"
+
+app = FastAPI()
+
+
+@app.get("/h")
+async def h():
+    return {{"host": HOST, "seen": SEEN}}
+'''
+
+
+def test_module_variable_bound_twice(tmp_path):
+    """`X = os.getenv(...)` then `if not X: X = ...` at module level: the statements from the first binding to
+    the last run as one block at startup (SEEN keeps the value read in between)."""
+    pkg = project(tmp_path, SPAN_MAIN.format(between=""))
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "ms_proj_main__6" in gen
+
+
+def test_module_variable_bound_twice_with_a_call_between_refused(tmp_path, capsys):
+    pkg = project(tmp_path, SPAN_MAIN.format(between="print(HOST)"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "bound by several module-level statements" in capsys.readouterr().err
+
+
+def test_sync_and_async_session_dependencies_in_one_app(tmp_path):
+    """A sync `Session` dependency next to an `AsyncSession` one: each route makes its session with its own
+    dependency's configuration (the first one seen is the application's default)."""
+    src = SESSION_MAIN.format(body="    async with Session() as s:\n        yield s") + '''
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session as SyncSession, sessionmaker
+
+sync_maker = sessionmaker(bind=create_engine("postgresql+psycopg://x/y"))
+
+
+def sync_db():
+    s = sync_maker()
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+@app.get("/sync/{team_id}")
+def sync_team(team_id: int, s: SyncSession = Depends(sync_db)):
+    return {"name": s.get(Team, team_id).name}
+'''
+    pkg = project(tmp_path, src)
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "dynrt::session(cx)" in gen and "dynrt::session_with(cx, false, true, true, true)" in gen
+
+
+INSTR_MAIN = '''
+from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
+
+app = FastAPI()
+{setup}
+
+
+@app.get("/items/{{item_id}}")
+async def item(item_id: int):
+    return {{"id": item_id}}
+'''
+
+
+@pytest.mark.parametrize("setup", [
+    "Instrumentator().instrument(app).expose(app)",
+    "instrumentator = Instrumentator(excluded_handlers=['/metrics']).instrument(app, metric_namespace='x')\n\n\n"
+    "@app.on_event('startup')\nasync def _startup():\n    instrumentator.expose(app, include_in_schema=False)",
+])
+def test_prometheus_fastapi_instrumentator(tmp_path, setup):
+    """`Instrumentator().instrument(app).expose(app)`: its middleware in the stack, `/metrics` added (dynrt/instr.rs)."""
+    pkg = project(tmp_path, INSTR_MAIN.format(setup=setup))
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "dynrt::instr::instrument(" in gen and "dynrt::instr::take_pending()" in gen and "dynrt::instr::expose(" in gen

@@ -585,6 +585,12 @@ fn plain_500() -> Response {
 }
 
 /// `Request(scope, receive)` inside an ASGI app: the request being served (its own scope only)
+/// `Request(scope)` without receive: the request being served, its body unreadable (Starlette's `empty_receive`)
+pub fn request_from_scope_norecv(cx: &Cx, scope: &V) -> R {
+    request_from_scope(cx, scope)?;
+    Ok(V::native(Native::Request(cx.req.clone(), super::web::REQ_NORECV)))
+}
+
 pub fn request_from_scope(cx: &Cx, scope: &V) -> R {
     let same = match (&*cx.asgi_scope.lock(), scope) {
         (Some(V::Dict(a)), V::Dict(b)) => Arc::ptr_eq(a, b),

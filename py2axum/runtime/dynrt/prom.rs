@@ -881,6 +881,44 @@ fn add(m: &Metric, by: f64) {
     persist(&st, 0, st.value, 0.0);
 }
 
+// ---------------------------------------------------------------- for the runtime's own instrumentation
+// (prometheus_fastapi_instrumentator, dynrt/instr.rs): the metric objects behind the values
+
+pub fn metric_of(v: &V) -> Option<Arc<Metric>> {
+    match v {
+        V::Native(n) => match &**n {
+            Native::Prom(p) => match &**p {
+                Prom::Metric(m) => Some(m.clone()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `metric.labels(*values)`
+pub fn child(m: &Arc<Metric>, values: &[&str]) -> R<Arc<Metric>> {
+    labels(m, values.iter().map(V::str).collect(), vec![])
+}
+
+/// `counter.inc()`
+pub fn inc_one(m: &Metric) -> R<()> {
+    counter_inc(m, 1.0)
+}
+
+/// `summary.observe(x)` / `histogram.observe(x)`
+pub fn observe_f(m: &Metric, x: f64) -> R<()> {
+    observe(m, &V::Float(x), None)
+}
+
+/// `gauge.inc(by)` (negative: dec)
+pub fn gauge_add(m: &Metric, by: f64) -> R<()> {
+    m.check_observable()?;
+    add(m, by);
+    Ok(())
+}
+
 fn exc_matches(e: &Exc, t: &V) -> R<bool> {
     super::types::isinstance(&V::Exc(e.clone()), t)
 }

@@ -120,7 +120,8 @@ impl Deep {
                 if let Some(c) = self.seen(k) {
                     return Ok(c);
                 }
-                let same = items.iter().zip(t.iter()).all(|(a, b)| ops::is(a, b));
+                // each item deep-copied to itself (an immutable value comes back as it is)
+                let same = items.iter().zip(t.iter()).all(|(a, b)| immutable(b) && !matches!(b, V::Tuple(_) | V::Frozen(_)) || ops::is(a, b));
                 let out = if same { v.clone() } else { V::tuple(items) };
                 self.remember(k, v, &out);
                 Ok(out)

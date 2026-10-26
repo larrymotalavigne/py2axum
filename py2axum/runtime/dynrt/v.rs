@@ -318,6 +318,8 @@ pub enum Native {
     Routing(Arc<super::routing::RObj>),
     /// prometheus_client objects (see `prom`)
     Prom(Arc<super::prom::Prom>),
+    /// prometheus_fastapi_instrumentator's `Instrumentator` (dynrt/instr.rs)
+    Instr(Arc<super::instr::Instr>),
     /// a coroutine object (see `aio`)
     Coro(Mutex<Option<super::BoxFut<'static>>>),
     /// `asyncio.Semaphore` / `asyncio.Lock`
@@ -541,6 +543,7 @@ impl V {
                 Native::Module(_) => "module",
                 Native::Tenacity(t) => super::tenacity::type_name(t),
                 Native::Prom(p) => super::prom::type_name(p),
+                Native::Instr(_) => "PrometheusFastApiInstrumentator",
                 Native::Sentry(o) => super::sentry::type_name(o),
                 Native::Routing(o) => super::routing::type_name(o),
                 Native::TraceFrame(_) => "frame",

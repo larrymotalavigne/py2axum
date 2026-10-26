@@ -8,6 +8,7 @@ pub mod complex;
 pub mod mimetab;
 pub mod copymod;
 pub mod ctxmw;
+pub mod instr;
 pub mod fraction;
 pub mod gcmod;
 pub mod jwks;
@@ -121,6 +122,9 @@ pub struct CxInner {
     pub req: Arc<web::ReqCell>,
     pub resp: Arc<web::RespCell>,
     pub session: tokio::sync::OnceCell<V>,
+    /// the configuration of the session dependency that made `session` (commit after, expire_on_commit,
+    /// autoflush, sync), when a route names its own (`session_with`); the application's otherwise
+    pub session_cfg: std::sync::OnceLock<(bool, bool, bool, bool)>,
     pub deps: web::DepCache,
     /// generator dependencies waiting for their code after `yield` (run in reverse order)
     pub teardowns: parking_lot::Mutex<Vec<web::DepTeardown>>,
@@ -170,6 +174,7 @@ impl CxInner {
             background: std::sync::OnceLock::new(),
             in_trace: std::sync::atomic::AtomicBool::new(false),
             ctxvars: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            session_cfg: std::sync::OnceLock::new(),
             asgi_scope: parking_lot::Mutex::new(None),
             asgi_seen: parking_lot::Mutex::new(None),
             ws: std::sync::OnceLock::new(),
@@ -201,11 +206,34 @@ impl CxInner {
 
 /// The request's `AsyncSession` (FastAPI caches the dependency per request).
 pub async fn session(cx: &Cx) -> R {
+    if let Some(&(c, e, a, s)) = cx.session_cfg.get() {
+        return session_with(cx, c, e, a, s).await;
+    }
     Ok(cx
         .session
         .get_or_init(|| async { V::Session(orm::Session::new(cx.app.pool.clone(), cx.app.expire_on_commit, cx.app.autoflush, cx.app.sync_session, Arc::downgrade(cx))) })
         .await
         .clone())
+}
+
+/// The request's session made by a given session dependency (an application whose routes use session dependencies
+/// of different configurations: sync and async, commit after the endpoint or not). A request whose dependencies
+/// would need two different sessions is refused.
+pub async fn session_with(cx: &Cx, commit_after: bool, expire_on_commit: bool, autoflush: bool, sync: bool) -> R {
+    let cfg = (commit_after, expire_on_commit, autoflush, sync);
+    if *cx.session_cfg.get_or_init(|| cfg) != cfg {
+        return Err(Exc::type_error("py2axum: one request uses two session dependencies of different configurations"));
+    }
+    Ok(cx
+        .session
+        .get_or_init(|| async { V::Session(orm::Session::new(cx.app.pool.clone(), expire_on_commit, autoflush, sync, Arc::downgrade(cx))) })
+        .await
+        .clone())
+}
+
+/// the request's session commits after the endpoint (`yield s; await s.commit()`)
+pub fn commit_after(cx: &Cx) -> bool {
+    cx.session_cfg.get().map(|c| c.0).unwrap_or(cx.app.commit_after)
 }
 
 /// While it lives, `request` stands for another of Starlette's Request objects (web::REQ_*); the previous one after.
