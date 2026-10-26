@@ -185,3 +185,7 @@ app.include_router(heroes.router)
 from . import gear  # noqa: E402
 
 app.include_router(gear.router)
+
+from . import tmpl  # noqa: E402
+
+app.include_router(tmpl.router)

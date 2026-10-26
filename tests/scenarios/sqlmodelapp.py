@@ -94,6 +94,30 @@ STEPS += [
 ]
 
 
+T = "/tmpl"
+STEPS += [
+    # the official full-stack template's patterns (fixtures/sqlmodelapp/tmpl.py)
+    ("POST", f"{T}/owners", {"email": "ann@example.com", "password": "correct-horse", "full_name": "Ann"}),
+    ("POST", f"{T}/owners", {"email": "bob@example.com", "password": "short"}),
+    ("POST", f"{T}/owners", {"email": "not-an-email", "password": "long-enough"}),
+    ("POST", f"{T}/login", {"email": "ann@example.com", "password": "correct-horse"}),
+    ("POST", f"{T}/login", {"email": "ann@example.com", "password": "wrong-horse"}),
+    ("POST", f"{T}/login", {"email": "nobody@example.com", "password": "x"}),
+    ("PATCH", f"{T}/owners/ann@example.com", {"full_name": "Ann B"}),
+    ("PATCH", f"{T}/owners/ann@example.com", {"password": "new-password-1"}),
+    ("PATCH", f"{T}/owners/ann@example.com", {"password": "short"}),
+    ("POST", f"{T}/login", {"email": "ann@example.com", "password": "new-password-1"}),
+    ("GET", f"{T}/legacy", None),
+    ("GET", f"{T}/legacy?password=nope", None),
+    ("POST", f"{T}/owners/ann@example.com/notes", {"title": "first"}),
+    ("POST", f"{T}/owners/ann@example.com/notes", {"title": "second"}),
+    ("POST", f"{T}/owners/ann@example.com/notes", {"title": ""}),
+    ("POST", f"{T}/owners/ann@example.com/naive", None),
+    ("DELETE", f"{T}/owners/ann@example.com/notes", None),
+    ("DELETE", f"{T}/owners/nobody@example.com/notes", None),
+]
+
+
 def reset(db: str) -> None:
     """the tables created once, by SQLModel itself (as the startup handler would: both servers starting together on a
     fresh database would race on CREATE TYPE / CREATE TABLE), then emptied"""
@@ -109,4 +133,4 @@ def reset(db: str) -> None:
     SQLModel.metadata.create_all(main.engine)
     main.engine.dispose()
     with psycopg.connect(db, autocommit=True) as c:
-        c.execute("TRUNCATE pilot, song, sm_hero, sm_team, sm_mission, sm_gear RESTART IDENTITY")
+        c.execute("TRUNCATE pilot, song, sm_hero, sm_team, sm_mission, sm_gear, sm_note, sm_owner RESTART IDENTITY")

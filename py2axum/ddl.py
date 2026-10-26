@@ -24,7 +24,9 @@ from .ir import TranspileError
 from .modules import Ext, ModRef, Sym, function_imports
 
 # where values may come from: what these packages define is safe to build at translation time
-REAL_ROOTS = {"sqlalchemy", "datetime", "decimal", "uuid", "typing", "typing_extensions", "enum", "ipaddress"}
+# pydantic: its types in a `Mapped[...]` annotation whose column type is given (`Mapped[EmailStr]` of a SQLModel table)
+REAL_ROOTS = {"sqlalchemy", "datetime", "decimal", "uuid", "typing", "typing_extensions", "enum", "ipaddress", "pydantic",
+              "sqlmodel"}  # sqlmodel: its column types (`UTCDateTime`)
 BUILTINS = {"int": int, "str": str, "float": float, "bool": bool, "bytes": bytes, "dict": dict, "list": list,
             "set": set, "tuple": tuple, "frozenset": frozenset, "object": object, "type": type}
 # mapped attributes without DDL (their columns, if any, are declared elsewhere)
@@ -342,7 +344,9 @@ class DdlBuilder:
             return f(node, module, env)
         from sqlalchemy.types import TypeEngine
         project_type = isinstance(f, type) and getattr(f, "_py2axum_ddl", False) and issubclass(f, TypeEngine)
-        if not (callable(f) and self.origin(f).split(".")[0] == "sqlalchemy" or project_type):
+        # SQLModel's own column types (`UTCDateTime()`): SQLAlchemy TypeDecorators
+        sqlmodel_type = isinstance(f, type) and issubclass(f, TypeEngine) and self.origin(f).split(".")[0] == "sqlmodel"
+        if not (callable(f) and self.origin(f).split(".")[0] == "sqlalchemy" or project_type or sqlmodel_type):
             raise self.err(f"`{ast.unparse(node.func)}(...)` is not evaluated at translation time (only SQLAlchemy "
                            "constructors and project functions returning one)", node, module)
         args = []

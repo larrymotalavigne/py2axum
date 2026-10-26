@@ -522,6 +522,7 @@ EXCEPTIONS: dict[str, str] = {
     **{f"passlib.exc.{n}": f"PASSLIB_{c}" for n, c in (
         ("UnknownHashError", "UNKNOWN_HASH_ERROR"), ("PasswordValueError", "PASSWORD_VALUE_ERROR"),
         ("PasswordSizeError", "PASSWORD_SIZE_ERROR"))},
+    **{f"pwdlib{m}.UnknownHashError": "UNKNOWN_HASH_ERROR" for m in ("", ".exceptions")},
     "requests.RequestException": "REQUESTS_EXCEPTION",
     "requests.exceptions.RequestException": "REQUESTS_EXCEPTION",
     "requests.ConnectionError": "REQUESTS_CONNECTION_ERROR",
