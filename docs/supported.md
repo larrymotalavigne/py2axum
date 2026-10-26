@@ -281,6 +281,12 @@ OpenTelemetry data and does not read `OTEL_*`. `FastAPI(telemetry={...})` is acc
 (`tracing`, `metrics`, `logs`, `operation_spans`, `auto_configure`) as literals; a provider (`tracer_provider=`...),
 `exclude=` and the `opentelemetry` SDK calls are refused.
 
+## `api_route(methods=[...])`
+
+A route registered by `@router.api_route(path, methods=["GET", "POST"])` is one route per method in the binary. A
+request with another method gets the same 405, whose `Allow` header lists the route's methods in the order written:
+FastAPI joins a `set` of them, whose order changes from one Python process to the next (string hashing).
+
 ## SQLModel
 
 SQLModel classes are rewritten into SQLAlchemy mapped classes and Pydantic models at translation (see

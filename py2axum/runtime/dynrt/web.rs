@@ -2134,7 +2134,12 @@ pub async fn route(cx: &Cx, routes: &'static [RouteDef]) -> R<Response> {
         if super::sentry::active() {
             super::sentry::route_matched(cx, runtime_prefix(r.path), Some(r.src), false);
         }
-        return Err(Exc::http(405, V::str("Method Not Allowed"), vec![("allow".into(), r.method.into())]));
+        // the APIRoute's methods (several for `api_route(methods=[...])`; FastAPI joins a set, in no fixed order)
+        let allow = match r.node {
+            Some(super::routing::Node::Api { methods, .. }) if methods.len() > 1 => methods.join(", "),
+            _ => r.method.into(),
+        };
+        return Err(Exc::http(405, V::str("Method Not Allowed"), vec![("allow".into(), allow)]));
     }
     // routes added at run time (`app.add_route`) come after the declared ones
     if let Some((a, full)) = super::routing::added_match(&path, &cx.req.method) {
