@@ -52,7 +52,7 @@ num-traits = "0.2"
 url = "2"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 libc = "0.2"
-p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 rsa = { version = "0.9", features = ["sha2"] }

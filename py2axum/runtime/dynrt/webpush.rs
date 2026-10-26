@@ -5,7 +5,8 @@ use std::sync::Arc;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use base64::Engine as _;
 use p256::ecdsa::signature::Signer;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::elliptic_curve::Generate;
 
 use super::ops;
 use super::v::*;
@@ -101,7 +102,7 @@ fn vapid_header(key: &p256::SecretKey, claims: &V) -> R<String> {
     let token = format!("{}.{}", B64URL.encode(br#"{"typ":"JWT","alg":"ES256"}"#), B64URL.encode(json.as_bytes()));
     let sk = p256::ecdsa::SigningKey::from(key.clone());
     let sig: p256::ecdsa::Signature = sk.sign(token.as_bytes());
-    let public = key.public_key().to_encoded_point(false);
+    let public = key.public_key().to_sec1_point(false);
     Ok(format!("vapid t={token}.{},k={}", B64URL.encode(sig.to_bytes()), B64URL.encode(public.as_bytes())))
 }
 
@@ -115,8 +116,8 @@ fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
 /// http_ece.encrypt(version="aes128gcm", rs=4096) with a fresh sender key and salt
 fn encrypt(data: &[u8], receiver: &[u8], auth: &[u8]) -> R<Vec<u8>> {
     let receiver_key = p256::PublicKey::from_sec1_bytes(receiver).map_err(|_| Exc::value_error("Invalid EC key."))?;
-    let sender = p256::ecdh::EphemeralSecret::random(&mut rand::rngs::OsRng);
-    let sender_pub = p256::EncodedPoint::from(sender.public_key());
+    let sender = p256::ecdh::EphemeralSecret::generate();
+    let sender_pub = p256::Sec1Point::from(sender.public_key());
     let shared = sender.diffie_hellman(&receiver_key);
     let mut info = b"WebPush: info\x00".to_vec();
     info.extend_from_slice(receiver);
