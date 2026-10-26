@@ -474,3 +474,39 @@ async def x():
     generate(tmp_path, pkg)
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert gen.index('pattern: "^/b$"') < gen.index('pattern: "^/a$"')
+
+
+def test_settings_value_as_a_constraint(tmp_path):
+    """`Query(le=settings.MAX_PAGE)`, `Field(max_length=settings.NAME_LEN)`: read when the application starts."""
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "proj" / "settings.py").write_text(
+        "from pydantic_settings import BaseSettings\n\n\nclass Settings(BaseSettings):\n    max_page: int = 100\n"
+        "    name_len: int = 20\n\n\nSETTINGS = Settings()\n")
+    src = '''
+from fastapi import FastAPI, Query
+from pydantic import BaseModel, Field
+
+from .settings import SETTINGS
+
+app = FastAPI()
+
+
+class M(BaseModel):
+    name: str = Field(max_length=SETTINGS.name_len)
+
+
+@app.get("/x")
+async def x(limit: int = Query(10, le=SETTINGS.max_page)):
+    return {"limit": limit}
+
+
+@app.post("/y")
+async def y(m: M):
+    return m
+'''
+    (tmp_path / "proj" / "__init__.py").write_text("")
+    (tmp_path / "proj" / "models.py").write_text("")
+    (tmp_path / "proj" / "main.py").write_text(src)
+    generate(tmp_path, tmp_path / "proj")
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "late: Some(&LB_1)" in gen and "pub async fn lb_2" in gen

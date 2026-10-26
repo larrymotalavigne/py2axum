@@ -1,7 +1,8 @@
 """Routers mounted under prefixes read from the settings at startup (overridable by the environment)."""
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from starlette.routing import Match
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -11,6 +12,9 @@ class ApiSettings(BaseSettings):
 
     API_PREFIX: str = "/api/v1"
     ADMIN_PREFIX: str = "/admin"
+    # constraints of the routes below (DYNAPP_MAX_PAGE set by scripts_start_dyn.sh: read at startup)
+    MAX_PAGE: int = 50
+    NAME_LEN: int = 8
 
 
 settings = ApiSettings()
@@ -24,6 +28,21 @@ async def require_user(x_user: str | None = Header(default=None)) -> str:
 
 router = APIRouter(prefix="/things")
 admin = APIRouter()
+
+
+class Named(BaseModel):
+    name: str = Field(max_length=settings.NAME_LEN)
+
+
+@router.get("/page")
+async def page(size: int = Query(10, ge=1, le=settings.MAX_PAGE)):
+    """a bound read from the settings (the environment's value)"""
+    return {"size": size}
+
+
+@router.post("/named")
+async def named(body: Named):
+    return body
 
 
 @router.get("/whoami")

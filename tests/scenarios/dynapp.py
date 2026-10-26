@@ -505,6 +505,11 @@ STEPS: list = [
     ("GET", "/owners-cls/slug?q=x&bad=true", None),
     # include_router(prefix=<settings>) read at startup (DYNAPP_API_PREFIX=/api/v9 in scripts_start_dyn.sh,
     # the default /api/v1 must not answer), include_router(dependencies=...) (fixtures/dynapp/apiv.py)
+    ("GET", "/api/v9/things/page?size=20", None),
+    ("GET", "/api/v9/things/page?size=21", None),
+    ("GET", "/api/v9/things/page?size=0", None),
+    ("POST", "/api/v9/things/named", {"name": "12345678"}),
+    ("POST", "/api/v9/things/named", {"name": "123456789"}),
     ("GET", "/api/v9/things/whoami", None, {"x-user": "u"}),
     ("GET", "/api/v9/things/whoami", None),
     ("GET", "/api/v9/things/whois", None, {"remote-user": "ada"}),

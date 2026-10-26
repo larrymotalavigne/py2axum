@@ -7,6 +7,8 @@ LOG=${LOG:-/tmp/py2axum-logs}; mkdir -p "$LOG"
 DB=${DATABASE_URL:?DATABASE_URL required}
 # fixtures/dynapp/apiv.py: a router prefix read from the settings, overridden here (read at startup, not frozen)
 export DYNAPP_API_PREFIX=/api/v9
+# fixtures/dynapp/apiv.py: a Query(le=) bound read from the settings
+export DYNAPP_MAX_PAGE=20
 for port in $REF_PORT $CAND_PORT; do pid=$(lsof -tiTCP:$port -sTCP:LISTEN); [ -n "$pid" ] && kill $pid; done; sleep 1
 # stdout and stderr apart, process ids kept: the log conformance (tests/conformance.py --logs) compares them
 DATABASE_URL="$DB" PYTHONUNBUFFERED=1 nohup uvicorn fixtures.dynapp.main:app --host 127.0.0.1 --port $REF_PORT \

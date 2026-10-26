@@ -114,11 +114,11 @@ impl Truth for V {
     }
 }
 
-static NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false };
-static NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false };
-static TD_INT: TD = TD::Int(NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false });
-static TD_FLOAT: TD = TD::Float(NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false });
-static TD_STR: TD = TD::Str(StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false });
+static NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false, late: None };
+static NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false, late: None };
+static TD_INT: TD = TD::Int(NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false, late: None });
+static TD_FLOAT: TD = TD::Float(NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false, late: None });
+static TD_STR: TD = TD::Str(StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false, late: None });
 static TD_BOOL: TD = TD::Bool;
 static TD_ANY: TD = TD::Any;
 static TD_NONE: TD = TD::NoneT;

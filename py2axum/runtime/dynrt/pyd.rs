@@ -21,9 +21,85 @@ pub struct NumC {
     pub mul: Option<f64>,
     /// the model's `allow_inf_nan=False`: a float that is not finite is a `finite_number` error
     pub finite: bool,
+    /// bounds read from the settings when the application starts (`Query(le=settings.MAX_PAGE)`)
+    pub late: Option<&'static LateBounds>,
 }
 
-pub const NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false };
+pub const NO_NUM: NumC = NumC { ge: None, gt: None, le: None, lt: None, mul: None, finite: false, late: None };
+
+/// constraint values that are expressions of the settings (`Query(le=settings.MAX_PAGE)`, `Field(max_length=
+/// settings.NAME_LEN)`): evaluated at startup, where Python evaluates them when it imports the module (a
+/// generated `lb_N` sets them before the first request)
+pub struct LateBounds {
+    cell: OnceLock<LB>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LB {
+    pub ge: Option<f64>,
+    pub gt: Option<f64>,
+    pub le: Option<f64>,
+    pub lt: Option<f64>,
+    pub min: Option<usize>,
+    pub max: Option<usize>,
+}
+
+impl LateBounds {
+    pub const fn new() -> LateBounds {
+        LateBounds { cell: OnceLock::new() }
+    }
+    pub fn set(&self, b: LB) {
+        let _ = self.cell.set(b);
+    }
+    pub fn get(&self) -> LB {
+        self.cell.get().copied().unwrap_or_default()
+    }
+}
+
+/// a numeric bound's value (`None`: no bound, as pydantic reads `le=None`)
+pub fn late_num(v: &V) -> R<Option<f64>> {
+    match v {
+        V::None => Ok(None),
+        V::Int(i) => Ok(Some(*i as f64)),
+        V::Float(f) => Ok(Some(*f)),
+        V::Bool(b) => Ok(Some(*b as i64 as f64)),
+        o => Err(Exc::type_error(format!("py2axum: a numeric bound read from the settings must be an int or a float, not {}", o.type_name()))),
+    }
+}
+
+/// a length bound's value
+pub fn late_len(v: &V) -> R<Option<usize>> {
+    match v {
+        V::None => Ok(None),
+        V::Int(i) if *i >= 0 => Ok(Some(*i as usize)),
+        o => Err(Exc::type_error(format!("py2axum: a length bound read from the settings must be a non-negative int, not {}", ops::repr(o)?))),
+    }
+}
+
+impl NumC {
+    /// the constraints with the late bounds filled in
+    pub fn eff(&self) -> NumC {
+        match self.late {
+            None => *self,
+            Some(l) => {
+                let b = l.get();
+                NumC { ge: b.ge.or(self.ge), gt: b.gt.or(self.gt), le: b.le.or(self.le), lt: b.lt.or(self.lt), late: None, ..*self }
+            }
+        }
+    }
+}
+
+impl StrC {
+    pub fn eff(&self) -> StrC {
+        match self.late {
+            None => *self,
+            Some(l) => {
+                let b = l.get();
+                StrC { min: b.min.or(self.min), max: b.max.or(self.max), late: None, ..*self }
+            }
+        }
+    }
+}
 
 pub struct Pat {
     pub src: &'static str,
@@ -49,6 +125,7 @@ pub struct DecC {
     pub decimal_places: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
 pub struct StrC {
     pub min: Option<usize>,
     pub max: Option<usize>,
@@ -58,9 +135,11 @@ pub struct StrC {
     pub upper: bool,
     /// `StringConstraints(ascii_only=True)`
     pub ascii: bool,
+    /// lengths read from the settings at startup (see NumC::late)
+    pub late: Option<&'static LateBounds>,
 }
 
-pub const NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false };
+pub const NO_STR: StrC = StrC { min: None, max: None, pattern: None, strip: false, lower: false, upper: false, ascii: false, late: None };
 
 pub enum Lit {
     Str(&'static str),
@@ -962,6 +1041,7 @@ fn enum_scalar(input: &V, d: &'static EnumDesc, i: u16, td: &'static TD, loc: &[
         }
         TD::Int(c) => {
             e.floor(LAX);
+            let c = c.eff();
             if c.ge.or(c.gt).or(c.le).or(c.lt).or(c.mul).is_none() {
                 return Some(Some(value));
             }
@@ -996,6 +1076,7 @@ fn check_num(x: f64, c: &NumC, loc: &[V], input: &V, e: &mut Errs) -> bool {
 }
 
 fn check_num_kind(x: f64, c: &NumC, loc: &[V], input: &V, e: &mut Errs, float: bool) -> bool {
+    let c = &c.eff();
     if let Some(m) = c.mul {
         // pydantic-core: exact for an int, within |x| / 1e9 for a float; checked before the bounds
         let bad = if float {
@@ -2075,6 +2156,7 @@ fn val_in(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
         }
         TD::Str(c) => match input {
             V::Str(s) => {
+                let c = &c.eff();
                 // pydantic-core: strip, then the ASCII check, the lengths and the pattern, then the case
                 let s: String = if c.strip { s.trim().to_string() } else { s.to_string() };
                 if c.ascii && !s.is_ascii() {
@@ -2761,10 +2843,10 @@ fn label(td: &TD) -> String {
         TD::Any => "any".into(),
         TD::NoneT => "none".into(),
         TD::Bool => "bool".into(),
-        TD::Int(c) => if c.ge.or(c.gt).or(c.le).or(c.lt).or(c.mul).is_some() { "constrained-int" } else { "int" }.into(),
-        TD::Float(c) => if c.ge.or(c.gt).or(c.le).or(c.lt).or(c.mul).is_some() { "constrained-float" } else { "float" }.into(),
+        TD::Int(c) => if c.late.is_some() || c.ge.or(c.gt).or(c.le).or(c.lt).or(c.mul).is_some() { "constrained-int" } else { "int" }.into(),
+        TD::Float(c) => if c.late.is_some() || c.ge.or(c.gt).or(c.le).or(c.lt).or(c.mul).is_some() { "constrained-float" } else { "float" }.into(),
         TD::Str(c) => {
-            if c.min.is_some() || c.max.is_some() || c.pattern.is_some() || c.strip || c.lower || c.upper { "constrained-str" } else { "str" }.into()
+            if c.late.is_some() || c.min.is_some() || c.max.is_some() || c.pattern.is_some() || c.strip || c.lower || c.upper { "constrained-str" } else { "str" }.into()
         }
         TD::DateTime => "datetime".into(),
         TD::Date => "date".into(),
@@ -4621,7 +4703,7 @@ pub fn object_new(desc: &'static SchemaDesc) -> V {
 /// the name pydantic-core gives a validator, which titles a TypeAdapter's ValidationError (`1 validation error for
 /// list[int]`): None for a type whose name this does not reproduce (url, secret, deque... compose their names)
 pub fn td_title(td: &TD) -> Option<String> {
-    let num = |c: &NumC| c.ge.is_none() && c.gt.is_none() && c.le.is_none() && c.lt.is_none() && c.mul.is_none();
+    let num = |c: &NumC| c.late.is_none() && c.ge.is_none() && c.gt.is_none() && c.le.is_none() && c.lt.is_none() && c.mul.is_none();
     let join = |ts: &[&'static TD], sep: &str| ts.iter().map(|t| td_title(t)).collect::<Option<Vec<_>>>().map(|v| v.join(sep));
     Some(match td {
         TD::Any => "any".into(),
@@ -4629,7 +4711,7 @@ pub fn td_title(td: &TD) -> Option<String> {
         TD::Bool => "bool".into(),
         TD::Int(c) => if num(c) { "int" } else { "constrained-int" }.into(),
         TD::Float(c) => if num(c) { "float" } else { "constrained-float" }.into(),
-        TD::Str(c) => if c.min.is_none() && c.max.is_none() && c.pattern.is_none() && !c.strip && !c.lower && !c.upper && !c.ascii { "str" } else { "constrained-str" }.into(),
+        TD::Str(c) => if c.late.is_none() && c.min.is_none() && c.max.is_none() && c.pattern.is_none() && !c.strip && !c.lower && !c.upper && !c.ascii { "str" } else { "constrained-str" }.into(),
         TD::DateTime => "datetime".into(),
         TD::Date => "date".into(),
         TD::Time => "time".into(),

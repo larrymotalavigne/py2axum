@@ -106,6 +106,8 @@ A Pydantic v2 model with `EmailStr`, `Literal`, nested models, `Decimal` constra
   A str is checked as pydantic-core does: stripped, then `ascii_only`, the lengths and the pattern, and only then
   lowered or uppercased (`str_to_upper` with a lowercase `pattern` accepts lowercase input). The `str_*` and `use_enum_values` settings of a model apply to
   the items and keys of its containers too.
+- A bound read from the settings (`Field(max_length=settings.NAME_LEN)`, `Query(le=settings.MAX_PAGE)`, on an
+  `int`, `float` or `str`): evaluated when the application starts, where Python evaluates it at import.
 - `datetime` and `date` bounds (`Field(gt=datetime(2000, 1, 1))`, `annotated_types.Gt(...)`, a module constant;
   `tzinfo=timezone.utc` or `timezone(timedelta(...))`), `AwareDatetime`, `NaiveDatetime`: checked after the type in
   pydantic-core's order (`le`, `lt`, `ge`, `gt`, then the timezone), compared as speedate does (two aware values

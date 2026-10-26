@@ -1297,9 +1297,14 @@ class Project:
         for every `bytes` of the field (inside containers too, not inside another model)."""
         prev, self._val_bytes = self.__dict__.get("_val_bytes"), (cons or {}).get("_val_bytes")
         try:
-            return self._static_td(self._td_init(ann, module, cons or {}, scope))
+            out = self._static_td(self._td_init(ann, module, cons or {}, scope))
         finally:
             self._val_bytes = prev
+        late = [k for k, v in (cons or {}).items() if isinstance(v, LateCons)]
+        if late and not cons.get("_late_used"):
+            raise self.err(f"{late[0]}= read from the settings does not apply to `{ast.unparse(ann)}` (int, float and "
+                           "str only)", ann, module)
+        return out
 
     def _static_td(self, init: str) -> str:
         if init not in self.tds:
@@ -1311,11 +1316,73 @@ class Project:
             self.pats[src] = f"PAT_{len(self.pats) + 1}"
         return self.pats[src]
 
+    def settings_value(self, node: ast.AST, module: str, scope=None) -> bool:
+        """`settings.MAX_PAGE` (an attribute of a module global that is not a constant, like a pydantic-settings
+        instance): a value the application reads when it starts."""
+        if not isinstance(node, ast.Attribute):
+            return False
+        root = node
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if not isinstance(root, ast.Name):
+            return False
+        t = self.resolve(module, root, scope)
+        if not isinstance(t, Sym):
+            return False
+        d = self.ix.definition(t)
+        if not (isinstance(d, (ast.Assign, ast.AnnAssign)) and isinstance(d.value, ast.Call)):
+            return False
+        try:
+            self.const(node, module, scope)
+            return False  # a constant after all
+        except TranspileError:
+            return True
+
+    def late_bounds(self, late: dict) -> str:
+        """`LB_n`, the bounds read from the settings at startup, and `lb_n` (in the startup list) that sets them."""
+        items = self.__dict__.setdefault("late_items", [])
+        key = tuple((k, lc.module, lc.node.lineno, lc.node.col_offset) for k, lc in late.items())
+        done = self.__dict__.setdefault("late_done", {})
+        if key in done:
+            return done[key]
+        n = len(items) + 1
+        name, fn = f"LB_{n}", f"lb_{n}"
+        first = next(iter(late.values()))
+        fc = FnCompiler(self, first.module, None, fn)
+        prev, self.cur = self.cur, ("global", Sym(first.module, f"<{fn}>"))
+        try:
+            fields = []
+            for k, lc in late.items():
+                fc.module = lc.module
+                v = fc.expr(lc.node)
+                conv = "late_len" if k in ("min_length", "max_length") else "late_num"
+                field = {"min_length": "min", "max_length": "max"}.get(k, k)
+                fields.append(f"{field}: {fc.q(f'{RT}::pyd::{conv}(&{v})')}")
+        finally:
+            self.cur = prev
+        body = "\n".join("    " + line for line in fc.lines)
+        self.items.append(
+            f"pub static {name}: {RT}::pyd::LateBounds = {RT}::pyd::LateBounds::new();\n"
+            f"/// constraints read from the settings ({self.rel_file(first.module)}:{first.node.lineno})\n"
+            f"pub async fn {fn}(cx: &Cx) -> R {{\n{body}\n    {name}.set({RT}::pyd::LB {{ {', '.join(fields)}, ..Default::default() }});\n"
+            f"    Ok(V::None)\n}}")
+        items.append(name)
+        done[key] = name
+        self.__dict__.setdefault("eager", []).append((first.module, first.node.lineno, fn))
+        return name
+
+    def _late(self, cons: dict, keys: tuple) -> str:
+        late = {k: cons[k] for k in keys if isinstance(cons.get(k), LateCons)}
+        if not late:
+            return "None"
+        cons["_late_used"] = True
+        return f"Some(&{self.late_bounds(late)})"
+
     def _num(self, cons: dict) -> str:
         def o(k):
-            return f"Some({float(cons[k])!r}f64)" if k in cons else "None"
+            return f"Some({float(cons[k])!r}f64)" if k in cons and not isinstance(cons[k], LateCons) else "None"
         return (f"{RT}::pyd::NumC {{ ge: {o('ge')}, gt: {o('gt')}, le: {o('le')}, lt: {o('lt')}, mul: {o('multiple_of')}, "
-                f"finite: {str(bool(cons.get('_finite'))).lower()} }}")
+                f"finite: {str(bool(cons.get('_finite'))).lower()}, late: {self._late(cons, ('ge', 'gt', 'le', 'lt'))} }}")
 
     def _dec(self, cons: dict, node, module: str) -> str:
         def bound(k):
@@ -1333,10 +1400,14 @@ class Project:
 
     def _str(self, cons: dict) -> str:
         # a field's own length constraints, else model_config's str_min_length / str_max_length
-        mn = f"Some({cons['min_length']})" if "min_length" in cons else f"Some({cons['_smin']})" if "_smin" in cons else "None"
-        mx = f"Some({cons['max_length']})" if "max_length" in cons else f"Some({cons['_smax']})" if "_smax" in cons else "None"
+        def length(k, cfg):
+            if isinstance(cons.get(k), LateCons):
+                return f"Some({cons[cfg]})" if cfg in cons else "None"
+            return f"Some({cons[k]})" if k in cons else f"Some({cons[cfg]})" if cfg in cons else "None"
+        mn, mx = length("min_length", "_smin"), length("max_length", "_smax")
+        late = self._late(cons, ("min_length", "max_length"))
         p = f"Some(&{self.pat(cons['pattern'])})" if "pattern" in cons else "None"
-        return (f"{RT}::pyd::StrC {{ min: {mn}, max: {mx}, pattern: {p}, strip: {str(bool(cons.get('_strip'))).lower()}, "
+        return (f"{RT}::pyd::StrC {{ late: {late}, min: {mn}, max: {mx}, pattern: {p}, strip: {str(bool(cons.get('_strip'))).lower()}, "
                 f"lower: {str(bool(cons.get('_lower'))).lower()}, upper: {str(bool(cons.get('_upper'))).lower()}, "
                 f"ascii: {str(bool(cons.get('_ascii'))).lower()} }}")
 
@@ -1825,7 +1896,10 @@ class Project:
                 opts["default"] = a0
         is_field = (dotted(call.func) or "").split(".")[-1] == "Field"
         for kw in call.keywords:
-            if kw.arg in {"gt", "ge", "lt", "le"}:
+            if kw.arg in {"gt", "ge", "lt", "le", "min_length", "max_length"} and self.settings_value(kw.value, module, scope):
+                # `le=settings.MAX_PAGE`: read when the application starts (late_bounds)
+                cons[kw.arg] = LateCons(kw.value, module)
+            elif kw.arg in {"gt", "ge", "lt", "le"}:
                 cons[kw.arg] = self.const_bound(kw.value, module, scope)
             elif kw.arg in self.FIELD_KW:
                 cons["pattern" if kw.arg == "regex" else kw.arg] = self.const(kw.value, module, scope)
@@ -9409,6 +9483,16 @@ RESPONSE_CLASSES = {"Response", "StreamingResponse", "FileResponse", "RedirectRe
                     "PlainTextResponse", "ORJSONResponse", "UJSONResponse", "EventSourceResponse"}
 
 
+class LateCons:
+    """A constraint value that is an expression of the settings (`le=settings.MAX_PAGE`), read at startup."""
+
+    def __init__(self, node: ast.AST, module: str):
+        self.node, self.module = node, module
+
+    def __repr__(self) -> str:
+        return f"<settings {ast.unparse(self.node)}>"
+
+
 @dataclass
 class RParam:
     name: str
@@ -14486,7 +14570,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     # module globals (and the app factory's locals) evaluated at startup, as importing the app does
     order = {name: i for i, name in enumerate(import_order(fe))}
     keep = set(proj.globals.values()) | proj.__dict__.get("modst", set())
-    eager = sorted({e for e in proj.__dict__.get("eager", []) if e[2] in keep or e[2].startswith(("fl_", "gd_", "ca_"))},
+    eager = sorted({e for e in proj.__dict__.get("eager", []) if e[2] in keep or e[2].startswith(("fl_", "gd_", "ca_", "lb_"))},
                    key=lambda e: (order.get(e[0], 0), e[1], e[2]))
     proj.items.append(
         "/// Module globals evaluated at startup like Python's import (a failure is logged; the routes reading\n"
