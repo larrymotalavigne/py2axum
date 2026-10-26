@@ -1,7 +1,8 @@
 """Pydantic options evaluated at translation time: alias generators.
 
 An alias generator only ever sees the field names, all known statically, so the aliases are computed here and
-the runtime gets plain keys. Supported: `pydantic.alias_generators` (ported below, pydantic 2.14), and a lambda
+the runtime gets plain keys. Supported: `pydantic.alias_generators` (ported below, pydantic 2.14), pyhumps's
+`camelize`/`pascalize`/`decamelize`/`kebabize`... (ported, pyhumps 3.8), and a lambda
 or a one-`return` function of the name built from string operations (`str` methods, `+`, `*`, indexing,
 slicing, comprehensions, `''.join(...)`); anything else is refused by the caller.
 """
@@ -34,8 +35,72 @@ def to_snake(camel: str) -> str:
     return snake.lower()
 
 
+# ---------------------------------------------------------------- pyhumps 3.8 (humps.main), on strings
+
+_ACRONYM_RE = re.compile(r"([A-Z\d]+)(?=[A-Z\d]|$)")
+_PASCAL_RE = re.compile(r"([^\-_]+)")
+_SPLIT_RE = re.compile(r"([\-_]*[A-Z][^A-Z]*[\-_]*)")
+_UNDERSCORE_RE = re.compile(r"(?<=[^\-_])[\-_]+[^\-_]")
+
+
+def _humps_none(s) -> str:
+    return "" if s is None else re.sub(r"\s+", "", str(s))
+
+
+def humps_camelize(name: str) -> str:
+    s = _humps_none(name)
+    if s.isupper() or s.isnumeric():
+        return name
+    if len(s) != 0 and not s[:2].isupper():
+        s = s[0].lower() + s[1:]
+    return _UNDERSCORE_RE.sub(lambda m: m.group(0)[-1].upper(), s)
+
+
+def humps_pascalize(name: str) -> str:
+    s = _humps_none(name)
+    if s.isupper() or s.isnumeric():
+        return name
+    s = humps_camelize(_PASCAL_RE.sub(lambda m: m.group(1)[0].upper() + m.group(1)[1:], s))
+    return s[0].upper() + s[1:] if len(s) != 0 else s
+
+
+def _humps_separate(string: str, separator: str = "_") -> str:
+    return separator.join(s for s in _SPLIT_RE.split(string) if s)
+
+
+def _humps_abbreviations(string: str) -> str:
+    return _ACRONYM_RE.sub(lambda m: m.group(0).title(), string)
+
+
+def humps_decamelize(name: str) -> str:
+    s = _humps_none(name)
+    if s.isupper() or s.isnumeric():
+        return name
+    return _humps_separate(_humps_abbreviations(s)).lower()
+
+
+def humps_kebabize(name: str) -> str:
+    s = _humps_none(name)
+    if s.isnumeric():
+        return name
+    if not s.isupper() and (s == humps_camelize(s) or s == humps_pascalize(s)):
+        return _humps_separate(_humps_abbreviations(s), "-").lower()
+    return _UNDERSCORE_RE.sub(lambda m: "-" + m.group(0)[-1], s)
+
+
+def humps_dekebabize(name: str) -> str:
+    s = _humps_none(name)
+    if s.isnumeric():
+        return name
+    return s.replace("-", "_")
+
+
+_HUMPS = {"camelize": humps_camelize, "pascalize": humps_pascalize, "decamelize": humps_decamelize,
+          "depascalize": humps_decamelize, "kebabize": humps_kebabize, "dekebabize": humps_dekebabize}
+
 LIBRARY = {"pydantic.alias_generators.to_pascal": to_pascal, "pydantic.alias_generators.to_camel": to_camel,
-           "pydantic.alias_generators.to_snake": to_snake}
+           "pydantic.alias_generators.to_snake": to_snake,
+           **{f"humps{m}.{n}": f for m in ("", ".main") for n, f in _HUMPS.items()}}
 
 # ---------------------------------------------------------------- string expressions
 

@@ -755,3 +755,13 @@ async def x():
     pkg = project(tmp_path, src)
     main_rs = generate(tmp_path, pkg)
     assert "Cors::new" in main_rs or "Cors::new" in (tmp_path / "out" / "src" / "gen.rs").read_text()
+
+
+@pytest.mark.parametrize("name, alias", [("created_at", "createdAt"), ("recipe_ingredient_id", "recipeIngredientId"),
+                                         ("id", "id"), ("HTTPCode", "HTTPCode")])
+def test_humps_alias_generator(name, alias):
+    """pyhumps's camelize as an alias generator (mealie): ported, computed at translation"""
+    from py2axum import pydstatic
+
+    assert pydstatic.LIBRARY["humps.main.camelize"](name) == alias
+    assert pydstatic.LIBRARY["humps.camelize"] is pydstatic.LIBRARY["humps.main.camelize"]

@@ -1,0 +1,1 @@
+- pyhumps's `camelize`, `pascalize`, `decamelize`, `kebabize`... as a model's `alias_generator` (ported from pyhumps 3.8, computed at translation).
