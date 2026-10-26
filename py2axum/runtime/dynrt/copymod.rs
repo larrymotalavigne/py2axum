@@ -41,11 +41,7 @@ fn refused(what: &str, v: &V) -> Exc {
 }
 
 fn new_dict(src: &Arc<Mutex<indexmap::IndexMap<Key, (V, V)>>>, items: indexmap::IndexMap<Key, (V, V)>) -> R {
-    let d = V::Dict(Arc::new(Mutex::new(items)));
-    match ops::default_factory(src) {
-        Some(f) => ops::defaultdict(f, d),
-        None => Ok(d),
-    }
+    ops::defaultdict_like(src, V::Dict(Arc::new(Mutex::new(items))))
 }
 
 fn inst(i: &pyd::Inst, vals: Vec<V>, extra: indexmap::IndexMap<String, V>) -> V {

@@ -7930,14 +7930,45 @@ class FnCompiler:
             if any(k.arg is None for k in node.keywords):
                 raise self.err("defaultdict(..., **mapping) is not supported", node)
             return self.q(f"{RT}::ops::defaultdict(\"deque\", {RT}::methods::b_dict(&vec![{', '.join(init)}], &{kwargs})?)")
+        if isinstance(fac, ast.Lambda) and not fac.args.args and not fac.args.vararg and not fac.args.kwonlyargs \
+                and not fac.args.kwarg and not fac.args.posonlyargs and self.literal_factory(fac.body):
+            # `defaultdict(lambda: {"n": 0})`, `defaultdict(lambda: defaultdict(int))`: a literal, made fresh at each
+            # missing key (a deep copy of it: what calling the lambda builds)
+            init = [self.expr(a) for a in node.args[1:]]
+            if any(k.arg is None for k in node.keywords):
+                raise self.err("defaultdict(..., **mapping) is not supported", node)
+            kwargs = "vec![" + ", ".join(f"({rs(k.arg)}.to_string(), {self.expr(k.value)})" for k in node.keywords) + "]"
+            tmpl = self.expr(fac.body)
+            return self.q(f"{RT}::ops::defaultdict_template({tmpl}, {RT}::methods::b_dict(&vec![{', '.join(init)}], &{kwargs})?)")
         if not (isinstance(fac, ast.Name) and self.static_ref(fac) == ("builtin", fac.id) and fac.id in self.DEFAULT_FACTORIES):
-            raise self.err(f"defaultdict({ast.unparse(fac)}): only a builtin type factory is supported "
-                           f"({', '.join(sorted(self.DEFAULT_FACTORIES))})", node)
+            raise self.err(f"defaultdict({ast.unparse(fac)}): only a builtin type factory or a lambda returning a literal "
+                           f"is supported ({', '.join(sorted(self.DEFAULT_FACTORIES))})", node)
         init = [self.expr(a) for a in node.args[1:]]
         kwargs = "vec![" + ", ".join(f"({rs(k.arg)}.to_string(), {self.expr(k.value)})" for k in node.keywords if k.arg) + "]"
         if any(k.arg is None for k in node.keywords):
             raise self.err("defaultdict(..., **mapping) is not supported", node)
         return self.q(f"{RT}::ops::defaultdict({rs(fac.id)}, {RT}::methods::b_dict(&vec![{', '.join(init)}], &{kwargs})?)")
+
+    def literal_factory(self, e: ast.AST) -> bool:
+        """A lambda body that builds the same value at each call without reading anything: constants, displays of
+        such, builtin types called without arguments, `defaultdict(<builtin>)` / `defaultdict(lambda: <literal>)`."""
+        if isinstance(e, ast.Constant):
+            return True
+        if isinstance(e, (ast.List, ast.Tuple, ast.Set)):
+            return all(self.literal_factory(x) for x in e.elts)
+        if isinstance(e, ast.Dict):
+            return all(k is not None and self.literal_factory(k) for k in e.keys) and all(self.literal_factory(v) for v in e.values)
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)) and isinstance(e.operand, ast.Constant):
+            return True
+        if isinstance(e, ast.Call) and not e.keywords and isinstance(e.func, ast.Name):
+            ref = self.static_ref(e.func)
+            if ref == ("builtin", e.func.id) and e.func.id in self.DEFAULT_FACTORIES | {"dict"} and not e.args:
+                return True
+            if ref == Ext("collections.defaultdict") and len(e.args) == 1:
+                f = e.args[0]
+                return (isinstance(f, ast.Name) and self.static_ref(f) == ("builtin", f.id) and f.id in self.DEFAULT_FACTORIES) \
+                    or (isinstance(f, ast.Lambda) and not f.args.args and self.literal_factory(f.body))
+        return False
 
     def formatter_call(self, node: ast.Call) -> str | None:
         """`string.Formatter().vformat(fmt, args, mapping)` / `.format(fmt, *args, **kw)` (the base class:
@@ -8280,9 +8311,9 @@ class FnCompiler:
         if name == "columns":
             # `text(...).columns(...)` (a TextualSelect): no runtime value has a columns() method
             raise self.err("method .columns() (text().columns(), a TextualSelect) is not supported", node)
-        if name in {"form", "stream"}:
-            # Starlette's `await request.form()` / `request.stream()`: no runtime value has them (the names are
-            # in the runtime's catalog for other reasons), each would raise AttributeError at run time
+        if name == "form":
+            # Starlette's `await request.form()`: no runtime value has it (the name is in the runtime's catalog for
+            # other reasons), it would raise AttributeError at run time
             raise self.err(f"`request.{name}()` is not supported: declare Form()/File() parameters, or read "
                            "`await request.body()`", node)
         if name not in runtime_names():
@@ -9174,7 +9205,10 @@ class FnCompiler:
             return f"{{ let mut {res} = !{hit}; {lbl}: {{ {body} }} V::Bool({res}) }}"
         # iter()/next() keep no state here: only the one-shot forms are translated
         if name == "iter" and not getattr(self, "_iter_ok", False) and self.stored_iter(node):
-            raise self.err("iter() stored in a variable is not supported (its consumption state is not kept)", node)
+            # `it = iter(x)`: an iterator keeping its position (next(it), then `for y in it` / list(it) take the rest)
+            if len(node.args) != 1 or node.keywords:
+                raise self.err("iter(callable, sentinel) is not supported", node)
+            return self.q(f"{RT}::methods::b_iter_stored(&{self.expr(node.args[0])})")
         if name == "next" and node.args:
             a0 = node.args[0]
             if isinstance(a0, ast.Call) and isinstance(a0.func, ast.Name) and a0.func.id == "iter":
@@ -11038,9 +11072,7 @@ def endpoint_decorators(fe: Frontend, fn, m, deco: ast.Call) -> None:
         shown = ast.unparse(d)
         shown = shown if len(shown) <= 60 else shown[:57] + "..."
         if d in http:
-            raise TranspileError(f"endpoint {fn.name}: several route decorators on one function (@{shown}) are not "
-                                 "supported: FastAPI registers the function once per decorator, the binary would serve "
-                                 "only one of them; define one endpoint per route", d, src)
+            continue  # another registration of the function (build_routes translates each)
         below = fn.decorator_list.index(d) > fn.decorator_list.index(deco)
         raise TranspileError(f"endpoint {fn.name}: decorator @{shown} on an endpoint is not supported: "
                              + ("FastAPI registers the decorated function, the binary would run the endpoint without it"
@@ -11093,6 +11125,26 @@ def ws_route(proj: Project, rb: RouteBuilder, fe: Frontend, fn, m, found, idx: i
             proj.errors.append(e)
             proj.__dict__.setdefault("route_infos", []).append((info, e))
     return idx
+
+
+def route_key(fn, deco, n: int, k: int) -> tuple:
+    """Where a route decorator registers among the module's routes: its line; the decorators of one function in
+    registration order (the lowest first)."""
+    return (deco.lineno,) if n <= 1 else (fn.decorator_list[0].lineno, k)
+
+
+def route_node_item(items, nodes, members, order, m, fn, deco, router, path, pattern, found, n: int, k: int) -> None:
+    """The route tree's node of one route decorator (`APIRoute` or WebSocket route)."""
+    name = next((kw.value.value for kw in deco.keywords if kw.arg == "name" and isinstance(kw.value, ast.Constant)), fn.name)
+    ident_ = f"RN_{len(nodes) + 1}"
+    nodes[(m.name, deco.lineno)] = ident_
+    if found is None:
+        items.append(f"static {ident_}: {RT}::routing::Node = {RT}::routing::Node::Ws {{ path: {rs(path)}, "
+                     f"pattern: {rs(pattern)}, name: {rs(name)} }};")
+    else:
+        items.append(f"static {ident_}: {RT}::routing::Node = {RT}::routing::Node::Api {{ path: {rs(path)}, pattern: {rs(pattern)}, "
+                     f"methods: &[{rs(deco.func.attr.upper())}], name: {rs(name)} }};")
+    members.setdefault(router or "app", []).append(((order.get(m.name, 0), *route_key(fn, deco, n, k)), ident_))
 
 
 def emit_descriptors(p: Project) -> list[str]:
@@ -14018,28 +14070,21 @@ def route_tree(p: "Project", fe: Frontend) -> tuple[str, dict]:
         for fn in ast.walk(m.tree):
             if not isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)):
                 continue
-            found = fe._route_decorator(fn, m.name, parents)
+            founds = fe._route_decorators(fn, m.name, parents)
             ws = fe._ws_decorator(fn, m.name, parents)
-            if found is None and ws is None:
+            if not founds and ws is None:
                 continue
-            deco, router = found or ws
-            r = fe.routers.get(router) if router else None
-            try:
-                path = (r.prefix if r else "") + route_path(deco, str(m.path))
-                pattern = starlette_pattern(path, fn, str(m.path))
-            except (TranspileError, IndexError):
-                continue  # the route itself is refused
-            name = next((k.value.value for k in deco.keywords if k.arg == "name" and isinstance(k.value, ast.Constant)), fn.name)
-            ident_ = f"RN_{len(nodes) + 1}"
-            nodes[(m.name, fn.lineno)] = ident_
-            if found is None:
-                items.append(f"static {ident_}: {RT}::routing::Node = {RT}::routing::Node::Ws {{ path: {rs(path)}, "
-                             f"pattern: {rs(pattern)}, name: {rs(name)} }};")
-            else:
-                items.append(f"static {ident_}: {RT}::routing::Node = {RT}::routing::Node::Api {{ path: {rs(path)}, pattern: {rs(pattern)}, "
-                             f"methods: &[{rs(deco.func.attr.upper())}], name: {rs(name)} }};")
-            members.setdefault(router or "app", []).append(((order.get(m.name, 0), fn.lineno), ident_))
+            for k_, (deco, router) in enumerate(founds or [ws]):
+                found = founds[k_] if founds else None
+                r = fe.routers.get(router) if router else None
+                try:
+                    path = (r.prefix if r else "") + route_path(deco, str(m.path))
+                    pattern = starlette_pattern(path, fn, str(m.path))
+                except (TranspileError, IndexError):
+                    continue  # the route itself is refused
+                route_node_item(items, nodes, members, order, m, fn, deco, router, path, pattern, found, len(founds), k_)
     routers: dict[object, str] = {}
+
 
     def router_def(sym) -> str:
         if sym not in routers:
@@ -14257,6 +14302,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         proj.cur = None
     ws_routes = []
     route_keys: dict[int, tuple] = {}
+    route_decos: dict[int, int] = {}  # the line of the route decorator that registered it (its node in the tree)
     route_conds: dict[int, tuple] = {}
     for m in [] if relay else fe.index.package_modules():
         parents = fe._parents(m.name)
@@ -14282,59 +14328,58 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
             wsf = fe._ws_decorator(fn, m.name, parents)
             if wsf is not None:
                 idx = ws_route(proj, rb, fe, fn, m, wsf, idx, ws_routes, collect)
-            found = fe._route_decorator(fn, m.name, parents)
-            if found is None:
-                continue
-            deco, router = found
-            mounts = fe._mounts_cache.get(router, []) if router else [Mount("", deps=list(fe.__dict__.get("app_deps", [])))]
-            for mt in mounts:
-                idx += 1
-                r = fe.routers.get(router) if router else None
-                path = mt.prefix + (r.prefix if r else "") + route_path(deco, str(m.path))
-                if fe.shown_path(path) in fe.__dict__.get("python_side", ()):
-                    # proxied by its runtime path: a prefix read from the settings stays a marker until startup
-                    fe.__dict__.setdefault("python_side_raw", set()).add(path)
-                    fe.notes.append(f"{m.path}:{fn.lineno}: {deco.func.attr.upper()} {fe.shown_path(path)} declared Python-side")
-                    continue
-                rid = ("route", idx)
-                for k in re.findall("\x01(\\d+)\x01", path):
-                    proj.edges.setdefault(rid, set()).add(("prefix", int(k)))
-                for k, _ in mt.conds:
-                    proj.edges.setdefault(rid, set()).add(("cond", k))
-                tail = path.rsplit("\x01", 1)[-1] if "\x01" in path else None
-                if tail == "":
-                    empty_under.setdefault(int(path.split("\x01")[-2]), fn.name)
-                proj.cur = rid
-                info = {"method": deco.func.attr, "path": fe.shown_path(path), "func": fn.name, "file": str(m.path), "line": fn.lineno,
-                        "conditional": mt.conditional, "node": fn, "module": m.name, "router": router, "id": rid}
-                try:
-                    if r is not None and r.unsupported:
-                        raise TranspileError(f"unsupported APIRouter option {r.unsupported[0].arg}=", r.unsupported[0], r.file)
-                    if mt.unsupported:
-                        node, f = mt.unsupported[0]
-                        if getattr(node, "arg", None) == "prefix":
-                            raise TranspileError("include_router(prefix=<non-literal>) inside a function (app factory) "
-                                                 "is not supported: call include_router at module level, or use a "
-                                                 "literal prefix", node, f)
-                        raise TranspileError(f"unsupported include_router option {getattr(node, 'arg', '?')}=", node, f)
-                    if mt.conditional:
-                        raise TranspileError("include_router(...) under an `if` is not supported: the binary would "
-                                             "serve the route unconditionally", fn, str(m.path))
-                    endpoint_decorators(fe, fn, m, deco)
-                    handler, axum_path = rb.route(fn, m.name, path, deco.func.attr, deco, router, mt, idx)
-                    proj.cur = None
-                    proj.drain()
-                    routes.append((deco.func.attr, axum_path, handler, path, fn, m, router))
-                    route_keys[id(routes[-1])] = (*mt.chain, (m.name, (deco.lineno,)))
-                    if mt.conds:
-                        route_conds[id(routes[-1])] = mt.conds
-                    proj.__dict__.setdefault("route_infos", []).append((info, None))
-                except TranspileError as e:
-                    proj.cur = None
-                    if not collect:
-                        raise
-                    proj.errors.append(e)
-                    proj.__dict__.setdefault("route_infos", []).append((info, e))
+            founds = fe._route_decorators(fn, m.name, parents)
+            for k_, (deco, router) in enumerate(founds):
+              mounts = fe._mounts_cache.get(router, []) if router else [Mount("", deps=list(fe.__dict__.get("app_deps", [])))]
+              for mt in mounts:
+                  idx += 1
+                  r = fe.routers.get(router) if router else None
+                  path = mt.prefix + (r.prefix if r else "") + route_path(deco, str(m.path))
+                  if fe.shown_path(path) in fe.__dict__.get("python_side", ()):
+                      # proxied by its runtime path: a prefix read from the settings stays a marker until startup
+                      fe.__dict__.setdefault("python_side_raw", set()).add(path)
+                      fe.notes.append(f"{m.path}:{fn.lineno}: {deco.func.attr.upper()} {fe.shown_path(path)} declared Python-side")
+                      continue
+                  rid = ("route", idx)
+                  for k in re.findall("\x01(\\d+)\x01", path):
+                      proj.edges.setdefault(rid, set()).add(("prefix", int(k)))
+                  for k, _ in mt.conds:
+                      proj.edges.setdefault(rid, set()).add(("cond", k))
+                  tail = path.rsplit("\x01", 1)[-1] if "\x01" in path else None
+                  if tail == "":
+                      empty_under.setdefault(int(path.split("\x01")[-2]), fn.name)
+                  proj.cur = rid
+                  info = {"method": deco.func.attr, "path": fe.shown_path(path), "func": fn.name, "file": str(m.path), "line": fn.lineno,
+                          "conditional": mt.conditional, "node": fn, "module": m.name, "router": router, "id": rid}
+                  try:
+                      if r is not None and r.unsupported:
+                          raise TranspileError(f"unsupported APIRouter option {r.unsupported[0].arg}=", r.unsupported[0], r.file)
+                      if mt.unsupported:
+                          node, f = mt.unsupported[0]
+                          if getattr(node, "arg", None) == "prefix":
+                              raise TranspileError("include_router(prefix=<non-literal>) inside a function (app factory) "
+                                                   "is not supported: call include_router at module level, or use a "
+                                                   "literal prefix", node, f)
+                          raise TranspileError(f"unsupported include_router option {getattr(node, 'arg', '?')}=", node, f)
+                      if mt.conditional:
+                          raise TranspileError("include_router(...) under an `if` is not supported: the binary would "
+                                               "serve the route unconditionally", fn, str(m.path))
+                      endpoint_decorators(fe, fn, m, deco)
+                      handler, axum_path = rb.route(fn, m.name, path, deco.func.attr, deco, router, mt, idx)
+                      proj.cur = None
+                      proj.drain()
+                      routes.append((deco.func.attr, axum_path, handler, path, fn, m, router))
+                      route_keys[id(routes[-1])] = (*mt.chain, (m.name, route_key(fn, deco, len(founds), k_)))
+                      route_decos[id(routes[-1])] = deco.lineno
+                      if mt.conds:
+                          route_conds[id(routes[-1])] = mt.conds
+                      proj.__dict__.setdefault("route_infos", []).append((info, None))
+                  except TranspileError as e:
+                      proj.cur = None
+                      if not collect:
+                          raise
+                      proj.errors.append(e)
+                      proj.__dict__.setdefault("route_infos", []).append((info, e))
     if not relay:
         engine_globals(proj, fe)
         module_statements(proj, fe)
@@ -14464,16 +14509,25 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         routes.sort(key=lambda r: tuple((rank.get(mod, 0), ln) for mod, ln in route_keys.get(id(r), ())))
     tree, nodes = route_tree(proj, fe)
     proj.items.append(tree)
+    def node_of(r, m) -> str:
+        key = (m.name, route_decos.get(id(r), 0))
+        return ('Some(&' + nodes[key] + ')') if key in nodes else 'None'
+
     route_defs = [f"    {RT}::web::RouteDef {{ method: {rs(method.upper())}, pattern: {rs_marked(pattern)}, run: {handler}, "
-                  f"node: {('Some(&' + nodes[(m.name, fn.lineno)] + ')') if (m.name, fn.lineno) in nodes else 'None'}, "
+                  f"node: {node_of(r, m)}, "
                   f"path: {rs_marked(path)}, src: ({rs(proj.rel_file(m.name) + ':' + str(fn.lineno))}, {rs(fn.name)}, {rs(m.name)}), "
                   f"sync_endpoint: {str(not isinstance(fn, ast.AsyncFunctionDef)).lower()}, "
                   f"first_line: {fn.decorator_list[0].lineno if fn.decorator_list else fn.lineno}, "
                   f"raw: {('Some(' + proj.__dict__['route_raw'][handler] + ')') if handler in proj.__dict__.get('route_raw', {}) else 'None'}, "
                   f"body: {str(proj.__dict__.get('route_body', {}).get(proj.__dict__.get('route_raw', {}).get(handler, handler), False)).lower()} }},"
-                  for method, pattern, handler, path, fn, m, _ in routes]
-    ws_defs = [f"    {RT}::ws::WsRouteDef {{ pattern: {rs_marked(pattern)}, run: {handler}, "
-               f"node: {('Some(&' + nodes[(m.name, fn.lineno)] + ')') if (m.name, fn.lineno) in nodes else 'None'} }},"
+                  for r in routes for method, pattern, handler, path, fn, m, _ in [r]]
+
+    def ws_node(fn, m) -> str:
+        wsd = fe._ws_decorator(fn, m.name, fe._parents(m.name))
+        key = (m.name, wsd[0].lineno if wsd else 0)
+        return ('Some(&' + nodes[key] + ')') if key in nodes else 'None'
+
+    ws_defs = [f"    {RT}::ws::WsRouteDef {{ pattern: {rs_marked(pattern)}, run: {handler}, node: {ws_node(fn, m)} }},"
                for pattern, handler, fn, m in ws_routes]
     if any(isinstance(n, (ast.Import, ast.ImportFrom)) and "unicodedata" in ast.unparse(n)
            for m in list(proj.ix.modules.values()) for n in ast.walk(m.tree)):

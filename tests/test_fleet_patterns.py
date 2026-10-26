@@ -455,3 +455,22 @@ def test_prometheus_fastapi_instrumentator(tmp_path, setup):
     generate(tmp_path, pkg)
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "dynrt::instr::instrument(" in gen and "dynrt::instr::take_pending()" in gen and "dynrt::instr::expose(" in gen
+
+
+def test_several_route_decorators(tmp_path):
+    """`@app.get("/a")` over `@app.post("/b")`: one route each, the lowest decorator registered first."""
+    src = '''
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/a")
+@app.post("/b", status_code=201)
+async def x():
+    return {"ok": 1}
+'''
+    pkg = project(tmp_path, src)
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert gen.index('pattern: "^/b$"') < gen.index('pattern: "^/a$"')

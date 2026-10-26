@@ -142,6 +142,57 @@ pub async fn gather(args: Vec<V>, kwargs: &[(String, V)]) -> R {
     Ok(V::list(out))
 }
 
+/// `asyncio.as_completed(fs)`: the awaitables are scheduled at once (`ensure_future`, a task given twice once); the
+/// iterator gives as many awaitables, the k-th one resolving with the k-th to complete (its result, or its
+/// exception raised where it is awaited)
+pub fn as_completed(cx: &Cx, args: Vec<V>, kwargs: &[(String, V)]) -> R {
+    for (k, v) in kwargs {
+        match k.as_str() {
+            "timeout" if v.is_none() => {}
+            "timeout" => return Err(Exc::type_error("py2axum: asyncio.as_completed(timeout=) is not supported")),
+            _ => return Err(Exc::type_error(format!("as_completed() got an unexpected keyword argument '{k}'"))),
+        }
+    }
+    let [fs] = &args[..] else {
+        return Err(Exc::type_error(format!("as_completed() takes 1 positional argument but {} were given", args.len())));
+    };
+    if matches!(fs, V::Native(n) if matches!(&**n, Native::Coro(_) | Native::Task(_) | Native::AFuture(_))) {
+        return Err(Exc::type_error(format!("expect an iterable of futures, not {}", fs.type_name())));
+    }
+    let mut items: Vec<V> = Vec::new();
+    for a in super::ops::iter(fs)? {
+        if !matches!(&a, V::Native(n) if matches!(&**n, Native::Coro(_) | Native::Task(_) | Native::AFuture(_))) {
+            return Err(Exc::type_error("An asyncio.Future, a coroutine or an awaitable is required"));
+        }
+        if !items.iter().any(|x| super::ops::is(x, &a)) {
+            items.push(a);
+        }
+    }
+    let outs: Vec<V> = items.iter().map(|_| future_new(cx)).collect();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<R>();
+    for a in items {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(await_value(a).await);
+        });
+    }
+    drop(tx);
+    let slots = outs.clone();
+    tokio::spawn(async move {
+        for out in &slots {
+            let Some(r) = rx.recv().await else { break };
+            let V::Native(n) = out else { continue };
+            let Native::AFuture(f) = &**n else { continue };
+            let st = match r {
+                Ok(v) => FutState::Done(v),
+                Err(e) => FutState::Failed(e),
+            };
+            let _ = settle(out, f, st);
+        }
+    });
+    Ok(V::native(Native::Iter(Mutex::new(outs.into()))))
+}
+
 /// `asyncio.Semaphore(value=1)` / `asyncio.Lock()`
 pub struct Sem {
     pub sem: tokio::sync::Semaphore,

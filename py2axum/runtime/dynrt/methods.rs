@@ -286,10 +286,7 @@ pub fn default_copy(v: &V) -> R {
                 out.push((k.clone(), default_copy(x)?));
             }
             let copy = V::dict_from(out)?;
-            match ops::default_factory(d) {
-                Some(f) => ops::defaultdict(f, copy)?,
-                None => copy,
-            }
+            ops::defaultdict_like(d, copy)?
         }
         V::Set(s) => V::Set(Arc::new(Mutex::new(s.lock().clone()))),
         // copy.copy(frozenset) is the same object
@@ -1812,6 +1809,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::Request(r, o) => match name {
                 "is_disconnected" => Ok(V::Bool(r.disconnected.load(std::sync::atomic::Ordering::Relaxed))),
                 "body" => Ok(V::Bytes(Arc::from(&r.read_body(*o)?[..]))),
+                // `request.stream()`: the body in one chunk then b"" (the binary has it whole)
+                "stream" if args.is_empty() && kwargs.is_empty() => {
+                    Ok(V::native(Native::AsyncItems(parking_lot::Mutex::new(Some(r.stream_items(*o)?)))))
+                }
                 // Starlette: `json.loads(await self.body())` (bytes: json.detect_encoding, UnicodeDecodeError)
                 "json" => super::libs::json_loads(&V::Bytes(Arc::from(&r.read_body(*o)?[..]))),
                 _ => Err(no_attr(recv, name)),
@@ -2624,7 +2625,8 @@ fn dict_method(d: &Arc<Mutex<IndexMap<Key, (V, V)>>>, name: &str, args: &[V], kw
             }
             Ok(V::None)
         }
-        "copy" => Ok(V::Dict(Arc::new(Mutex::new(d.lock().clone())))),
+        // a defaultdict's copy keeps its factory (defaultdict.copy is __copy__)
+        "copy" => ops::defaultdict_like(d, V::Dict(Arc::new(Mutex::new(d.lock().clone())))),
         "clear" => {
             d.lock().clear();
             Ok(V::None)
@@ -3698,6 +3700,17 @@ pub fn b_all(v: &V) -> R {
 }
 
 /// `next(it[, default])` on a stored value: only iterators keep a position (a list is a TypeError)
+/// `it = iter(x)` kept in a variable: an iterator stays itself; anything else iterable becomes an iterator over its
+/// items as they are now (a list changed later is not seen, unlike CPython's list iterator)
+pub fn b_iter_stored(x: &V) -> R {
+    if let V::Native(n) = x {
+        if matches!(&**n, Native::Iter(_) | Native::ValIter(_) | Native::CronGen(_)) {
+            return Ok(x.clone());
+        }
+    }
+    Ok(V::native(Native::Iter(Mutex::new(ops::iter(x)?.into()))))
+}
+
 pub fn b_next_iter(args: &[V]) -> R {
     if let Some(r) = super::proto::next(&args[0], args.get(1)) {
         return r;

@@ -299,6 +299,11 @@ impl Layer {
         let (status, out_len) = match &res {
             Ok(r) => (r.status().as_u16(), match r.headers().get("content-length").and_then(|v| v.to_str().ok()) {
                 Some(v) => py_int(v).unwrap_or(0),
+                // a body of known size: the content-length the server writes (Starlette's responses set it)
+                None if !matches!(r.status().as_u16(), 100..=199 | 204 | 304) => {
+                    use axum::body::HttpBody as _;
+                    r.body().size_hint().exact().map(|n| n as i64).unwrap_or(0)
+                }
                 // Response(content=b"", headers=...) populates content-length 0 (none for 1xx, 204, 304)
                 None => 0,
             }),

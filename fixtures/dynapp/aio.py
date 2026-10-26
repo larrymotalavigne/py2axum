@@ -106,3 +106,23 @@ async def acm():
         out.append(lock.locked())
     out.append(lock.locked())
     return {"out": out, "a": a.events, "b": b.events, "c": c.events}
+
+
+@router.get("/as_completed")
+async def as_completed_route():
+    """completion order (slow(1) first), a failure raised where its turn is awaited, tasks and coroutines mixed"""
+    order = []
+    for c in asyncio.as_completed([slow(3), slow(1), slow(2)]):
+        order.append(await c)
+    got = []
+    t = asyncio.create_task(slow(2))
+    for c in asyncio.as_completed([slow(1, fail=True), t]):
+        try:
+            got.append(await c)
+        except ValueError as e:
+            got.append(f"ValueError: {e}")
+    first = None
+    for c in asyncio.as_completed(slow(i) for i in (2, 1)):
+        first = await c
+        break
+    return {"order": order, "got": got, "first": first}

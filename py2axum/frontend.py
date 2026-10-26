@@ -838,6 +838,21 @@ class Frontend:
                 found = (d, t)
         return found
 
+    def _route_decorators(self, fn, module: str, parents) -> list[tuple[ast.Call, Sym | None]]:
+        """Every HTTP route decorator of the function, in registration order (the lowest first: Python applies
+        decorators bottom up, each registers the function once more)."""
+        out = []
+        for d in reversed(fn.decorator_list):
+            if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS):
+                continue
+            if self._is_app(module, d.func.value):
+                out.append((d, None))
+                continue
+            t = self.index.resolve_expr(module, d.func.value, _enclosing_fn(fn, parents))
+            if isinstance(t, Sym) and t in self.routers:
+                out.append((d, t))
+        return out
+
     def _ws_decorator(self, fn, module: str, parents) -> tuple[ast.Call, Sym | None] | None:
         """`@app.websocket(...)` -> (decorator, None); `@router.websocket(...)` -> (decorator, router)."""
         found = None

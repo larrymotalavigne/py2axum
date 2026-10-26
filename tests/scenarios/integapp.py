@@ -512,10 +512,11 @@ STEPS += [("GET", "/added/early", None), ("GET", "/added/late", None), ("GET", "
           ("POST", "/added/late", None), ("GET", "/added/nowhere", None)]
 # prometheus_fastapi_instrumentator (fixtures/integapp/instr.py): templates, statuses, sizes, exclusions, then the samples
 STEPS += [("GET", "/instr/items/3", None), ("GET", "/instr/items/12", None), ("GET", "/instr/items/x", None),
-          ("GET", "/instr/items/3/", None), ("POST", "/instr/echo", {"a": [1, 2, 3]}),
+          ("POST", "/instr/echo", {"a": [1, 2, 3]}),
           ("GET", "/instr/skip", None), ("GET", "/instr/empty", None), ("GET", "/instr/stream", None),
           ("GET", "/instr/boom", None), ("GET", "/instr/check", None)]
-# (a 405 or an unmatched path is relayed to the reference under --python-side mount: it would count it twice)
+# (a 405, a trailing-slash redirect or an unmatched path is relayed to the reference under --python-side mount: it
+# would count it twice)
 
 # documented differences of the log conformance (tests/logcmp.py): records left out on both sides
 LOG_IGNORE = []

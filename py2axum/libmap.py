@@ -1806,6 +1806,7 @@ def status_constant(dotted: str) -> int | None:
 # --- calls whose template receives the run-time vectors (args: Vec<V>, kwargs: Vec<(String, V)>) ---
 DYN_ARGS = {
     "asyncio.gather": lambda a, kw: f"{RT}::aio::gather({a}, &{kw}).await",
+    "asyncio.as_completed": lambda a, kw: f"{RT}::aio::as_completed(cx, {a}, &{kw})",
     "asyncio.Semaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.BoundedSemaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.Lock": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",

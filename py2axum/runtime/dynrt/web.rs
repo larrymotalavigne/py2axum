@@ -103,6 +103,28 @@ impl ReqCell {
         Ok(b)
     }
 
+    /// Starlette's `Request.stream()` on a Request object: its `_body` then b"" when read already; else what its
+    /// receive channel yields (one chunk here: the body is whole), the stream then consumed (`body()` raises)
+    pub fn stream_items(&self, obj: u32) -> R<Vec<V>> {
+        let bytes = |b: &[u8]| V::Bytes(Arc::from(b));
+        if let Some(b) = self.cached_body(obj) {
+            return Ok(vec![bytes(&b), bytes(b"")]);
+        }
+        if obj == REQ_SERVER || obj == REQ_NORECV {
+            return Err(Exc::runtime("Receive channel has not been made available"));
+        }
+        if obj == REQ_ROUTE && self.form_read.swap(true, Ordering::Relaxed) {
+            return Err(Exc::runtime("Stream consumed"));
+        }
+        let b = if obj == REQ_ROUTE { self.body_bytes() } else { self.incoming(obj) };
+        let mut out = Vec::new();
+        if !b.is_empty() {
+            out.push(bytes(&b));
+        }
+        out.push(bytes(b""));
+        Ok(out)
+    }
+
     pub fn empty() -> ReqCell {
         ReqCell {
             method: "GET".into(),

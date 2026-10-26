@@ -125,6 +125,10 @@ STEPS: list = [    # dunder methods, hashability, frozen models (fixtures/langap
     ("GET", "/pydv1/misc", None),
     ("GET", "/pydv1/validate_default", None),
     ("GET", "/modspan/", None),
+    ("GET", "/modspan/iter", None),
+    ("GET", "/modspan/ddlambda", None),
+    ("GET", "/modspan/multi/a", None), ("POST", "/modspan/multi/b", None), ("PUT", "/modspan/multi/a", None),
+    ("PUT", "/modspan/multi/zz", None), ("POST", "/modspan/multi/a", None), ("GET", "/modspan/multi/b", None),
     # redis.asyncio (fixtures/langapp/rds.py; Redis database 13, emptied by reset)
     ("POST", "/rds/basic", None),
     ("POST", "/rds/pickled", None),

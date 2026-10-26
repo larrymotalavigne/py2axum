@@ -158,3 +158,24 @@ async def mvj_none():
     except ValidationError as e:
         return _errors(e)
     return {}
+
+
+@router.post("/stream")
+async def stream(request: Request, then: str = ""):
+    """`request.stream()`: the chunks joined, the final b"" seen; then body() raises once the stream is consumed"""
+    chunks = [c async for c in request.stream()]
+    out = {"joined": b"".join(chunks).decode(), "last_empty": chunks[-1] == b""}
+    if then == "body":
+        try:
+            await request.body()
+        except RuntimeError as e:
+            out["body"] = str(e)
+    return out
+
+
+@router.post("/stream/after")
+async def stream_after(request: Request):
+    """after body(): `_body` then b"" """
+    body = await request.body()
+    chunks = [c async for c in request.stream()]
+    return {"n": len(chunks), "same": chunks[0] == body, "last": chunks[-1].decode()}

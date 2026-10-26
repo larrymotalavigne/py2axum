@@ -1487,6 +1487,7 @@ pub fn repr(v: &V) -> R<String> {
                     let parts = most_common(d)?.iter().map(|(k, v)| Ok(format!("{}: {}", repr(k)?, repr(v)?))).collect::<R<Vec<_>>>()?;
                     format!("Counter({{{}}})", parts.join(", "))
                 }
+                Some("<lambda>") => format!("defaultdict(<function <lambda> at {}>, {{{}}})", addr(Arc::as_ptr(d) as usize), parts.join(", ")),
                 Some(f) => format!("defaultdict(<class '{f}'>, {{{}}})", parts.join(", ")),
                 None => format!("{{{}}}", parts.join(", ")),
             }
@@ -2211,6 +2212,42 @@ pub fn defaultdict(factory: &'static str, init: V) -> R {
     Ok(init)
 }
 
+/// `defaultdict(lambda: <literal>)`: the literal each missing key gets a deep copy of (factory "<lambda>")
+static TEMPLATES: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, (std::sync::Weak<DictCell>, V)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+pub fn defaultdict_template(template: V, init: V) -> R {
+    let V::Dict(d) = &init else { return Err(Exc::type_error("py2axum: defaultdict initial value must be a dict")) };
+    {
+        let mut reg = TEMPLATES.lock();
+        if reg.len() >= 64 && reg.len().is_power_of_two() {
+            reg.retain(|_, (w, _)| w.strong_count() > 0);
+        }
+        reg.insert(Arc::as_ptr(d) as usize, (Arc::downgrade(d), template));
+    }
+    defaultdict("<lambda>", init)
+}
+
+/// a new dict with `src`'s factory (a defaultdict's copy, a Counter's): `init` is already a fresh dict
+pub fn defaultdict_like(src: &Arc<DictCell>, init: V) -> R {
+    match default_factory(src) {
+        Some("<lambda>") => match TEMPLATES.lock().get(&(Arc::as_ptr(src) as usize)).map(|(_, t)| t.clone()) {
+            Some(t) => defaultdict_template(t, init),
+            None => Ok(init),
+        },
+        Some(f) => defaultdict(f, init),
+        None => Ok(init),
+    }
+}
+
+fn template_value(d: &Arc<DictCell>) -> R {
+    let t = TEMPLATES.lock().get(&(Arc::as_ptr(d) as usize)).map(|(_, t)| t.clone());
+    match t {
+        Some(t) => super::copymod::deepcopy(&t),
+        None => Ok(V::None),
+    }
+}
+
 pub fn default_factory(d: &Arc<DictCell>) -> Option<&'static str> {
     let reg = DEFAULTS.lock();
     if reg.is_empty() {
@@ -2468,7 +2505,7 @@ pub fn getitem(v: &V, k: &V) -> R {
                     Some("Counter") => V::Int(0),
                     // defaultdict.__missing__: the factory's value is stored, then returned
                     Some(f) => {
-                        let v = default_value(f);
+                        let v = if f == "<lambda>" { template_value(d)? } else { default_value(f) };
                         dict_put(&mut d.lock(), key, k.clone(), v.clone());
                         v
                     }

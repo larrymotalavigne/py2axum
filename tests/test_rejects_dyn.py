@@ -465,7 +465,7 @@ def test_column_type_factory_other_module(tmp_path, capsys):
 @pytest.mark.parametrize(
     "body, message",
     [
-        ("    it = iter([1, 2])\n    return {'a': next(it)}", "iter() stored in a variable is not supported"),
+        ("    it = iter(lambda: 1, 1)\n    return {'a': next(it)}", "iter(callable, sentinel) is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicate()}", "method .frobnicate() is not implemented by the runtime"),
         ("    d = {}\n    return {'a': d.model_dump(round_trip=True)}", ".model_dump(round_trip=) is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicated}", "attribute .frobnicated is not provided by the runtime"),
@@ -1054,7 +1054,7 @@ async def c():
 @pytest.mark.parametrize(
     "expr, message",
     [
-        ("defaultdict(lambda: 0)", "defaultdict(lambda: 0): only a builtin type factory is supported"),
+        ("defaultdict(lambda: [x])", "defaultdict(lambda: [x]): only a builtin type factory or a lambda returning a literal"),
         ("defaultdict()", "defaultdict(factory[, mapping]) with a builtin type as factory is the only supported form"),
         ('next(string.Formatter().parse("{a}"))', "parse() inside list() or tuple()"),
     ],
@@ -3342,10 +3342,10 @@ def test_nonlocal_outside_enclosing_function_rejected(tmp_path, capsys):
 
 
 
-@pytest.mark.parametrize("call", ["await request.form()", "[c async for c in request.stream()]"])
+@pytest.mark.parametrize("call", ["await request.form()"])
 def test_request_form_and_stream_rejected(tmp_path, capsys, call):
-    """Starlette's `request.form()` / `request.stream()` have no runtime counterpart: an AttributeError at run
-    time otherwise (the names are in the runtime's catalog for other values)."""
+    """Starlette's `request.form()` has no runtime counterpart: an AttributeError at run time otherwise (the name
+    is in the runtime's catalog for other values). `request.stream()` is translated (dynapp /reqbody/stream)."""
     err = _reject(tmp_path, capsys, f'''
         from fastapi import FastAPI, Request
 
@@ -5355,9 +5355,9 @@ app.include_router(router)
     # above: runs at import on the registered function
     ('@require_admin\n@app.get("/x")\nasync def x():\n    return {"x": 1}', 0,
      "decorator @require_admin on an endpoint is not supported: it runs at import"),
-    # a second route decorator registers the function once more
-    ('@app.get("/x")\n@app.post("/y")\nasync def x():\n    return {"x": 1}', 0, "several route decorators on one function"),
-    ('@router.get("/x")\n@router.put("/x")\nasync def x():\n    return {"x": 1}', 0, "several route decorators on one function"),
+    # several route decorators register the function once each (translated); another decorator is still refused
+    ('@app.get("/x")\n@app.post("/y")\n@require_admin\nasync def x():\n    return {"x": 1}', 2,
+     "endpoint x: decorator @require_admin on an endpoint is not supported"),
     ('@app.websocket("/ws")\n@require_admin\nasync def x(ws: WebSocket):\n    await ws.accept()', 1,
      "endpoint x: decorator @require_admin on an endpoint is not supported"),
 ])

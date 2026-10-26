@@ -238,12 +238,18 @@ pub enum LoopIter {
     Next(V),
     /// the old sequence protocol: `__getitem__(0)`, `__getitem__(1)`... until IndexError
     Index(V, i64),
+    /// an iterator of the runtime kept in a variable (`it = iter(x)`): taken one item at a time, so a `break`
+    /// leaves the rest in it
+    Stored(V),
 }
 
 impl LoopIter {
     pub async fn start(v: &V) -> R<LoopIter> {
         if is_inst(v) && (dunder(v, "__iter__").is_some() || dunder(v, "__getitem__").is_some()) {
             return Self::start_sync(v);
+        }
+        if matches!(v, V::Native(n) if matches!(&**n, Native::Iter(_))) {
+            return Ok(LoopIter::Stored(v.clone()));
         }
         Ok(LoopIter::Eager(super::orm::iter(v).await?.into_iter()))
     }
@@ -277,6 +283,13 @@ impl LoopIter {
                 Ok(v) => Ok(Some(v)),
                 Err(e) if e.isinstance(&STOP_ITERATION) => Ok(None),
                 Err(e) => Err(e),
+            },
+            LoopIter::Stored(v) => match v {
+                V::Native(n) => match &**n {
+                    Native::Iter(q) => Ok(q.lock().pop_front()),
+                    _ => Ok(None),
+                },
+                _ => Ok(None),
             },
             LoopIter::Index(v, i) => match call(v, "__getitem__", vec![V::Int(*i)]).expect("checked") {
                 Ok(x) => {
