@@ -12540,6 +12540,9 @@ MW_GZIP = {"starlette.middleware.gzip.GZipMiddleware", "fastapi.middleware.gzip.
 # (`Session.accessed`/`.modified`): with every read of `request.session` / `scope["session"]` refused in the
 # translated code (FnCompiler.SCOPE_BY_MIDDLEWARE), it leaves the binary's responses as they are
 MW_SESSION = {"starlette.middleware.sessions.SessionMiddleware", "fastapi.middleware.sessions.SessionMiddleware"}
+# sentry-sdk 2's SentryAsgiMiddleware added explicitly: sentry-sdk's FastAPI/Starlette integration already wraps the
+# app (the middleware is applied once), and the binary reports as that integration does (dynrt/sentry.rs)
+MW_SENTRY = {"sentry_sdk.integrations.asgi.SentryAsgiMiddleware"}
 
 
 # what registers a route on the app (call or decorator), in Starlette's routing order
@@ -12907,7 +12910,7 @@ def mw_class_kind(fe: Frontend, module: str, cls: ast.AST) -> str | None:
         c = libmap.canonical(t.dotted)
         return ("cors" if c in MW_CORS else "base" if c in MW_BASE else "gzip" if c in MW_GZIP
                 else "context" if c in MW_CONTEXT else "https" if c in MW_HTTPS else "trusted" if c in MW_TRUSTED
-                else "session" if c in MW_SESSION else None)
+                else "session" if c in MW_SESSION else "sentry" if c in MW_SENTRY else None)
     if isinstance(t, Sym):
         d = fe.index.definition(t)
         if isinstance(d, ast.ClassDef) and len(d.bases) == 1:
@@ -13024,7 +13027,8 @@ def stack_node(fe: Frontend, module: str, node: ast.AST) -> bool:
     """A registration the middleware stack compiles (so not a global error)."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr == "add_middleware" and fe._is_app(module, node.func.value):
-            return mw_kind(fe, module, node) in {"cors", "base", "user", "asgi", "context", "https", "trusted", "session"}
+            return mw_kind(fe, module, node) in {"cors", "base", "user", "asgi", "context", "https", "trusted", "session",
+                                                  "sentry"}
         if node.func.attr == "add_exception_handler" and fe._is_app(module, node.func.value):
             return True
         if is_add_route(fe, module, node):
@@ -14228,6 +14232,9 @@ def build_stack(p: "Project", fe: Frontend) -> str:
             fc.emit(f"__st.{add}({RT}::asgi::Mw::Context({context_mw(fe, module, call, p.src(module))}));")
         elif kind == "session":
             session_mw_options(p, module, call)  # no layer: transparent while nothing reads the session (MW_SESSION)
+        elif kind == "sentry":
+            if len(call.args) != 1 or call.keywords:
+                raise TranspileError("add_middleware(SentryAsgiMiddleware) is supported without options", call, p.src(module))
         elif kind in {"https", "trusted"}:
             # HTTP only here: a WebSocket handshake does not cross the stack (refused with WebSocket routes)
             fe.host_mws = [*fe.__dict__.get("host_mws", []), (call, p.src(module))]

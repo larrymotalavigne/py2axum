@@ -707,3 +707,24 @@ async def s(x: Status):
     pkg = project(tmp_path, src)
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     assert "subclassing an enum is not supported" in capsys.readouterr().err
+
+
+def test_sentry_asgi_middleware_is_transparent(tmp_path):
+    """`app.add_middleware(SentryAsgiMiddleware)` over sentry-sdk 2's automatic FastAPI integration: applied once,
+    the binary reporting as that integration does."""
+    src = '''
+import sentry_sdk
+from fastapi import FastAPI
+from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+
+sentry_sdk.init(dsn=None)
+app = FastAPI()
+app.add_middleware(SentryAsgiMiddleware)
+
+
+@app.get("/x")
+async def x():
+    return {"ok": True}
+'''
+    pkg = project(tmp_path, src)
+    generate(tmp_path, pkg)

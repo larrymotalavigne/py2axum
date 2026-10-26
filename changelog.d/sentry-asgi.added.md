@@ -1,0 +1,1 @@
+- `app.add_middleware(SentryAsgiMiddleware)` (sentry-sdk 2): transparent, as sentry-sdk's automatic FastAPI integration already wraps the app.
