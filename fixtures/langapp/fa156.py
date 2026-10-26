@@ -4,7 +4,7 @@ floats in JSON Lines, empty file inputs, text items of a `list[bytes]` file fiel
 from collections.abc import AsyncIterable
 from typing import Annotated
 
-from fastapi import APIRouter, Body, File, Form, Query, UploadFile
+from fastapi import APIRouter, Body, File, Form, Query, Request, Response, UploadFile
 from pydantic import AfterValidator, BaseModel
 
 router = APIRouter(prefix="/fa156")
@@ -70,3 +70,29 @@ async def upload(file: UploadFile | None = File(None), files: list[UploadFile] =
 @router.post("/blobs")
 async def blobs(data: list[bytes] = File([])):
     return {"sizes": [len(d) for d in data], "first": data[0].decode() if data else None}
+
+
+@router.head("/probe")
+async def probe_head(response: Response):
+    response.headers["x-probe"] = "head"
+    return {"ok": True}
+
+
+@router.get("/probe")
+async def probe_get():
+    return {"ok": "get"}
+
+
+@router.options("/probe")
+async def probe_options():
+    return Response(status_code=204, headers={"allow": "GET, HEAD, OPTIONS"})
+
+
+@router.api_route("/multi/{x}", methods=["GET", "POST"])
+async def multi(x: int, request: Request):
+    return {"x": x, "method": request.method}
+
+
+@router.api_route("/onlyget")
+async def onlyget():
+    return {"default": "GET"}

@@ -63,6 +63,9 @@ def suggestion(e, path: str | None) -> str:
 
 
 def _global(result: dict, e) -> None:
+    # one entry per error: a module parsed by several passes reports its syntax error once
+    if any(g["error"] == e.render() and g["code"] == e.code for g in result["global"]):
+        return
     result["global"].append({"construction": classify(e, english=True)[0], "error": e.render(), "where": _where(e),
                              "code": e.code, "suggestion": suggestion(e, None)})
 

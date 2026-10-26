@@ -50,6 +50,11 @@ LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception
 LOGURU_LEVEL_METHODS = frozenset({"trace", "debug", "info", "success", "warning", "error", "critical"})
 
 
+class LoneSurrogate(TranspileError):
+    """A string with a lone surrogate (`re.compile('[\\ud800-\\udfff]')`): no Rust string holds one. Raised without
+    a location; the expression being compiled gives it one."""
+
+
 def rs(s: str) -> str:
     """A Rust string literal (JSON's escapes are Rust's, but for control characters: `\\u{1c}`, not `\\u001c`)."""
     if not _RS_SPECIAL.search(s):
@@ -58,7 +63,8 @@ def rs(s: str) -> str:
     for ch in s:
         o = ord(ch)
         if 0xD800 <= o <= 0xDFFF:
-            raise ValueError(f"a lone surrogate (\\u{o:04x}) cannot be held in a Rust string: {s[:40]!r}")
+            raise LoneSurrogate(f"unsupported constant: a lone surrogate (\\u{o:04x}) cannot be held in a Rust string: "
+                                f"{s[:40]!r}")
         out.append(json.dumps(ch, ensure_ascii=False)[1:-1] if o >= 0x20 or ch in "\n\r\t" else f"\\u{{{o:x}}}")
     return '"' + "".join(out) + '"'
 
@@ -6884,6 +6890,10 @@ class FnCompiler:
         self.pos_nodes.append(node)
         try:
             return m(node)
+        except LoneSurrogate as e:
+            if e.node is None:
+                raise self.err(e.msg, node) from None
+            raise
         finally:
             self.pos_nodes.pop()
 
@@ -11210,9 +11220,9 @@ class RouteBuilder:
         return self.p.ix.module(module).defs.get(fn.name) is fn
 
 
-ROUTE_DECORATOR_ATTRS = HTTP_METHODS | {"websocket"}
+ROUTE_DECORATOR_ATTRS = HTTP_METHODS | {"websocket", "api_route"}
 # route decorators of FastAPI/Starlette outside HTTP_METHODS: refused rather than left unregistered
-UNTRANSLATED_ROUTE_ATTRS = {"api_route", "head", "options", "trace", "route"}
+UNTRANSLATED_ROUTE_ATTRS = {"api_route", "trace", "route"}
 
 
 def endpoint_decorators(fe: Frontend, fn, m, deco: ast.Call) -> None:
@@ -11228,6 +11238,8 @@ def endpoint_decorators(fe: Frontend, fn, m, deco: ast.Call) -> None:
             and (fe._is_app(m.name, d.func.value)
                  or fe.index.resolve_expr(m.name, d.func.value, frontend_enclosing_fn(fn, parents)) in fe.routers)]
     for d in fn.decorator_list:
+        if d is getattr(deco, "p2a_orig", None):
+            continue  # the `api_route(methods=[...])` this per-method decorator stands for
         if d is deco or (d in http and d.func.attr == "websocket" and deco.func.attr != "websocket") \
                 or (d in http and d.func.attr != "websocket" and deco.func.attr == "websocket"):
             continue
@@ -12710,6 +12722,7 @@ def mount_not_last(fe: Frontend, e: TranspileError) -> str | None:
     mod = fe.index.module_of(e.file).name
     parents = fe._parents(mod)
     scope = _enclosing_fn(e.node, parents)
+    prefix = mount_prefix(fe, e)
 
     def is_app(module: str, node: ast.AST) -> bool:  # the app, also imported from its module
         if fe._is_app(module, node):
@@ -12738,6 +12751,8 @@ def mount_not_last(fe: Frontend, e: TranspileError) -> str | None:
             else:
                 continue
             what = f"`{ast.unparse(where.func)}(...)` at {m.path}:{where.lineno}"
+            if prefix and not _may_reach_mount(fe, m.name, where, prefix):
+                continue  # its paths are outside the mount's prefix: the order does not matter
             if m.name != mod:
                 return f"{what} is in another module (the registration order depends on the imports)"
             if _enclosing_fn(at, ps) is not scope:
@@ -12745,6 +12760,29 @@ def mount_not_last(fe: Frontend, e: TranspileError) -> str | None:
             if where.lineno > e.node.lineno:
                 return f"{what} comes after it"
     return None
+
+
+def _may_reach_mount(fe: Frontend, mod: str, call: ast.Call, prefix: str) -> bool:
+    """Whether a registration (`@app.get(path)`, `app.add_api_route(path, ...)`, `app.include_router(r,
+    prefix=...)`) may match a path under a mount's prefix (the prefix itself or below it): its literal part before
+    the first parameter is compared; not a constant, or an included router without a prefix, may."""
+    if call.func.attr == "include_router":
+        arg = next((k.value for k in call.keywords if k.arg == "prefix"), None)
+        wild = True  # the router's own paths follow the prefix
+    else:
+        arg = call.args[0] if call.args else next((k.value for k in call.keywords if k.arg == "path"), None)
+        wild = False
+    try:
+        path = Project(fe).const(arg, mod) if arg is not None else None
+    except TranspileError:
+        return True
+    if not isinstance(path, str) or (wild and not path):
+        return True
+    lit, brace, _ = path.partition("{")
+    if wild or brace:
+        # the rest of the path is free: it reaches the mount when it extends the prefix, or the prefix extends it
+        return lit == prefix or lit.startswith(prefix + "/") or prefix.startswith(lit)
+    return path == prefix or path.startswith(prefix + "/")
 
 
 def mount_prefix(fe: Frontend, e: TranspileError) -> str:
@@ -14480,6 +14518,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                         raise e
                     fe.global_errors.append(e)
                 if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in UNTRANSLATED_ROUTE_ATTRS
+                        and not (d.func.attr == "api_route" and fe._expand(d))
                         and (fe._is_app(m.name, d.func.value)
                              or fe.index.resolve_expr(m.name, d.func.value, frontend_enclosing_fn(fn, parents)) in fe.routers)):
                     # not a route of the translation: the binary would not serve it at all (404/405 where FastAPI answers)

@@ -17,7 +17,7 @@ from pathlib import Path
 from .ir import Gzip, TranspileError
 from .modules import Ext, ModuleIndex, Sym, is_ext
 
-HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
 DECLARATIVE = ("sqlalchemy.orm.DeclarativeBase", "sqlalchemy.orm.DeclarativeBaseNoMeta")
 DECLARATIVE_FACTORIES = ("sqlalchemy.orm.declarative_base", "sqlalchemy.ext.declarative.declarative_base")
 
@@ -824,10 +824,35 @@ class Frontend:
 
     # ------------------------------------------------------------------ routes
 
+    def _expand(self, d) -> list:
+        """A route decorator as the per-method decorators it stands for: `@router.api_route(path, methods=[...])`
+        (a literal list of HTTP methods, GET when omitted) is one `@router.<method>(path, ...)` per method, made
+        once (the same nodes on every call); any other decorator is itself."""
+        if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "api_route"):
+            return [d]
+        cache = self.__dict__.setdefault("_api_routes", {})
+        if id(d) not in cache:
+            kw = next((k for k in d.keywords if k.arg == "methods"), None)
+            names = None
+            if kw is None:
+                names = ["get"]
+            elif isinstance(kw.value, (ast.List, ast.Tuple, ast.Set)) and all(
+                    isinstance(e, ast.Constant) and isinstance(e.value, str) for e in kw.value.elts):
+                names = list(dict.fromkeys(e.value.lower() for e in kw.value.elts))
+            out = []
+            if names and all(n in HTTP_METHODS for n in names):
+                for n in names:
+                    func = ast.copy_location(ast.Attribute(value=d.func.value, attr=n, ctx=ast.Load()), d.func)
+                    c = ast.copy_location(ast.Call(func=func, args=d.args, keywords=[k for k in d.keywords if k.arg != "methods"]), d)
+                    c.p2a_orig = d
+                    out.append(c)
+            cache[id(d)] = (d, out)
+        return cache[id(d)][1]
+
     def _route_decorator(self, fn, module: str, parents) -> tuple[ast.Call, Sym | None] | None:
         """`@app.get(...)` -> (decorator, None); `@router.get(...)` -> (decorator, router)."""
         found = None
-        for d in fn.decorator_list:
+        for d in [x for dd in fn.decorator_list for x in self._expand(dd)]:
             if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS):
                 continue
             if self._is_app(module, d.func.value):
@@ -842,7 +867,7 @@ class Frontend:
         """Every HTTP route decorator of the function, in registration order (the lowest first: Python applies
         decorators bottom up, each registers the function once more)."""
         out = []
-        for d in reversed(fn.decorator_list):
+        for d in [x for dd in reversed(fn.decorator_list) for x in self._expand(dd)]:
             if not (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_METHODS):
                 continue
             if self._is_app(module, d.func.value):

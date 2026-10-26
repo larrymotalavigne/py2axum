@@ -1,2 +1,3 @@
-- Several route decorators on one endpoint (`@app.get("/a")` over `@app.post("/b")`): one route each, the lowest
-  decorator registered first, each with its own options.
+- `@router.head(...)`, `@router.options(...)` and `@router.api_route(path, methods=[...])` (a literal list, GET when
+  omitted: one route per method) are translated. An `app.mount(...)` followed by routes stays on the Python side
+  when none of those routes can match a path under its prefix (the registration order does not matter then).

@@ -883,6 +883,10 @@ STEPS += [
     ("POST", "/fa156/nullembed", {"item": {"name": "i"}, "k": "3"}),
     ("POST", "/fa156/nullembed", [1]),
     ("GET", "/fa156/nan", None),
+    ("HEAD", "/fa156/probe", None), ("GET", "/fa156/probe", None), ("OPTIONS", "/fa156/probe", None),
+    ("POST", "/fa156/probe", None),
+    ("GET", "/fa156/multi/3", None), ("POST", "/fa156/multi/4", None), ("PUT", "/fa156/multi/4", None), ("GET", "/fa156/multi/x", None),
+    ("GET", "/fa156/onlyget", None), ("POST", "/fa156/onlyget", None),
     ("GET", "/fa156/nan?n=0", None),
     *[("POST", path, *_multipart(parts)) for path, parts in [
         ("/fa156/upload", [("file", "", None, b""), ("files", "", None, b""), ("note", "n")]),

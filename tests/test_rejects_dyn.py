@@ -2327,11 +2327,15 @@ async def x():
         ('app.mount("/sub", sub)', "", [], "app.mount(...) is not translated: as the app's last registration "
          "it can stay on the Python side (--python-side mount, or --python-side auto)", 16),
         # a route after it would be shadowed in Python but served by the binary
-        ('app.mount("/sub", sub)\n\n\n@app.get("/y")\nasync def y():\n    return {}',
+        ('app.mount("/sub", sub)\n\n\n@app.get("/sub/y")\nasync def y():\n    return {}',
          "", ["--python-side", "mount"], "`app.get(...)` at ", 16),
-        ('app.mount("/sub", sub)\napp.add_api_route("/y", x)', "", ["--python-side", "mount"], "`app.add_api_route(...)` at ", 16),
-        ('def setup():\n    app.mount("/sub", sub)', "", ["--python-side", "mount"], "is in another function", 17),
-        ('app.mount("/sub", sub)', "from fastapi import APIRouter\n\nfrom .main import app\n\n\n@app.get('/z')\nasync def z():\n"
+        ('app.mount("/sub", sub)\n\n\n@app.get("/{name}")\nasync def y(name: str):\n    return {}',
+         "", ["--python-side", "mount"], "`app.get(...)` at ", 16),
+        ('app.mount("/sub", sub)\napp.add_api_route("/sub", x)', "", ["--python-side", "mount"], "`app.add_api_route(...)` at ", 16),
+        # a route after it that cannot match under its prefix: the order does not matter
+        ('app.mount("/sub", sub)\n\n\n@app.get("/y")\nasync def y():\n    return {}', "", ["--python-side", "mount"], None, None),
+        ('def setup():\n    app.mount("/", sub)', "", ["--python-side", "mount"], "is in another function", 17),
+        ('app.mount("/sub", sub)', "from fastapi import APIRouter\n\nfrom .main import app\n\n\n@app.get('/sub/z')\nasync def z():\n"
          "    return {}\n", ["--python-side", "mount"], "is in another module", 16),
     ],
 )
@@ -5386,11 +5390,27 @@ def test_endpoint_decorator_left_to_python(tmp_path):
     assert main([str(pkg), "--root", str(tmp_path), "--python-side", "auto", "-o", str(tmp_path / "out")]) == 0
 
 
-@pytest.mark.parametrize("decorator", ['@app.api_route("/x", methods=["GET", "POST"])', '@app.head("/x")',
-                                       '@router.options("/x")', '@app.trace("/x")', '@app.route("/x")'])
+@pytest.mark.parametrize("decorator", ['@app.api_route("/x", methods=["GET", "POST"])', '@app.api_route("/x")',
+                                       '@app.head("/x")', '@app.options("/x")'])
+def test_other_route_decorators_translated(tmp_path, decorator):
+    """`api_route` with a literal list of methods (GET when omitted) is one route per method; `head` and `options`
+    routes are routes like the others"""
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "main.py").write_text(DECO_MAIN.format(endpoint=f"{decorator}\nasync def x():\n    return {{\"x\": 1}}"))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 0
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    methods = ["GET", "POST"] if "methods" in decorator else ["HEAD"] if "head" in decorator else \
+        ["OPTIONS"] if "options" in decorator else ["GET"]
+    for meth in methods:
+        assert f'method: "{meth}"' in gen
+
+
+@pytest.mark.parametrize("decorator", ['@app.api_route("/x", methods=list(("GET",)))', '@app.trace("/x")', '@app.route("/x")'])
 def test_untranslated_route_decorator_rejected(tmp_path, capsys, decorator):
-    """route decorators outside get/post/put/patch/delete/websocket left the function unregistered: the binary
-    answered 404/405 where FastAPI served the route. Refused (P2A0318)."""
+    """route decorators outside get/post/put/patch/delete/head/options/websocket (and api_route with literal methods)
+    left the function unregistered: the binary answered 404/405 where FastAPI served the route. Refused (P2A0318)."""
     pkg = tmp_path / "proj"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
