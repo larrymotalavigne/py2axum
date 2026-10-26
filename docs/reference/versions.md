@@ -88,6 +88,21 @@ Other pydantic 2.14 changes concern constructs py2axum refuses (`multiple_of`, `
 (`model_validate_json`): a `Decimal` from a 3-item array (`Decimal((sign, digits, exponent))`) and an Enum
 with a `None` member (2.13 returns it for any unknown JSON value) are not reproduced.
 
+FastAPI behaviours that follow the project's version (request handling changed release by release from 0.144 to
+0.156; `fixtures/langapp/fa156.py` runs each case on both sides):
+
+| From | Behaviour |
+|---|---|
+| 0.144 | a non-finite float in a JSON Lines or SSE item without an item model is `null` (was `NaN`); a text field among the files of a `list[bytes]` parameter is kept (was a 500) |
+| 0.147 | a `bool` (or `bool \| None`) form field missing from the form is `False`, its default ignored (an unchecked checkbox) |
+| 0.148 | defaults are applied at validation: a missing parameter's default is not validated (`AfterValidator`s and conversions skip it), and a parameter model's absent fields are left out of its input (the model's own defaults apply) |
+| 0.149 | an empty form value is absent for the fields of a form model too |
+| 0.150 | an empty file input (empty filename, no content) is absent, and left out of a list of files |
+| 0.151 | a JSON `null` body is a value: validated against a single body parameter, each field missing for an embedded body; a `null` field of an embedded body is validated (was its default) |
+| 0.152 | the errors of a header model name the headers (`save-data`), not the fields (`save_data`) |
+
+Starlette 1.8 compares host names case-insensitively in `TrustedHostMiddleware`.
+
 WebSocket routes reproduce Starlette 1.7
 (`WebSocketDisconnected`): a project declaring them needs `starlette>=1.7.0`. Below the lowest versions, the
 differences found were FastAPI's security schemes (401 vs 403, credential stripping), empty `Form` strings and
