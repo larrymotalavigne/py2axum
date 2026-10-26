@@ -924,7 +924,7 @@ def test_form_in_dependency_rejected(tmp_path, capsys):
         ("from fastapi.middleware import Middleware\nfrom fastapi.middleware.gzip import GZipMiddleware\n"
          "app.add_middleware(GZipMiddleware)\napp2 = FastAPI(middleware=[Middleware(GZipMiddleware)])\n",
          "GZipMiddleware registered twice is not supported"),
-        # a list changed after its definition is not read statically (an unchanged one is: test_fopd_patterns)
+        # a list changed after its definition is not read statically (an unchanged one is: test_fleet_patterns)
         ("mws = []\nmws.append(None)\napp2 = FastAPI(middleware=mws)\n",
          "FastAPI(middleware=...) must be a literal list of Middleware(...)"),
         ("from starlette_context import plugins\nfrom starlette_context.middleware import RawContextMiddleware\n"
