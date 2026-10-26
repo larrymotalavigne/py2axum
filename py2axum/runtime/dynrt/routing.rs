@@ -55,6 +55,33 @@ pub enum RObj {
 }
 
 static APP: OnceLock<&'static RouterDef> = OnceLock::new();
+/// FastAPI's docs routes when its `*_url` options are read at startup (not literals): set once by `set_docs`
+static DOCS: OnceLock<Vec<&'static Node>> = OnceLock::new();
+
+/// `FastAPI.setup()`: the docs routes its options add (openapi_url, then docs_url and its oauth2 redirect,
+/// then redoc_url), from the options' values read at startup
+pub fn set_docs(openapi: &V, docs: &V, redirect: &V, redoc: &V) -> R<()> {
+    let s = |v: &V| -> R<Option<String>> { if super::ops::truthy(v)? { Ok(Some(super::ops::str_(v)?)) } else { Ok(None) } };
+    let mut out: Vec<&'static Node> = Vec::new();
+    let mut add = |path: String, name: &'static str| {
+        let pattern: &'static str = Box::leak(format!("^{}$", regex::escape(&path)).into_boxed_str());
+        out.push(Box::leak(Box::new(Node::Starlette { path: Box::leak(path.into_boxed_str()), pattern, name })));
+    };
+    if let Some(o) = s(openapi)? {
+        add(o, "openapi");
+        if let Some(d) = s(docs)? {
+            add(d, "swagger_ui_html");
+            if let Some(r) = s(redirect)? {
+                add(r, "swagger_ui_redirect");
+            }
+        }
+        if let Some(r) = s(redoc)? {
+            add(r, "redoc_html");
+        }
+    }
+    let _ = DOCS.set(out);
+    Ok(())
+}
 static ADDED: RwLock<Vec<Arc<Added>>> = RwLock::new(Vec::new());
 /// the middlewares `app.add_middleware` registers while the stack is being built
 static BUILD: Mutex<Option<Vec<Mw>>> = Mutex::new(None);
@@ -293,7 +320,11 @@ fn routes_of(r: &'static RouterDef, app: bool) -> R {
     if !r.error.is_empty() {
         return Err(Exc::type_error(r.error));
     }
-    let mut out: Vec<V> = r.routes.iter().map(|n| obj(RObj::Node(n))).collect();
+    let mut out: Vec<V> = Vec::new();
+    if app {
+        out.extend(DOCS.get().into_iter().flatten().map(|n| obj(RObj::Node(n))));
+    }
+    out.extend(r.routes.iter().map(|n| obj(RObj::Node(n))));
     if app {
         out.extend(ADDED.read().iter().map(|a| obj(RObj::Added(a.clone()))));
     }

@@ -13745,19 +13745,39 @@ def route_tree(p: "Project", fe: Frontend) -> tuple[str, dict]:
     return "\n".join(items), nodes
 
 
-def fastapi_docs_routes(fe: Frontend) -> tuple[list[tuple[str, str]] | None, str]:
-    """The routes `FastAPI(...)` adds for its documentation, with its literal `*_url` options (else None and
-    the error raised when the routes are inspected)."""
-    opts = {"openapi_url": "/openapi.json", "docs_url": "/docs", "redoc_url": "/redoc",
-            "swagger_ui_oauth2_redirect_url": "/docs/oauth2-redirect"}
+DOCS_URL_DEFAULTS = {"openapi_url": "/openapi.json", "docs_url": "/docs", "swagger_ui_oauth2_redirect_url": "/docs/oauth2-redirect",
+                     "redoc_url": "/redoc"}
+
+
+def fastapi_docs_options(fe: Frontend) -> tuple[str, dict] | None:
+    """`FastAPI(docs_url=None if SETTINGS.is_production() else "/", ...)`: (module, {option: expression}) of the
+    application's `*_url` options when one is not a literal (read at startup, routing::set_docs), else None."""
     for m in fe.index.package_modules():
+        if fe.app_vars and m.name not in fe.app_vars:
+            continue
+        for node in ast.walk(m.tree):
+            if (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call)
+                    and is_ext(fe.index.resolve_expr(m.name, node.value.func), "fastapi.FastAPI")):
+                kws = {k.arg: k.value for k in node.value.keywords if k.arg in DOCS_URL_DEFAULTS}
+                if any(not isinstance(v, ast.Constant) for v in kws.values()):
+                    return m.name, kws
+    return None
+
+
+def fastapi_docs_routes(fe: Frontend) -> tuple[list[tuple[str, str]] | None, str]:
+    """The routes `FastAPI(...)` adds for its documentation, with its literal `*_url` options (else none here:
+    read at startup, fastapi_docs_options)."""
+    opts = dict(DOCS_URL_DEFAULTS)
+    for m in fe.index.package_modules():
+        if fe.app_vars and m.name not in fe.app_vars:
+            continue
         for node in ast.walk(m.tree):
             if (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call)
                     and is_ext(fe.index.resolve_expr(m.name, node.value.func), "fastapi.FastAPI")):
                 for k in node.value.keywords:
                     if k.arg in opts:
                         if not isinstance(k.value, ast.Constant):
-                            return None, f"py2axum: app.routes needs a literal FastAPI({k.arg}=) ({m.path}:{k.value.lineno})"
+                            return [], ""
                         opts[k.arg] = k.value.value
     out = []
     if opts["openapi_url"]:
@@ -14070,9 +14090,29 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
         for r in routes:
             c = route_conds.get(id(r), ())
             off.append("false" if not c else "!(" + " && ".join(f"{'' if b else '!'}__c[{k}]" for k, b in c) + ")")
+    docs_init = ""
+    if (dopts := fastapi_docs_options(fe)) is not None and not relay:
+        dmod, kws = dopts
+        proj.cur = ("docs", 0)
+        fc = FnCompiler(proj, dmod, None, "docs_urls")
+        try:
+            vals = [fc.expr(kws[k]) if k in kws else ("V::None" if v is None else f"V::str({rs(v)})")
+                    for k, v in DOCS_URL_DEFAULTS.items()]
+            body = "\n".join("    " + l for l in fc.lines)
+            proj.items.append(f"/// FastAPI's docs routes, from its `*_url` options read at startup\n"
+                              f"async fn docs_urls(cx: &Cx) -> R<()> {{\n{body}\n    {RT}::routing::set_docs("
+                              + ", ".join(f"&{v}" for v in vals) + ")\n}")
+            proj.drain()
+            docs_init = "    docs_urls(cx).await?;\n"
+        except TranspileError as e:
+            if not collect:
+                raise
+            fe.global_errors.append(e)
+        finally:
+            proj.cur = None
     proj.items.append(
         "/// The runtime `include_router(prefix=...)` values, read once the module globals are set.\n"
-        "pub async fn init_prefixes(cx: &Cx) -> R<()> {\n"
+        "pub async fn init_prefixes(cx: &Cx) -> R<()> {\n" + docs_init +
         f"    {RT}::web::set_prefixes(vec![" + "".join(
             f"({f}(cx).await?, {'Some(' + rs(empty_under[i]) + ')' if i in empty_under else 'None'}), "
             for i, f in enumerate(prefix_fns)) + "])?;\n"

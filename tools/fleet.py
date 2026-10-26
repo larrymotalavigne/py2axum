@@ -15,7 +15,6 @@ import argparse
 import json
 import subprocess
 import sys
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 

@@ -13,7 +13,9 @@ FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)")
 # (file, enclosing function): each one caches what it leaks, keyed by the value
 ALLOWED = {("types.rs", "schema_td"), ("types.rs", "intern"), ("types.rs", "td_of"), ("v.rs", "psycopg_class"),
            # pytz's table, read once; dateutil: a tzoffset name, a zone file (per path and contents), a tzstr string
-           ("pytzrt.rs", "str"), ("dutz.rs", "name_code"), ("dutz.rs", "register")}
+           ("pytzrt.rs", "str"), ("dutz.rs", "name_code"), ("dutz.rs", "register"),
+           # FastAPI's docs routes from non-literal *_url options: built once at startup (a OnceLock)
+           ("routing.rs", "set_docs")}
 
 
 def leaks() -> list[tuple[str, str, int]]:
