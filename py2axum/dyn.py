@@ -12938,9 +12938,31 @@ def mw_entries(fe: Frontend, module: str, call: ast.Call) -> list | None:
         lit = _single_list_binding(fe, module, call, kw.value)
         if lit is not None:
             return list(lit.elts)
+    if isinstance(kw.value, ast.Call) and not kw.value.args and not kw.value.keywords:
+        lit = _returned_list(fe, module, kw.value.func)
+        if lit is not None:
+            return list(lit.elts)
     if not isinstance(kw.value, (ast.List, ast.Tuple)):
         raise TranspileError("FastAPI(middleware=...) must be a literal list of Middleware(...)", kw.value, str(fe.index.module(module).path))
     return list(kw.value.elts)
+
+
+def _returned_list(fe: Frontend, module: str, func: ast.AST) -> ast.List | None:
+    """`make_middleware()`: a function of the same module without parameters whose body only returns a list literal
+    (`return [...]`, or `x = [...]` then `return x`)"""
+    t = fe.index.resolve_expr(module, func)
+    d = fe.index.definition(t) if isinstance(t, Sym) and t.module == module else None
+    if not isinstance(d, ast.FunctionDef) or d.decorator_list or d.args.args or d.args.vararg or d.args.kwonlyargs or d.args.kwarg:
+        return None
+    body = [st for st in d.body if not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))]
+    if len(body) == 1 and isinstance(body[0], ast.Return) and isinstance(body[0].value, ast.List):
+        return body[0].value
+    if (len(body) == 2 and isinstance(body[0], ast.Assign) and len(body[0].targets) == 1
+            and isinstance(body[0].targets[0], ast.Name) and isinstance(body[0].value, ast.List)
+            and isinstance(body[1], ast.Return) and isinstance(body[1].value, ast.Name)
+            and body[1].value.id == body[0].targets[0].id):
+        return body[0].value
+    return None
 
 
 def session_mw_options(p: "Project", module: str, call: ast.Call) -> None:

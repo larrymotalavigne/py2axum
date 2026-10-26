@@ -1,0 +1,1 @@
+- `FastAPI(middleware=make_middleware())`: a function of the module that returns a list of `Middleware(...)`.

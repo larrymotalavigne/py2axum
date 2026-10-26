@@ -728,3 +728,30 @@ async def x():
 '''
     pkg = project(tmp_path, src)
     generate(tmp_path, pkg)
+
+
+def test_middleware_list_from_a_factory(tmp_path):
+    """`FastAPI(middleware=make_middleware())`: a function of the module returning a list of Middleware(...)."""
+    src = '''
+from fastapi import FastAPI
+from fastapi.middleware import Middleware
+from fastapi.middleware.cors import CORSMiddleware
+
+
+def make_middleware() -> list[Middleware]:
+    middleware = [
+        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"]),
+    ]
+    return middleware
+
+
+app = FastAPI(middleware=make_middleware())
+
+
+@app.get("/x")
+async def x():
+    return {"ok": True}
+'''
+    pkg = project(tmp_path, src)
+    main_rs = generate(tmp_path, pkg)
+    assert "Cors::new" in main_rs or "Cors::new" in (tmp_path / "out" / "src" / "gen.rs").read_text()
