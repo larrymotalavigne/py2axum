@@ -104,4 +104,9 @@ The same rules apply in a cluster:
 - Request bodies are not capped by default: cap them at the ingress or with `PY2AXUM_MAX_BODY`
   ([Security § Request input](security.md#request-input)).
 
+[`examples/kubernetes/bookshelf.yaml`](https://github.com/larrymotalavigne/py2axum/blob/main/examples/kubernetes/bookshelf.yaml)
+puts these together for the bookshelf example: a Deployment whose pod runs the binary and the uvicorn sidecar
+(on the pod's loopback), the Service on the binary's port only, health probes on `/health`, the shared settings
+in one Secret, and a Job standing for the migrations.
+
 A smaller, fully native example with its own Dockerfile is in [`examples/notes`](https://github.com/larrymotalavigne/py2axum/tree/main/examples/notes).

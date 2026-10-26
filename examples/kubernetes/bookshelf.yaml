@@ -1,0 +1,97 @@
+# The bookshelf example in hybrid mode on Kubernetes: one pod runs the binary (the only port the Service exposes)
+# and the uvicorn sidecar for the routes left to Python, reachable from the binary only (127.0.0.1:8000).
+# The images are the two of examples/docker (Dockerfile, Dockerfile.python), pushed to your registry:
+#   kubectl apply -f examples/kubernetes/bookshelf.yaml
+# PostgreSQL is not part of it: DATABASE_URL points at yours. The binary does not create tables: run your
+# migrations first (the Job at the end stands for them).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bookshelf
+type: Opaque
+stringData:
+  # both processes read the same settings: they sign and verify the same tokens
+  DATABASE_URL: postgresql+psycopg://bookshelf:change-me@postgres.default.svc/bookshelf
+  BOOKSHELF_SECRET: change-me-in-production-0123456789
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bookshelf
+  labels: {app: bookshelf}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: bookshelf}
+  template:
+    metadata:
+      labels: {app: bookshelf}
+    spec:
+      # above PY2AXUM_SHUTDOWN_TIMEOUT (25 s by default): the binary closes its streams itself before the SIGKILL
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: registry.example.com/bookshelf-api:1.0.0       # examples/docker/Dockerfile
+          ports:
+            - {name: http, containerPort: 8080}
+          envFrom:
+            - secretRef: {name: bookshelf}
+          env:
+            - {name: PY2AXUM_PYTHON_URL, value: "http://127.0.0.1:8000"}
+            - {name: PY2AXUM_MAX_BODY, value: "10485760"}       # or cap request bodies at the ingress
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+        - name: python
+          image: registry.example.com/bookshelf-python:1.0.0    # examples/docker/Dockerfile.python
+          # the pod's loopback only; X-Forwarded-* trusted from the relay alone when clients can reach the
+          # binary directly (docs/advanced/security.md, hybrid deployments)
+          command: ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000", "--forwarded-allow-ips", ""]
+          envFrom:
+            - secretRef: {name: bookshelf}
+          readinessProbe:
+            tcpSocket: {port: 8000}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            runAsUser: 65534                                     # the image's `nobody`
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bookshelf
+spec:
+  selector: {app: bookshelf}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+---
+# Stands for your migrations (`alembic upgrade head` in the Python image, for instance), run before a rollout
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bookshelf-migrate
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: registry.example.com/bookshelf-python:1.0.0
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef: {name: bookshelf}
