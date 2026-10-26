@@ -5234,7 +5234,7 @@ class Project:
             m = self.ix.module(module)
             body = m.tree.body
             found = []
-            for n, bs in m.binders.items():
+            for bs in m.binders.values():
                 if len(bs) < 2 or not all(any(b is st for st in body) for b in bs):
                     continue
                 idx = [next(i for i, st in enumerate(body) if st is b) for b in bs]
