@@ -10,7 +10,7 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import colls, construct, cp, corpusx, decoprops, decos, docsx, dunders, edges, extras, fa156, kwargs, modspan, ormx, pk, procx, pydcorpus, pydmore, pydv1, pyver, rds, realworld, sec, silent, stdmore
+from . import colls, construct, cp, corpusx, decoprops, decos, docsx, dunders, edges, extras, fa156, kwargs, pubapps, modspan, ormx, pk, procx, pydcorpus, pydmore, pydv1, pyver, rds, realworld, sec, silent, stdmore
 
 app = FastAPI()
 app.include_router(decos.router)
@@ -38,6 +38,7 @@ app.include_router(ormx.router)
 app.include_router(construct.router)
 app.include_router(silent.router)
 app.include_router(fa156.router)
+app.include_router(pubapps.router)
 # the syntax of newer Pythons: py2axum folds `sys.version_info` against the project's Python (a 3.12 project never
 # parses these modules)
 if sys.version_info >= (3, 14):

@@ -1892,6 +1892,18 @@ class Project:
                 "multiple_of"}
     IGNORED_KW = {"description", "title", "examples", "example", "json_schema_extra", "deprecated", "include_in_schema",
                   "openapi_examples"}
+    # pydantic 2's `Field()` parameters: any other keyword is an extra, put in `json_schema_extra` (deprecated)
+    PYD_FIELD_PARAMS = {"default", "default_factory", "alias", "alias_priority", "validation_alias", "serialization_alias",
+                        "title", "field_title_generator", "description", "examples", "exclude", "exclude_if",
+                        "discriminator", "deprecated", "json_schema_extra", "frozen", "validate_default", "repr", "init",
+                        "init_var", "kw_only", "pattern", "strict", "coerce_numbers_to_str", "gt", "ge", "lt", "le",
+                        "multiple_of", "allow_inf_nan", "max_digits", "decimal_places", "min_length", "max_length",
+                        "union_mode", "fail_fast", "regex", "min_items", "max_items", "const", "unique_items"}
+
+    def pyd_field_call(self, call: ast.Call, module: str) -> bool:
+        """`call` is pydantic's `Field()` (not FastAPI's Query/Body...)"""
+        t = self.resolve(module, call.func)
+        return isinstance(t, Ext) and t.dotted in {"pydantic.Field", "pydantic.fields.Field", "sqlmodel.Field"}
 
     def field_cons(self, call: ast.Call, module: str, scope=None) -> tuple[dict, dict]:
         """Field()/Query()/Path()/Body()/Header() -> (constraints, options)."""
@@ -1926,6 +1938,8 @@ class Project:
                 pass
             elif kw.arg == "discriminator" and is_field:
                 cons["_disc"] = (kw.value, module)  # the union below it is discriminated (`_union`)
+            elif is_field and kw.arg is not None and kw.arg not in self.PYD_FIELD_PARAMS and self.pyd_field_call(call, module):
+                pass  # `Field(True, nullable=True)`: pydantic's json_schema_extra (the schema only, as json_schema_extra)
             else:
                 raise self.err(f"unsupported option {kw.arg}= in {dotted(call.func)}()", kw, module)
         for k in ("min", "max"):
@@ -2113,7 +2127,13 @@ class Project:
             if isinstance(t, Ext) and t.dotted in self.ENUM_BASES:
                 base_kind = self.ENUM_BASES[t.dotted] or "unsupported"
             elif isinstance(t, Sym) and self.enum_kind(t):
-                raise self.err(f"enum {sym.name}: subclassing an enum is not supported", b, sym.module)
+                if not self.memberless_enum(t):
+                    raise self.err(f"enum {sym.name}: subclassing an enum is not supported (only an enum without "
+                                   "members or methods, as a common base)", b, sym.module)
+                # `class AppEnum(StrEnum): pass` then `class Status(AppEnum)`: Python allows deriving from an enum
+                # without members; the subclass is an enum of the base's kind
+                base_kind = self.enum_kind(t)
+                continue
             elif dotted(b) in {"str", "int"}:
                 mixin = dotted(b)
         if base_kind is None:
@@ -2123,6 +2143,12 @@ class Project:
         if base_kind == "Plain" and mixin:
             return "Str" if mixin == "str" else "Int"
         return base_kind
+
+    def memberless_enum(self, sym: Sym) -> bool:
+        """a project enum class whose body is only a docstring and `pass`/`...` (a base for other enums)"""
+        node = self.ix.definition(sym)
+        return isinstance(node, ast.ClassDef) and not node.keywords and not node.decorator_list and all(
+            isinstance(st, ast.Pass) or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)) for st in node.body)
 
     def enum(self, sym: Sym) -> tuple[str, str, list[str]]:
         if sym in self.enums:

@@ -643,3 +643,67 @@ def remove(item_id: uuid.UUID) -> dict:
     generate(tmp_path, pkg, "--allow-untested-versions")
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "ColTy::UtcDateTime" in gen and "pwd_new(" in gen and 'pwd_hasher("bcrypt"' in gen
+
+
+def test_enum_base_without_members_and_field_extras(tmp_path):
+    """`class AppEnum(StrEnum): pass` as a base of the app's enums (Python allows deriving from an enum without
+    members), and pydantic's `Field(True, nullable=True)` (an extra keyword: json_schema_extra, the schema only)."""
+    src = '''
+from enum import StrEnum
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+
+class AppEnum(StrEnum):
+    """common base"""
+
+    pass
+
+
+class Status(AppEnum):
+    active = "Active"
+    closed = "Closed"
+
+
+class Item(BaseModel):
+    status: Status = Status.active
+    enabled: bool | None = Field(True, nullable=True)
+
+
+app = FastAPI()
+
+
+@app.post("/items")
+async def items(item: Item):
+    return {"status": item.status, "upper": item.status.upper(), "enabled": item.enabled}
+'''
+    pkg = project(tmp_path, src)
+    generate(tmp_path, pkg)
+
+
+def test_enum_base_with_members_still_refused(tmp_path, capsys):
+    src = '''
+from enum import StrEnum
+
+from fastapi import FastAPI
+
+
+class AppEnum(StrEnum):
+    a = "A"
+
+
+class Status(AppEnum):
+    b = "B"
+
+
+app = FastAPI()
+
+
+@app.get("/s")
+async def s(x: Status):
+    return {"x": x}
+'''
+    pkg = project(tmp_path, src)
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "subclassing an enum is not supported" in capsys.readouterr().err
