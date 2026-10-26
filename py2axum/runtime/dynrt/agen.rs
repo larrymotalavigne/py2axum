@@ -222,7 +222,7 @@ pub async fn anext(it: &V) -> R {
 /// a project object calls its `__aiter__`
 pub async fn aiter(cx: &Cx, it: &V) -> R {
     match it {
-        V::Native(n) if matches!(&**n, Native::Gen(_) | Native::WsIter(..) | Native::AsyncItems(_) | Native::AmqpIter(_)) => Ok(it.clone()),
+        V::Native(n) if matches!(&**n, Native::Gen(_) | Native::WsIter(..) | Native::AsyncItems(_) | Native::AmqpIter(_) | Native::RPubSubListen(_)) => Ok(it.clone()),
         V::Inst(_) => super::methods::call_method(cx, it, "__aiter__", vec![], vec![]).await,
         o => Err(Exc::type_error(format!("'async for' requires an object with __aiter__ method, got {}", o.type_name()))),
     }
@@ -238,6 +238,10 @@ pub async fn anext_opt(cx: &Cx, it: &V) -> R<Option<V>> {
         V::Native(n) if matches!(&**n, Native::AmqpIter(_)) => {
             let Native::AmqpIter(a) = &**n else { unreachable!() };
             return super::rmq::iter_next(a).await;
+        }
+        V::Native(n) if matches!(&**n, Native::RPubSubListen(_)) => {
+            let Native::RPubSubListen(p) = &**n else { unreachable!() };
+            return p.listen_next().await;
         }
         V::Native(n) if matches!(&**n, Native::Gen(_)) => anext(it).await,
         V::Native(n) if matches!(&**n, Native::AsyncItems(_)) => {

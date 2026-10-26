@@ -255,6 +255,7 @@ pub async fn aenter(cx: &Cx, v: &V) -> R {
             // `async with Redis(...) as r` / `async with r.pipeline() as pipe` (redis.asyncio)
             Native::Redis(c) if !c.sync => Ok(v.clone()),
             Native::RPipe(p) if !p.client.sync => Ok(v.clone()),
+            Native::RPubSub(_) => Ok(v.clone()),
             Native::AmqpIter(it) => {
                 super::rmq::iter_enter(it).await?;
                 Ok(v.clone())
@@ -386,9 +387,9 @@ pub async fn aexit(cx: &Cx, v: &V, exc: Option<Exc>) -> R {
             super::mcp::log("mcp.server.streamable_http_manager", "StreamableHTTP session manager shutting down", vec![], None);
             Ok(V::Bool(false))
         }
-        V::Native(n) if matches!(&**n, Native::Redis(_) | Native::RPipe(_)) => {
-            // the client closed (`aclose()`), the pipeline reset
-            let name = if matches!(&**n, Native::Redis(_)) { "aclose" } else { "reset" };
+        V::Native(n) if matches!(&**n, Native::Redis(_) | Native::RPipe(_) | Native::RPubSub(_)) => {
+            // the client or pubsub closed (`aclose()`), the pipeline reset
+            let name = if matches!(&**n, Native::RPipe(_)) { "reset" } else { "aclose" };
             call_method(cx, v, name, vec![], vec![]).await?;
             Ok(V::Bool(false))
         }

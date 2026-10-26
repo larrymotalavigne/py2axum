@@ -140,6 +140,7 @@ STEPS: list = [    # dunder methods, hashability, frozen models (fixtures/langap
     ("GET", "/rds/sync-def", None),
     ("POST", "/rds/pipe", None),
     ("POST", "/rds/apool", None),
+    ("POST", "/rds/pubsub", None),
     # collections.defaultdict, string.Formatter, str.format errors (fixtures/langapp/colls.py)
     ("POST", "/colls/count", ["ab", "abc", "b", "bcd", "a"]),
     ("POST", "/colls/count", []),

@@ -186,3 +186,37 @@ async def async_pool():
         except ResponseError as e:
             out.append(str(e))
     return out
+
+
+@router.post("/pubsub")
+async def pubsub():
+    """r.pubsub(): the (un)subscribe confirmations and the messages, read by get_message() and listen()"""
+    out = {}
+    ps = CLIENT.pubsub()
+    try:
+        await ps.get_message()
+    except RuntimeError as e:
+        out["unset"] = str(e)
+    await ps.subscribe("ps:a", "ps:b", "ps:a")
+    await ps.psubscribe(["ev:*"])
+    out["subscribed"] = ps.subscribed
+    msgs = [await ps.get_message(timeout=1.0) for _ in range(3)]
+    out["receivers"] = [await CLIENT.publish("ps:a", "hello"), await CLIENT.publish("ev:x", b"\x01"), await CLIENT.publish("ps:none", 1)]
+    msgs += [await ps.get_message(timeout=1.0) for _ in range(2)]
+    msgs.append(await ps.get_message(timeout=0.05))
+    await ps.unsubscribe("ps:a")
+    msgs.append(await ps.get_message(ignore_subscribe_messages=False, timeout=1))
+    await ps.unsubscribe()
+    await ps.punsubscribe()
+    out["msgs"] = msgs
+    out["rest"] = [m async for m in ps.listen()]
+    out["after"] = ps.subscribed
+    await ps.aclose()
+    async with TEXT.pubsub(ignore_subscribe_messages=True) as t:
+        await t.subscribe("ps:t")
+        out["confirm_ignored"] = await t.get_message(timeout=1.0)
+        await TEXT.publish("ps:t", "é")
+        async for m in t.listen():
+            out["text"] = m
+            break
+    return out

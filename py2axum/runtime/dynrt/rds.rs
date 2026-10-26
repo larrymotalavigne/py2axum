@@ -14,8 +14,8 @@ use super::ops;
 use super::v::*;
 
 pub struct RClient {
-    url: String,
-    decode: bool,
+    pub(super) url: String,
+    pub(super) decode: bool,
     retries: usize,
     /// `redis.Redis` rather than `redis.asyncio.Redis`
     pub sync: bool,
@@ -169,7 +169,7 @@ fn conn_err(e: &redis::RedisError) -> Exc {
 
 /// redis-py's message of an error reply: `ERR` (and the other codes it maps to a class) dropped, the rest kept
 /// (`WRONGTYPE Operation against a key...`)
-fn server_msg(code: &str, detail: Option<&str>) -> String {
+pub(super) fn server_msg(code: &str, detail: Option<&str>) -> String {
     let detail = detail.unwrap_or("");
     const STRIPPED: &[&str] = &["ERR", "OOM", "WRONGPASS", "EXECABORT", "LOADING", "NOSCRIPT", "READONLY", "NOAUTH", "NOPERM",
         "ASK", "TRYAGAIN", "MOVED", "CLUSTERDOWN", "CROSSSLOT", "MASTERDOWN"];
@@ -280,7 +280,7 @@ impl RClient {
 }
 
 /// redis-py's encoder: bytes as is, str as UTF-8, int/float as their repr; other types refused
-fn arg(v: &V) -> R<Vec<u8>> {
+pub(super) fn arg(v: &V) -> R<Vec<u8>> {
     Ok(match v {
         V::Bytes(b) => b.to_vec(),
         V::Str(s) => s.as_bytes().to_vec(),
@@ -389,6 +389,7 @@ fn allowed_kwargs(name: &str) -> &'static [&'static str] {
         "zrange" => &["desc", "withscores"],
         "zrevrange" => &["withscores"],
         "pipeline" => &["transaction"],
+        "pubsub" => &["ignore_subscribe_messages"],
         "expire" | "pexpire" => &["time", "nx", "xx", "gt", "lt"],
         _ => &[],
     }
@@ -713,6 +714,7 @@ pub async fn method(c: &Arc<RClient>, name: &str, args: Vec<V>, kwargs: Vec<(Str
             *c.conn.lock().await = None;
             return Ok(V::None);
         }
+        "pubsub" => return super::rps::new(c, &args, &kwargs),
         "pipeline" => {
             // pipeline(transaction=True, shard_hint=None)
             if args.len() > 1 {

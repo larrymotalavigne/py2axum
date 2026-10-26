@@ -289,6 +289,9 @@ pub enum Native {
     RPool(Arc<super::rds::RPool>),
     /// `r.pipeline()`
     RPipe(Arc<super::rds::RPipe>),
+    /// `r.pubsub()` and its `listen()` (see `rps`)
+    RPubSub(Arc<super::rps::RPubSub>),
+    RPubSubListen(Arc<super::rps::RPubSub>),
     /// the items of an async iterator produced by the runtime (`scan_iter`), read by `async for`
     AsyncItems(Mutex<Option<Vec<V>>>),
     /// `yarl.URL`
@@ -557,6 +560,8 @@ impl V {
                 Native::RRetry(_) => "Retry",
                 Native::RPool(_) => "ConnectionPool",
                 Native::RPipe(_) => "Pipeline",
+                Native::RPubSub(_) => "PubSub",
+                Native::RPubSubListen(_) => "async_generator",
                 Native::AsyncItems(_) => "async_generator",
                 Native::Maker(_, _, false, _) => "async_sessionmaker",
                 Native::Maker(_, _, true, _) => "sessionmaker",

@@ -678,6 +678,7 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::Type(t) if name == "__name__" || name == "__qualname__" => Ok(V::str(t.rsplit('.').next().unwrap_or(t))),
             Native::TThread(t) => super::thread::thread_attr(t, name),
             Native::YarlUrl(u) => super::http::yarl_attr(u, name),
+            Native::RPubSub(p) if name == "subscribed" => Ok(V::Bool(p.subscribed())),
             Native::AmqpConn(c) => super::rmq::conn_attr(c, name),
             Native::AmqpChan(c) => super::rmq::chan_attr(c, name),
             Native::AmqpIncoming(m) => super::rmq::incoming_attr(m, name),
@@ -1335,6 +1336,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
         V::Native(n) if matches!(&**n, Native::RPipe(_)) => {
             let Native::RPipe(p) = &**n else { unreachable!() };
             super::rds::pipe_method(p, recv, name, args, kwargs).await
+        }
+        V::Native(n) if matches!(&**n, Native::RPubSub(_)) => {
+            let Native::RPubSub(p) = &**n else { unreachable!() };
+            super::rps::method(p, name, args, kwargs).await
         }
         V::Native(n) if matches!(&**n, Native::Sem(_)) => {
             let Native::Sem(s) = &**n else { unreachable!() };

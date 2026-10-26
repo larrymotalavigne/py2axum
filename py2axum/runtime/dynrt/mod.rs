@@ -51,6 +51,7 @@ pub mod pickle;
 pub mod qr;
 pub mod proto;
 pub mod rds;
+pub mod rps;
 pub mod rmq;
 pub mod satable;
 pub mod tenacity;
