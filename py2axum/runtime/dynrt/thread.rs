@@ -342,6 +342,22 @@ thread_local! {
     static THREAD_LOOP: std::cell::RefCell<Option<V>> = const { std::cell::RefCell::new(None) };
 }
 
+/// `loop.call_later(...)`'s handle: `cancel()` before the delay keeps the callback from running
+pub struct TimerHandle {
+    pub cancelled: AtomicBool,
+}
+
+pub fn timer_method(t: &TimerHandle, name: &str) -> R {
+    match name {
+        "cancel" => {
+            t.cancelled.store(true, Ordering::SeqCst);
+            Ok(V::None)
+        }
+        "cancelled" => Ok(V::Bool(t.cancelled.load(Ordering::SeqCst))),
+        _ => Err(Exc::attr_error(format!("'TimerHandle' object has no attribute '{name}'"))),
+    }
+}
+
 /// `asyncio.get_running_loop()` / `get_event_loop()`: the loop of the calling thread
 pub fn running_loop() -> R {
     if IDENT.with(|c| c.get()) == 0 {
@@ -372,6 +388,31 @@ pub async fn loop_method(cx: &Cx, recv: &V, l: &Arc<ELoop>, name: &str, args: Ve
                 l.pending.lock().push((cb.clone(), rest.to_vec()));
             }
             Ok(V::None)
+        }
+        "call_later" => {
+            // call_later(delay, callback, *args): a TimerHandle; the callback runs as a task of the loop after the delay
+            let (Some(delay), Some(cb)) = (args.first(), args.get(1)) else {
+                return Err(Exc::type_error("call_later() missing required positional arguments: 'delay' and 'callback'"));
+            };
+            let secs = match delay {
+                V::Int(i) => *i as f64,
+                V::Float(f) => *f,
+                V::Bool(b) => *b as i64 as f64,
+                o => return Err(Exc::type_error(format!("'<' not supported between instances of '{}' and 'int'", o.type_name()))),
+            };
+            let handle = Arc::new(TimerHandle { cancelled: AtomicBool::new(false) });
+            let (h, cx2, cb, rest) = (handle.clone(), cx.clone(), cb.clone(), args[2..].to_vec());
+            tokio::spawn(async move {
+                if secs > 0.0 {
+                    tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+                }
+                if !h.cancelled.load(Ordering::SeqCst) {
+                    if let Err(e) = super::web::spawn_task(&cx2, cb, rest, vec![]) {
+                        super::logging::emit_sync("asyncio", super::logging::ERROR, "Exception in callback", vec![], vec![], Some(e), &super::logging::NO_LOC);
+                    }
+                }
+            });
+            Ok(V::native(Native::Timer(handle)))
         }
         "run_forever" => {
             if l.id == 0 {

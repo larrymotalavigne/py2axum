@@ -310,6 +310,9 @@ VALUES: dict[str, str] = {
     "sqlalchemy.null": "V::None",
     **{f"sqlalchemy.{t}": f'V::str("{t}")' for t in ("String", "Text", "Unicode", "Integer", "BigInteger", "Float", "Date", "Boolean", "Numeric")},
     "os.environ": f"{RT}::libs::environ()",
+    # redis connection classes (`connection_class=` of a pool)
+    **{f"redis.{m}{c}": f'V::native({RT}::Native::ExtType("redis.{"asyncio." if m.startswith("asyncio") else ""}connection.{c}"))'
+       for m in ("", "connection.", "asyncio.", "asyncio.connection.") for c in ("Connection", "SSLConnection")},
     **{f"orjson.{k}": f"V::Int({v})" for k, v in (
         ("OPT_APPEND_NEWLINE", 1024), ("OPT_INDENT_2", 1), ("OPT_NAIVE_UTC", 2), ("OPT_NON_STR_KEYS", 4),
         ("OPT_OMIT_MICROSECONDS", 8), ("OPT_PASSTHROUGH_DATACLASS", 2048), ("OPT_PASSTHROUGH_DATETIME", 512),
@@ -1806,6 +1809,11 @@ def status_constant(dotted: str) -> int | None:
 # --- calls whose template receives the run-time vectors (args: Vec<V>, kwargs: Vec<(String, V)>) ---
 DYN_ARGS = {
     "asyncio.gather": lambda a, kw: f"{RT}::aio::gather({a}, &{kw}).await",
+    # redis clients and pools, also as values called with keyword arguments (`pool_class(host=..., ...)`, aiocache)
+    **{n: (lambda sync: lambda a, kw: f"{RT}::rds::new(&{a}, &{kw}, {sync})")(
+        "false" if n.startswith("redis.asyncio") else "true") for n in REDIS_CLIENTS},
+    **{f"redis.{m}ConnectionPool": (lambda sync: lambda a, kw: f"{RT}::rds::pool_new(&{a}, &{kw}, {sync})")(
+        "false" if m.startswith("asyncio") else "true") for m in ("", "connection.", "asyncio.", "asyncio.connection.")},
     "asyncio.as_completed": lambda a, kw: f"{RT}::aio::as_completed(cx, {a}, &{kw})",
     "asyncio.Semaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",
     "asyncio.BoundedSemaphore": lambda a, kw: f"{RT}::aio::semaphore(&{a}, &{kw})",

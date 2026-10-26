@@ -85,6 +85,38 @@ pub fn pool_from_url(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
     Ok(V::native(Native::RPool(Arc::new(RPool { url, options, sync }))))
 }
 
+/// the URL of `host=`, `port=`, `db=`, `username=`, `password=` (and `connection_class=SSLConnection`: rediss), the
+/// other options left
+fn url_of(kwargs: &[(String, V)]) -> R<(String, Vec<(String, V)>)> {
+    let s = |k: &str, d: &str| -> R<String> { kw(kwargs, k).filter(|v| !v.is_none()).map(ops::str_).transpose().map(|x| x.unwrap_or_else(|| d.into())) };
+    let (host, port, db) = (s("host", "localhost")?, s("port", "6379")?, s("db", "0")?);
+    let auth = match (kw(kwargs, "username").filter(|v| !v.is_none()), kw(kwargs, "password").filter(|v| !v.is_none())) {
+        (Some(u), Some(p)) => format!("{}:{}@", ops::str_(u)?, ops::str_(p)?),
+        (None, Some(p)) => format!(":{}@", ops::str_(p)?),
+        _ => String::new(),
+    };
+    let scheme = match kw(kwargs, "connection_class") {
+        None | Some(V::None) => "redis",
+        Some(V::Native(n)) if matches!(&**n, Native::ExtType(t) if t.ends_with("SSLConnection")) => "rediss",
+        Some(V::Native(n)) if matches!(&**n, Native::ExtType(t) if t.ends_with(".Connection")) => "redis",
+        Some(_) => return Err(Exc::type_error("py2axum: redis connection_class= other than Connection/SSLConnection is not supported")),
+    };
+    let rest: Vec<(String, V)> = kwargs.iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "host" | "port" | "db" | "password" | "username" | "connection_class"))
+        .cloned().collect();
+    Ok((format!("{scheme}://{auth}{host}:{port}/{db}"), rest))
+}
+
+/// `ConnectionPool(host=, port=, db=, password=, ..., connection_class=)` (keyword arguments): the clients built on it
+pub fn pool_new(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error("py2axum: ConnectionPool() takes keyword arguments only"));
+    }
+    let (url, options) = url_of(kwargs)?;
+    check_options(&options)?;
+    Ok(V::native(Native::RPool(Arc::new(RPool { url, options, sync }))))
+}
+
 /// `redis.asyncio.Redis(host="localhost", port=6379, db=0, password=None, username=None, ...)` (sync: `redis.Redis`);
 /// `Redis(connection_pool=pool)`: the pool's URL and options (redis-py ignores the client's other options then)
 pub fn new(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
@@ -104,16 +136,8 @@ pub fn new(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
         }
         return client(pool.url.clone(), &pool.options, sync);
     }
-    let s = |k: &str, d: &str| -> R<String> { kw(kwargs, k).filter(|v| !v.is_none()).map(ops::str_).transpose().map(|x| x.unwrap_or_else(|| d.into())) };
-    let (host, port, db) = (s("host", "localhost")?, s("port", "6379")?, s("db", "0")?);
-    let auth = match (kw(kwargs, "username").filter(|v| !v.is_none()), kw(kwargs, "password").filter(|v| !v.is_none())) {
-        (Some(u), Some(p)) => format!("{}:{}@", ops::str_(u)?, ops::str_(p)?),
-        (None, Some(p)) => format!(":{}@", ops::str_(p)?),
-        _ => String::new(),
-    };
-    let rest: Vec<(String, V)> =
-        kwargs.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "port" | "db" | "password" | "username")).cloned().collect();
-    client(format!("redis://{auth}{host}:{port}/{db}"), &rest, sync)
+    let (url, rest) = url_of(kwargs)?;
+    client(url, &rest, sync)
 }
 
 /// `Retry(backoff, retries)` (`redis.asyncio.retry`): the number of retries is kept
@@ -365,6 +389,7 @@ fn allowed_kwargs(name: &str) -> &'static [&'static str] {
         "zrange" => &["desc", "withscores"],
         "zrevrange" => &["withscores"],
         "pipeline" => &["transaction"],
+        "expire" | "pexpire" => &["time", "nx", "xx", "gt", "lt"],
         _ => &[],
     }
 }
@@ -432,11 +457,83 @@ fn build(name: &str, args: &[V], kwargs: &[(String, V)]) -> R<Built> {
             let amount = a.get(1).cloned().or_else(|| k("amount")).unwrap_or(V::Int(1));
             plain(words(if name.starts_with("incr") { "INCRBY" } else { "DECRBY" }, &[a[0].clone(), amount])?)
         }
-        "expire" => {
-            let [key, t] = need(args, 2, name, &["name", "time"])? else { unreachable!() };
-            let mut w = words("EXPIRE", std::slice::from_ref(key))?;
-            w.push(seconds(t)?.to_string().into_bytes());
+        "expire" | "pexpire" => {
+            // expire(name, time, nx=False, xx=False, gt=False, lt=False): seconds (pexpire: milliseconds), an int or a
+            // timedelta
+            let given: Vec<V> = match (args.len(), k("time")) {
+                (1, Some(t)) => vec![args[0].clone(), t],
+                _ => args.to_vec(),
+            };
+            let [key, t] = need(&given, 2, name, &["name", "time"])? else { unreachable!() };
+            let mut w = words(&name.to_ascii_uppercase(), std::slice::from_ref(key))?;
+            let n = match (name, t) {
+                ("pexpire", V::Delta(d)) => super::dt::micros(d).div_euclid(1000),
+                ("pexpire", V::Int(i)) => *i,
+                ("pexpire", o) => return Err(Exc::type_error(format!("py2axum: pexpire() time must be an int or a timedelta, not {}", o.type_name()))),
+                _ => seconds(t)?,
+            };
+            w.push(n.to_string().into_bytes());
+            for (opt, word) in [("nx", "NX"), ("xx", "XX"), ("gt", "GT"), ("lt", "LT")] {
+                if flag(opt)? {
+                    w.push(word.as_bytes().to_vec());
+                }
+            }
             Ok(Built { words: w, post: Post::Bool })
+        }
+        "psetex" => {
+            // psetex(name, time_ms, value): milliseconds, an int or a timedelta
+            let [key, t, val] = need(args, 3, name, &["name", "time_ms", "value"])? else { unreachable!() };
+            let ms = match t {
+                V::Delta(d) => super::dt::micros(d).div_euclid(1000),
+                V::Int(i) => *i,
+                o => return Err(Exc::type_error(format!("py2axum: psetex() time_ms must be an int or a timedelta, not {}", o.type_name()))),
+            };
+            let mut w = words("PSETEX", std::slice::from_ref(key))?;
+            w.push(ms.to_string().into_bytes());
+            w.push(arg(val)?);
+            Ok(Built { words: w, post: Post::Bool })
+        }
+        "pfadd" => {
+            if args.is_empty() {
+                need(args, 1, name, &["name"])?;
+            }
+            plain(words("PFADD", args)?)
+        }
+        "pfcount" => {
+            if args.is_empty() {
+                return Err(Exc::msg(&REDIS_RESPONSE_ERROR, "wrong number of arguments for 'pfcount' command"));
+            }
+            plain(words("PFCOUNT", args)?)
+        }
+        "eval" => {
+            // eval(script, numkeys, *keys_and_args): the reply as is
+            if args.len() < 2 {
+                need(args, 2, name, &["script", "numkeys"])?;
+            }
+            plain(words("EVAL", args)?)
+        }
+        "execute_command" => {
+            // the command's words as given; the reply through redis-py's callback of that command (RESP2)
+            let Some(first) = args.first() else {
+                return Err(Exc::type_error("py2axum: execute_command() needs the command name"));
+            };
+            let cmd = ops::str_(first)?.to_ascii_uppercase();
+            let post = match cmd.as_str() {
+                "AUTH" | "COPY" | "EXPIRE" | "EXPIREAT" | "HEXISTS" | "HMSET" | "MOVE" | "MSETNX" | "PERSIST" | "PSETEX" | "PEXPIRE"
+                | "PEXPIREAT" | "RENAMENX" | "SETEX" | "SETNX" | "SMOVE" => Post::Bool,
+                "ASKING" | "FLUSHALL" | "FLUSHDB" | "LSET" | "LTRIM" | "MSET" | "PFMERGE" | "READONLY" | "READWRITE" | "RENAME" | "SAVE"
+                | "SELECT" | "SHUTDOWN" | "SLAVEOF" | "SWAPDB" | "WATCH" | "UNWATCH" => Post::Ok_,
+                "PING" => Post::Ping,
+                "HGETALL" => Post::Dict,
+                "SMEMBERS" | "SDIFF" | "SINTER" | "SUNION" => Post::Set,
+                "INCRBYFLOAT" | "HINCRBYFLOAT" | "ZSCORE" => Post::Float,
+                _ => Post::Plain,
+            };
+            let mut w = vec![cmd.into_bytes()];
+            for a in &args[1..] {
+                w.push(arg(a)?);
+            }
+            Ok(Built { words: w, post })
         }
         "persist" => Ok(Built { words: words("PERSIST", need(args, 1, name, &["name"])?)?, post: Post::Bool }),
         "keys" => {

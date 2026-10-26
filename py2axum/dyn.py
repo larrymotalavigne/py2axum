@@ -5989,6 +5989,10 @@ class FnCompiler:
                     self.emit(f"{self.q(f'{RT}::ops::delitem(&{self.expr(t.value)}, &{self.expr(t.slice)})')};")
                 elif isinstance(t, ast.Name) and (t.id in self.locals or t.id in self.nonlocals):
                     self.emit(f"{self.store_name(t.id, t)} = V::Unbound;")
+                elif isinstance(t, ast.Name) and self.node is None and t.id in self.p.ix.module(self.module).imports \
+                        and not any(isinstance(n, ast.Name) and n.id == t.id and isinstance(n.ctx, ast.Load)
+                                    and n.lineno > t.lineno for n in ast.walk(self.p.ix.module(self.module).tree)):
+                    pass  # `del redis` after a module-level import guard: imports are resolved statically, never read again
                 else:
                     raise self.err("unsupported del target", t)
         else:
@@ -6405,6 +6409,16 @@ class FnCompiler:
         ast.copy_location(handler, node)
         self.try_stmt(ast.copy_location(ast.Try(body=body, handlers=[handler], orelse=[], finalbody=[mk("\0actx_exit")]), node))
 
+    def guard_never_passes(self, node: ast.Try) -> bool:
+        """A module-level `try` whose body imports a module that is not installed (`try: import aiomcache`): the
+        import raises, so its `else` branch never runs (and its names, imported from there, resolve nowhere)."""
+        if self.node is not None or not node.orelse:
+            return False
+        from .modules import _import_specs
+        imps = [st for st in node.body if isinstance(st, (ast.Import, ast.ImportFrom))]
+        specs, _ = _import_specs(imps, self.p.ix.module(self.module).package)
+        return any(not self.p.ix.importable(spec[1]) for spec in specs.values())
+
     def try_stmt(self, node: ast.Try) -> None:
         n = self.p.uid()
         slot, lbl = f"__exc{n}", f"'try{n}"
@@ -6443,7 +6457,8 @@ class FnCompiler:
         self.ind += 1
         self.emit("None => {")
         self.ind += 1
-        self.block(node.orelse)
+        if not self.guard_never_passes(node):
+            self.block(node.orelse)
         self.ind -= 1
         self.emit("}")
         self.emit(f"Some({e}) => {{")
@@ -7879,6 +7894,9 @@ class FnCompiler:
         args, kwargs = self.dyn_args(node)
         cls = self.p.ix.definition(csym)
         if not cls.bases:
+            if all(isinstance(a, ast.Starred) for a in node.args) and all(k.arg is None for k in node.keywords):
+                # `super().__init__(*args, **kwargs)` (a cooperative mixin): a TypeError when anything is left over
+                return self.q(f"{RT}::methods::object_init_args(&{args}, &{kwargs})")
             if node.args or node.keywords:
                 raise self.err("object.__init__() takes no arguments", node)
             return "V::None"
@@ -8175,6 +8193,13 @@ class FnCompiler:
             e = self.p.json_schemas()[1].get((self.module, node.lineno, node.col_offset))
             if e is not None:
                 raise e
+        if (isinstance(node.func, ast.Name) and node.func.id == "__import__" and not self.is_local("__import__")
+                and self.p.resolve(self.module, node.func, self.scope_root()) is None and self.static_ref(node) is None):
+            # `__import__(name, fromlist=[...])` of a name computed at run time: modules are resolved at translation,
+            # there is no table of them to import from by name; raised when reached (a library's configuration path)
+            args, kwargs = self.dyn_args(node)
+            return self.q(f"{{ let _ = ({args}, {kwargs}); Err::<V, Exc>(Exc::msg(&{RT}::v::IMPORT_ERROR, "
+                          f"\"py2axum: __import__() of a module name computed at run time is not supported\")) }}")
         sup = self.super_init(node)
         if sup is not None:
             return sup
@@ -8228,6 +8253,11 @@ class FnCompiler:
                 obj = self.expr(inst)
                 d = self.q(f"{RT}::methods::getattr(cx, &{obj}, \"dispatch\").await")
                 return self.q(f"{RT}::routing::add_dispatch(&{recv}, {d})")
+            if node.func.attr == "__getattribute__" and len(node.args) == 1 and not node.keywords:
+                # `obj.__getattribute__(name)`: the lookup without the class's `__getattr__` fallback
+                recv = self.expr(node.func.value)
+                name = self.expr(node.args[0])
+                return self.q(f"{RT}::methods::getattribute(cx, &{recv}, &{self.q(f'{RT}::ops::str_(&{name})')}).await")
             recv = self.expr(node.func.value)
             self.check_method(node)
             self.p.method_edges(node.func.attr)
@@ -8756,6 +8786,12 @@ class FnCompiler:
         """A library function used as a value (`run_in_executor(None, threading.get_ident)`): a function object
         calling its translation with 0 to 3 positional arguments."""
         tmpl = libmap.CALLS[name]
+        if name in libmap.DYN_ARGS and not name.startswith("operator."):
+            # the template takes the run-time vectors: a function object taking keyword arguments too
+            code = libmap.DYN_ARGS[name]("args", "kwargs")
+            mod, _, qual = name.rpartition(".")
+            return (f"{RT}::pyfn({rs(mod)}, {rs(qual)}, None, false, std::sync::Arc::new(|cx: &Cx, args: Vec<V>, "
+                    f"kwargs: Vec<(String, V)>| -> {RT}::BoxFut<'_> {{ Box::pin(async move {{ let _ = (cx, &args, &kwargs); {code} }}) }}))")
         arms = []
         for n in range(4):
             if name in libmap.DYN_ARGS:

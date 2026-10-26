@@ -1116,6 +1116,8 @@ pub fn setattr(v: &V, name: &str, val: V) -> R<()> {
             Ok(())
         }
         V::Native(n) => match &**n {
+            // redis-py's `client.auto_close_connection_pool = True` (aiocache): the pool closes with the client here
+            Native::Redis(_) if name == "auto_close_connection_pool" => Ok(()),
             Native::State(r) => {
                 // shared by every request (`app.state.counter += 1` in a middleware): the shortest hold
                 let mut st = r.state.lock();
@@ -1839,6 +1841,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::Row(names, vals) if name == "_asdict" => V::dict_from(names.iter().zip(vals.iter()).map(|(k, x)| (V::str(k), x.clone())).collect()),
             Native::Row(_, vals) if name == "_tuple" => Ok(V::tuple(vals.to_vec())),
             Native::UrlParts(u) if name == "geturl" => Ok(V::str(super::stdlib::url_parts_geturl(u))),
+            Native::Timer(t) => super::thread::timer_method(t, name),
             Native::UrlParts(u) if name == "_replace" => super::stdlib::url_parts_replace(u, &args, &kwargs),
             Native::Task(t) => web::task_method(cx, t, recv, name, &args).await,
             Native::Gen(g) => super::agen::method(g, recv, name, &args).await,
@@ -3709,6 +3712,15 @@ pub fn b_iter_stored(x: &V) -> R {
         }
     }
     Ok(V::native(Native::Iter(Mutex::new(ops::iter(x)?.into()))))
+}
+
+/// `super().__init__(*args, **kwargs)` reaching `object.__init__`: arguments are a TypeError (CPython's message when
+/// the class does not override `__new__`)
+pub fn object_init_args(args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() || !kwargs.is_empty() {
+        return Err(Exc::type_error("object.__init__() takes exactly one argument (the instance to initialize)"));
+    }
+    Ok(V::None)
 }
 
 pub fn b_next_iter(args: &[V]) -> R {

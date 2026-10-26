@@ -69,7 +69,15 @@ class Module:
         return self.name if self.is_pkg else self.name.rpartition(".")[0]
 
 
-def _import_specs(stmts, package: str) -> tuple[dict[str, tuple], list[str]]:
+def _guard_imports_resolve(body, package: str, importable) -> bool:
+    """The imports of a `try` body all resolve (its `else` branch then runs): `importable(dotted)`, or unknown (None)."""
+    if importable is None:
+        return False
+    specs, _ = _import_specs([st for st in body if isinstance(st, (ast.Import, ast.ImportFrom))], package)
+    return all(importable(spec[1]) for spec in specs.values())
+
+
+def _import_specs(stmts, package: str, importable=None) -> tuple[dict[str, tuple], list[str]]:
     """Import statements directly in `stmts` -> {local: spec}, star modules.
 
     spec = ("module", dotted) for `import a.b as x` / ("from", module, name) for `from m import n`.
@@ -102,7 +110,11 @@ def _import_specs(stmts, package: str) -> tuple[dict[str, tuple], list[str]]:
             if isinstance(node, ast.Try):
                 for h in node.handlers:
                     inner += h.body
-            o, s = _import_specs(inner, package)
+                # `try: import redis / except ImportError: ... / else: from .backends.redis import RedisCache`: the
+                # else branch's imports when the guarded ones resolve
+                if node.orelse and _guard_imports_resolve(node.body, package, importable):
+                    inner += node.orelse
+            o, s = _import_specs(inner, package, importable)
             for k, v in o.items():
                 out.setdefault(k, v)
             stars += s
@@ -794,7 +806,7 @@ class ModuleIndex:
             for n in ({node.name} if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                       else stmt_bindings(node)):
                 m.binders.setdefault(n, []).append(node)
-        m.imports, m.stars = _import_specs(tree.body, m.package)
+        m.imports, m.stars = _import_specs(tree.body, m.package, self.importable)
         for node in tree.body:
             if getattr(node, "is_lazy", 0):
                 specs, _ = _import_specs([node], m.package)

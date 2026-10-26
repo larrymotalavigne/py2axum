@@ -318,6 +318,8 @@ pub enum Native {
     Routing(Arc<super::routing::RObj>),
     /// prometheus_client objects (see `prom`)
     Prom(Arc<super::prom::Prom>),
+    /// `loop.call_later(...)`'s TimerHandle
+    Timer(Arc<super::thread::TimerHandle>),
     /// prometheus_fastapi_instrumentator's `Instrumentator` (dynrt/instr.rs)
     Instr(Arc<super::instr::Instr>),
     /// a coroutine object (see `aio`)
@@ -544,6 +546,7 @@ impl V {
                 Native::Tenacity(t) => super::tenacity::type_name(t),
                 Native::Prom(p) => super::prom::type_name(p),
                 Native::Instr(_) => "PrometheusFastApiInstrumentator",
+                Native::Timer(_) => "TimerHandle",
                 Native::Sentry(o) => super::sentry::type_name(o),
                 Native::Routing(o) => super::routing::type_name(o),
                 Native::TraceFrame(_) => "frame",
