@@ -2235,6 +2235,9 @@ class Project:
         return name
 
     def model(self, sym: Sym) -> ModelInfo:
+        # the function being compiled uses this mapped class: an error of its relationships (resolved after the
+        # functions, Project.drain) blocks it, as it blocks the generation
+        self.class_edge(sym)
         if sym in self.class_errors:
             raise self.class_errors[sym]
         if sym in self.models:
@@ -2756,6 +2759,10 @@ class Project:
                     raise self.err(f"relationship {info.sym.name}.{name}: no target class", call, module)
                 target_node = self._rel_target_from_ann(ann)
             tsym = self._rel_target(target_node, module, call)
+            # a route reaching this class can load the other one (lazy loads, back_populates, cascades): what does
+            # not translate there blocks it too (closure_errors), as the generation would
+            self.edges.setdefault(("class", info.sym), set()).add(("class", tsym))
+            self.edges.setdefault(("class", tsym), set()).add(("class", info.sym))
             tinfo = self.model(tsym)
             lazy_kw = opts.get("lazy")
             write_only = kind == "WriteOnlyMapped" or (isinstance(lazy_kw, ast.Constant) and lazy_kw.value == "write_only")
@@ -13833,7 +13840,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     # functions that fail to translate become stubs that raise; the build fails only if a translated
     # route can reach one (below)
     proj.__dict__["defer_fn_errors"] = True
-    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt", "python-dotenv"):
+    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt", "python-dotenv", "pyjwt"):
         # stripe: the installed release when the project locks none (as the conformance fixtures run)
         v = locked_version(fe.index.root, lib) or (_installed_stripe() if lib == "stripe" else None)
         if v:

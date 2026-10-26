@@ -21,6 +21,8 @@ const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01
 enum Alg {
     None,
     Hmac(&'static str),
+    /// RS256/384/512 (PKCS#1 v1.5) and PS256/384/512 (PSS): verification with a public key (dynrt/jwks.rs)
+    Rsa(&'static str),
 }
 
 fn exc(class: &'static Class, msg: impl AsRef<str>) -> Exc {
@@ -66,8 +68,11 @@ fn lookup(alg: &V) -> R<Option<Alg>> {
             "HS256" => Some(Alg::Hmac("HS256")),
             "HS384" => Some(Alg::Hmac("HS384")),
             "HS512" => Some(Alg::Hmac("HS512")),
+            a @ ("RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512") => {
+                Some(Alg::Rsa(ASYMMETRIC.iter().find(|x| **x == a).copied().unwrap_or("RS256")))
+            }
             a if ASYMMETRIC.contains(&a) => {
-                return Err(Exc::runtime(format!("py2axum: jwt algorithm {a} is not supported (HS256, HS384, HS512 and none only)")))
+                return Err(Exc::runtime(format!("py2axum: jwt algorithm {a} is not supported (HS256, HS384, HS512, none, and RS*/PS* to verify)")))
             }
             _ => None,
         },
@@ -220,6 +225,14 @@ fn prepare(alg: &Alg, key: &V, enforce: bool) -> R<Option<Vec<u8>>> {
             }
             Ok(None)
         }
+        Alg::Rsa(name) => {
+            // RSAAlgorithm.prepare_key of anything else than a key object: a PEM text (not reproduced) or a TypeError
+            match key {
+                V::Str(_) | V::Bytes(_) => Err(Exc::runtime(format!(
+                    "py2axum: a PEM or SSH key for {name} is not supported (pass a key from PyJWK / PyJWKClient)"))),
+                _ => Err(Exc::type_error("Expecting a PEM-formatted key.")),
+            }
+        }
         Alg::Hmac(name) => {
             let k = hmac_key(key)?;
             let min = match *name {
@@ -356,6 +369,9 @@ pub fn encode(payload: &V, key: &V, algorithm: Option<&V>, headers: &V, sort_hea
     let msg_payload = if detached { json_payload.clone() } else { b64(json_payload.as_bytes()) };
     let signing_input = format!("{h64}.{msg_payload}");
     let a = lookup(&alg)?.ok_or_else(|| exc(&NOT_IMPLEMENTED_ERROR, "Algorithm not supported"))?;
+    if let Alg::Rsa(name) = &a {
+        return Err(Exc::runtime(format!("py2axum: signing with {name} is not supported (RSA keys verify only)")));
+    }
     let k = prepare(&a, key, false)?;
     let sig = match (&a, &k) {
         (Alg::Hmac(name), Some(k)) => hmac_sign(name, k, signing_input.as_bytes()),
@@ -494,8 +510,15 @@ pub fn decode_complete(token: &V, key: &V, algorithms: &V, options: &V, audience
     let merged = merge_options(options)?;
     let enforce = ops::truthy(&opt(&merged, "enforce_minimum_key_length"))?;
     let verify = ops::truthy(&verify_signature)?;
+    let jwk = match key {
+        V::Native(n) => match &**n {
+            Native::Jwk(j) => Some(j.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
     // PyJWS.decode_complete
-    if verify && !ops::truthy(algorithms)? {
+    if verify && !ops::truthy(algorithms)? && jwk.is_none() {
         return Err(exc(&PYJWT_DECODE_ERROR, "It is required that you pass in a value for the \"algorithms\" argument when calling decode()."));
     }
     let (payload, signing_input, header, signature) = load(token)?;
@@ -514,17 +537,40 @@ pub fn decode_complete(token: &V, key: &V, algorithms: &V, options: &V, audience
     }
     if verify {
         // PyJWS._verify_signature
+        // a PyJWK without algorithms: its own algorithm only
+        let algorithms = match (&jwk, algorithms) {
+            (Some(j), V::None) => V::list(vec![V::str(&j.alg)]),
+            _ => algorithms.clone(),
+        };
+        let algorithms = &algorithms;
         let alg = get(&header, "alg").ok_or_else(|| exc(&PYJWT_INVALID_ALGORITHM, "Algorithm not specified"))?;
         if !ops::truthy(&alg)? || (!algorithms.is_none() && !ops::contains(algorithms, &alg)?) {
             return Err(exc(&PYJWT_INVALID_ALGORITHM, "The specified alg value is not allowed"));
         }
-        let a = lookup(&alg)?.ok_or_else(|| exc(&PYJWT_INVALID_ALGORITHM, "Algorithm not supported"))?;
-        let k = prepare(&a, key, enforce)?;
-        let ok = match (&a, &k) {
-            (Alg::Hmac(name), Some(k)) => {
-                bool::from(subtle::ConstantTimeEq::ct_eq(signature.as_slice(), hmac_sign(name, k, &signing_input).as_slice()))
+        let ok = if let Some(j) = &jwk {
+            // the PyJWK's algorithm, bound at construction, whatever the header says
+            if !matches!(&alg, V::Str(s) if **s == *j.alg) {
+                return Err(exc(&PYJWT_INVALID_ALGORITHM, format!(
+                    "Token algorithm {} does not match the key's algorithm {}", ops::repr(&alg)?, ops::repr(&V::str(&j.alg))?)));
             }
-            _ => false,
+            let a = lookup(&V::str(&j.alg))?.ok_or_else(|| exc(&PYJWT_INVALID_ALGORITHM, "Algorithm not supported"))?;
+            verify_with(&a, &j.key, &signing_input, &signature, enforce)?
+        } else {
+            let a = lookup(&alg)?.ok_or_else(|| exc(&PYJWT_INVALID_ALGORITHM, "Algorithm not supported"))?;
+            match (&a, key) {
+                (Alg::Rsa(_), V::Native(n)) if matches!(&**n, Native::RsaPub(_)) => {
+                    let Native::RsaPub(k) = &**n else { unreachable!() };
+                    verify_with(&a, &super::jwks::KeyMaterial::Rsa(k.clone()), &signing_input, &signature, enforce)?
+                }
+                _ => {
+                    let k = prepare(&a, key, enforce)?;
+                    match (&a, &k) {
+                        (Alg::Hmac(name), Some(k)) => bool::from(subtle::ConstantTimeEq::ct_eq(
+                            signature.as_slice(), hmac_sign(name, k, &signing_input).as_slice())),
+                        _ => false,
+                    }
+                }
+            }
         };
         if !ok {
             return Err(exc(&PYJWT_INVALID_SIGNATURE, "Signature verification failed"));
@@ -533,6 +579,30 @@ pub fn decode_complete(token: &V, key: &V, algorithms: &V, options: &V, audience
     let claims = json_object(&payload, "payload")?;
     validate_claims(&claims, &merged, audience, issuer, subject, leeway)?;
     V::dict_from(vec![(V::str("payload"), claims), (V::str("header"), header), (V::str("signature"), V::Bytes(Arc::from(signature.as_slice())))])
+}
+
+/// `Algorithm.check_key_length` then `Algorithm.verify` with a key object (an RSA public key, an HMAC secret)
+fn verify_with(a: &Alg, key: &super::jwks::KeyMaterial, signing_input: &[u8], signature: &[u8], enforce: bool) -> R<bool> {
+    use super::jwks::KeyMaterial;
+    use rsa::traits::PublicKeyParts;
+    match (a, key) {
+        (Alg::Rsa(name), KeyMaterial::Rsa(k)) => {
+            let bits = k.n().bits();
+            if enforce && bits < 2048 {
+                return Err(exc(&PYJWT_INVALID_KEY, format!(
+                    "The RSA key is {bits} bits long, which is below the minimum recommended size of 2048 bits. See NIST SP 800-131A.")));
+            }
+            Ok(super::jwks::rsa_verify(name, k, signing_input, signature))
+        }
+        (Alg::Hmac(name), KeyMaterial::Hmac(k)) => {
+            let k = hmac_key(&V::Bytes(Arc::from(k.as_slice())))?;
+            Ok(bool::from(subtle::ConstantTimeEq::ct_eq(signature, hmac_sign(name, &k, signing_input).as_slice())))
+        }
+        (_, KeyMaterial::Other(what)) => Err(Exc::runtime(format!("py2axum: verifying with {what} is not supported"))),
+        // an RSA key object given to HMAC (`force_bytes`), or a secret to RSA
+        (Alg::Hmac(_), _) => Err(Exc::type_error("Expected a string or bytes value")),
+        _ => Err(Exc::type_error("Expecting a PEM-formatted key.")),
+    }
 }
 
 /// `jwt.decode(...)`: the claims

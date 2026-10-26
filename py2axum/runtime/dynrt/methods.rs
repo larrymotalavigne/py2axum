@@ -513,6 +513,10 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
             Native::Record(_, f) => f.iter().find(|(k, _)| *k == name).map(|(_, x)| x.clone()).ok_or_else(|| no_attr(v, name)),
             Native::HttpResp(r) => super::http::resp_attr(r, name),
             Native::HttpClient(c) => super::http::client_attr(c, name),
+            Native::Jwk(j) => super::jwks::jwk_attr(j, name),
+            Native::JwkSet(s) => super::jwks::set_attr(s, name),
+            Native::JwkClient(c) => super::jwks::client_attr(c, name),
+            Native::RsaPub(k) => super::jwks::rsa_attr(k, name),
             Native::HttpUrl(u) => super::http::url_attr(u, name),
             Native::HttpReq(r) => super::http::req_attr(r, name),
             // a CryptContext's method read as a value (`v = pwd_context.verify`)
@@ -1699,6 +1703,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 _ => Err(no_attr(recv, name)),
             },
             Native::HttpClient(c) => super::http::client_method(cx, recv, c, name, args, kwargs).await,
+            Native::JwkClient(c) => super::jwks::client_method(c, name, &args, &kwargs).await,
             Native::HttpResp(r) => super::http::resp_method(r, recv, name, &args, &kwargs),
             Native::WriteOnly(o, ri) => orm::write_only_method(o, *ri, name, args, kwargs),
             Native::Savepoint(sess, sp) => match name {

@@ -2395,6 +2395,7 @@ pub fn getitem(v: &V, k: &V) -> R {
     if let V::Native(n) = v {
         match &**n {
             Native::CtCache(c) => return super::ctools::getitem(c, k),
+            Native::JwkSet(s) => return super::jwks::set_getitem(s, k),
             Native::SaColumns(t) => return super::satable::getitem(t, k),
             Native::Mime(m) => return super::mail::mime_getitem(m, k),
             Native::EmailMsg(m) => return super::emailmsg::getitem(m, k),

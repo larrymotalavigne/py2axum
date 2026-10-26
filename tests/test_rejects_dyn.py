@@ -1149,13 +1149,12 @@ async def t(token: str):
     ("jwt.encode({'a': 1}, KEY, algorithm='RS256')", "jwt.encode(): algorithm 'RS256' is not supported"),
     ("jwt.encode({'a': 1}, KEY, headers={'alg': 'ES256'})", "jwt.encode(): algorithm 'ES256' is not supported"),
     ("jwt.decode(token, KEY, algorithms=['HS256', 'EdDSA'])", "jwt.decode(): algorithm 'EdDSA' is not supported"),
-    ("jwt.decode(token, KEY, ['PS256'])", "jwt.decode(): algorithm 'PS256' is not supported"),
+    ("jwt.decode(token, KEY, ['ES256'])", "jwt.decode(): algorithm 'ES256' is not supported"),
     ("jwt.encode({'a': 1}, KEY, json_encoder=None)", "jwt.encode(json_encoder=) is not supported"),
     ("jwt.decode(token, KEY, algorithms=['HS256'], detached_payload=b'x')", "jwt.decode(detached_payload=) is not supported"),
     ("jwt.decode(token, KEY, algorithms=['HS256'], verify=True)", "jwt.decode(verify=) is not supported"),
     ("jwt.decode(token, KEY, ['HS256'], None, True)", "jwt.decode(): verify is not supported"),
     ("jwt.decode(token, KEY, algorithms=['HS256'], foo=1)", "jwt.decode(foo=) is not supported"),
-    ("jwt.PyJWKClient('https://idp/jwks').get_signing_key_from_jwt(token)", "is not supported"),
 ])
 def test_pyjwt_outside_subset_rejected(tmp_path, capsys, stmt, msg):
     pkg = tmp_path / "proj"

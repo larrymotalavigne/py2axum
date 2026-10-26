@@ -198,6 +198,11 @@ pub enum Native {
     /// an instance of a library class the binary only stores (`OAuth2PasswordBearer(...)` as a settings default):
     /// (module, class); its identity, type name and repr only, any other use is refused at compile time
     LibInstance(&'static str, &'static str),
+    /// PyJWT's `PyJWK`, `PyJWKSet`, `PyJWKClient` and a cryptography `RSAPublicKey` (dynrt/jwks.rs)
+    Jwk(Arc<super::jwks::Jwk>),
+    JwkSet(Arc<Vec<Arc<super::jwks::Jwk>>>),
+    JwkClient(Arc<super::jwks::Client>),
+    RsaPub(Arc<rsa::RsaPublicKey>),
     /// a method read on its class (`Cls.method`): a function whose first argument is the receiver, or that takes
     /// none for a `@staticmethod` (true)
     Unbound(super::pyd::MethodFn, bool),
@@ -487,6 +492,10 @@ impl V {
                 Native::NotImplemented => "NotImplementedType",
                 Native::Object => "object",
                 Native::LibInstance(_, cls) => cls,
+                Native::Jwk(_) => "PyJWK",
+                Native::JwkSet(_) => "PyJWKSet",
+                Native::JwkClient(_) => "PyJWKClient",
+                Native::RsaPub(_) => "RSAPublicKey",
                 Native::Kwargs(_) => "kwargs",
                 Native::ValErr(..) => "ValErr",
                 Native::Streaming(_) => "StreamingResponse",

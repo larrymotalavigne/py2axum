@@ -9,6 +9,7 @@ arguments (name -> expression) and return a Rust expression of type `R` (a `Resu
 """
 from __future__ import annotations
 
+import json
 import re
 
 RT = "dynrt"
@@ -45,7 +46,8 @@ def _default_handler(which: str):
             raise ValueError("expected two arguments (request, exc)")
         req = a[0] if a else kw["request"]
         exc = a[1] if len(a) == 2 else kw["exc"]
-        return f"{{ let _ = {req}; {RT}::web::default_exc_handler(&{exc}, {which!r}) }}".replace("'", '"')
+        # the name quoted alone: the argument expressions may hold string literals with `'` (Rust code as is)
+        return f"{{ let _ = {req}; {RT}::web::default_exc_handler(&{exc}, {json.dumps(which)}) }}"
     return tmpl
 
 
@@ -60,6 +62,20 @@ def _session(a, kw, sync: bool):
 
 def rs_(s: str) -> str:
     return '"' + s + '"'
+
+
+def _pyjwt_215(what: str) -> str:
+    """PyJWT's JWK classes are ported from 2.15 (2.13 and 2.14 differ: no refresh cooldown, no scheme check)."""
+    v = LIB_VERSIONS.get("pyjwt")
+    if v is not None and not v.startswith("2.15."):
+        raise ValueError(f"jwt.{what} is ported from PyJWT 2.15 (the project locks {v})")
+    return ""
+
+
+def _pyjwk(a, kw) -> str:
+    v = _bind("PyJWK", a, kw, ["jwk_data", "algorithm"], {"jwk_data", "algorithm"})
+    alg = "None" if v.get("algorithm") is None else f"Some(&{v['algorithm']})"
+    return f"{RT}::jwks::jwk_value({RT}::jwks::jwk_new(&{v['jwk_data']}, {alg}))"
 
 
 def _dotenv_patch() -> int:
@@ -1036,10 +1052,11 @@ def pyjwt_static(name, node):
                       if isinstance(kk, ast.Constant) and kk.value == "alg" for x in lits(vv)]
     if len(node.args) >= 3:
         found += lits(node.args[2])
-    bad = [x for x in found if x in PYJWT_ASYMMETRIC]
+    verify_only = {"RS256", "RS384", "RS512", "PS256", "PS384", "PS512"} if name.split(".")[-1] in {"decode", "decode_complete"} else set()
+    bad = [x for x in found if x in PYJWT_ASYMMETRIC - verify_only]
     if bad:
-        raise ValueError(f"algorithm {bad[0]!r} is not supported (HMAC HS256/HS384/HS512 and 'none' only: "
-                         "RSA/EC/EdDSA keys are not reproduced)")
+        raise ValueError(f"algorithm {bad[0]!r} is not supported (HMAC HS256/HS384/HS512 and 'none', and RS*/PS* to "
+                         "verify with a key from PyJWK / PyJWKClient: EC/EdDSA keys and signing with RSA are not reproduced)")
 
 
 def _bcrypt5() -> bool:
@@ -1197,6 +1214,16 @@ CALLS = {
            ("HTTPBearer", "fastapi.security.http", ("bearerFormat", "scheme_name", "description", "auto_error"), 0, ()),
            ("HTTPBasic", "fastapi.security.http", ("scheme_name", "realm", "description", "auto_error"), 0, ()))
        for m in ("", "." + mod.rsplit(".", 1)[1])},
+    # PyJWT 2.15's JWKs (dynrt/jwks.rs): PyJWKClient, PyJWK, PyJWKSet, verification with RS*/PS* keys
+    **{f"jwt{m}.PyJWKClient": (lambda a, kw: _pyjwt_215("PyJWKClient") or f"{RT}::jwks::client_new(&{_argv(a)}, &{_kwvec(kw)})")
+       for m in ("", ".jwks_client")},
+    **{f"jwt{m}.PyJWK{f}": (lambda a, kw: _pyjwt_215("PyJWK") or _pyjwk(a, kw)) for m in ("", ".api_jwk") for f in ("", ".from_dict")},
+    **{f"jwt{m}.PyJWKSet.from_dict": (lambda a, kw: _pyjwt_215("PyJWKSet") or
+                                      f"{RT}::jwks::set_value({RT}::jwks::set_from_dict(&{_bind('PyJWKSet.from_dict', a, kw, ['obj'], {'obj'})['obj']}))")
+       for m in ("", ".api_jwk")},
+    **{f"jwt{m}.PyJWKSet": (lambda a, kw: _pyjwt_215("PyJWKSet") or
+                            f"{RT}::jwks::set_value({RT}::jwks::set_new(&{_bind('PyJWKSet', a, kw, ['keys'], {'keys'})['keys']}))")
+       for m in ("", ".api_jwk")},
     # gc (dynrt/gcmod.rs): the binary has no cycle collector; thresholds and the enabled flag are kept
     **{f"gc.{n}": (lambda n: lambda a, kw: f'{RT}::gcmod::call("{n}", &{_argv(a)}, &{_kwvec(kw)})')(n)
        for n in ("collect", "enable", "disable", "isenabled", "freeze", "unfreeze", "get_freeze_count", "get_count",
@@ -1716,8 +1743,9 @@ CALLS = {
 
 # namespaces whose attribute calls are generic: `func.count(...)` -> orm::func("count", ...)
 NAMESPACE_CALLS = {
-    "sqlalchemy.func": lambda name, a, kw: f"{RT}::orm::func({name!r}, {_argv(a)})".replace("'", '"'),
-    "sqlalchemy.sql.func": lambda name, a, kw: f"{RT}::orm::func({name!r}, {_argv(a)})".replace("'", '"'),
+    # the function name quoted alone (`func.date_trunc(text("'day'"), ...)`: an argument may hold a `'`)
+    "sqlalchemy.func": lambda name, a, kw: f"{RT}::orm::func({json.dumps(name)}, {_argv(a)})",
+    "sqlalchemy.sql.func": lambda name, a, kw: f"{RT}::orm::func({json.dumps(name)}, {_argv(a)})",
 }
 
 STATUS_MODULES = ("fastapi.status", "starlette.status")
