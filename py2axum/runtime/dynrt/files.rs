@@ -38,6 +38,14 @@ pub fn upload(filename: Option<String>, content_type: Option<String>, headers: V
     V::native(Native::Upload(Arc::new(Upload { filename, content_type, headers, file: bytesio(data) })))
 }
 
+/// FastAPI 0.150's `_is_empty_file_input`: what a browser sends when no file is chosen (an empty filename, no
+/// content)
+pub fn empty_upload(v: &V) -> bool {
+    let V::Native(n) = v else { return false };
+    let Native::Upload(u) = &**n else { return false };
+    u.filename.as_deref() == Some("") && as_bio(&u.file).buf.lock().is_empty()
+}
+
 /// `await upload.read()`: the rest of an UploadFile's content (from its position, which moves to the end)
 pub fn upload_read_all(v: &V) -> Option<Vec<u8>> {
     let V::Native(n) = v else { return None };

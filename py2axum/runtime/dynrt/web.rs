@@ -212,6 +212,8 @@ pub async fn param_after(cx: &Cx, source: &str, name: &str, alias: &str, td: &'s
         }
         None => match default() {
             d @ (V::None | V::Unbound) => return Ok(d),
+            // FastAPI 0.148: defaults are applied at validation, validated only with `validate_default=True`
+            d if super::fastapi_at_least(148) => return Ok(d),
             d => d,
         },
     };
@@ -366,6 +368,8 @@ pub fn read_body(cx: &Cx) -> R<Option<V>> {
 /// The single body parameter (not embedded): `loc = ["body", ...]`.
 pub async fn body_param(cx: &Cx, body: &Option<V>, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
     match body {
+        // FastAPI 0.151: a JSON `null` body is a value, validated
+        Some(V::None) if super::fastapi_at_least(151) => Ok(pyd::validate(cx, &V::None, td, &[V::str("body")], errs).await?.unwrap_or(V::None)),
         // a JSON `null` body is no body (FastAPI's _validate_value_with_model_field): missing, or the default
         None | Some(V::None) => {
             if required {
@@ -384,8 +388,14 @@ pub async fn body_field(cx: &Cx, body: &Option<V>, name: &str, td: &'static TD, 
     // fastapi request_body_to_args: `body.get(alias)`; a body without `.get` (a list, a str...) is a missing
     // field even when the parameter has a default; a `null` value counts as absent
     let missing = |errs: &mut Vec<ErrDetail>| errs.push(ErrDetail { kind: "missing", loc: vec![V::str("body"), V::str(name)], msg: "Field required".into(), input: V::None, ctx: None, custom: false });
+    // FastAPI 0.151: a `null` field is a value, validated; a `null` body has no `.get`: each field missing
+    let null_is_value = super::fastapi_at_least(151);
     let got = match body {
-        Some(V::Dict(d)) => d.lock().get(&Key::Str(Arc::from(name))).map(|(_, v)| v.clone()).filter(|v| !matches!(v, V::None)),
+        Some(V::Dict(d)) => d.lock().get(&Key::Str(Arc::from(name))).map(|(_, v)| v.clone()).filter(|v| null_is_value || !matches!(v, V::None)),
+        Some(V::None) if null_is_value => {
+            missing(errs);
+            return Ok(V::None);
+        }
         None | Some(V::None) | Some(V::Bytes(_)) => None,
         Some(_) => {
             missing(errs);
@@ -730,16 +740,42 @@ fn form_value(v: &FormVal) -> V {
     }
 }
 
+/// FastAPI 0.150: an empty file input is absent, as an empty string is
+fn form_absent(v: &FormVal) -> bool {
+    match v {
+        FormVal::Text(t) => t.is_empty(),
+        FormVal::File(f) => super::fastapi_at_least(150) && super::files::empty_upload(f),
+    }
+}
+
+/// FastAPI 0.150: the empty file inputs left out of a list
+fn form_list<'a>(vals: Vec<&'a FormVal>) -> Vec<&'a FormVal> {
+    if !super::fastapi_at_least(150) {
+        return vals;
+    }
+    vals.into_iter().filter(|v| !matches!(v, FormVal::File(f) if super::files::empty_upload(f))).collect()
+}
+
+/// FastAPI 0.147: a `bool` (or `bool | None`) form field absent from the form is False (an unchecked checkbox)
+fn form_bool_absent(form: &[(String, FormVal)], alias: &str, td: &TD) -> bool {
+    super::fastapi_at_least(147)
+        && matches!(td.bare(), TD::Bool | TD::Optional(TD::Bool))
+        && !form.iter().any(|(k, _)| k == alias)
+}
+
 /// A `Form()` parameter: last value, or all of them for a list; "" counts as missing (FastAPI).
 pub async fn form_field(cx: &Cx, form: &[(String, FormVal)], alias: &str, td: &'static TD, required: bool, default: fn() -> V, errs: &mut Vec<ErrDetail>) -> R {
     let loc = vec![V::str("body"), V::str(alias)];
     let vals: Vec<&FormVal> = form.iter().filter(|(k, _)| k == alias).map(|(_, v)| v).collect();
-    let raw = if matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_))) {
+    let raw = if form_bool_absent(form, alias, td) {
+        Some(V::Bool(false))
+    } else if matches!(td.bare(), TD::List(_)) || matches!(td, TD::Optional(t) if matches!(t.bare(), TD::List(_))) {
+        let vals = form_list(vals);
         if vals.is_empty() { None } else { Some(V::list(vals.iter().map(|v| form_value(v)).collect())) }
     } else {
         match vals.last() {
             None => None,
-            Some(FormVal::Text(t)) if t.is_empty() => None,
+            Some(v) if form_absent(v) => None,
             Some(v) => Some(form_value(v)),
         }
     };
@@ -789,6 +825,12 @@ pub async fn param_model(cx: &Cx, source: &str, td: &'static TD, convert: bool, 
     };
     let mut values: IndexMap<String, V> = IndexMap::new();
     let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // FastAPI 0.148: an absent field is left to the model's default (no longer put in the input)
+    let fill_defaults = !super::fastapi_at_least(148);
+    // FastAPI 0.149: "" (0.150: an empty file input) read from a form is absent for a model's fields too
+    let form_empty_absent = source == "form" && super::fastapi_at_least(149);
+    // FastAPI 0.152: the errors of a header model name the headers (`save-data`), not the fields
+    let mut header_aliases: Vec<(&'static str, String)> = Vec::new();
     for f in desc.fields {
         let valias = f.alias.unwrap_or(f.name);
         let alias = if source == "header" && convert {
@@ -798,8 +840,23 @@ pub async fn param_model(cx: &Cx, source: &str, td: &'static TD, convert: bool, 
         };
         let look = alias.clone().unwrap_or_else(|| valias.to_string());
         let look = if source == "header" { look.to_ascii_lowercase() } else { look };
+        if source == "header" && alias.as_deref().is_some_and(|a| a != valias) && super::fastapi_at_least(152) {
+            header_aliases.push((f.name, alias.clone().unwrap_or_default()));
+        }
         let seq = td_is_sequence(f.td);
-        let raw = if seq && multi { Some(V::list(getlist(&look))) } else { get(&look) };
+        let empty = |v: &V| form_empty_absent && (matches!(v, V::Str(s) if s.is_empty()) || super::fastapi_at_least(150) && super::files::empty_upload(v));
+        let raw = if source == "form" && super::fastapi_at_least(147) && matches!(f.td.bare(), TD::Bool | TD::Optional(TD::Bool))
+            && !received.iter().any(|(k, _)| *k == look) {
+            Some(V::Bool(false))
+        } else if seq && multi {
+            let mut all = getlist(&look);
+            if form_empty_absent && super::fastapi_at_least(150) {
+                all.retain(|v| !super::files::empty_upload(v));
+            }
+            Some(V::list(all))
+        } else {
+            get(&look).filter(|v| !empty(v))
+        };
         let missing = match &raw {
             None => true,
             Some(V::List(l)) if seq => l.lock().is_empty(),
@@ -807,6 +864,8 @@ pub async fn param_model(cx: &Cx, source: &str, td: &'static TD, convert: bool, 
         };
         let value = if !missing {
             raw
+        } else if !fill_defaults {
+            None
         } else {
             match &f.default {
                 pyd::Dflt::Required => None,
@@ -837,7 +896,18 @@ pub async fn param_model(cx: &Cx, source: &str, td: &'static TD, convert: bool, 
     }
     let input = V::dict_from(values.into_iter().map(|(k, v)| (V::str(k), v)).collect())?;
     let loc = vec![V::str(if source == "form" { "body" } else { source })];
-    Ok(pyd::validate(cx, &input, td, &loc, errs).await?.unwrap_or(V::None))
+    let n = errs.len();
+    let out = pyd::validate(cx, &input, td, &loc, errs).await?.unwrap_or(V::None);
+    if !header_aliases.is_empty() {
+        for e in &mut errs[n..] {
+            if let Some(V::Str(name)) = e.loc.get(1) {
+                if let Some((_, h)) = header_aliases.iter().find(|(f, _)| **name == **f) {
+                    e.loc[1] = V::str(h);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A `File()` parameter typed `bytes` (or `bytes | None`, `list[bytes]`), as FastAPI's `_extract_form_body`:
@@ -850,6 +920,7 @@ pub async fn form_file_bytes(cx: &Cx, form: &[(String, FormVal)], alias: &str, t
     let seq = td_is_sequence(td);
     // `_get_multidict_value`: a File() is a Form(): an empty string is absent; an empty list too
     let raw: Option<V> = if seq {
+        let vals = form_list(vals);
         if vals.is_empty() {
             None
         } else {
@@ -857,6 +928,8 @@ pub async fn form_file_bytes(cx: &Cx, form: &[(String, FormVal)], alias: &str, t
             for v in vals {
                 match v {
                     FormVal::File(f) => out.push(V::Bytes(Arc::from(super::files::upload_read_all(f).unwrap_or_default()))),
+                    // FastAPI 0.144: a text field is kept as it is
+                    FormVal::Text(t) if super::fastapi_at_least(144) => out.push(V::str(t)),
                     FormVal::Text(_) => return Err(Exc::attr_error("'str' object has no attribute 'read'")),
                 }
             }
@@ -865,7 +938,7 @@ pub async fn form_file_bytes(cx: &Cx, form: &[(String, FormVal)], alias: &str, t
     } else {
         match vals.last() {
             None => None,
-            Some(FormVal::Text(t)) if t.is_empty() => None,
+            Some(v) if form_absent(v) => None,
             Some(FormVal::Text(t)) => Some(V::str(t)),
             Some(FormVal::File(f)) => Some(V::Bytes(Arc::from(super::files::upload_read_all(f).unwrap_or_default()))),
         }
@@ -885,7 +958,7 @@ pub fn form_file(form: &[(String, FormVal)], alias: &str, list: bool, required: 
     let loc = vec![V::str("body"), V::str(alias)];
     let vals: Vec<&FormVal> = form.iter().filter(|(k, _)| k == alias).map(|(_, v)| v).collect();
     // FastAPI's `_get_multidict_value`: an empty string is absent for a single field, a list keeps it
-    let present: Vec<&FormVal> = vals.into_iter().filter(|v| list || !matches!(v, FormVal::Text(t) if t.is_empty())).collect();
+    let present: Vec<&FormVal> = if list { form_list(vals) } else { vals.into_iter().filter(|v| !form_absent(v)).collect() };
     if present.is_empty() {
         if required {
             errs.push(ErrDetail { kind: "missing", loc, msg: "Field required".into(), input: V::None, ctx: None, custom: false });
@@ -2602,9 +2675,27 @@ async fn gen_data(cx: &Cx, v: &V, item: Option<&'static TD>) -> R<String> {
             }
         }
         None => {
-            let s = super::libs::json_dumps(&pyd::jsonable(v)?, &[])?;
+            let mut data = pyd::jsonable(v)?;
+            // FastAPI 0.144 (`_normalize_non_finite_floats`): NaN and infinities become null (json.dumps wrote NaN)
+            if super::fastapi_at_least(144) {
+                data = finite_floats(&data);
+            }
+            let s = super::libs::json_dumps(&data, &[])?;
             Ok(ops::str_(&s)?)
         }
+    }
+}
+
+/// FastAPI's `_normalize_non_finite_floats` over JSON-compatible data (dict keys kept)
+fn finite_floats(v: &V) -> V {
+    match v {
+        V::Float(f) if !f.is_finite() => V::None,
+        V::Dict(d) => {
+            let items: Vec<(V, V)> = d.lock().values().map(|(k, x)| (k.clone(), finite_floats(x))).collect();
+            V::dict_from(items).unwrap_or_else(|_| v.clone())
+        }
+        V::List(l) => V::list(l.lock().iter().map(finite_floats).collect()),
+        _ => v.clone(),
     }
 }
 

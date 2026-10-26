@@ -743,6 +743,23 @@ pub fn python() -> (u32, u32) {
     PYTHON.get().copied().unwrap_or((3, 12))
 }
 
+static FASTAPI: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+
+/// The FastAPI version the project locks (or the one installed next to the generator): request handling that
+/// changed between releases (0.144 to 0.156: defaults, empty form values, `null` bodies...).
+pub fn set_fastapi(major: u32, minor: u32, patch: u32) {
+    let _ = FASTAPI.set((major, minor, patch));
+}
+
+pub fn fastapi() -> (u32, u32, u32) {
+    FASTAPI.get().copied().unwrap_or((0, 142, 3))
+}
+
+/// FastAPI at least `0.minor`
+pub fn fastapi_at_least(minor: u32) -> bool {
+    fastapi() >= (0, minor, 0)
+}
+
 static PYTHON_PATCH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 /// The patch release of the project's Python, where a behaviour changed inside a minor (`u32::MAX`: not

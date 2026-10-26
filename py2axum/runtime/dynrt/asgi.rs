@@ -86,12 +86,16 @@ impl TrustedHost {
             return None;
         }
         let Some((host, port)) = parse_host(cx.req.header("host")) else { return Some(invalid_host()) };
+        // Starlette 1.8: host names compared case-insensitively (the redirect keeps the Host header's netloc)
+        let fold = web::starlette() >= (1, 8);
+        let name = if fold { host.to_lowercase() } else { host.clone() };
         let mut www = false;
         for p in &self.hosts {
-            if host == *p || (p.starts_with('*') && host.ends_with(&p[1..])) {
+            let p = if fold { p.to_lowercase() } else { p.clone() };
+            if name == p || (p.starts_with('*') && name.ends_with(&p[1..])) {
                 return None;
             }
-            if format!("www.{host}") == *p {
+            if format!("www.{name}") == p {
                 www = true;
             }
         }

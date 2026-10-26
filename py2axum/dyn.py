@@ -12074,6 +12074,7 @@ async fn serve() {{
     dynrt::set_python_patch({pypatch});
     dynrt::set_python_features(&[{pyfeatures}]);
     dynrt::orm::set_sqlalchemy({sa_major}, {sa_minor});
+    dynrt::set_fastapi({fa_ver});
     dynrt::logging::init_clock();
     dynrt::logging::set_source_root({source_root});
     // uvicorn's Config.configure_logging(): its LOGGING_CONFIG and options, before the import
@@ -14756,6 +14757,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     b = lambda x: str(x).lower()  # noqa: E731
     pyver = target_python(fe.index.root)
     sa_ver = tuple(int(x) for x in re.findall(r"\d+", locked_version(fe.index.root, "sqlalchemy") or _installed("sqlalchemy") or "2.1")[:2])
+    fa_ver = (tuple(int(x) for x in re.findall(r"\d+", locked_version(fe.index.root, "fastapi") or "0.142.3")[:3]) + (0, 0, 0))[:3]
     (out_dir / "src" / "main.rs").write_text(MAIN.format(expire=b(expire), autoflush=b(autoflush), commit=b(commit), sync=b(sync), layers=layers,
                                                          pymajor=pyver[0], pyminor=pyver[1], pypatch=target_python_patch(fe.index.root),
                                                          pyfeatures=", ".join(f"({rs(k)}, {str(v).lower()})" for k, v in python_features(fe.index.root).items()),
@@ -14772,7 +14774,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                                                           mount_fallback=", ".join(rs(x) for x in sorted(set(fe.__dict__.get("mount_fallback", [])))),
                                                           source_root=rs(str(Path(fe.index.root).resolve())),
                                                           loguru_init=loguru_init(proj),
-                                                          sa_major=sa_ver[0], sa_minor=sa_ver[1]))
+                                                          sa_major=sa_ver[0], sa_minor=sa_ver[1], fa_ver=", ".join(map(str, fa_ver))))
     (out_dir / "src" / "gen.rs").write_text("\n".join(gen) + "\n")
     if shutil.which("rustfmt"):
         subprocess.run(["rustfmt", "--edition", "2021", str(out_dir / "src" / "gen.rs"), str(out_dir / "src" / "main.rs")], check=False,

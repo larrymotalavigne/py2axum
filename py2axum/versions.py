@@ -23,12 +23,12 @@ from .ir import TranspileError
 # the `conformance` extra of pyproject.toml and by docs/reference/versions.md (tests/test_versions.py); the CI job
 # `versions` installs both ends (`python -m py2axum.versions min|max`) and runs pytest + the dynapp conformance.
 SUPPORTED: dict[str, tuple[str, str, str]] = {
-    "fastapi": ("0.137.0", "0.142.3", "0.143"),
-    "starlette": ("1.0.0", "1.7.0", "1.8"),
+    "fastapi": ("0.137.0", "0.156.8", "0.157"),
+    "starlette": ("1.0.0", "1.9.0", "1.10"),
     "pydantic": ("2.12.0", "2.14.0", "2.15"),
     "pydantic-core": ("2.41.1", "2.50.0", "2.51"),
     "pydantic-settings": ("2.11.0", "2.16.0", "2.17"),
-    "sqlalchemy": ("2.0.44", "2.1.4", "2.2"),
+    "sqlalchemy": ("2.0.44", "2.1.5", "2.2"),
     "psycopg": ("3.2.12", "3.3.6", "3.4"),
     "httpx": ("0.28.1", "0.28.1", "0.29"),
     "aiohttp": ("3.13.0", "3.14.4", "3.15"),
@@ -173,6 +173,8 @@ def in_range(name: str, version: str) -> bool:
 # reproduces apart from both ends (pydantic 2.13's messages, still locked by most projects)
 MIDDLES: dict[str, dict[str, str]] = {
     "pydantic2.13": {"pydantic": "2.13.5", "pydantic-core": "2.46.5"},
+    # the previous highest: FastAPI changed its request handling from 0.144 to 0.156 (dynrt `fastapi_at_least`)
+    "fastapi0.142": {"fastapi": "0.142.3", "starlette": "1.7.0", "sqlalchemy": "2.1.4"},
 }
 
 
