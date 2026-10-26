@@ -3,6 +3,8 @@
 //! `base64.b32decode` as CPython has it.
 use base64::Engine as _;
 
+use std::sync::Arc;
+
 use super::ops;
 use super::v::*;
 use super::Cx;
@@ -412,24 +414,117 @@ pub fn totp_method(t: &Totp, name: &str, args: &[V], kwargs: &[(String, V)]) -> 
     }
 }
 
-// ---------------------------------------------------------------- pwdlib (Argon2)
+// ---------------------------------------------------------------- pwdlib (Argon2, bcrypt)
+
+/// a pwdlib hasher: `Argon2Hasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16,
+/// type=Type.ID)` (argon2-cffi's defaults) or `BcryptHasher(rounds=12, prefix="2b")`
+pub enum PwdHasher {
+    Argon2 { t: u32, m: u32, p: u32, len: usize, salt: usize, alg: argon2::Algorithm },
+    Bcrypt { rounds: u32, prefix: String },
+}
+
+/// `pwdlib.PasswordHash(hashers)`: the first hasher hashes, each verifies the hashes it identifies (`bcrypt5`:
+/// the locked bcrypt release is 5.x)
+pub struct PwdHash {
+    hashers: Vec<Arc<PwdHasher>>,
+    bcrypt5: bool,
+}
+
+const ARGON2_DEFAULT: PwdHasher = PwdHasher::Argon2 { t: 3, m: 65536, p: 4, len: 32, salt: 16, alg: argon2::Algorithm::Argon2id };
 
 /// `pwdlib.PasswordHash.recommended()`: one Argon2 hasher with argon2-cffi's defaults (argon2id, t=3,
 /// m=65536 KiB, p=4, 32-byte hash, 16-byte salt).
-pub fn pwd_recommended() -> R {
-    Ok(V::native(Native::PwdHash))
+pub fn pwd_recommended(bcrypt5: bool) -> R {
+    Ok(V::native(Native::PwdHash(Arc::new(PwdHash { hashers: vec![Arc::new(ARGON2_DEFAULT)], bcrypt5 }))))
 }
 
-const ARGON2_T: u32 = 3;
-const ARGON2_M: u32 = 65536;
-const ARGON2_P: u32 = 4;
-const ARGON2_LEN: usize = 32;
+/// `pwdlib.PasswordHash(hashers)` (a sequence of hashers, at least one)
+pub fn pwd_new(bcrypt5: bool, args: &[V], kwargs: &[(String, V)]) -> R {
+    let seq = match (args, kwargs) {
+        ([v], []) => v.clone(),
+        ([], [(k, v)]) if k == "hashers" => v.clone(),
+        _ => return Err(Exc::type_error("PasswordHash.__init__() takes 1 positional argument: 'hashers'")),
+    };
+    let mut hashers = Vec::new();
+    for h in ops::iter(&seq)? {
+        match &h {
+            V::Native(n) if matches!(&**n, Native::PwdHasher(_)) => {
+                let Native::PwdHasher(x) = &**n else { unreachable!() };
+                hashers.push(x.clone());
+            }
+            o => return Err(Exc::type_error(format!("py2axum: PasswordHash() of a '{}' (only pwdlib's Argon2Hasher and BcryptHasher)", o.type_name()))),
+        }
+    }
+    if hashers.is_empty() {
+        return Err(Exc::new(&ASSERTION_ERROR, vec![V::str("You must specify at least one hasher.")]));
+    }
+    Ok(V::native(Native::PwdHash(Arc::new(PwdHash { hashers, bcrypt5 }))))
+}
+
+fn int_arg(v: Option<&V>, name: &str, default: i64) -> R<i64> {
+    match v {
+        None => Ok(default),
+        Some(V::Int(i)) => Ok(*i),
+        Some(o) => Err(Exc::type_error(format!("py2axum: {name}= must be an int, not {}", o.type_name()))),
+    }
+}
+
+/// `Argon2Hasher(...)` / `BcryptHasher(...)`
+pub fn pwd_hasher(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+    let names: &[&str] = if kind == "argon2" {
+        &["time_cost", "memory_cost", "parallelism", "hash_len", "salt_len", "type"]
+    } else {
+        &["rounds", "prefix"]
+    };
+    if args.len() > names.len() {
+        return Err(Exc::type_error(format!("too many positional arguments ({} given)", args.len())));
+    }
+    let mut got: Vec<Option<V>> = vec![None; names.len()];
+    for (i, a) in args.iter().enumerate() {
+        got[i] = Some(a.clone());
+    }
+    for (k, v) in kwargs {
+        let Some(i) = names.iter().position(|n| n == k) else {
+            return Err(Exc::type_error(format!("__init__() got an unexpected keyword argument '{k}'")));
+        };
+        got[i] = Some(v.clone());
+    }
+    let h = if kind == "argon2" {
+        let alg = match got[5].as_ref() {
+            None => argon2::Algorithm::Argon2id,
+            Some(V::Str(t)) => match &**t {
+                "ID" => argon2::Algorithm::Argon2id,
+                "I" => argon2::Algorithm::Argon2i,
+                "D" => argon2::Algorithm::Argon2d,
+                o => return Err(Exc::value_error(format!("py2axum: argon2 type {o}"))),
+            },
+            Some(o) => return Err(Exc::type_error(format!("py2axum: type= must be an argon2.Type, not {}", o.type_name()))),
+        };
+        PwdHasher::Argon2 {
+            t: int_arg(got[0].as_ref(), "time_cost", 3)? as u32,
+            m: int_arg(got[1].as_ref(), "memory_cost", 65536)? as u32,
+            p: int_arg(got[2].as_ref(), "parallelism", 4)? as u32,
+            len: int_arg(got[3].as_ref(), "hash_len", 32)? as usize,
+            salt: int_arg(got[4].as_ref(), "salt_len", 16)? as usize,
+            alg,
+        }
+    } else {
+        let prefix = match got[1].as_ref() {
+            None => "2b".to_string(),
+            Some(V::Str(p)) => p.to_string(),
+            Some(o) => return Err(Exc::type_error(format!("py2axum: prefix= must be a str, not {}", o.type_name()))),
+        };
+        PwdHasher::Bcrypt { rounds: int_arg(got[0].as_ref(), "rounds", 12)? as u32, prefix }
+    };
+    Ok(V::native(Native::PwdHasher(Arc::new(h))))
+}
 
 fn str_or_bytes(v: Option<&V>, name: &str) -> R<Vec<u8>> {
     match v {
         Some(V::Str(s)) => Ok(s.as_bytes().to_vec()),
         Some(V::Bytes(b)) => Ok(b.to_vec()),
-        Some(o) => Err(Exc::type_error(format!("{name} must be str or bytes, not {}", o.type_name()))),
+        // pwdlib's validate_str_or_bytes
+        Some(_) => Err(Exc::type_error(format!("{name} must be str or bytes"))),
         None => Err(Exc::type_error(format!("missing required argument: '{name}'"))),
     }
 }
@@ -443,63 +538,113 @@ fn argon2_identify(h: &[u8]) -> bool {
     std::str::from_utf8(h).map(|s| re.is_match(s)).unwrap_or(false)
 }
 
-fn argon2_hash(pw: &[u8]) -> R<String> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let params = argon2::Params::new(ARGON2_M, ARGON2_T, ARGON2_P, Some(ARGON2_LEN)).map_err(|e| Exc::runtime(e.to_string()))?;
-    let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let salt: [u8; 16] = rand::random();
-    let salt = SaltString::encode_b64(&salt).map_err(|e| Exc::runtime(e.to_string()))?;
-    super::thread::blocking(|| a.hash_password(pw, &salt).map(|h| h.to_string())).map_err(|e| Exc::runtime(e.to_string()))
+/// pwdlib's bcrypt `_IDENTIFY_REGEX` (`re.match`: a trailing newline is accepted before `$`): (prefix, rounds)
+fn bcrypt_parse(h: &[u8]) -> Option<(String, u32)> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"^\$(2[abxy])\$(\d{2})\$[A-Za-z0-9+/.]{22}[A-Za-z0-9+/.]{31}\n?$").unwrap());
+    let s = std::str::from_utf8(h).ok()?;
+    let c = re.captures(s)?;
+    Some((c[1].to_string(), c[2].parse().ok()?))
 }
 
-/// argon2-cffi's verify: a mismatch or an invalid hash is False for pwdlib
-fn argon2_verify(pw: &[u8], h: &[u8]) -> bool {
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    let Ok(s) = std::str::from_utf8(h) else { return false };
-    let Ok(parsed) = PasswordHash::new(s) else { return false };
-    super::thread::blocking(|| argon2::Argon2::default().verify_password(pw, &parsed).is_ok())
+impl PwdHasher {
+    fn identify(&self, h: &[u8]) -> bool {
+        match self {
+            PwdHasher::Argon2 { .. } => argon2_identify(h),
+            PwdHasher::Bcrypt { .. } => bcrypt_parse(h).is_some(),
+        }
+    }
+
+    fn hash(&self, pw: &[u8], bcrypt5: bool) -> R<String> {
+        match self {
+            PwdHasher::Argon2 { t, m, p, len, salt, alg } => {
+                use argon2::password_hash::{PasswordHasher, SaltString};
+                let params = argon2::Params::new(*m, *t, *p, Some(*len)).map_err(|e| Exc::runtime(e.to_string()))?;
+                let a = argon2::Argon2::new(*alg, argon2::Version::V0x13, params);
+                let raw: Vec<u8> = (0..*salt).map(|_| rand::random::<u8>()).collect();
+                let salt = SaltString::encode_b64(&raw).map_err(|e| Exc::runtime(e.to_string()))?;
+                super::thread::blocking(|| a.hash_password(pw, &salt).map(|h| h.to_string())).map_err(|e| Exc::runtime(e.to_string()))
+            }
+            PwdHasher::Bcrypt { rounds, prefix } => {
+                let salt: [u8; 16] = rand::random();
+                let s = format!("${prefix}${rounds:02}${}", bcrypt_b64().encode(salt));
+                let out = super::thread::blocking(|| hashpw(pw, s.as_bytes(), bcrypt5))?;
+                Ok(String::from_utf8_lossy(&out).into_owned())
+            }
+        }
+    }
+
+    /// argon2-cffi's verify (a mismatch or an invalid hash is False for pwdlib); bcrypt.checkpw
+    fn verify(&self, pw: &[u8], h: &[u8], bcrypt5: bool) -> R<bool> {
+        match self {
+            PwdHasher::Argon2 { .. } => {
+                use argon2::password_hash::{PasswordHash, PasswordVerifier};
+                let Ok(s) = std::str::from_utf8(h) else { return Ok(false) };
+                let Ok(parsed) = PasswordHash::new(s) else { return Ok(false) };
+                Ok(super::thread::blocking(|| argon2::Argon2::default().verify_password(pw, &parsed).is_ok()))
+            }
+            PwdHasher::Bcrypt { .. } => {
+                use subtle::ConstantTimeEq;
+                Ok(super::thread::blocking(|| hashpw(pw, h, bcrypt5))?.ct_eq(h).into())
+            }
+        }
+    }
+
+    /// argon2-cffi's check_needs_rehash (the hash's parameters differ from the hasher's); bcrypt: rounds or prefix
+    fn needs_rehash(&self, h: &[u8]) -> bool {
+        match self {
+            PwdHasher::Argon2 { t, m, p, len, salt, alg } => {
+                use argon2::password_hash::PasswordHash;
+                let Ok(s) = std::str::from_utf8(h) else { return true };
+                let Ok(ph) = PasswordHash::new(s) else { return true };
+                let get = |k: &str| ph.params.get_decimal(k);
+                ph.algorithm.as_str() != alg.as_str() || ph.version != Some(0x13) || get("m") != Some(*m) || get("t") != Some(*t)
+                    || get("p") != Some(*p) || ph.hash.map(|x| x.len()) != Some(*len)
+                    || ph.salt.map(|x| x.as_str().len()) != Some((salt * 4).div_ceil(3))
+            }
+            PwdHasher::Bcrypt { rounds, prefix } => match bcrypt_parse(h) {
+                None => true,
+                Some((pf, r)) => r != *rounds || pf != *prefix,
+            },
+        }
+    }
 }
 
-/// argon2-cffi's check_needs_rehash: the hash's parameters differ from the hasher's
-fn argon2_needs_rehash(h: &[u8]) -> bool {
-    use argon2::password_hash::PasswordHash;
-    let Ok(s) = std::str::from_utf8(h) else { return true };
-    let Ok(p) = PasswordHash::new(s) else { return true };
-    let get = |k: &str| p.params.get_decimal(k);
-    p.algorithm.as_str() != "argon2id" || p.version != Some(0x13) || get("m") != Some(ARGON2_M) || get("t") != Some(ARGON2_T)
-        || get("p") != Some(ARGON2_P) || p.hash.map(|x| x.len()) != Some(ARGON2_LEN) || p.salt.map(|x| x.as_str().len()) != Some(22)
-}
-
-pub fn pwd_method(name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
+pub fn pwd_method(ph: &PwdHash, name: &str, args: &[V], kwargs: &[(String, V)]) -> R {
     let get = |i: usize, k: &str| args.get(i).or_else(|| kwargs.iter().find(|(n, _)| n == k).map(|(_, v)| v));
     let known: &[&str] = match name {
         "hash" => &["password"],
         "verify" | "verify_and_update" => &["password", "hash"],
         _ => return Err(Exc::attr_error(format!("'PasswordHash' object has no attribute '{name}'"))),
     };
-    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !known.contains(&k.as_str())) {
+    if name == "hash" && kwargs.iter().any(|(k, v)| k == "salt" && !v.is_none()) {
+        return Err(Exc::type_error("py2axum: PasswordHash.hash(salt=) is not supported (a random salt)"));
+    }
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| !known.contains(&k.as_str()) && !(name == "hash" && k == "salt")) {
         return Err(Exc::type_error(format!("py2axum: PasswordHash.{name}({k}=) is not supported")));
     }
     if args.len() > known.len() {
         return Err(Exc::type_error(format!("PasswordHash.{name}() takes {} positional arguments", known.len() + 1)));
     }
     let pw = str_or_bytes(get(0, "password"), "password")?;
+    let current = &ph.hashers[0];
     if name == "hash" {
-        return Ok(V::str(argon2_hash(&pw)?));
+        return Ok(V::str(current.hash(&pw, ph.bcrypt5)?));
     }
     let h = str_or_bytes(get(1, "hash"), "hash")?;
-    if !argon2_identify(&h) {
+    let Some((i, hasher)) = ph.hashers.iter().enumerate().find(|(_, x)| x.identify(&h)) else {
         let e = Exc::msg(&UNKNOWN_HASH_ERROR, "This hash can't be identified. Make sure it's valid and that its \
 corresponding hasher is enabled.");
         // `exc.hash`: what it failed to identify
         e.0.attrs.lock().insert("hash".into(), get(1, "hash").cloned().unwrap_or(V::None));
         return Err(e);
-    }
-    let ok = argon2_verify(&pw, &h);
+    };
+    let ok = hasher.verify(&pw, &h, ph.bcrypt5)?;
     if name == "verify" {
         return Ok(V::Bool(ok));
     }
-    let updated = if ok && argon2_needs_rehash(&h) { V::str(argon2_hash(&pw)?) } else { V::None };
+    // a hash of another hasher than the current one, or with other parameters, is hashed again
+    let updated = if ok && (i != 0 || hasher.needs_rehash(&h)) { V::str(current.hash(&pw, ph.bcrypt5)?) } else { V::None };
     Ok(V::tuple(vec![V::Bool(ok), updated]))
 }
 

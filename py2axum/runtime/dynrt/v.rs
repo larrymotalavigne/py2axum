@@ -90,7 +90,8 @@ pub enum Native {
     Address(String, u16),
     Totp(super::auth::Totp),
     /// `pwdlib.PasswordHash.recommended()`
-    PwdHash,
+    PwdHash(Arc<super::auth::PwdHash>),
+    PwdHasher(Arc<super::auth::PwdHasher>),
     /// `passlib.context.CryptContext(schemes=["bcrypt"])`
     PassCtx(Arc<super::auth::PassCtx>),
     /// `asyncio.create_task(coro)`: runs on its own; `add_done_callback`
@@ -436,7 +437,8 @@ impl V {
                 Native::CallNext(_) => "function",
                 Native::Address(..) => "Address",
                 Native::Totp(_) => "TOTP",
-                Native::PwdHash => "PasswordHash",
+                Native::PwdHash(_) => "PasswordHash",
+                Native::PwdHasher(h) => match &**h { super::auth::PwdHasher::Argon2 { .. } => "Argon2Hasher", _ => "BcryptHasher" },
                 Native::PassCtx(_) => "CryptContext",
                 Native::Task(_) => "Task",
                 Native::HttpClient(_) => "AsyncClient",

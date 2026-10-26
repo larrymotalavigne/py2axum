@@ -541,3 +541,105 @@ async def m():
         assert "json_enc_at" in (tmp_path / "out" / "src" / "gen.rs").read_text()
     else:
         assert "json_encoders for `datetime` inside" in capsys.readouterr().err
+
+
+def test_printed_warning(tmp_path):
+    """`warnings.warn(msg)` (UserWarning) and a builtin category CPython prints: `file:line: Category: message` and
+    the source line on stderr, once per message, category and line (the default filters' "default" action)."""
+    src = '''
+import warnings
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/w")
+async def w(n: int = 0):
+    warnings.warn(f"careful {n}")
+    warnings.warn("later", FutureWarning, stacklevel=1)
+    return {"ok": 1}
+'''
+    pkg = project(tmp_path, src)
+    generate(tmp_path, pkg)
+    gen = "".join((tmp_path / "out" / "src" / "gen.rs").read_text().split())
+    assert 'warn_print("UserWarning"' in gen and '"proj/main.py",11,"warnings.warn(f\\"careful{n}\\")"' in gen
+    assert 'warn_print("FutureWarning"' in gen
+
+
+def test_sqlmodel_template_patterns(tmp_path):
+    """The official full-stack template: a table model deriving from a SQLModel base with `datetime` columns
+    (SQLModel's UTCDateTime), `sqlmodel_update(data, update=...)` and `Table.model_validate(x, update=...)` in another
+    module, `col()`, `session.exec(statement)` of a `delete(...)`, pwdlib with Argon2 and bcrypt hashers."""
+    models = '''
+import uuid
+from datetime import datetime, timezone
+
+from sqlmodel import Field, SQLModel
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class ItemBase(SQLModel):
+    title: str = Field(min_length=1, max_length=255)
+
+
+class ItemCreate(ItemBase):
+    pass
+
+
+class Item(ItemBase, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    created_at: datetime | None = Field(default_factory=now)
+    secret: str = ""
+'''
+    src = '''
+import uuid
+
+from fastapi import FastAPI
+from pwdlib import PasswordHash
+from pwdlib.hashers.argon2 import Argon2Hasher
+from pwdlib.hashers.bcrypt import BcryptHasher
+from sqlmodel import Session, col, create_engine, delete
+
+from .models import Item, ItemBase, ItemCreate
+
+engine = create_engine("postgresql+psycopg://u@h/db")
+password_hash = PasswordHash((Argon2Hasher(), BcryptHasher()))
+app = FastAPI()
+
+
+@app.post("/items")
+def create(item_in: ItemCreate) -> ItemBase:
+    with Session(engine) as session:
+        item = Item.model_validate(item_in, update={"secret": password_hash.hash("x")})
+        session.add(item)
+        session.commit()
+        return item
+
+
+@app.patch("/items/{item_id}")
+def update(item_id: uuid.UUID, item_in: ItemCreate) -> ItemBase:
+    with Session(engine) as session:
+        item = session.get(Item, item_id)
+        item.sqlmodel_update(item_in.model_dump(exclude_unset=True), update={"secret": "s"})
+        ok, _ = password_hash.verify_and_update("x", item.secret)
+        session.add(item)
+        session.commit()
+        return item
+
+
+@app.delete("/items/{item_id}")
+def remove(item_id: uuid.UUID) -> dict:
+    with Session(engine) as session:
+        statement = delete(Item).where(col(Item.id) == item_id)
+        session.exec(statement)
+        session.commit()
+        return {"ok": True}
+'''
+    pkg = project(tmp_path, src, models)
+    generate(tmp_path, pkg, "--allow-untested-versions")
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "ColTy::UtcDateTime" in gen and "pwd_new(" in gen and 'pwd_hasher("bcrypt"' in gen

@@ -46,6 +46,25 @@ pub fn set_source_root(default: &str) {
     let _ = SOURCE_ROOT.set(root.trim_end_matches('/').to_string());
 }
 
+/// `warnings.warn(message, Category)` under CPython's default filters (action "default"): the first time a
+/// message of that category is warned at that line of the module, `file:line: Category: message` and the
+/// source line, stripped, on stderr (warnings.formatwarning); later ones are dropped (`__warningregistry__`)
+pub fn warn_print(category: &str, message: &V, file: &str, lineno: u32, line: &str, module: &str) -> R {
+    use std::io::Write;
+    static SEEN: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<(String, String, String, u32)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let text = super::ops::str_(message)?;
+    if !SEEN.lock().insert((module.to_string(), text.clone(), category.to_string(), lineno)) {
+        return Ok(V::None);
+    }
+    let mut out = format!("{}:{lineno}: {category}: {text}\n", source_path(file));
+    if !line.is_empty() {
+        out += &format!("  {line}\n");
+    }
+    let _ = std::io::stderr().lock().write_all(out.as_bytes());
+    Ok(V::None)
+}
+
 /// a project file's path as the Python process sees it (the source root + its path relative to --root)
 pub fn source_path(file: &str) -> String {
     if file.starts_with('/') {

@@ -35,7 +35,8 @@ SA_TYPES = {"str": "String", "int": "Integer", "float": "Float", "bool": "Boolea
 NOT_ENUM = {"datetime", "date", "time", "timedelta", "Any", "Json", "HttpUrl", "AnyUrl", "AnyHttpUrl", "IPv4Address",
             "IPv6Address", "IPv4Network", "IPv6Network", "Path", "NaiveDatetime", "AwareDatetime", "SecretStr",
             "Optional", "Union", "List", "Dict", "Set", "Tuple"}
-# a datetime column: DateTime (naive TIMESTAMP) before SQLModel 0.0.45, its UTCDateTime decorator since (refused)
+# a datetime column: DateTime (naive TIMESTAMP) before SQLModel 0.0.45, its UTCDateTime decorator since (TIMESTAMPTZ,
+# naive values refused, read in UTC); `NaiveDatetime` stays a naive DateTime
 NAIVE_DATETIME_BEFORE = (0, 0, 45)
 
 
@@ -112,7 +113,10 @@ class Rewriter:
                     self.function(node)
                 elif isinstance(node, ast.ClassDef) and not node.name.endswith("_p2a_sm_view"):
                     pass
-        _Calls(self).visit(self.tree)
+        calls = _Calls(self)
+        calls.visit(self.tree)
+        if calls.used_merge:
+            self.tree.body.append(self.merge_fn())
         if self.tables:
             self.tree.body.append(self.update_fn())
             if self.local("SQLModel") is None:
@@ -140,7 +144,8 @@ class Rewriter:
         extra = [ast.copy_location(ast.ImportFrom(module="pydantic", names=[ast.alias("BaseModel", "_p2a_sm_BaseModel")], level=0), node),
                  ast.copy_location(ast.ImportFrom(module="typing", names=[ast.alias("Any", "_p2a_sm_Any")], level=0), node),
                  ast.copy_location(ast.Import(names=[ast.alias("sqlalchemy", "_p2a_sm_sa")]), node),
-                 ast.copy_location(ast.Import(names=[ast.alias("sqlalchemy.orm", "_p2a_sm_orm")]), node)]
+                 ast.copy_location(ast.Import(names=[ast.alias("sqlalchemy.orm", "_p2a_sm_orm")]), node),
+                 ast.copy_location(ast.Import(names=[ast.alias("sqlmodel.sql.sqltypes", "_p2a_sm_sqltypes")]), node)]
         if keep:
             out.append(ast.copy_location(ast.ImportFrom(module="sqlmodel", names=keep, level=0), node))
         return out + extra
@@ -325,8 +330,10 @@ class Rewriter:
         base, optional = _base_annotation(st.annotation)
         tname = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", None)
         sa = SA_TYPES.get(tname)
-        if tname == "datetime" and self.version < NAIVE_DATETIME_BEFORE:
+        if tname == "datetime" and self.version < NAIVE_DATETIME_BEFORE or tname == "NaiveDatetime":
             sa = "DateTime"
+        elif tname == "datetime":
+            sa = "UTCDateTime"
         enum = None
         if sa is None and isinstance(base, ast.Name) and not hasattr(builtins, base.id) and base.id not in NOT_ENUM:
             # a class of the module's names: SQLModel's sa_Enum(type_) when it is an Enum (the translator refuses
@@ -344,7 +351,8 @@ class Rewriter:
             nullable = kw["nullable"]
         else:
             nullable = ast.Constant(nullable)
-        args: list[ast.AST] = [_attr("_p2a_sm_sa", sa)] if enum is None else [
+        args: list[ast.AST] = [_attr("_p2a_sm_sa", sa)] if enum is None and sa != "UTCDateTime" else \
+            [ast.Call(_attr("_p2a_sm_sqltypes", "UTCDateTime"), [], [])] if enum is None else [
             ast.Call(_attr("_p2a_sm_sa", "Enum"), [copy.deepcopy(enum)], [])]
         if sa == "String" and "max_length" in kw:
             # AutoString(length=max_length)
@@ -469,6 +477,18 @@ class Rewriter:
                 ast.copy_location(x, fn.body[0])
         fn.body[0:0] = pre
 
+    def merge_fn(self) -> ast.FunctionDef:
+        """the data of SQLModel's `model_validate(obj, update=...)`: a dict or a model's fields, then the update"""
+        fn = ast.parse("""def _p2a_sm_merge(obj, update):
+    data = dict(obj) if isinstance(obj, dict) else {key: getattr(obj, key) for key in type(obj).model_fields}
+    data.update(update or {})
+    return data
+""").body[0]
+        last = self.tree.body[-1]
+        for x in ast.walk(fn):
+            ast.copy_location(x, last)
+        return fn
+
     def update_fn(self) -> ast.FunctionDef:
         """SQLModel.sqlmodel_update(obj, update=None): a dict sets the keys that are fields of the instance, a model
         each of its fields (a key of `update` wins), then the rest of `update`"""
@@ -513,7 +533,9 @@ class _Calls(ast.NodeTransformer):
     def __init__(self, rw: Rewriter):
         self.rw = rw
         self.assigned: dict[str, ast.AST] = {}
-        self.update = True  # obj.sqlmodel_update(...) -> the module's _p2a_sm_sqlmodel_update (its own tables only)
+        self.update = True  # obj.sqlmodel_update(...) -> the module's _p2a_sm_sqlmodel_update
+        self.used_update = False
+        self.used_merge = False
 
     def visit_FunctionDef(self, node):
         prev, self.assigned = self.assigned, {}
@@ -530,7 +552,10 @@ class _Calls(ast.NodeTransformer):
 
     def plain_statement(self, e: ast.AST) -> bool:
         """`text(...)` / `update(...)` / `delete(...)` / `insert(...)` (possibly chained: `.where(...)`), the names
-        imported from sqlalchemy or sqlmodel"""
+        imported from sqlalchemy or sqlmodel; a name every assignment of which in the function is one"""
+        if isinstance(e, ast.Name):
+            values = self.assigned.get(e.id, [])
+            return bool(values) and all(not isinstance(v, ast.Name) and self.plain_statement(v) for v in values)
         while isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute):
             e = e.func.value
         if not (isinstance(e, ast.Call) and isinstance(e.func, ast.Name)):
@@ -565,9 +590,21 @@ class _Calls(ast.NodeTransformer):
             return len(e.args)
         return None
 
+    def is_sqlmodel_name(self, f: ast.AST, name: str) -> bool:
+        """`f` is `name` imported from sqlmodel (`from sqlmodel import col`)"""
+        if not isinstance(f, ast.Name):
+            return False
+        for st in self.rw.tree.body:
+            if isinstance(st, ast.ImportFrom) and st.level == 0 and st.module == "sqlmodel":
+                if any(a.name == name and (a.asname or a.name) == f.id for a in st.names):
+                    return True
+        return False
+
     def visit_Call(self, node: ast.Call):
         self.generic_visit(node)
         f = node.func
+        if self.is_sqlmodel_name(f, "col") and len(node.args) == 1 and not node.keywords:
+            return node.args[0]  # sqlmodel.col(x): x, typed for the type checkers
         if isinstance(f, ast.Attribute) and f.attr == "exec" and len(node.args) == 1 and not node.keywords:
             w = self.select_width(node.args[0])
             if w is not None:
@@ -575,13 +612,20 @@ class _Calls(ast.NodeTransformer):
             elif self.plain_statement(node.args[0]):
                 f.attr = "execute"  # SQLModel's exec() of anything but a select: the Result, as execute()
         elif isinstance(f, ast.Attribute) and f.attr == "sqlmodel_update" and self.update and self.rw.tables and node.args:
+            self.used_update = True
             node = ast.copy_location(ast.Call(func=_name("_p2a_sm_sqlmodel_update"), args=[f.value, *node.args],
                                               keywords=node.keywords), node)
         elif (isinstance(f, ast.Attribute) and f.attr == "model_validate" and isinstance(f.value, ast.Name)
-              and f.value.id in self.rw.tables and len(node.args) == 1 and not node.keywords):
+              and f.value.id in self.rw.tables and len(node.args) == 1
+              and all(k.arg == "update" for k in node.keywords)):
             t = f.value.id
+            arg = node.args[0]
+            if node.keywords:
+                # SQLModel's model_validate(obj, update={...}): the object's values, the update's keys winning
+                self.used_merge = True
+                arg = ast.Call(func=_name("_p2a_sm_merge"), args=[arg, node.keywords[0].value], keywords=[])
             inner = ast.Call(func=ast.Attribute(value=_name(f"{t}_p2a_sm_view"), attr="model_validate", ctx=ast.Load()),
-                             args=node.args, keywords=[])
+                             args=[arg], keywords=[])
             node = ast.copy_location(ast.Call(func=_name(f"{t}_p2a_sm_build"), args=[inner], keywords=[]), node)
         return node
 
@@ -620,7 +664,7 @@ def free_names(fields: list[tuple[str, ast.AnnAssign]]) -> set[str]:
 HELPERS = ("raw", "build_raw", "view", "build")
 
 
-def import_tables(tree: ast.Module, imported: dict[str, tuple[str, str]]) -> bool:
+def import_tables(tree: ast.Module, imported: dict[str, tuple[str, str]], fields: dict[str, list[str]] | None = None) -> bool:
     """Table classes another project module defines, used here (`from app.models import Song`): what `Rewriter` does
     for its own tables, in the routes of this module only (a route's parameter, return annotation and
     response_model= are the table's unvalidating view, a parameter turned into the table's instance first;
@@ -628,7 +672,7 @@ def import_tables(tree: ast.Module, imported: dict[str, tuple[str, str]]) -> boo
     are imported under `<local>_p2a_sm_<helper>`. Plain functions are left as written: a table instance they receive
     is the caller's object. Whether anything changed."""
     rw = Rewriter(tree)
-    rw.tables = {local: {"fields": [], "node": None} for local in imported}
+    rw.tables = {local: {"fields": list((fields or {}).get(local, [])), "node": None} for local in imported}
     changed = False
     for fn in ast.walk(tree):
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(isinstance(d, ast.Call) for d in fn.decorator_list):
@@ -636,12 +680,20 @@ def import_tables(tree: ast.Module, imported: dict[str, tuple[str, str]]) -> boo
             rw.function(fn)
             changed |= ast.dump(fn) != before
     calls = _Calls(rw)
-    calls.update = False
+    calls.update = fields is not None
     before = ast.dump(tree)
     calls.visit(tree)
     changed |= ast.dump(tree) != before
     if not changed:
         return False
+    if calls.used_merge:
+        tree.body.append(rw.merge_fn())
+    if calls.used_update:
+        # obj.sqlmodel_update(...) on the imported tables: SQLModel's rules with their fields
+        tree.body.append(rw.update_fn())
+    if calls.used_update or calls.used_merge:
+        imp = ast.ImportFrom(module="pydantic", names=[ast.alias("BaseModel", "_p2a_sm_BaseModel")], level=0)
+        tree.body.insert(0, ast.copy_location(imp, tree.body[0]))
     at = next((i for i, st in enumerate(tree.body) if not (isinstance(st, ast.ImportFrom) and st.module == "__future__")
                and not (i == 0 and isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))), len(tree.body))
     anchor = tree.body[at] if at < len(tree.body) else tree.body[-1]

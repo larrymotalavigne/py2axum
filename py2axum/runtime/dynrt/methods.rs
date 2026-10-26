@@ -1841,7 +1841,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             Native::RespHeaders(r) => super::resp::headers_method(&r.headers, name, &args, &kwargs),
             Native::CellHeaders(c) => super::resp::headers_method(&c.headers, name, &args, &kwargs),
             Native::Totp(t) => super::auth::totp_method(t, name, &args, &kwargs),
-            Native::PwdHash => super::auth::pwd_method(name, &args, &kwargs),
+            Native::PwdHash(p) => super::auth::pwd_method(p, name, &args, &kwargs),
             Native::PassCtx(c) => super::auth::passlib_method(cx, c, name, &args, &kwargs).await,
             Native::Row(names, vals) if name == "_asdict" => V::dict_from(names.iter().zip(vals.iter()).map(|(k, x)| (V::str(k), x.clone())).collect()),
             Native::Row(_, vals) if name == "_tuple" => Ok(V::tuple(vals.to_vec())),

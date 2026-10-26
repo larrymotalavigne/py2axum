@@ -66,6 +66,8 @@ pub enum ColTy {
     Date,
     DateTime,
     DateTimeTz,
+    /// SQLModel >= 0.0.45's `UTCDateTime`: TIMESTAMPTZ, a naive datetime refused at bind time, values read in UTC
+    UtcDateTime,
     Time,
     Json,
     /// `JSON(none_as_null=True)`: Python None is SQL NULL instead of JSON `null`
@@ -122,6 +124,7 @@ impl std::fmt::Debug for ColTy {
             ColTy::Date => "Date",
             ColTy::DateTime => "DateTime",
             ColTy::DateTimeTz => "DateTimeTz",
+            ColTy::UtcDateTime => "UtcDateTime",
             ColTy::Time => "Time",
             ColTy::Json => "Json",
             ColTy::JsonNull => "JsonNull",
@@ -4577,6 +4580,13 @@ fn push_bind(args: &mut PgArguments, b: &Bind) -> R<()> {
     use sqlx::Arguments;
     let Bind::V(v, ty) = b;
     let ty = &ty.map(ColTy::base);
+    if let (Some(ColTy::UtcDateTime), V::DateTime(d)) = (ty, v) {
+        if d.tz.is_none() {
+            // UTCDateTime.process_bind_param
+            return Err(statement_error(&VALUE_ERROR, "builtins.ValueError", "Datetime values must have timezone information. Use \
+                datetime.now(timezone.utc), or annotate the field with NaiveDatetime for naive storage.", None));
+        }
+    }
     let res = match v {
         V::None => match ty.unwrap_or(ColTy::Str) {
             ColTy::Int => args.add(None::<i32>),
@@ -4587,7 +4597,7 @@ fn push_bind(args: &mut PgArguments, b: &Bind) -> R<()> {
             ColTy::Numeric => args.add(None::<String>),
             ColTy::Date => args.add(None::<chrono::NaiveDate>),
             ColTy::DateTime => args.add(None::<chrono::NaiveDateTime>),
-            ColTy::DateTimeTz => args.add(None::<chrono::DateTime<chrono::Utc>>),
+            ColTy::DateTimeTz | ColTy::UtcDateTime => args.add(None::<chrono::DateTime<chrono::Utc>>),
             ColTy::Time => args.add(None::<chrono::NaiveTime>),
             // SQLAlchemy's JSON type stores None as JSON null unless none_as_null=True
             ColTy::Json => args.add(Some(sqlx::types::Json(serde_json::Value::Null))),
@@ -4745,6 +4755,14 @@ fn map_col(c: &ColDesc, v: V) -> V {
         ColTy::Enum(ec) => ec.from_db(v),
         ColTy::NumFloat => match v {
             V::Decimal(d) => V::Float(d.to_f64()),
+            o => o,
+        },
+        // UTCDateTime.process_result_value: in UTC (a naive value is UTC)
+        ColTy::UtcDateTime => match v {
+            V::DateTime(d) => V::DateTime(match d.tz {
+                Some(_) => DateTime::from_utc(d.utc(), super::dt::Tz::Utc),
+                None => DateTime::from_utc(d.wall, super::dt::Tz::Utc),
+            }),
             o => o,
         },
         _ => v,

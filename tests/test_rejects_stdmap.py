@@ -25,8 +25,8 @@ async def x(s: str = ""):
 
 
 @pytest.mark.parametrize("body, msg", [
-    ('    warnings.warn("careful")\n    return {}', "warnings.warn(): only categories CPython's default filters ignore"),
-    ('    warnings.warn("careful", RuntimeWarning)\n    return {}', "only categories CPython's default filters ignore"),
+    ('    warnings.warn("careful", stacklevel=2)\n    return {}', "warnings.warn(): only categories CPython's default filters ignore"),
+    ('    warnings.warn("careful", type(ValueError()))\n    return {}', "only categories CPython's default filters ignore"),
     ('    warnings.warn("careful", category=UserWarning, stacklevel=2)\n    return {}', "use logging.warning()"),
     ('    warnings.simplefilter("error")\n    return {}', 'supported with the action "ignore" only'),
     ('    warnings.filterwarnings("always")\n    return {}', 'supported with the action "ignore" only'),

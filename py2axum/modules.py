@@ -683,7 +683,7 @@ class ModuleIndex:
         for m in list(self.modules.values()):
             if not m.in_package:
                 continue
-            imported = {}
+            imported, fields = {}, {}
             for local, spec in m.imports.items():
                 if spec[0] != "from":
                     continue
@@ -692,8 +692,13 @@ class ModuleIndex:
                     src = self.modules.get(t.module)
                     if src is not None and t.name in src.sm_tables:
                         imported[local] = (t.module, t.name)
-            if imported and import_tables(m.tree, imported):
+                        fields[local] = src.sm_tables[t.name]
+            if imported and import_tables(m.tree, imported, fields):
                 m.imports, m.stars = _import_specs(m.tree.body, m.package)
+                for node in m.tree.body:  # the helpers it added (`_p2a_sm_sqlmodel_update`, `_p2a_sm_merge`)
+                    if isinstance(node, ast.FunctionDef) and node.name.startswith("_p2a_sm_") and node.name not in m.defs:
+                        m.defs[node.name] = node
+                        m.binders.setdefault(node.name, []).append(node)
 
     # ------------------------------------------------------------------ loading
 

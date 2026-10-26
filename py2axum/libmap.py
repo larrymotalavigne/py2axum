@@ -298,6 +298,9 @@ VALUES: dict[str, str] = {
     **{f"{m}.{n}": f"V::Int({v})" for m in ("subprocess", "asyncio.subprocess")
        for n, v in (("PIPE", -1), ("STDOUT", -2), ("DEVNULL", -3))},
     "sys.maxsize": "V::Int(i64::MAX)",  # CPython's on 64-bit platforms
+    # argon2-cffi's Type members, as pwdlib's Argon2Hasher(type=) takes them
+    **{f"argon2.Type.{t}": f'V::str("{t}")' for t in ("ID", "I", "D")},
+    **{f"argon2.low_level.Type.{t}": f'V::str("{t}")' for t in ("ID", "I", "D")},
     # pickle protocols: the default is 5 from Python 3.14 (4 before)
     "pickle.DEFAULT_PROTOCOL": f"V::Int(if {RT}::python() >= (3, 14) {{ 5 }} else {{ 4 }})",
     "pickle.HIGHEST_PROTOCOL": "V::Int(5)",
@@ -1415,8 +1418,14 @@ CALLS = {
     # passlib 1.7.4: CryptContext(schemes=["bcrypt"]) over the bcrypt package (passlib_static checks the call)
     "passlib.context.CryptContext": lambda a, kw: (list(a), kw.items(), f"{RT}::auth::passlib_context({_passlib_bcrypt()!r})".replace("'", '"'))[2],
     # pwdlib 0.2+: the recommended Argon2 hasher (hash, verify, verify_and_update)
-    "pwdlib.PasswordHash.recommended": lambda a, kw: f"{RT}::auth::pwd_recommended()" if not a and not kw else
+    "pwdlib.PasswordHash.recommended": lambda a, kw: f"{RT}::auth::pwd_recommended({str(_bcrypt5()).lower()})" if not a and not kw else
         (_ for _ in ()).throw(ValueError("PasswordHash.recommended() takes no arguments")),
+    # pwdlib 0.2+: PasswordHash((Argon2Hasher(...), BcryptHasher(...))): the first hashes, each verifies its own hashes
+    "pwdlib.PasswordHash": lambda a, kw: f"{RT}::auth::pwd_new({str(_bcrypt5()).lower()}, &{_argv(a)}, &{_kwvec(kw)})",
+    **{f"pwdlib.hashers.{m}.{c}": (lambda k: lambda a, kw: f"{RT}::auth::pwd_hasher(\"{k}\", &{_argv(a)}, &{_kwvec(kw)})")(k)
+       for m, c, k in (("argon2", "Argon2Hasher", "argon2"), ("bcrypt", "BcryptHasher", "bcrypt"))},
+    **{f"pwdlib.hashers.{c}": (lambda k: lambda a, kw: f"{RT}::auth::pwd_hasher(\"{k}\", &{_argv(a)}, &{_kwvec(kw)})")(k)
+       for c, k in (("Argon2Hasher", "argon2"), ("BcryptHasher", "bcrypt"))},
     "pyotp.random_base32": lambda a, kw: f"{RT}::auth::random_base32(&{_argv(a)}, &{_kwvec(kw)})",
     "pyotp.TOTP": lambda a, kw: f"{RT}::auth::totp_new(&{_argv(a)}, &{_kwvec(kw)})",
     "pyotp.totp.TOTP": lambda a, kw: f"{RT}::auth::totp_new(&{_argv(a)}, &{_kwvec(kw)})",

@@ -3454,6 +3454,9 @@ class Project:
                             raise self.err(f"column {name}: Enum({k.arg}=) is not supported", k, module)
                     col["ty"] = f"Enum(&{self.enum_col(et, by_value, pg_name if native else None)})"
                     continue
+                if isinstance(fn_t, Ext) and fn_t.dotted in {"sqlmodel.sql.sqltypes.UTCDateTime", "sqlmodel.UTCDateTime"}:
+                    col["ty"] = "UtcDateTime"
+                    continue
                 if isinstance(fn_t, Sym) and self.is_type_decorator(fn_t):
                     if isinstance(a, ast.Call):
                         for x in [*a.args, *(k.value for k in a.keywords)]:
@@ -9278,6 +9281,25 @@ class FnCompiler:
 
     # the categories CPython's default filters ignore (`ignore::DeprecationWarning`...); the others are printed on stderr
     IGNORED_WARNINGS = {"DeprecationWarning", "PendingDeprecationWarning", "ImportWarning", "ResourceWarning"}
+    # builtin categories CPython's default filters print (action "default": once per message, category and line)
+    PRINTED_WARNINGS = {"UserWarning", "RuntimeWarning", "FutureWarning", "SyntaxWarning", "UnicodeWarning",
+                        "BytesWarning", "EncodingWarning", "Warning"}
+
+    def printed_warning(self, node: ast.AST | None, msg: ast.AST | None) -> str | None:
+        """the name of a builtin category the default filters print, written at `node` (None: UserWarning, unless the
+        message is a warning instance)"""
+        if node is None:
+            if isinstance(msg, ast.Call):
+                ref = self.static_ref(msg.func)
+                if isinstance(ref, tuple) and ref[:1] == ("builtin",) and ref[1] in self.PRINTED_WARNINGS | self.IGNORED_WARNINGS:
+                    return None  # an instance written in place: refused below (its text is its args)
+            return "UserWarning"
+        ref = self.static_ref(node)
+        if isinstance(ref, tuple) and ref[:1] == ("builtin",) and ref[1] in self.PRINTED_WARNINGS:
+            return ref[1]
+        if isinstance(ref, Ext) and ref.dotted.startswith("builtins.") and ref.dotted[9:] in self.PRINTED_WARNINGS:
+            return ref.dotted[9:]
+        return None
 
     def warning_ignored(self, node: ast.AST, depth: int = 0) -> bool:
         """The category written at `node` is one the default filters ignore: a builtin of IGNORED_WARNINGS, or a project
@@ -9328,11 +9350,22 @@ class FnCompiler:
                 ok = self.warning_ignored(cat)
             else:  # the category is the message's own: a warning instance written in place
                 ok = isinstance(msg, ast.Call) and self.warning_ignored(msg.func)
+            printed = None if ok else self.printed_warning(cat, msg)
+            level = node.args[2] if len(node.args) > 2 else kws.get("stacklevel")
+            if printed is not None and msg is not None and (level is None or (isinstance(level, ast.Constant) and level.value == 1)) \
+                    and "source" not in kws and len(node.args) < 4:
+                # printed on stderr as CPython's default filters do: `file:line: Category: message` and the line
+                lines = Path(self.p.src(self.module)).read_text(encoding="utf-8", errors="replace").splitlines()
+                line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
+                text = self.expr(msg)
+                return self.q(f"{RT}::logging::warn_print({rs(printed)}, &{text}, {rs(self.p.rel_file(self.module))}, "
+                              f"{node.lineno}, {rs(line)}, {rs(self.module)})")
             if not ok:
                 raise self.err("warnings.warn(): only categories CPython's default filters ignore (DeprecationWarning, "
-                               "PendingDeprecationWarning, ImportWarning, ResourceWarning and their subclasses) are "
-                               "supported: any other warning is printed on stderr with the module's file path, once per "
-                               "location; use logging.warning() for it", node)
+                               "PendingDeprecationWarning, ImportWarning, ResourceWarning and their subclasses), or a "
+                               "builtin category they print (UserWarning, RuntimeWarning, FutureWarning...) with "
+                               "stacklevel=1, are supported: another warning is printed with the location of a caller "
+                               "py2axum does not know; use logging.warning() for it", node)
         args, kwargs = self.dyn_args(node)
         return self.q(f"{{ let _a: Vec<V> = {args}; let _k: Vec<(String, V)> = {kwargs}; Ok::<V, Exc>(V::None) }}")
 
