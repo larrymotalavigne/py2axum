@@ -8,12 +8,12 @@ conformance suites run on. CI runs the test suite and the full conformance of th
 
 | Library | Lowest tested | Highest tested | Accepted |
 |---|---|---|---|
-| fastapi | 0.137.0 | 0.156.8 | `>=0.137.0,<0.157` |
-| starlette | 1.0.0 | 1.9.0 | `>=1.0.0,<1.10` |
+| fastapi | 0.137.0 | 0.162.0 | `>=0.137.0,<0.163` |
+| starlette | 1.0.0 | 1.10.0 | `>=1.0.0,<1.11` |
 | pydantic | 2.12.0 | 2.14.0 | `>=2.12.0,<2.15` |
 | pydantic-core | 2.41.1 | 2.50.0 | `>=2.41.1,<2.51` |
 | pydantic-settings | 2.11.0 | 2.16.0 | `>=2.11.0,<2.17` |
-| sqlalchemy | 2.0.44 | 2.1.5 | `>=2.0.44,<2.2` |
+| sqlalchemy | 2.0.44 | 2.1.6 | `>=2.0.44,<2.2` |
 | psycopg | 3.2.12 | 3.3.6 | `>=3.2.12,<3.4` |
 | httpx | 0.28.1 | 0.28.1 | `>=0.28.1,<0.29` |
 | aiohttp | 3.13.0 | 3.14.4 | `>=3.13.0,<3.15` |
@@ -89,12 +89,12 @@ Other pydantic 2.14 changes concern constructs py2axum refuses (`multiple_of`, `
 with a `None` member (2.13 returns it for any unknown JSON value) are not reproduced.
 
 FastAPI behaviours that follow the project's version (request handling changed release by release from 0.144 to
-0.156; `fixtures/langapp/fa156.py` runs each case on both sides):
+0.162; `fixtures/langapp/fa156.py` runs each case on both sides, CI runs it on 0.142, 0.156 and 0.162):
 
 | From | Behaviour |
 |---|---|
 | 0.144 | a non-finite float in a JSON Lines or SSE item without an item model is `null` (was `NaN`); a text field among the files of a `list[bytes]` parameter is kept (was a 500) |
-| 0.147 | a `bool` (or `bool \| None`) form field missing from the form is `False`, its default ignored (an unchecked checkbox) |
+| 0.147 to 0.161 | a `bool` (or `bool \| None`) form field missing from the form is `False`, its default ignored (an unchecked checkbox; 0.162 dropped it) |
 | 0.148 | defaults are applied at validation: a missing parameter's default is not validated (`AfterValidator`s and conversions skip it), and a parameter model's absent fields are left out of its input (the model's own defaults apply) |
 | 0.149 | an empty form value is absent for the fields of a form model too |
 | 0.150 | an empty file input (empty filename, no content) is absent, and left out of a list of files |

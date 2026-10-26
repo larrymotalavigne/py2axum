@@ -35,10 +35,16 @@ jobs:
           python -m venv /tmp/w && /tmp/w/bin/pip install dist/*.whl && /tmp/w/bin/py2axum --help
 
   fastapi-previous:
-    # FastAPI changed its request handling release by release from 0.144 to 0.156 (dynrt `fastapi_at_least`): the
+    # FastAPI changed its request handling release by release from 0.144 to 0.162 (dynrt `fastapi_at_least`): the
     # previous highest versions stay tested on langapp, whose fixtures/langapp/fa156.py covers each change
-    name: conformance, FastAPI 0.142 (langapp)
+    name: conformance, FastAPI ${{ matrix.fastapi }} (langapp)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {fastapi: "0.142", pins: fastapi0.142, version: "0, 142, 3"}
+          - {fastapi: "0.156", pins: fastapi0.156, version: "0, 156, 8"}
     services:
       postgres:
         image: postgres:16-alpine
@@ -62,9 +68,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: generated/langapp_axum
-      - name: Python reference dependencies (FastAPI 0.142.3, Starlette 1.7.0, SQLAlchemy 2.1.4)
+      - name: Python reference dependencies (a previous highest FastAPI, Starlette, SQLAlchemy)
         run: >
-          pip install $(python -m py2axum.versions fastapi0.142) "uvicorn[standard]" "pydantic[email]" sqlmodel==0.0.48
+          pip install $(python -m py2axum.versions ${{ matrix.pins }}) "uvicorn[standard]" "pydantic[email]" sqlmodel==0.0.48
           pytest python-jose==3.5.0 pyjwt==2.15.1 bcrypt==5.0.0 "pwdlib[argon2,bcrypt]==0.3.1" pyotp==2.9.0 pywebpush==2.3.0
           py-vapid==1.9.4 http-ece==1.2.1 google-auth==2.49.0 requests psutil==7.2.2 alembic pydantic-settings
           sentry-sdk==2.71.0 itsdangerous==2.2.0 cryptography python-multipart==0.0.32 jinja2 aiosmtplib redis==8.1.0 aio-pika==10.0.1 tenacity==9.1.4 prometheus-client==0.26.0 nh3==0.3.6
@@ -76,7 +82,7 @@ jobs:
           BIN: generated/langapp_axum/target/release/langapp_axum
         run: |
           python -m py2axum fixtures/langapp --root . --python-side '/dunders/proxied/{name}' -o generated/langapp_axum --name langapp_axum
-          grep -q "set_fastapi(0, 142, 3)" generated/langapp_axum/src/main.rs
+          grep -q "set_fastapi(${{ matrix.version }})" generated/langapp_axum/src/main.rs
           (cd generated/langapp_axum && cargo build --release)
           python -c "from tests.scenarios import langapp; langapp.reset('$DATABASE_URL')"
           ./scripts_start_langapp.sh

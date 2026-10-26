@@ -756,9 +756,14 @@ fn form_list<'a>(vals: Vec<&'a FormVal>) -> Vec<&'a FormVal> {
     vals.into_iter().filter(|v| !matches!(v, FormVal::File(f) if super::files::empty_upload(f))).collect()
 }
 
-/// FastAPI 0.147: a `bool` (or `bool | None`) form field absent from the form is False (an unchecked checkbox)
+/// FastAPI 0.147 to 0.161: a `bool` (or `bool | None`) form field absent from the form is False (an unchecked
+/// checkbox; 0.162 dropped it)
+fn checkbox_inference() -> bool {
+    super::fastapi_at_least(147) && !super::fastapi_at_least(162)
+}
+
 fn form_bool_absent(form: &[(String, FormVal)], alias: &str, td: &TD) -> bool {
-    super::fastapi_at_least(147)
+    checkbox_inference()
         && matches!(td.bare(), TD::Bool | TD::Optional(TD::Bool))
         && !form.iter().any(|(k, _)| k == alias)
 }
@@ -845,7 +850,7 @@ pub async fn param_model(cx: &Cx, source: &str, td: &'static TD, convert: bool, 
         }
         let seq = td_is_sequence(f.td);
         let empty = |v: &V| form_empty_absent && (matches!(v, V::Str(s) if s.is_empty()) || super::fastapi_at_least(150) && super::files::empty_upload(v));
-        let raw = if source == "form" && super::fastapi_at_least(147) && matches!(f.td.bare(), TD::Bool | TD::Optional(TD::Bool))
+        let raw = if source == "form" && checkbox_inference() && matches!(f.td.bare(), TD::Bool | TD::Optional(TD::Bool))
             && !received.iter().any(|(k, _)| *k == look) {
             Some(V::Bool(false))
         } else if seq && multi {
