@@ -4407,7 +4407,7 @@ class Project:
                 if parent.__dict__.get("init") is not None:
                     info.__dict__["init"] = parent.__dict__["init"]
                 for k in ("strip", "lower", "upper", "smin", "smax", "strict", "field_sers", "model_ser", "root", "enum_values", "validate_assignment", "populate_by_name", "post_init",
-                          "alias_gen", "validate_by_alias", "ser_by_alias", "hide_input", "env_ignore_empty", "finite", "validate_default"):
+                          "alias_gen", "validate_by_alias", "ser_by_alias", "hide_input", "env_ignore_empty", "finite", "validate_default", "json_enc"):
                     if k in parent.__dict__:
                         info.__dict__[k] = parent.__dict__[k]
                 # the merged `model_config` (pydantic updates it from each base in order): `**Base.model_config`
@@ -4612,6 +4612,7 @@ class Project:
         if any(k.arg is None for k in cls_kw):
             raise self.err(f"schema {sym.name}: `**` in the class keywords is not supported", node, module)
         self.config_items(info, cls_kw, module)
+        self.json_encoded(sym, info, fields, node, module)
         # model_config validate_default (inherited, or the class's own): every field that does not set its own
         for f in fields:
             if "vd_explicit" in f:
@@ -5029,6 +5030,37 @@ class Project:
             sers[n] = entry
         info.__dict__["field_sers"] = sers
 
+    def json_encoded(self, sym: Sym, info, fields: list, node, module: str) -> None:
+        """`model_config json_encoders={datetime: fn, ...}`: each field whose annotation is one of those types gets
+        `fn` as its serializer in JSON mode (a field's own serializer wins). The type inside `Optional[...]` or a
+        container (pydantic applies the encoder there too) is refused."""
+        enc = info.__dict__.get("json_enc")
+        if enc is None:
+            return
+        d, emod = enc
+        keys = [(self.resolve(emod, k), v) for k, v in zip(d.keys, d.values)]
+        for k, (rk, _) in zip(d.keys, keys):
+            if not isinstance(rk, (Ext, Sym)):
+                raise self.err(f"model_config json_encoders: key `{ast.unparse(k)}` is not a type", k, emod)
+        for f in fields:
+            ann = f.get("ann")
+            if ann is None or f.get("serializer") or f["name"] in info.__dict__.get("field_sers", {}):
+                continue
+            a, amod = ann
+            t = self.resolve(amod, a) if isinstance(a, (ast.Name, ast.Attribute)) else None
+            hit = next((v for rk, v in keys if t is not None and rk == t), None)
+            if hit is not None:
+                vsym = Sym(emod, f"{sym.name}.<json_enc_{f['name']}>")
+                self.__dict__.setdefault("lambda_validators", {})[vsym] = hit
+                f["serializer"] = (vsym, False, self.function_validator_info(hit, emod, 1), self.WHEN_USED["json"])
+                continue
+            inner = [n for n in ast.walk(a) if isinstance(n, (ast.Name, ast.Attribute)) and n is not a]
+            for n in inner:
+                rt = self.resolve(amod, n)
+                if any(rt is not None and rt == rk for rk, _ in keys):
+                    raise self.err(f"schema {sym.name}.{f['name']}: model_config json_encoders for `{ast.unparse(n)}` inside "
+                                   f"`{ast.unparse(a)}` is not supported (only a field of that type itself)", node, module)
+
     def function_validator_info(self, fn, module: str, lead: int = 1) -> int:
         """0 or 1: whether a validator function (a lambda, a project function) takes `info` after the value (and
         the handler of a wrap validator: `lead` 2)."""
@@ -5229,6 +5261,11 @@ class Project:
             elif kw.arg in {"env_file", "env_file_encoding",
                             "arbitrary_types_allowed", "protected_namespaces", "json_schema_extra", "title"}:
                 pass
+            elif kw.arg == "json_encoders":
+                # pydantic 2 (deprecated, still applied): a JSON-mode serializer of the fields of that type (json_encoded)
+                if not isinstance(kw.value, ast.Dict) or any(k is None for k in kw.value.keys):
+                    raise self.err("model_config json_encoders= must be a dict literal {type: function}", kw, module)
+                info.__dict__["json_enc"] = (kw.value, module)
             elif kw.arg in {"defer_build", "cache_strings", "validate_return", "use_attribute_docstrings"}:
                 # when the validator is built, pydantic-core's string cache, `@validate_call` only, the JSON schema's
                 # descriptions (model_json_schema() refuses a model_config beyond from_attributes/extra): no effect here

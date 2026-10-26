@@ -510,3 +510,34 @@ async def y(m: M):
     generate(tmp_path, tmp_path / "proj")
     gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
     assert "late: Some(&LB_1)" in gen and "pub async fn lb_2" in gen
+
+
+@pytest.mark.parametrize("field, ok", [("at: datetime", True), ("at: datetime | None = None", False)])
+def test_json_encoders(tmp_path, capsys, field, ok):
+    """`model_config json_encoders={datetime: fn}`: the JSON-mode serializer of a datetime field; inside Optional,
+    refused (pydantic applies it to the datetime member)."""
+    src = f'''
+from datetime import datetime
+
+from fastapi import FastAPI
+from pydantic import BaseModel, ConfigDict
+
+app = FastAPI()
+
+
+class M(BaseModel):
+    model_config = ConfigDict(json_encoders={{datetime: lambda v: v.isoformat()}})
+    {field}
+
+
+@app.get("/m", response_model=M)
+async def m():
+    return M(at=datetime(2026, 1, 2))
+'''
+    pkg = project(tmp_path, src)
+    rc = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
+    assert rc == (0 if ok else 1)
+    if ok:
+        assert "json_enc_at" in (tmp_path / "out" / "src" / "gen.rs").read_text()
+    else:
+        assert "json_encoders for `datetime` inside" in capsys.readouterr().err

@@ -124,6 +124,8 @@ STEPS: list = [    # dunder methods, hashability, frozen models (fixtures/langap
     ("POST", "/pydv1/parse_raw", {"raw": "nope"}),
     ("GET", "/pydv1/misc", None),
     ("GET", "/pydv1/validate_default", None),
+    ("GET", "/pydv1/json_encoders", None),
+    ("GET", "/pydv1/json_encoders/modes", None),
     ("GET", "/modspan/", None),
     ("GET", "/modspan/iter", None),
     ("GET", "/modspan/ddlambda", None),

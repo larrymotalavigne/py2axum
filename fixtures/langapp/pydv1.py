@@ -1,5 +1,8 @@
 """Pydantic v1's methods on v2 models (deprecated, still shipped): parse_obj, parse_raw, validate, construct,
 from_orm, schema, update_forward_refs, .json(), .copy()."""
+import datetime as dt
+from decimal import Decimal
+
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -98,3 +101,27 @@ async def validate_default():
         bad = errs(e)
     c = LooseChild()
     return {"d": [d.n, d.tags, d.raw, d.when], "given": Defaults(n=4).n, "bad": bad, "child": [c.n, c.tags]}
+
+
+class Encoded(BaseModel):
+    """model_config json_encoders (pydantic 2 still applies them, in JSON mode only)"""
+    model_config = ConfigDict(json_encoders={dt.datetime: lambda v: v.strftime("%Y/%m/%d"), Decimal: float})
+    at: dt.datetime
+    amount: Decimal
+    day: dt.date
+
+
+class EncodedChild(Encoded):
+    extra: Decimal = Decimal("2.50")
+
+
+@router.get("/json_encoders", response_model=EncodedChild)
+async def json_encoders():
+    e = EncodedChild(at=dt.datetime(2026, 1, 2, 3, 4), amount=Decimal("1.50"), day=dt.date(2026, 1, 2))
+    return e
+
+
+@router.get("/json_encoders/modes")
+async def json_encoders_modes():
+    e = Encoded(at=dt.datetime(2026, 1, 2, 3, 4), amount=Decimal("1.50"), day=dt.date(2026, 1, 2))
+    return {"json": e.model_dump_json(), "py": str(e.model_dump()), "json_mode": e.model_dump(mode="json")}
