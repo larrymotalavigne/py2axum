@@ -18,18 +18,33 @@ from .ir import TranspileError
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    from .config import ConfigError
+
+    try:
+        return _main(argv)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+
+def _main(argv: list[str]) -> int:
+    from .config import apply as with_config
+
     if argv[:1] == ["check"]:
         from .check import main as check
+        from .check import parser as check_parser
 
-        return check(argv[1:])
+        return check(with_config(argv[1:], check_parser))
     if argv[:1] == ["watch"]:
         from .watch import main as watch
+        from .watch import parser as watch_parser
 
-        return watch(argv[1:])
+        return watch(with_config(argv[1:], watch_parser))
     from .versions import apply_python_flag
 
     if removed_backend(argv):
         return 2
+    argv = with_config(argv, parser)
     ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)

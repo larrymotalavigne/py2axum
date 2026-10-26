@@ -95,6 +95,29 @@ A failed cycle prints the error and keeps the previous binary running. Ctrl-C st
 
 <!-- py2axum:watch-help -->
 
+## Options in `pyproject.toml`
+
+An application's options can live in its `pyproject.toml`, under `[tool.py2axum]`, so that a plain
+`py2axum check` or `py2axum -o build/api` runs with them (from the directory of the file or below it):
+
+```toml
+[tool.py2axum]
+package = "api"
+root = "."
+app = "api.main:app"
+python-side = ["auto"]
+translate-libs = "auto"
+name = "api"
+fail-under = 90      # check only
+```
+
+The keys are the long options of the commands (`python-side` or `python_side`), plus `package` and `out`. A flag
+takes `true`, a repeatable option a string or a list, and paths are relative to the `pyproject.toml`. The closest
+`pyproject.toml` with a `[tool.py2axum]` table, from the current directory up, is read, and py2axum prints the
+options it took from it. They come before the command line's: a value given on the command line wins, and a
+repeatable option adds to the file's. A key that only another command takes (`fail-under` while generating, `run`
+outside `watch`) is skipped; an unknown key, or `explain`/`json`, is an error (exit status 2).
+
 ## The binary's `migrate`
 
 The generated binary applies the project's alembic migrations without Python when an `alembic.ini` was found at
