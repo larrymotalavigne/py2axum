@@ -141,7 +141,6 @@ T = "class T(SQLModel, table=True):\n    id: int | None = Field(default=None, pr
     ("from sqlalchemy import Column, String", T + "    name: str = Field(sa_column=Column('label', String))\n", "    return session.get(T, 1).id",
      "annotate with Mapped"),
     ("", T + "\n    def label(self):\n        return 'x'\n", "    return session.get(T, 1).id", "annotate with Mapped"),
-    ("from datetime import datetime", T + "    at: datetime\n", "    return session.get(T, 1).id", "annotate with Mapped"),
     ("", T + "    tags: list[str] = []\n", "    return session.get(T, 1).id", "annotate with Mapped"),
     # a statement given two widths (one entity, then two columns): scalars or rows cannot be told apart
     ("", T, "    statement = select(T)\n    statement = select(T.id, T.id)\n    return session.exec(statement).all()", "exec"),
@@ -185,15 +184,13 @@ class Account(SQLModel, table=True):
 '''
 
 
-@pytest.mark.parametrize("version, column", [((0, 0, 44), "DateTime"), ((0, 0, 24), "DateTime"), ((0, 0, 45), None)])
+@pytest.mark.parametrize("version, column", [((0, 0, 44), "_p2a_sm_sa.DateTime"), ((0, 0, 24), "_p2a_sm_sa.DateTime"),
+                                             ((0, 0, 45), "_p2a_sm_sqltypes.UTCDateTime()")])
 def test_datetime_column_follows_the_locked_sqlmodel(version, column):
     """SQLModel's get_sqlalchemy_type: datetime -> DateTime (naive) before 0.0.45, its UTCDateTime decorator since
-    (not rewritten: the class is left to the translator, which refuses it); EmailStr -> AutoString(max_length)"""
+    (TIMESTAMPTZ, read in UTC); EmailStr -> AutoString(max_length)"""
     out = ast.unparse(rewrite(ast.parse(DATED), version))
-    if column is None:
-        assert "class Account(SQLModel, table=True)" in out
-        return
-    assert f"created_at: _p2a_sm_orm.Mapped[datetime] = _p2a_sm_orm.mapped_column(_p2a_sm_sa.{column}," in out
+    assert f"created_at: _p2a_sm_orm.Mapped[datetime] = _p2a_sm_orm.mapped_column({column}," in out
     assert "email: _p2a_sm_orm.Mapped[EmailStr] = _p2a_sm_orm.mapped_column(_p2a_sm_sa.String(80)," in out
 
 
