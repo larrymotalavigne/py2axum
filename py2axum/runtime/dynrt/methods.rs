@@ -3884,6 +3884,12 @@ pub fn b_type(args: &[V]) -> R {
         V::Obj(o) => V::Class(o.desc.class),
         V::Enum(e, _) => V::Class(e.class),
         V::Decimal(_) => V::native(Native::Type("Decimal")),
+        // a defaultdict or Counter is a dict registered with its factory
+        V::Dict(d) => V::native(Native::Type(match ops::default_factory(d) {
+            Some("Counter") => "collections.Counter",
+            Some(_) => "collections.defaultdict",
+            None => "dict",
+        })),
         V::Native(n) if matches!(&**n, Native::TypeExpr(..)) => V::native(Native::ExtType("types.GenericAlias")),
         // builtins held as values are `Native::Type(name)`: the functions among them are not types
         V::Native(n) if matches!(&**n, Native::Type(t) if BUILTIN_FUNCTIONS.contains(t)) => V::native(Native::Type("builtin_function_or_method")),

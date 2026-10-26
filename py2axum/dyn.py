@@ -9434,12 +9434,17 @@ class FnCompiler:
         raise self.err(f"builtin `{name}()` is not supported", node)
 
     def stored_iter(self, call: ast.Call) -> bool:
-        """`it = iter(x)`: a stateful iterator (next(it) twice...), not translated; `f(iter(x))` is."""
+        """`it = iter(x)`: a stateful iterator (next(it) twice...), not translated; `f(iter(x))` is. So is
+        `iter(x) is y`, an identity test."""
         scope = self.node if self.node is not None else None
         if scope is None:
             return False
         for n in walk_scope(scope):
             if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and n.value is call:
+                return True
+            # `iter(it) is it`: an iterator's iter() is itself
+            if (isinstance(n, ast.Compare) and all(isinstance(o, (ast.Is, ast.IsNot)) for o in n.ops)
+                    and any(x is call for x in [n.left, *n.comparators])):
                 return True
         return False
 
