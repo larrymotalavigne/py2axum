@@ -11369,6 +11369,9 @@ def route_key(fn, deco, n: int, k: int) -> tuple:
 def route_node_item(items, nodes, members, order, m, fn, deco, router, path, pattern, found, n: int, k: int) -> None:
     """The route tree's node of one route decorator (`APIRoute` or WebSocket route)."""
     name = next((kw.value.value for kw in deco.keywords if kw.arg == "name" and isinstance(kw.value, ast.Constant)), fn.name)
+    methods = [x.upper() for x in getattr(deco, "p2a_methods", [deco.func.attr])]
+    if getattr(deco, "p2a_orig", None) is not None and (m.name, deco.lineno) in nodes:
+        return  # `api_route(methods=[...])`: one APIRoute for all its methods, made at its first method
     ident_ = f"RN_{len(nodes) + 1}"
     nodes[(m.name, deco.lineno)] = ident_
     if found is None:
@@ -11376,7 +11379,7 @@ def route_node_item(items, nodes, members, order, m, fn, deco, router, path, pat
                      f"pattern: {rs(pattern)}, name: {rs(name)} }};")
     else:
         items.append(f"static {ident_}: {RT}::routing::Node = {RT}::routing::Node::Api {{ path: {rs(path)}, pattern: {rs(pattern)}, "
-                     f"methods: &[{rs(deco.func.attr.upper())}], name: {rs(name)} }};")
+                     f"methods: &[{', '.join(rs(x) for x in methods)}], name: {rs(name)} }};")
     members.setdefault(router or "app", []).append(((order.get(m.name, 0), *route_key(fn, deco, n, k)), ident_))
 
 

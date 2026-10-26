@@ -848,6 +848,7 @@ class Frontend:
                     func = ast.copy_location(ast.Attribute(value=d.func.value, attr=n, ctx=ast.Load()), d.func)
                     c = ast.copy_location(ast.Call(func=func, args=d.args, keywords=[k for k in d.keywords if k.arg != "methods"]), d)
                     c.p2a_orig = d
+                    c.p2a_methods = names  # one APIRoute with all these methods (the route tree's node)
                     out.append(c)
             cache[id(d)] = (d, out)
         return cache[id(d)][1]
