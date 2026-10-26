@@ -338,6 +338,8 @@ def parser():
     ap.add_argument("--root", type=Path, default=None, help="import root, like sys.path (default: parent of the package)")
     ap.add_argument("--path", type=Path, action="append", default=[], metavar="DIR",
                     help="experimental: one more import root, like an extra sys.path entry (repeatable): the sibling packages of a monorepo the application installs from its own checkout")
+    ap.add_argument("--app", default=None, metavar="MODULE[:ATTR]",
+                    help="as for generation: the served application (uvicorn's import string), when the package has several")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="as for generation: routes or the lifespan left to Python; auto: every route that does not translate")
     ap.add_argument("--format", choices=["text", "json", "markdown"], default=None,
@@ -380,9 +382,11 @@ def main(argv: list[str]) -> int:
         ap.error("the package directory is required (or --explain CODE)")
     if not args.package.is_dir():
         ap.error(f"{args.package} is not a directory")
+    from .frontend import set_app_target
     from .modules import set_extra_roots
 
     set_extra_roots(args.path)
+    set_app_target(args.app)
     fmt = args.format or ("json" if args.json else "text")
     result = run(args.package, args.root, args.python_side, args.allow_untested_versions)
     s = result["summary"]

@@ -42,6 +42,7 @@ conformance suites run on. CI runs the test suite and the full conformance of th
 | loguru | 0.7.2 | 0.7.3 | `>=0.7.2,<0.8` |
 | bcrypt | 4.3.0 | 5.0.0 | `>=4.3.0,<5.1` |
 | passlib | 1.7.4 | 1.7.4 | `>=1.7.4,<1.8` |
+| python-dotenv | 1.2.0 | 1.2.4 | `>=1.2.0,<1.3` |
 | Python | 3.12 | 3.15 | `>=3.12,<3.16` |
 
 `mcp` is covered by the conformance of a real MCP server (tested internally), rather than by the matrix;

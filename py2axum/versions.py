@@ -74,6 +74,8 @@ SUPPORTED: dict[str, tuple[str, str, str]] = {
     # passlib 1.7.4 can no longer load its bcrypt backend (every hash and verify raises: reproduced)
     "bcrypt": ("4.3.0", "5.0.0", "5.1"),
     "passlib": ("1.7.4", "1.7.4", "1.8"),
+    # dynrt/dotenv.rs: load_dotenv / dotenv_values, a port of 1.2's parser.py, variables.py and main.py
+    "python-dotenv": ("1.2.0", "1.2.4", "1.3"),
 }
 # outside the CI matrix: their range is the lock of an application conformance-tested internally
 _LOCK_ONLY = ("mcp", "asyncpg", "icalendar")
@@ -89,7 +91,7 @@ _BY_IMPORT = {"pydantic_settings": ("pydantic-settings",), "sqlalchemy": ("sqlal
               "loguru": ("loguru",),
               "dateutil.parser": ("python-dateutil",), "dateutil.tz": ("python-dateutil",),
               "stripe": ("stripe",), "pgpy": ("pgpy", "pyasn1", "cryptography"),
-              "bcrypt": ("bcrypt",), "passlib": ("passlib", "bcrypt")}
+              "bcrypt": ("bcrypt",), "passlib": ("passlib", "bcrypt"), "dotenv": ("python-dotenv",)}
 # constructs translated with the semantics of a newer version than the range's lowest:
 # (label, regex on the package's source, distribution, lowest version)
 _FEATURES = [("WebSocket routes (Starlette 1.7's WebSocketDisconnected semantics)", r"\.websocket\(", "starlette", "1.7.0")]

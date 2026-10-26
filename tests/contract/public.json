@@ -48,6 +48,17 @@
    },
    {
     "flags": [
+     "--app"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "MODULE[:ATTR]",
+    "required": false
+   },
+   {
+    "flags": [
      "--python-side"
     ],
     "action": "AppendAction",
@@ -178,6 +189,17 @@
     "choices": null,
     "default": [],
     "metavar": "DIR",
+    "required": false
+   },
+   {
+    "flags": [
+     "--app"
+    ],
+    "action": "StoreAction",
+    "nargs": null,
+    "choices": null,
+    "default": null,
+    "metavar": "MODULE[:ATTR]",
     "required": false
    },
    {
@@ -568,6 +590,7 @@
   "PY2AXUM_TARGET_PYTHON",
   "PYCHARM_HOSTED",
   "PYTHONCOERCECLOCALE",
+  "PYTHON_DOTENV_DISABLED",
   "SOURCE_DATE_EPOCH",
   "STRIPE_LOG",
   "TRAVIS",
@@ -629,6 +652,8 @@
   "P2A0315",
   "P2A0316",
   "P2A0318",
+  "P2A0319",
+  "P2A0320",
   "P2A0401",
   "P2A0402",
   "P2A0403",

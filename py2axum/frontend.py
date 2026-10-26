@@ -9,6 +9,7 @@ imports of each module (`modules.py`): nothing is imported or executed.
 from __future__ import annotations
 
 import ast
+import copy
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,6 +64,15 @@ class Mount:
     resp_cls: tuple[ast.AST, str] | None = None  # (default_response_class=, module) of the nearest including router
     conds: tuple[tuple[int, bool], ...] = ()  # (index in Frontend.dyn_conds, branch): `if` tests read at startup
 
+
+
+# `--app MODULE[:ATTR]` (set_app_target): the module of the application the binary serves, else every FastAPI()
+APP_TARGET: str | None = None
+
+
+def set_app_target(target: str | None) -> None:
+    global APP_TARGET
+    APP_TARGET = target or None
 
 
 def route_path(deco: ast.Call, src: str) -> str:
@@ -229,10 +239,30 @@ class Frontend:
         if any("FastAPI" in ast.dump(n.func) for m in own for n in ast.walk(m.tree)
                if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))):
             mods = own
+        if APP_TARGET is not None:
+            # `--app api.main[:create_app]`: the one application uvicorn serves (a package with several entry
+            # points: `main.py`, `publish_main.py`...); the others' registrations are not this binary's
+            module, _, attr = APP_TARGET.partition(":")
+            chosen = [m for m in mods if m.name == module]
+            if not chosen:
+                raise TranspileError(f"--app {APP_TARGET}: no module `{module}` in the package (modules are named from "
+                                     f"--root, like uvicorn's import string)", None, str(self.package))
+            if attr and attr not in chosen[0].defs:
+                raise TranspileError(f"--app {APP_TARGET}: `{module}` defines no `{attr}`", None, str(chosen[0].path))
+            mods = chosen
+            self.app_target_module = module
         for m in mods:
+            parents = self._parents(m.name)
             for node in ast.walk(m.tree):
                 if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call):
-                    if dotted(node.value.func) in {"FastAPI", "fastapi.FastAPI"} or is_ext(
+                    sub = self._fastapi_subclass(m.name, node.value.func, _enclosing_fn(node, parents))
+                    if sub is not None:
+                        # `app = MetricsFastAPI(...)`: an application, served by a class of the project that changes how
+                        # FastAPI builds or routes it (its methods run inside Starlette): the whole application in Python
+                        self._global(TranspileError(
+                            f"the application is an instance of `{sub}`, a subclass of FastAPI of the project: not "
+                            "supported (its overrides run inside FastAPI and Starlette)", node, str(m.path)))
+                    if sub is not None or dotted(node.value.func) in {"FastAPI", "fastapi.FastAPI"} or is_ext(
                         self.index.resolve_expr(m.name, node.value.func), "fastapi.FastAPI"
                     ):
                         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -244,6 +274,30 @@ class Frontend:
                                 f"{m.path}:{node.lineno}: FastAPI() built under a condition; "
                                 "every variant is analysed together"
                             )
+        if APP_TARGET is not None and not self.app_vars:
+            raise TranspileError(f"--app {APP_TARGET}: no `app = FastAPI(...)` in that module", None, str(self.package))
+
+    def _fastapi_subclass(self, module: str, func: ast.AST, scope) -> str | None:
+        """`MetricsFastAPI(...)` (or `app_class(...)`, a local bound once to it): the name of a project class deriving
+        from fastapi.FastAPI, else None."""
+        if isinstance(func, ast.Name) and scope is not None:
+            binds = [n for n in ast.walk(scope) if isinstance(n, ast.Assign) and len(n.targets) == 1
+                     and isinstance(n.targets[0], ast.Name) and n.targets[0].id == func.id]
+            if len(binds) == 1 and isinstance(binds[0].value, (ast.Name, ast.Attribute)):
+                func = binds[0].value
+        t = self.index.resolve_expr(module, func, scope) if isinstance(func, (ast.Name, ast.Attribute)) else None
+        seen = 0
+        while isinstance(t, Sym) and seen < 8:
+            d = self.index.definition(t)
+            if not isinstance(d, ast.ClassDef):
+                return None
+            for b in d.bases:
+                bt = self.index.resolve_expr(t.module, b)
+                if is_ext(bt, "fastapi.FastAPI", "starlette.applications.Starlette"):
+                    return t.name
+            t = self.index.resolve_expr(t.module, d.bases[0]) if len(d.bases) == 1 else None
+            seen += 1
+        return None
 
     def _is_app(self, module: str, node: ast.AST) -> bool:
         return isinstance(node, ast.Name) and node.id in self.app_vars.get(module, ())
@@ -324,7 +378,9 @@ class Frontend:
                 call = node.value
                 if not (dotted(call.func) == "APIRouter"
                         or is_ext(self.index.resolve_expr(m.name, call.func), "fastapi.APIRouter")):
-                    continue
+                    call = self._router_maker_call(m.name, call)
+                    if call is None:
+                        continue
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for t in targets:
                     if isinstance(t, ast.Name):
@@ -335,6 +391,51 @@ class Frontend:
                     sym = Sym(m.name, f"{fn.name}()")
                     self.routers[sym] = self._router(sym, call, file)
                     self.router_factories[Sym(m.name, fn.name)] = (sym, local, fn)
+
+    def _router_maker_call(self, module: str, call: ast.Call) -> ast.Call | None:
+        """`router_v2 = make_router(Impl.V2)`, `make_router` a function of the same module whose body only returns
+        `APIRouter(...)`: that call with the parameters replaced by the arguments (names, attributes and
+        constants: evaluated once, as the function evaluates them). A non-literal prefix is read at startup."""
+        t = self.index.resolve_expr(module, call.func) if isinstance(call.func, (ast.Name, ast.Attribute)) else None
+        fn = self.index.definition(t) if isinstance(t, Sym) and t.module == module else None
+        if not (isinstance(fn, ast.FunctionDef) and not fn.decorator_list):
+            return None
+        body = fn.body[1:] if fn.body and isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant) else fn.body
+        if not (len(body) == 1 and isinstance(body[0], ast.Return) and isinstance(body[0].value, ast.Call)):
+            return None
+        made = body[0].value
+        if not (dotted(made.func) == "APIRouter" or is_ext(self.index.resolve_expr(module, made.func), "fastapi.APIRouter")):
+            return None
+        a = fn.args
+        if a.posonlyargs or a.vararg or a.kwarg or a.kwonlyargs:
+            return None
+        names = [x.arg for x in a.args]
+        if len(call.args) > len(names) or any(k.arg not in names for k in call.keywords) or any(
+                isinstance(x, ast.Starred) for x in call.args):
+            return None
+        bound = dict(zip(names, call.args)) | {k.arg: k.value for k in call.keywords}
+        defaults = dict(zip(names[len(names) - len(a.defaults):], a.defaults))
+        for n in names:
+            if n not in bound:
+                if n not in defaults:
+                    return None
+                bound[n] = defaults[n]
+        simple = (ast.Name, ast.Attribute, ast.Constant)
+        if not all(isinstance(v, simple) and all(isinstance(x, (*simple, ast.Load)) for x in ast.walk(v)) for v in bound.values()):
+            return None
+        # a parameter rebound or shadowed in the body: not a plain substitution
+        if any(isinstance(n, (ast.Lambda, ast.comprehension, ast.NamedExpr)) for n in ast.walk(made)):
+            return None
+
+        class Subst(ast.NodeTransformer):
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Load) and node.id in bound:
+                    return ast.copy_location(copy.deepcopy(bound[node.id]), node)
+                return node
+        out = Subst().visit(copy.deepcopy(made))
+        ast.fix_missing_locations(out)
+        out._p2a_made = True
+        return out
 
     def _router_factory(self, module: str, fn: ast.AST) -> tuple[str, ast.Call] | None:
         """`def build_router(): r = APIRouter(...); r.include_router(...)...; return r` (gymhero): a function without
@@ -372,7 +473,11 @@ class Frontend:
                 try:
                     r.prefix = literal(kw.value, file)
                 except TranspileError:
-                    r.unsupported.append(kw)
+                    if getattr(call, "_p2a_made", False) and isinstance(kw.value, ast.JoinedStr):
+                        # a router made by a function from its arguments (_router_maker_call): read at startup
+                        r.prefix = self._dyn_prefix(kw.value, file, sym.module)
+                    else:
+                        r.unsupported.append(kw)
             elif kw.arg == "dependencies":
                 r.deps = kw
             elif kw.arg == "route_class":
@@ -549,10 +654,16 @@ class Frontend:
         it = loop.iter
         if isinstance(it, (ast.Tuple, ast.List)):
             return None if any(isinstance(e, ast.Starred) for e in it.elts) else [(module, e) for e in it.elts]
-        if not isinstance(it, ast.Name) or (scope is not None and any(
+        if isinstance(it, ast.Attribute) and isinstance(it.value, ast.Name):
+            # `for r in views.ROUTERS:`: a module of the project, imported, read as an attribute
+            t = self.index.resolve_expr(module, it, scope)
+            if not isinstance(t, Sym):
+                return None
+        elif not isinstance(it, ast.Name) or (scope is not None and any(
                 isinstance(n, ast.Name) and n.id == it.id and isinstance(n.ctx, ast.Store) for n in ast.walk(scope))):
             return None
-        t = self.index.resolve(module, it.id)
+        else:
+            t = self.index.resolve(module, it.id)
         dm = self.index.module(t.module) if isinstance(t, Sym) else None
         d = dm.defs.get(t.name) if dm is not None else None
         if not (isinstance(d, ast.Assign) and len(d.targets) == 1 and isinstance(d.value, (ast.Tuple, ast.List))
@@ -565,6 +676,17 @@ class Frontend:
                     and getattr(n, "target", getattr(n, "value", None)).id == t.name)
                 for n in ast.walk(dm.tree)):
             return None  # `ROUTERS.append(...)`: changed after its definition
+        for m in self.index.package_modules():
+            for n in ast.walk(m.tree):
+                if not (isinstance(n, ast.Attribute) and n.attr == t.name and m.name != t.module):
+                    continue
+                if isinstance(n.ctx, ast.Store):
+                    return None  # rebound from another module (`views.ROUTERS = ...`)
+                up = self._parents(m.name).get(n)
+                if isinstance(d.value, ast.List) and (isinstance(up, ast.Attribute) or (
+                        isinstance(up, ast.Subscript) and isinstance(up.ctx, (ast.Store, ast.Del)))
+                        or isinstance(up, ast.AugAssign)):
+                    return None  # `views.ROUTERS.append(...)` / `views.ROUTERS[0] = ...` elsewhere
         return [(t.module, e) for e in d.value.elts]
 
     def shown_path(self, path: str) -> str:
@@ -589,7 +711,9 @@ class Frontend:
                 if cond is None:
                     continue  # `if dianjin is not None:` after a failed import guard: never runs
                 scope = _enclosing_fn(node, parents)
-                if cond and scope is None and (tests := self._startup_tests(m.name, node, parents)) is not None:
+                lib_include = self._library_router(m.name, node.args[0], scope) is not None
+                if (cond and scope is None and not lib_include
+                        and (tests := self._startup_tests(m.name, node, parents)) is not None):
                     # `if settings.ENABLE_X:` at module level: read once at startup, the routes served or not
                     self.include_conds[id(node)] = tuple(
                         (self._dyn_cond(t, file, m.name), branch) for t, branch in tests)

@@ -920,10 +920,13 @@ def test_form_in_dependency_rejected(tmp_path, capsys):
          "middleware Sync is not supported (CORSMiddleware, GZipMiddleware, BaseHTTPMiddleware"),
         ("flag = False\napp2 = FastAPI(strict_content_type=flag)\n",
          "FastAPI(strict_content_type=...) must be a literal True or False"),
+        # Middleware(GZipMiddleware) in the list is the binary's outermost layer, as add_middleware's: once only
         ("from fastapi.middleware import Middleware\nfrom fastapi.middleware.gzip import GZipMiddleware\n"
-         "app2 = FastAPI(middleware=[Middleware(GZipMiddleware)])\n",
-         "Middleware(GZipMiddleware) in FastAPI(middleware=[...]) is not supported"),
-        ("mws = []\napp2 = FastAPI(middleware=mws)\n", "FastAPI(middleware=...) must be a literal list of Middleware(...)"),
+         "app.add_middleware(GZipMiddleware)\napp2 = FastAPI(middleware=[Middleware(GZipMiddleware)])\n",
+         "GZipMiddleware registered twice is not supported"),
+        # a list changed after its definition is not read statically (an unchanged one is: test_fopd_patterns)
+        ("mws = []\nmws.append(None)\napp2 = FastAPI(middleware=mws)\n",
+         "FastAPI(middleware=...) must be a literal list of Middleware(...)"),
         ("from starlette_context import plugins\nfrom starlette_context.middleware import RawContextMiddleware\n"
          "app.add_middleware(RawContextMiddleware, plugins=(plugins.UserAgentPlugin(),))\n",
          "RawContextMiddleware: plugin plugins.UserAgentPlugin() is not supported"),

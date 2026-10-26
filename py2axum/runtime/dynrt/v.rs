@@ -195,6 +195,9 @@ pub enum Native {
     NotImplemented,
     /// `object()`: a bare object, its identity only (a sentinel: `MISSING = object()`)
     Object,
+    /// an instance of a library class the binary only stores (`OAuth2PasswordBearer(...)` as a settings default):
+    /// (module, class); its identity, type name and repr only, any other use is refused at compile time
+    LibInstance(&'static str, &'static str),
     /// a method read on its class (`Cls.method`): a function whose first argument is the receiver, or that takes
     /// none for a `@staticmethod` (true)
     Unbound(super::pyd::MethodFn, bool),
@@ -483,6 +486,7 @@ impl V {
                 Native::Bound(..) => "method",
                 Native::NotImplemented => "NotImplementedType",
                 Native::Object => "object",
+                Native::LibInstance(_, cls) => cls,
                 Native::Kwargs(_) => "kwargs",
                 Native::ValErr(..) => "ValErr",
                 Native::Streaming(_) => "StreamingResponse",

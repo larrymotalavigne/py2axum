@@ -20,6 +20,7 @@ These variables and their defaults are a stable interface ([Versioning and depre
 | `PY2AXUM_LOG_LEVEL` | unset | uvicorn's `--log-level` (kept for older deployments); the application's own records follow its `logging` configuration, as in Python |
 | `PY2AXUM_SHUTDOWN_TIMEOUT` | `25` | seconds to wait for in-flight requests and streams after SIGTERM ([Graceful shutdown](../advanced/shutdown.md)) |
 | `PY2AXUM_SQL_DEBUG` | unset | set: a database error is logged with its SQL statement (not its bound values) |
+| `PYTHON_DOTENV_DISABLED` | unset | read by `dotenv.load_dotenv()` as python-dotenv reads it: `1`, `true`, `t`, `yes` or `y` and nothing is loaded ([Libraries](libraries.md)) |
 | `PY2AXUM_MAX_BODY` | unset | largest request body in bytes, 413 past it ([Security § Request input](../advanced/security.md#request-input)); unset: no limit, like uvicorn |
 | `PY2AXUM_STACK_SIZE` | `268435456` (256 MiB) | stack of the runtime threads, in bytes (reserved address space; [Security § Request input](../advanced/security.md#request-input)) |
 | `LC_ALL`, `LC_CTYPE`, `PYTHONCOERCECLOCALE` | | read at startup as CPython does (PEP 538): with `LC_ALL` unset or empty, a C `LC_CTYPE` and `PYTHONCOERCECLOCALE` other than `0`, the binary sets `LC_CTYPE=C.UTF-8` in its environment (`os.environ`, child processes); `PYTHONCOERCECLOCALE=warn` prints CPython's warning |

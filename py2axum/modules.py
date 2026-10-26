@@ -190,8 +190,31 @@ def dotted_name(e: ast.AST) -> str | None:
     return None
 
 
+def _sys_path_edit(st: ast.stmt) -> bool:
+    """`sys.path += [...]` / `sys.path.append(...)` / `.insert(...)` / `.extend(...)`: only changes where later
+    imports are looked up, which the index resolves statically (--root, --path); its arguments call nothing."""
+    def is_sys_path(n):
+        return isinstance(n, ast.Attribute) and n.attr == "path" and isinstance(n.value, ast.Name) and n.value.id == "sys"
+
+    def pure(n):
+        return not any(isinstance(x, (ast.Call, ast.Await, ast.NamedExpr, ast.Yield, ast.YieldFrom)) for x in ast.walk(n))
+    if isinstance(st, ast.AugAssign) and isinstance(st.op, ast.Add) and is_sys_path(st.target):
+        return pure(st.value)
+    if (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and isinstance(st.value.func, ast.Attribute)
+            and st.value.func.attr in {"append", "insert", "extend"} and is_sys_path(st.value.func.value)):
+        # os.path.join/dirname/abspath of literals and __file__ are allowed: path computations without effects
+        return all(pure(a) or all(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                                  and ast.unparse(c.func).startswith(("os.path.", "str(", "Path("))
+                                  for c in ast.walk(a) if isinstance(c, ast.Call))
+                   for a in [*st.value.args, *(k.value for k in st.value.keywords)])
+    return False
+
+
 def startup_skipped(st: ast.stmt) -> bool:
-    """`if __name__ == "__main__":` (never true in the binary) and `if TYPE_CHECKING:` (imports only)."""
+    """`if __name__ == "__main__":` (never true in the binary), `if TYPE_CHECKING:` (imports only), and the edits
+    of `sys.path` (import lookup, resolved statically)."""
+    if _sys_path_edit(st):
+        return True
     if not isinstance(st, ast.If):
         return False
     t = st.test

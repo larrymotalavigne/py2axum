@@ -2665,6 +2665,10 @@ fn val_in(input: &V, td: &'static TD, loc: &[V], e: &mut Errs) -> Option<V> {
             if matches!(input, V::Inst(i) if i.desc.open && i.desc.name == *name) {
                 return Some(input.clone());
             }
+            // a library class the binary only stores (`OAuth2PasswordBearer`): its name
+            if matches!(input, V::Native(n) if matches!(&**n, Native::LibInstance(_, c) if *c == *name)) {
+                return Some(input.clone());
+            }
             e.push("is_instance_of", loc, format!("Input should be an instance of {name}"), input, Some(vec![("class", V::str(*name))]));
             None
         }

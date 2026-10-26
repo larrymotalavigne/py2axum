@@ -33,9 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = parser()
     args = ap.parse_args(argv)
     apply_python_flag(args)
+    from .frontend import set_app_target
     from .modules import set_extra_roots
 
     set_extra_roots(args.path)
+    set_app_target(args.app)
     from .libsrc import apply_flags
 
     try:
@@ -113,6 +115,8 @@ def parser() -> argparse.ArgumentParser:
                     help="import root, like sys.path (default: parent of the package)")
     ap.add_argument("--path", type=Path, action="append", default=[], metavar="DIR",
                     help="experimental: one more import root, like an extra sys.path entry (repeatable): the sibling packages of a monorepo the application installs from its own checkout")
+    ap.add_argument("--app", default=None, metavar="MODULE[:ATTR]",
+                    help="the served application, as uvicorn's import string (`api.main:app`, `api.main:create_app`): only that module's FastAPI() is analysed when the package has several entry points (default: every FastAPI() of the package, analysed together)")
     ap.add_argument("--python-side", action="append", default=[], metavar="PATH|lifespan|mount|auto",
                     help="what stays in a Python process next to the binary (raw routes such as /api/v1/mcp, lifespan; "
                          "mount: the app's last app.mount() and include_router() of a library's router, which get every "

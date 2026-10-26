@@ -767,10 +767,14 @@ class Project:
         with_t = ast.With if sync else ast.AsyncWith
         body = [b for b in fn.body if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))]
         outer_finally = []
-        if (len(body) == 1 and isinstance(body[0], ast.Try) and not body[0].handlers and not body[0].orelse
+        outer_handlers = []
+        if (len(body) == 1 and isinstance(body[0], ast.Try) and not body[0].orelse
                 and len(body[0].body) == 1 and isinstance(body[0].body[0], with_t)):
-            # try: async with maker() as s: yield s / finally: await s.aclose()
+            # try: async with maker() as s: yield s / [except: await s.rollback(); raise] / finally: await s.aclose()
+            # The handlers and the finally run once the `with` has closed the session: a rollback or a close of a
+            # closed session does nothing, so they are checked (rollback then re-raise, cleanups only) and dropped.
             outer_finally = body[0].finalbody
+            outer_handlers = body[0].handlers
             body = body[0].body
 
         def assigned(st):
@@ -793,12 +797,14 @@ class Project:
                 and body[1].items[0].context_expr.func.id == assigned(body[0])[0]):
             # factory = get_session_factory() / async with factory() as s: ... (the maker read once, then called)
             factory, body = assigned(body[0])[1], body[1:]
+        must_close = False
         if len(body) == 2 and assigned(body[0]) and isinstance(body[1], ast.Try):
             # s = maker() / try: yield s / finally: [await] s.close()
             sname, maker_call = assigned(body[0])
             inner = [body[1]]
             if not body[1].finalbody:
                 raise bad(body[1])
+            must_close = True  # no `with` closes it: the finally must
         elif len(body) == 1 and isinstance(body[0], with_t) and len(body[0].items) == 1:
             item = body[0].items[0]
             if not isinstance(item.optional_vars, ast.Name):
@@ -831,6 +837,16 @@ class Project:
             return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr in meths
                     and isinstance(call.func.value, ast.Name) and call.func.value.id == sname and not call.args)
 
+        def is_cleanup(stmt):
+            """A statement of a `finally:` that leaves the request's result unchanged: `[await] s.close()` /
+            `s.aclose()`, or `s.expunge_all()` (synchronous on both sessions: it only empties the identity map)."""
+            if is_call(stmt, "close"):
+                return True
+            return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Attribute) and stmt.value.func.attr == "expunge_all"
+                    and isinstance(stmt.value.func.value, ast.Name) and stmt.value.func.value.id == sname
+                    and not stmt.value.args and not stmt.value.keywords)
+
         def is_yield(stmt):
             return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield)
                     and isinstance(stmt.value.value, ast.Name) and stmt.value.value.id == sname)
@@ -840,22 +856,35 @@ class Project:
             return isinstance(stmt, ast.Raise) and stmt.cause is None and (
                 stmt.exc is None or (caught is not None and isinstance(stmt.exc, ast.Name) and stmt.exc.id == caught))
 
+        def rollback_reraise(h):
+            return len(h.body) == 2 and is_call(h.body[0], "rollback") and is_reraise(h.body[1], h.name)
+
         commit = False
         if len(inner) == 1 and is_yield(inner[0]):
             pass
-        elif len(inner) == 1 and isinstance(inner[0], ast.Try) and not inner[0].orelse:
+        elif len(inner) == 2 and is_yield(inner[0]) and is_call(inner[1], "commit"):
+            # yield s / await s.commit(): an error thrown at the yield skips the commit, the `with` rolls back
+            commit = True
+        elif len(inner) == 1 and isinstance(inner[0], ast.Try):
             t = inner[0]
             if not (t.body and is_yield(t.body[0]) and all(is_call(x, "commit") for x in t.body[1:]) and len(t.body) <= 2):
                 raise bad(t)
-            commit = len(t.body) == 2
+            # `else: await s.commit()` commits when the endpoint succeeded, as a commit after the yield does (an
+            # error of the commit itself then skips the handler: the `with` rolls back on close, the same outcome)
+            if t.orelse and not (len(t.body) == 1 and len(t.orelse) == 1 and is_call(t.orelse[0], "commit")):
+                raise bad(t.orelse[0])
+            commit = len(t.body) == 2 or bool(t.orelse)
             for h in t.handlers:
-                if not (len(h.body) == 2 and is_call(h.body[0], "rollback") and is_reraise(h.body[1], h.name)):
+                if not rollback_reraise(h):
                     raise bad(h)
-            if not all(is_call(x, "close") for x in t.finalbody):
+            if not all(is_cleanup(x) for x in t.finalbody) or (must_close and not any(is_call(x, "close") for x in t.finalbody)):
                 raise bad(t)
         else:
             raise bad(inner[0] if inner else fn)
-        if not all(is_call(x, "close") for x in outer_finally):
+        for h in outer_handlers:
+            if not rollback_reraise(h):
+                raise bad(h)
+        if not all(is_cleanup(x) for x in outer_finally):
             raise bad(fn)
         if direct is not None:
             expire, autoflush = True, True
@@ -1508,6 +1537,9 @@ class Project:
                 return f"{RT}::pyd::TD::Decimal({self._dec(cons, ann, module)})"
             if t.package == "typing" and last in {"Dict", "List", "Set", "Tuple"}:
                 return self._scalar(last.lower(), cons, ann, module)
+            if libmap.canonical(t.dotted) in LIB_INSTANCE_TYPES:
+                # an arbitrary type of a library the binary only stores (libs::lib_instance): an isinstance check
+                return f"{RT}::pyd::TD::Instance({rs(last)})"
             raise self.err(f"unsupported type annotation `{ast.unparse(ann)}` ({t.dotted})", ann, module)
         if isinstance(t, Sym):
             if t in self.fe.schema_syms:
@@ -5575,7 +5607,12 @@ class FnCompiler:
     def stmt(self, node: ast.stmt) -> None:
         done = self.p.fe.__dict__.get("configure_includes", ())
         if done and ((isinstance(node, ast.Expr) and id(node.value) in done) or (
-                isinstance(node, ast.For) and all(isinstance(b, ast.Expr) and id(b.value) in done for b in node.body))):
+                isinstance(node, ast.For) and all(isinstance(b, ast.Expr) and id(b.value) in done for b in node.body)) or (
+                # `if lib_router is not None: app.include_router(lib_router)`: the include is relayed to Python, the
+                # test has no side effect (no call)
+                isinstance(node, ast.If) and not node.orelse and not any(isinstance(n, (ast.Call, ast.Await, ast.NamedExpr))
+                                                                         for n in ast.walk(node.test))
+                and all(isinstance(b, ast.Expr) and id(b.value) in done for b in node.body))):
             return  # `app.include_router(...)` (or a loop of them) registered statically by the frontend
         if getattr(node, "end_col_offset", None) is None:
             return self.stmt_(node)
@@ -9040,6 +9077,10 @@ class FnCompiler:
 # ====================================================================== routes and dependencies
 
 
+# library classes whose instances the binary only stores (libmap: libs::lib_instance), usable as an arbitrary type
+LIB_INSTANCE_TYPES = {"fastapi.security.OAuth2PasswordBearer", "fastapi.security.HTTPBearer", "fastapi.security.HTTPBasic",
+                      "fastapi.security.oauth2.OAuth2PasswordBearer", "fastapi.security.http.HTTPBearer",
+                      "fastapi.security.http.HTTPBasic"}
 # fastapi/starlette Response classes (a return annotation of one of them is no response model)
 RESPONSE_CLASSES = {"Response", "StreamingResponse", "FileResponse", "RedirectResponse", "JSONResponse", "HTMLResponse",
                     "PlainTextResponse", "ORJSONResponse", "UJSONResponse", "EventSourceResponse"}
@@ -10276,10 +10317,18 @@ class RouteBuilder:
             # (FastAPI fixes it on the route as it is added or included), else FastAPI(default_response_class=)
             own = self.fe.routers[router].resp_cls if router is not None else None
             node, where = (own, router.module) if own is not None else (mount.resp_cls or (None, None))
+            if node is None and self.fe.__dict__.get("default_resp_custom") is not None:
+                node, where = self.fe.default_resp_custom  # FastAPI(default_response_class=<project class>)
             if node is not None:
                 t = self.p.resolve(where, node)
+                if isinstance(t, Sym):
+                    # a project subclass (`class ORJSONResponse(Response)` with media_type and render()): as on a route
+                    t, custom_resp = self.response_subclass(t)
                 last = t.dotted.split(".")[-1] if isinstance(t, Ext) and t.dotted.split(".")[0] in {"fastapi", "starlette"} else None
-                if last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse", "ORJSONResponse"}:
+                if custom_resp != (None, None) and last in {"Response", "JSONResponse"}:
+                    last = "JSONResponse" if last == "JSONResponse" else "Response"
+                if last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse", "ORJSONResponse"} and not (
+                        custom_resp != (None, None) and last == "Response"):
                     raise TranspileError(f"APIRouter(default_response_class={ast.unparse(node)}) is not supported "
                                          "(JSONResponse, ORJSONResponse, HTMLResponse or PlainTextResponse)", node,
                                          self.p.src(where))
@@ -11676,6 +11725,7 @@ def prepare(fe: Frontend, python_side: set[str]):
     fe.collect = True
     gzip = fe._middlewares()
     fe.collect = collect
+    gzip = list_gzip(fe, gzip)
     kept = []
     on_events: list[TranspileError] = []
     for e in fe.global_errors:
@@ -11683,7 +11733,11 @@ def prepare(fe: Frontend, python_side: set[str]):
         if (e.node is not None and e.file and stack_node(fe, fe.index.module_of(e.file).name, e.node)
                 and not ("add_route" in txt and (_route_path(fe, e) in python_side or fe.__dict__.get("auto_side") is not None))):
             continue  # compiled into the middleware stack (generate_project)
-        if "add_route" in txt and isinstance(e.node, ast.Call) and e.node.args:
+        raw = isinstance(e.node, ast.Call) and isinstance(e.node.func, ast.Attribute) and e.node.func.attr in {
+            "add_route", "add_api_route", "add_websocket_route", "add_api_websocket_route"}
+        if raw and e.node.args:
+            # `app.add_api_route("/readiness", readiness, methods=["GET"])`: a route registered by a call, its literal
+            # path relayed before routing (the Python app answers it, in its own registration order)
             mod = fe.index.module_of(e.file).name
             try:
                 path = Project(fe).const(e.node.args[0], mod)
@@ -11753,7 +11807,10 @@ def prepare(fe: Frontend, python_side: set[str]):
                     elif kw.arg == "default_response_class":
                         t = fe.index.resolve_expr(m.name, kw.value)
                         last = t.dotted.split(".")[-1] if isinstance(t, Ext) and t.dotted.split(".")[0] in {"fastapi", "starlette"} else None
-                        if last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse", "ORJSONResponse"}:
+                        if isinstance(t, Sym) and isinstance(fe.index.definition(t), ast.ClassDef):
+                            # a project response class: checked and applied per route (RouteBuilder.response_subclass)
+                            fe.default_resp_custom = (kw.value, m.name)
+                        elif last not in {"JSONResponse", "HTMLResponse", "PlainTextResponse", "ORJSONResponse"}:
                             kept.append(TranspileError(f"FastAPI(default_response_class={ast.unparse(kw.value)}) is not "
                                                        "supported (JSONResponse, ORJSONResponse, HTMLResponse or "
                                                        "PlainTextResponse)", kw, str(m.path)))
@@ -11795,6 +11852,16 @@ def prepare(fe: Frontend, python_side: set[str]):
             e = lib_router_side(fe, e, python_side, collect)
             if e is None:
                 continue
+        elif (isinstance(e.node, ast.Call) and isinstance(e.node.func, ast.Attribute) and e.node.func.attr == "include_router"
+              and "cannot resolve" in e.msg and (prefix := factory_router_prefix(fe, e)) is not None):
+            # a router a project function builds from its arguments: every route of it under `prefix`, relayed
+            fe.python_side = {*fe.__dict__.get("python_side", ()), prefix}
+            fe.__dict__.setdefault("configure_includes", set()).add(id(e.node))
+            fe.__dict__.setdefault("lib_prefix_includes", set()).add(id(e.node))
+            fe.notes.append(f"{e.file}:{e.node.lineno}: include_router({ast.unparse(e.node.args[0])[:60]}) stays on the "
+                            f"Python side: every request under {prefix} is relayed to PY2AXUM_PYTHON_URL (the router its "
+                            "function builds has all its routes under that prefix)")
+            continue
         fe.global_errors.append(e)
     if fe.global_errors and not fe.collect:
         raise fe.global_errors[0]
@@ -11885,6 +11952,10 @@ SCHEMA_HOOKS = {"__get_pydantic_core_schema__", "__get_pydantic_json_schema__"}
 ROUTE_BASES = {"fastapi.routing.APIRoute", "fastapi.APIRoute"}
 REQUEST_BASES = {"fastapi.Request", "fastapi.requests.Request", "starlette.requests.Request"}
 MW_GZIP = {"starlette.middleware.gzip.GZipMiddleware", "fastapi.middleware.gzip.GZipMiddleware"}
+# Starlette >= 1.0's SessionMiddleware changes a response only when the session was read or written
+# (`Session.accessed`/`.modified`): with every read of `request.session` / `scope["session"]` refused in the
+# translated code (FnCompiler.SCOPE_BY_MIDDLEWARE), it leaves the binary's responses as they are
+MW_SESSION = {"starlette.middleware.sessions.SessionMiddleware", "fastapi.middleware.sessions.SessionMiddleware"}
 
 
 # what registers a route on the app (call or decorator), in Starlette's routing order
@@ -11906,6 +11977,18 @@ def _is_lib_router(e: TranspileError) -> bool:
 
 def lib_router_side(fe: Frontend, e: TranspileError, python_side: set[str], collect: bool) -> TranspileError | None:
     """`app.include_router(<library router>)`: left to Python (None) like a final mount, else the refusal."""
+    prefix = lib_router_static_prefix(fe, e)
+    if prefix:
+        # every route of the library is under `prefix`: a request there is relayed to the Python app, which routes it
+        # as Starlette does (its own routes included, whatever the registration order); no other request can reach
+        # the library's routes
+        fe.python_side = {*fe.__dict__.get("python_side", ()), prefix}
+        fe.__dict__.setdefault("configure_includes", set()).add(id(e.node))
+        fe.__dict__.setdefault("lib_prefix_includes", set()).add(id(e.node))
+        fe.notes.append(f"{e.file}:{e.node.lineno}: include_router({ast.unparse(e.node.args[0])}) stays on the Python side: "
+                        f"every request under {prefix} is relayed to PY2AXUM_PYTHON_URL (the library's routes are all "
+                        "under that prefix, read from its installed source)")
+        return None
     why = lib_router_refusal(fe, e)
     if why:
         return TranspileError(f"{e.msg}; it can stay on the Python side only as one of the app's last registrations: {why}",
@@ -11923,6 +12006,151 @@ def lib_router_prefix(fe: Frontend, e: TranspileError) -> str:
     """The literal `prefix=` of `app.include_router(<library router>, prefix=...)` ("" without one: every path)."""
     kw = next((k for k in e.node.keywords if k.arg == "prefix"), None)
     return "" if kw is None else Project(fe).const(kw.value, fe.index.module_of(e.file).name).rstrip("/")
+
+
+def lib_router_static_prefix(fe: Frontend, e: TranspileError) -> str | None:
+    """The full prefix every route of `app.include_router(<library router>[, prefix="/p"])` is under, when it can be
+    read statically: the router is a module global `r = APIRouter(prefix="/x", ...)` of the library's installed
+    source whose routes are only added with `@r.<method>(...)` decorators (no mount, no included router, no
+    add_route), and the include's own prefix is a literal. None otherwise (an empty prefix included: every path)."""
+    from . import libsrc
+    from .frontend import _enclosing_fn
+
+    mod = fe.index.module_of(e.file).name
+    call = e.node
+    if not (call.args and fe._is_app(mod, call.func.value)):
+        return None
+    outer = ""
+    kw = next((k for k in call.keywords if k.arg == "prefix"), None)
+    if kw is not None:
+        if not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)):
+            return None
+        outer = kw.value.value
+    if any(k.arg not in {"prefix", "tags", "dependencies", "responses", "include_in_schema", "deprecated"}
+           for k in call.keywords):
+        return None
+    scope = _enclosing_fn(call, fe._parents(mod))
+    t = fe.index.resolve_expr(mod, call.args[0], scope)
+    if not isinstance(t, Ext) or "." not in t.dotted:
+        return None
+    lib_mod, _, var = t.dotted.rpartition(".")
+    rel = Path(*lib_mod.split("."))
+    try:
+        sites = libsrc.site_packages(Path(fe.index.root))
+    except ValueError:
+        return None
+    src = next((p for s in sites for p in (s / rel.with_suffix(".py"), s / rel / "__init__.py") if p.is_file()), None)
+    if src is None:
+        return None
+    try:
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+    inner = None
+    for st in tree.body:
+        if (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                and st.targets[0].id == var):
+            if inner is not None or not (isinstance(st.value, ast.Call) and (dotted(st.value.func) or "").split(".")[-1] == "APIRouter"):
+                return None
+            pk = next((k for k in st.value.keywords if k.arg == "prefix"), None)
+            if pk is None or not (isinstance(pk.value, ast.Constant) and isinstance(pk.value.value, str)):
+                return None
+            inner = pk.value.value
+    if inner is None:
+        return None
+    for n in ast.walk(tree):
+        # anything else than `@router.<method>(...)` that adds a route to the router (or rebinds it)
+        if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == var
+                and n.attr in {"mount", "include_router", "add_route", "add_api_route", "add_websocket_route",
+                               "host", "routes", "prefix"}):
+            return None
+        if isinstance(n, (ast.Global, ast.Nonlocal)) and var in n.names:
+            return None
+    prefix = (outer.rstrip("/") + inner).rstrip("/")
+    if not prefix.startswith("/") or "{" in prefix:
+        return None
+    return prefix
+
+
+def factory_router_prefix(fe: Frontend, e: TranspileError) -> str | None:
+    """`app.include_router(build_router(..., prefix="/x"))`, `build_router` a project function that makes one local
+    `r = APIRouter(prefix=<literal, or one of its parameters>)`, adds routes to it only with `@r.<method>(...)`
+    decorators and returns it: the full prefix every route is under (with the include's literal prefix), when it
+    can be read statically (a literal argument, else the parameter's default, a literal or a module constant)."""
+    mod = fe.index.module_of(e.file).name
+    call = e.node
+    if not (call.args and isinstance(call.args[0], ast.Call) and fe._is_app(mod, call.func.value)):
+        return None
+    outer = ""
+    for k in call.keywords:
+        if k.arg == "prefix":
+            if not (isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)):
+                return None
+            outer = k.value.value
+        elif k.arg not in {"tags", "dependencies", "responses", "include_in_schema", "deprecated"}:
+            return None
+    made = call.args[0]
+    scope = frontend_enclosing_fn(call, fe._parents(mod))
+    t = fe.index.resolve_expr(mod, made.func, scope) if isinstance(made.func, (ast.Name, ast.Attribute)) else None
+    fn = fe.index.definition(t) if isinstance(t, Sym) else None
+    if not isinstance(fn, ast.FunctionDef) or fn.decorator_list:
+        return None
+    routers = [st for st in ast.walk(fn) if isinstance(st, ast.Assign) and len(st.targets) == 1
+               and isinstance(st.targets[0], ast.Name) and isinstance(st.value, ast.Call)
+               and is_ext(fe.index.resolve_expr(t.module, st.value.func), "fastapi.APIRouter")]
+    if len(routers) != 1:
+        return None
+    local = routers[0].targets[0].id
+    rets = [n for n in walk_scope(fn) if isinstance(n, ast.Return)]  # the endpoints' own returns excluded
+    if not rets or not all(isinstance(r.value, ast.Name) and r.value.id == local for r in rets):
+        return None
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == local
+                and n.attr not in HTTP_METHODS | {"api_route"}):
+            return None  # include_router, mount, add_api_route, routes...: a route that may be elsewhere
+        if isinstance(n, ast.Name) and n.id == local and isinstance(n.ctx, ast.Store) and n is not routers[0].targets[0]:
+            return None
+    pk = next((k for k in routers[0].value.keywords if k.arg == "prefix"), None)
+    if pk is None:
+        return None
+    proj = Project(fe)
+
+    def const(node, module):
+        try:
+            v = proj.const(node, module)
+        except TranspileError:
+            return None
+        return v if isinstance(v, str) else None
+    if isinstance(pk.value, ast.Constant):
+        inner = pk.value.value if isinstance(pk.value.value, str) else None
+    elif isinstance(pk.value, ast.Name):
+        a = fn.args
+        params = [*a.posonlyargs, *a.args]
+        names = [x.arg for x in params]
+        if pk.value.id in names:
+            i = names.index(pk.value.id)
+            given = made.args[i] if i < len(made.args) else next((k.value for k in made.keywords if k.arg == pk.value.id), None)
+            if given is not None:
+                inner = const(given, mod)
+            else:
+                d = dict(zip(names[len(names) - len(a.defaults):], a.defaults)).get(pk.value.id)
+                inner = const(d, t.module) if d is not None else None
+        elif pk.value.id in [x.arg for x in a.kwonlyargs]:
+            given = next((k.value for k in made.keywords if k.arg == pk.value.id), None)
+            d = dict(zip([x.arg for x in a.kwonlyargs], a.kw_defaults)).get(pk.value.id)
+            inner = const(given, mod) if given is not None else const(d, t.module) if d is not None else None
+        else:
+            inner = None
+        if any(isinstance(n, ast.Name) and n.id == pk.value.id and isinstance(n.ctx, ast.Store) for n in ast.walk(fn)):
+            return None
+    else:
+        inner = None
+    if inner is None or any(isinstance(x, ast.Starred) for x in made.args) or any(k.arg is None for k in made.keywords):
+        return None
+    prefix = (outer.rstrip("/") + inner).rstrip("/")
+    if not prefix.startswith("/") or "{" in prefix:
+        return None
+    return prefix
 
 
 def lib_router_refusal(fe: Frontend, e: TranspileError) -> str | None:
@@ -12066,7 +12294,8 @@ def mw_class_kind(fe: Frontend, module: str, cls: ast.AST) -> str | None:
     if isinstance(t, Ext):
         c = libmap.canonical(t.dotted)
         return ("cors" if c in MW_CORS else "base" if c in MW_BASE else "gzip" if c in MW_GZIP
-                else "context" if c in MW_CONTEXT else "https" if c in MW_HTTPS else "trusted" if c in MW_TRUSTED else None)
+                else "context" if c in MW_CONTEXT else "https" if c in MW_HTTPS else "trusted" if c in MW_TRUSTED
+                else "session" if c in MW_SESSION else None)
     if isinstance(t, Sym):
         d = fe.index.definition(t)
         if isinstance(d, ast.ClassDef) and len(d.bases) == 1:
@@ -12090,9 +12319,76 @@ def mw_entries(fe: Frontend, module: str, call: ast.Call) -> list | None:
     kw = next((k for k in call.keywords if k.arg == "middleware"), None)
     if kw is None or not (isinstance(call.func, (ast.Name, ast.Attribute)) and dotted(call.func) in {"FastAPI", "fastapi.FastAPI"}):
         return None
+    if isinstance(kw.value, ast.Name):
+        lit = _single_list_binding(fe, module, call, kw.value)
+        if lit is not None:
+            return list(lit.elts)
     if not isinstance(kw.value, (ast.List, ast.Tuple)):
         raise TranspileError("FastAPI(middleware=...) must be a literal list of Middleware(...)", kw.value, str(fe.index.module(module).path))
     return list(kw.value.elts)
+
+
+def session_mw_options(p: "Project", module: str, call: ast.Call) -> None:
+    """`SessionMiddleware(app, secret_key, ...)`: its options, checked as Starlette's signature checks them (the
+    layer itself is transparent, MW_SESSION)."""
+    names = ["secret_key", "session_cookie", "max_age", "path", "same_site", "https_only", "domain", "partitioned"]
+    given = len(call.args) - 1 + len(call.keywords)
+    if len(call.args) - 1 > len(names) or any(k.arg not in names for k in call.keywords) or not given:
+        raise TranspileError("SessionMiddleware(secret_key, session_cookie=, max_age=, path=, same_site=, https_only=, "
+                             "domain=, partitioned=): unknown or missing option", call, p.src(module))
+
+
+def list_gzip(fe: Frontend, gzip):
+    """`FastAPI(middleware=[..., Middleware(GZipMiddleware, minimum_size=..., compresslevel=...)])`: its options, as
+    `app.add_middleware(GZipMiddleware, ...)` gives them (the binary's GZip is the outermost layer: a documented
+    difference, docs/tutorial/middleware.md). Refused next to another GZipMiddleware."""
+    for m in fe.index.package_modules():
+        if m.name not in fe.app_vars:
+            continue  # another application's module (--app)
+        for n in ast.walk(m.tree):
+            if not isinstance(n, ast.Call):
+                continue
+            try:
+                entries = mw_entries(fe, m.name, n)
+            except TranspileError:
+                continue
+            for e in entries or ():
+                if not (isinstance(e, ast.Call) and e.args and mw_class_kind(fe, m.name, e.args[0]) == "gzip"):
+                    continue
+                as_add = ast.copy_location(ast.Call(func=ast.Name("add_middleware", ast.Load()),
+                                                    args=[ast.Name("GZipMiddleware", ast.Load())], keywords=e.keywords), e)
+                try:
+                    if gzip is not None:
+                        raise TranspileError("GZipMiddleware registered twice is not supported", e, str(m.path))
+                    gzip = fe._middleware(as_add, str(m.path))
+                except TranspileError as err:
+                    fe.global_errors.append(err)
+                    if not fe.collect:
+                        raise
+    return gzip
+
+
+def _single_list_binding(fe: Frontend, module: str, call: ast.Call, name: ast.Name) -> ast.List | ast.Tuple | None:
+    """`middleware = [Middleware(...), ...]` then `FastAPI(middleware=middleware)` in the same scope: the list literal,
+    when it is the name's only binding, made before the call, and the name is read nowhere else (no append, no
+    reassignment, no other use that could change the list)."""
+    parents = fe._parents(module)
+    scope = frontend_enclosing_fn(call, parents)
+    tree = scope if scope is not None else fe.index.module(module).tree
+    stores, loads = [], []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == name.id:
+            (stores if isinstance(n.ctx, ast.Store) else loads).append(n)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name.id in n.names:
+            return None
+    if len(stores) != 1 or loads != [name]:
+        return None
+    st = parents.get(stores[0])
+    if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and st.targets[0] is stores[0]
+            and isinstance(st.value, (ast.List, ast.Tuple)) and st.lineno < call.lineno
+            and frontend_enclosing_fn(st, parents) is scope):
+        return None
+    return st.value
 
 
 def stack_deco(fe: Frontend, module: str, d: ast.AST) -> str | None:
@@ -12116,7 +12412,7 @@ def stack_node(fe: Frontend, module: str, node: ast.AST) -> bool:
     """A registration the middleware stack compiles (so not a global error)."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr == "add_middleware" and fe._is_app(module, node.func.value):
-            return mw_kind(fe, module, node) in {"cors", "base", "user", "asgi", "context", "https", "trusted"}
+            return mw_kind(fe, module, node) in {"cors", "base", "user", "asgi", "context", "https", "trusted", "session"}
         if node.func.attr == "add_exception_handler" and fe._is_app(module, node.func.value):
             return True
         if is_add_route(fe, module, node):
@@ -12924,6 +13220,8 @@ def module_statements(p: "Project", fe: Frontend) -> None:
             if output_only and not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
                                     and _reaches_sentry_init(p, m.name, st.value)) and not _sets_library_conf(p, m.name, st):
                 continue
+            if startup_skipped(st):
+                continue  # `sys.path += [...]` (imports are resolved statically), `if __name__ == "__main__":`
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call):
                 f = st.value.func
                 if isinstance(f, ast.Attribute) and (f.attr in FRAMEWORK_CALLS or fe._is_app(m.name, f.value)):
@@ -13163,8 +13461,14 @@ def build_stack(p: "Project", fe: Frontend) -> str:
     p.__dict__["stack_classes"] = []
 
     def stmts(fc: "FnCompiler", module: str, body: list, factory) -> None:
+        relayed = fe.__dict__.get("lib_prefix_includes", set())
         for st in body:
             if not _stack_relevant(fe, module, st):
+                continue
+            if (isinstance(st, ast.Expr) and id(st.value) in relayed) or (
+                    isinstance(st, ast.If) and not st.orelse and all(isinstance(b, ast.Expr) and id(b.value) in relayed for b in st.body)
+                    and not any(isinstance(n, (ast.Call, ast.Await, ast.NamedExpr)) for n in ast.walk(st.test))):
+                # a library router relayed by its prefix (lib_router_static_prefix): no barrier, its `if` not read
                 continue
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and configure_call(fe, module, st.value):
                 # `configure(app)`: a project function given the application, run while the stack is built
@@ -13222,8 +13526,7 @@ def build_stack(p: "Project", fe: Frontend) -> str:
         if not (isinstance(f, Ext) and libmap.canonical(f.dotted) in MW_ENTRY and e.args):
             raise TranspileError("FastAPI(middleware=[...]) entries must be Middleware(cls, ...)", e, p.src(module))
         if mw_class_kind(fe, module, e.args[0]) == "gzip":
-            raise TranspileError("Middleware(GZipMiddleware) in FastAPI(middleware=[...]) is not supported "
-                                 "(use app.add_middleware(GZipMiddleware, ...))", e, p.src(module))
+            return  # the outermost tower layer (prepare: list_gzip), as for app.add_middleware(GZipMiddleware)
         middleware(fc, module, e, push=True)
 
     def middleware(fc: "FnCompiler", module: str, call: ast.Call, push: bool = False) -> None:
@@ -13271,6 +13574,8 @@ def build_stack(p: "Project", fe: Frontend) -> str:
             fc.emit(f"__st.{add}({RT}::asgi::Mw::Dispatch({fc.expr(disp[0].value)}));")
         elif kind == "context":
             fc.emit(f"__st.{add}({RT}::asgi::Mw::Context({context_mw(fe, module, call, p.src(module))}));")
+        elif kind == "session":
+            session_mw_options(p, module, call)  # no layer: transparent while nothing reads the session (MW_SESSION)
         elif kind in {"https", "trusted"}:
             # HTTP only here: a WebSocket handshake does not cross the stack (refused with WebSocket routes)
             fe.host_mws = [*fe.__dict__.get("host_mws", []), (call, p.src(module))]
@@ -13528,7 +13833,7 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
     # functions that fail to translate become stubs that raise; the build fails only if a translated
     # route can reach one (below)
     proj.__dict__["defer_fn_errors"] = True
-    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt"):
+    for lib in ("httpx", "aiohttp", "uvloop", "stripe", "bcrypt", "python-dotenv"):
         # stripe: the installed release when the project locks none (as the conformance fixtures run)
         v = locked_version(fe.index.root, lib) or (_installed_stripe() if lib == "stripe" else None)
         if v:

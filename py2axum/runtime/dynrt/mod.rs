@@ -8,6 +8,8 @@ pub mod complex;
 pub mod mimetab;
 pub mod ctxmw;
 pub mod fraction;
+pub mod gcmod;
+pub mod dotenv;
 pub mod auth;
 pub mod crypto;
 pub mod decimal;

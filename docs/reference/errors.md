@@ -61,6 +61,8 @@ Codes are stable: a code always names the same class of refusal, and a retired c
 | [P2A0315](#p2a0315) | Router of a library |
 | [P2A0316](#p2a0316) | Left to Python with the lifespan |
 | [P2A0318](#p2a0318) | Endpoint decorator |
+| [P2A0319](#p2a0319) | Subclass of FastAPI |
+| [P2A0320](#p2a0320) | Served application (--app) |
 | [P2A0401](#p2a0401) | Type annotation |
 | [P2A0402](#p2a0402) | Field option |
 | [P2A0403](#p2a0403) | Pydantic validator |
@@ -533,7 +535,7 @@ See [Bigger applications](../tutorial/bigger-applications.md).
 
 The routes of a router defined in a library are not translated (py2axum reads only the project); as the app's last registrations, they can stay in Python.
 
-**What to do:** Include the library's router last (`app.include_router(...)` on the app, unconditionally, with a literal prefix or none, nothing registering routes after it) and pass `--python-side mount` (implied by `--python-side auto`).
+**What to do:** Install the library in the project's environment (a `.venv` at the root, or `--venv`): when all its routes are under one literal prefix, py2axum reads it and relays that prefix to Python, wherever the router is included. Else include the library's router last (`app.include_router(...)` on the app, unconditionally, with a literal prefix or none, nothing registering routes after it) and pass `--python-side mount` (implied by `--python-side auto`).
 
 See [Bigger applications](../tutorial/bigger-applications.md#routers-of-libraries).
 
@@ -556,6 +558,26 @@ FastAPI registers the function its decorators produce: a decorator below the rou
 **What to do:** Move the decorator's logic into a dependency (`Depends(...)` on the endpoint or `dependencies=[...]`), define one endpoint per route, or leave the route to Python with `--python-side '<path>'` (or `--python-side auto`).
 
 See [Dependencies](../tutorial/dependencies.md).
+
+### P2A0319
+
+**Subclass of FastAPI** — *whole application*
+
+The application is an instance of a project class deriving from FastAPI (or Starlette): its overrides (a patched router, `build_middleware_stack`, `__call__`) run inside the framework, which the binary does not.
+
+**What to do:** Build the application with `FastAPI(...)` itself and move what the subclass adds to middlewares, dependencies or the lifespan; else the whole application stays in Python (`--python-side auto`).
+
+See [Bigger applications](../tutorial/bigger-applications.md).
+
+### P2A0320
+
+**Served application (--app)** — *whole application*
+
+`--app MODULE[:ATTR]` names the module of the application the binary serves, as uvicorn's import string.
+
+**What to do:** Give the module path from --root (`api.main:create_app` for `back/api/main.py` with `--root back`), of a module that builds `app = FastAPI(...)`.
+
+See [reference/cli.md](../reference/cli.md).
 
 ## Pydantic
 

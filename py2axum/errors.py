@@ -215,11 +215,24 @@ CLASSES: list[ErrorClass] = [
                                          r"; as the app's last registration it can stay"),
       "The routes of a router defined in a library are not translated (py2axum reads only the project); as the "
       "app's last registrations, they can stay in Python.",
-      "Include the library's router last (`app.include_router(...)` on the app, unconditionally, with a literal "
-      "prefix or none, nothing registering routes after it) and pass `--python-side mount` (implied by "
-      "`--python-side auto`).",
+      "Install the library in the project's environment (a `.venv` at the root, or `--venv`): when all its routes "
+      "are under one literal prefix, py2axum reads it and relays that prefix to Python, wherever the router is "
+      "included. Else include the library's router last (`app.include_router(...)` on the app, unconditionally, "
+      "with a literal prefix or none, nothing registering routes after it) and pass `--python-side mount` "
+      "(implied by `--python-side auto`).",
       "tutorial/bigger-applications.md#routers-of-libraries", "routeur de la bibliothèque \\1",
       "router of library \\1", whole_app=True),
+    E("P2A0319", "Subclass of FastAPI", r"a subclass of FastAPI of the project",
+      "The application is an instance of a project class deriving from FastAPI (or Starlette): its overrides (a "
+      "patched router, `build_middleware_stack`, `__call__`) run inside the framework, which the binary does not.",
+      "Build the application with `FastAPI(...)` itself and move what the subclass adds to middlewares, "
+      "dependencies or the lifespan; else the whole application stays in Python (`--python-side auto`).",
+      "tutorial/bigger-applications.md", "sous-classe de FastAPI", "FastAPI subclass", whole_app=True),
+    E("P2A0320", "Served application (--app)", r"^--app ",
+      "`--app MODULE[:ATTR]` names the module of the application the binary serves, as uvicorn's import string.",
+      "Give the module path from --root (`api.main:create_app` for `back/api/main.py` with `--root back`), of a "
+      "module that builds `app = FastAPI(...)`.",
+      "reference/cli.md", "--app", "--app", whole_app=True),
     E("P2A0313", "Exception handler", (r"exception_handler", r"add_exception_handler"),
       "This form of exception handler registration is not reproduced.",
       "Register handlers with `@app.exception_handler(Exc)` or `app.add_exception_handler(Exc, handler)` at "

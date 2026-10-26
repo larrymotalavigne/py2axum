@@ -1129,3 +1129,37 @@ pub fn oauth2_form(fields: Vec<(String, V)>) -> R {
     }
     namespace(&[], &kw)
 }
+
+
+/// `Cls(*args, **kwargs)` of a library class the binary only stores (Native::LibInstance): the call's signature is
+/// checked as Python checks it before running the constructor: `params` in order, the first `npos` of them
+/// positional-or-keyword (the others keyword-only), `required` among the positional ones
+pub fn lib_instance(module: &'static str, cls: &'static str, params: &[&str], npos: usize, required: &[&str], args: &[V],
+                    kwargs: &[(String, V)]) -> R {
+    if args.len() > npos {
+        let takes = if npos == 0 { "1 positional argument".to_string() } else { format!("from 1 to {} positional arguments", npos + 1) };
+        return Err(Exc::type_error(format!("{cls}.__init__() takes {takes} but {} were given", args.len() + 1)));
+    }
+    for (k, _) in kwargs {
+        match params.iter().position(|p| p == k) {
+            None => return Err(Exc::type_error(format!("{cls}.__init__() got an unexpected keyword argument '{k}'"))),
+            Some(i) if i < args.len() => {
+                return Err(Exc::type_error(format!("{cls}.__init__() got multiple values for argument '{k}'")))
+            }
+            _ => {}
+        }
+    }
+    let missing: Vec<String> = required.iter().copied().filter(|r| {
+        let i = params.iter().position(|p| p == r).unwrap_or(usize::MAX);
+        i >= args.len() && !kwargs.iter().any(|(k, _)| k == r)
+    }).map(|m| format!("'{m}'")).collect();
+    if !missing.is_empty() {
+        let names = match missing.len() {
+            1 => missing[0].clone(),
+            n => format!("{} and {}", missing[..n - 1].join(", "), missing[n - 1]),
+        };
+        return Err(Exc::type_error(format!("{cls}.__init__() missing {} required positional argument{}: {names}",
+                                           missing.len(), if missing.len() > 1 { "s" } else { "" })));
+    }
+    Ok(V::native(Native::LibInstance(module, cls)))
+}

@@ -62,6 +62,12 @@ def rs_(s: str) -> str:
     return '"' + s + '"'
 
 
+def _dotenv_patch() -> int:
+    """The patch release of the project's python-dotenv 1.2 (its parser changed in 1.2.3 and 1.2.4)."""
+    v = LIB_VERSIONS.get("python-dotenv", "1.2.4").split(".")
+    return int(re.match(r"\d+", v[2]).group()) if len(v) > 2 and re.match(r"\d+", v[2]) else 0
+
+
 def _argv(args: list[str]) -> str:
     return "vec![" + ", ".join(args) + "]"
 
@@ -1180,6 +1186,25 @@ def croniter_static(name, node):
 
 
 CALLS = {
+    # fastapi's security schemes as plain values (a settings default never used as a dependency): only stored.
+    # Used as `Depends(scheme)` they are compiled by the route builder (dyn.RouteBuilder.security_call) instead
+    **{f"fastapi.security{m}.{c}": (lambda mod, c, ps, npos, req: lambda a, kw: (
+        f'{RT}::libs::lib_instance("{mod}", "{c}", &[{", ".join(chr(34) + p + chr(34) for p in ps)}], {npos}, '
+        f'&[{", ".join(chr(34) + p + chr(34) for p in req)}], &{_argv(a)}, &{_kwvec(kw)})'))(mod, c, ps, npos, req)
+       for c, mod, ps, npos, req in (
+           ("OAuth2PasswordBearer", "fastapi.security.oauth2",
+            ("tokenUrl", "scheme_name", "scopes", "description", "auto_error", "refreshUrl"), 6, ("tokenUrl",)),
+           ("HTTPBearer", "fastapi.security.http", ("bearerFormat", "scheme_name", "description", "auto_error"), 0, ()),
+           ("HTTPBasic", "fastapi.security.http", ("scheme_name", "realm", "description", "auto_error"), 0, ()))
+       for m in ("", "." + mod.rsplit(".", 1)[1])},
+    # gc (dynrt/gcmod.rs): the binary has no cycle collector; thresholds and the enabled flag are kept
+    **{f"gc.{n}": (lambda n: lambda a, kw: f'{RT}::gcmod::call("{n}", &{_argv(a)}, &{_kwvec(kw)})')(n)
+       for n in ("collect", "enable", "disable", "isenabled", "freeze", "unfreeze", "get_freeze_count", "get_count",
+                 "get_threshold", "set_threshold")},
+    # python-dotenv 1.2 (dynrt/dotenv.rs)
+    **{f"dotenv{m}.{f}": (lambda f: lambda a, kw: f"{RT}::dotenv::{f}({RT}::dotenv::Rev::of({_dotenv_patch()}), "
+                                                  f"&{_argv(a)}, &{_kwvec(kw)})")(f)
+       for m in ("", ".main") for f in ("load_dotenv", "dotenv_values")},
     **{c + ("." + k if k else ""): (lambda f: lambda a, kw: f"{RT}::croniter::{f}(&{_argv(a)}, &{_kwvec(kw)})")(_CRON_FN[k])
        for c in _CRON_CLASSES for k in ("", "is_valid", "match", "match_range", "expand", "datetime_to_timestamp")},
     **{f"{m}.{k}": (lambda f: lambda a, kw: f"{RT}::croniter::{f}(&{_argv(a)}, &{_kwvec(kw)})")(_CRON_FN[k])

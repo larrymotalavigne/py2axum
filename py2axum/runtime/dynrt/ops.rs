@@ -1391,6 +1391,9 @@ pub fn repr(v: &V) -> R<String> {
         if matches!(&**n, Native::Object) {
             return Ok(format!("<object object at {}>", addr(Arc::as_ptr(n) as *const () as usize)));
         }
+        if let Native::LibInstance(m, c) = &**n {
+            return Ok(format!("<{m}.{c} object at {}>", addr(Arc::as_ptr(n) as *const () as usize)));
+        }
     }
     if let V::Native(n) = v {
         if let Native::CtCache(c) = &**n {
