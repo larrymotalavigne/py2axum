@@ -108,8 +108,9 @@ bad_users = Table("bad_users", Base.metadata, Column("team_id", ForeignKey("team
 @pytest.mark.parametrize(
     "rel, message",
     [
+        # the pair's other side missing (SQLAlchemy raises at configuration)
         ('members: Mapped[list["User"]] = relationship(secondary=team_users, back_populates="teams")',
-         "back_populates= on a many-to-many relationship is not supported"),
+         "back_populates='teams' must name a many-to-many relationship of User"),
         ('members: Mapped[list["User"]] = relationship(secondary="team_users", backref="teams")',
          "backref= on a many-to-many relationship is not supported"),
         ('members: Mapped[list["User"]] = relationship(secondary=team_users, cascade="all, delete-orphan")',

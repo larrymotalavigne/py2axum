@@ -2914,14 +2914,96 @@ class Project:
                            "relationship is not supported", call, module)
         if not lit("uselist", True):
             raise self.err(f"relationship {where}: uselist=False on a many-to-many relationship is not supported", call, module)
-        for k in ("back_populates", "backref"):
-            if k in opts:
-                # SQLAlchemy keeps both collections in step as soon as one changes (instrumented lists): not modelled
-                raise self.err(f"relationship {where}: {k}= on a many-to-many relationship is not supported", opts[k], module)
+        if "backref" in opts:
+            raise self.err(f"relationship {where}: backref= on a many-to-many relationship is not supported", opts["backref"], module)
+        if "back_populates" in opts:
+            # SQLAlchemy keeps both collections in step when one changes in memory (instrumented lists): not modelled.
+            # It changes nothing else (SQL, loading): accepted when no code of the project mutates either collection
+            back = lit("back_populates")
+            # SQLAlchemy configures the pair: the other class must declare `back` as a relationship to this one, with
+            # back_populates naming this one (else InvalidRequestError / a warning at configuration)
+            other = next((st for st in self.fe.model_syms[tsym].body
+                          if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Call)
+                          and (dotted(st.value.func) or "").split(".")[-1] == "relationship"
+                          and any(isinstance(t, ast.Name) and t.id == back
+                                  for t in (st.targets if isinstance(st, ast.Assign) else [st.target]))), None)
+            pair = next((k.value.value for k in other.value.keywords if k.arg == "back_populates"
+                         and isinstance(k.value, ast.Constant)), None) if other is not None else None
+            if not isinstance(back, str) or pair != name or "secondary" not in {k.arg for k in other.value.keywords}:
+                raise self.err(f"relationship {where}: back_populates={back!r} must name a many-to-many relationship of "
+                               f"{tsym.name} whose back_populates is {name!r}", opts["back_populates"], module)
+            mutated = self._collection_mutation({name, back} if isinstance(back, str) else {name}, {info.sym, tsym})
+            if mutated is not None:
+                node_, mmod = mutated
+                raise self.err(f"relationship {where}: back_populates= on a many-to-many relationship whose collection is "
+                               f"changed in memory (`{ast.unparse(node_)[:50]}`, {self.src(mmod)}:{node_.lineno}) is not "
+                               "supported (both sides are not kept in step)", opts["back_populates"], module)
         rels.append({"name": name, "target": tsym, "m2o": False, "local": li, "remote": ri, "uselist": True, "order": [],
-                     "lazy": self.LAZY[lazy], "back": lit("back_populates"), "delete": False, "orphan": False,
+                     "lazy": self.LAZY[lazy], "back": None, "delete": False, "orphan": False,
                      "passive_deletes": bool(lit("passive_deletes", False)), "secondary": (sec, left[0], right[0]),
                      "write_only": write_only, "refresh_expire": "refresh-expire" in cascade})
+
+    def _collection_mutation(self, names: set[str], classes: set[Sym]):
+        """The first statement of the project that may change a collection attribute named in `names` in memory:
+        `x.<name>.append/extend/insert/remove/pop/clear/add/discard/update(...)`, `x.<name> = ...`, `x.<name> += ...`,
+        `del x.<name>[...]`, `x.<name>[i] = ...`, or a constructor of one of `classes` given `<name>=`. Matched by
+        attribute name whatever the receiver (an over-approximation). (node, module) or None."""
+        mut = {"append", "extend", "insert", "remove", "pop", "clear", "add", "discard", "update", "__setitem__",
+               "__delitem__", "__iadd__"}
+        from .frontend import _enclosing_fn
+
+        def not_mapped(cls_node, module):
+            t = self.ix.resolve_expr(module, cls_node) if isinstance(cls_node, (ast.Name, ast.Attribute)) else None
+            return isinstance(t, Sym) and t not in self.fe.model_syms and isinstance(self.ix.definition(t), ast.ClassDef)
+
+        def other_instance(recv, module, fn) -> bool:
+            """`recv` is certainly an instance of a project class that is not mapped: a local bound only to
+            `Cls(...)` (or `{k: Cls(...) ...}` / `[Cls(...) ...]`, read by subscript), or annotated `Cls`."""
+            sub = isinstance(recv, ast.Subscript)
+            base = recv.value if sub else recv
+            if not (isinstance(base, ast.Name) and fn is not None):
+                return False
+            values = []
+            for a in ast.walk(fn):
+                if isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == base.id for t in a.targets):
+                    values.append(a.value)
+                elif isinstance(a, ast.AnnAssign) and isinstance(a.target, ast.Name) and a.target.id == base.id:
+                    ann = a.annotation
+                    if sub and isinstance(ann, ast.Subscript):
+                        ann = ann.slice.elts[-1] if isinstance(ann.slice, ast.Tuple) else ann.slice
+                    if not not_mapped(ann, module):
+                        return False
+                    if a.value is not None:
+                        values.append(a.value)
+                elif isinstance(a, (ast.For, ast.comprehension)) and isinstance(a.target, ast.Name) and a.target.id == base.id:
+                    return False
+            if not values:
+                return False
+            for v in values:
+                if sub and isinstance(v, (ast.DictComp, ast.ListComp)):
+                    v = v.value if isinstance(v, ast.DictComp) else v.elt
+                if not (isinstance(v, ast.Call) and not_mapped(v.func, module)):
+                    return False
+            return True
+        for m in self.ix.package_modules():
+            parents = self.fe._parents(m.name)
+            for n in ast.walk(m.tree):
+                if isinstance(n, ast.Attribute) and n.attr in names:
+                    if other_instance(n.value, m.name, _enclosing_fn(n, parents)):
+                        continue
+                    up = parents.get(n)
+                    if isinstance(n.ctx, (ast.Store, ast.Del)):
+                        return n, m.name
+                    if isinstance(up, ast.Attribute) and up.attr in mut and isinstance(parents.get(up), ast.Call):
+                        return up, m.name
+                    if isinstance(up, ast.AugAssign) and up.target is n:
+                        return up, m.name
+                    if isinstance(up, ast.Subscript) and isinstance(up.ctx, (ast.Store, ast.Del)):
+                        return up, m.name
+                if isinstance(n, ast.Call) and any(k.arg in names for k in n.keywords) and isinstance(n.func, (ast.Name, ast.Attribute)):
+                    if self.ix.resolve_expr(m.name, n.func) in classes:
+                        return n, m.name
+        return None
 
     def _remote_side(self, v, info, name, module) -> set[int] | None:
         """`remote_side=`: column indexes of the model (id, [id], "id", "[Model.id]", a set or tuple of them)."""
@@ -6060,6 +6142,21 @@ class FnCompiler:
     def exc_match(self, t: ast.AST | None, e: str) -> str:
         if t is None:
             return "true"
+        if isinstance(t, (ast.Name, ast.Attribute)) and not (isinstance(t, ast.Name) and self.is_local(t.id)):
+            # `except NETWORK_ERRORS:` with `NETWORK_ERRORS = (TimeoutError, aiohttp.ClientError, ...)` a module constant
+            # bound once (a tuple: immutable): its classes, each resolved in the constant's module
+            ref = self.p.resolve(self.module, t, self.scope_root())
+            m = self.p.ix.module(ref.module) if isinstance(ref, Sym) else None
+            d = m.defs.get(ref.name) if m is not None else None
+            if (isinstance(d, (ast.Assign, ast.AnnAssign)) and isinstance(d.value, ast.Tuple)
+                    and len(m.binders.get(ref.name, [d])) <= 1
+                    and not any(isinstance(x, ast.Starred) for x in d.value.elts)):
+                saved = self.module
+                self.module = ref.module
+                try:
+                    return "(" + (" || ".join(self.exc_match(x, e) for x in d.value.elts) or "false") + ")"
+                finally:
+                    self.module = saved
         if isinstance(t, ast.Tuple):
             # the whole tuple is evaluated before any test: an element that raises does so first
             for x in t.elts:
