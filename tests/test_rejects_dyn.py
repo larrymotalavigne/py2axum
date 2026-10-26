@@ -465,7 +465,7 @@ def test_column_type_factory_other_module(tmp_path, capsys):
 @pytest.mark.parametrize(
     "body, message",
     [
-        ("    it = iter(lambda: 1, 1)\n    return {'a': next(it)}", "iter(callable, sentinel) is not supported"),
+        ("    it = iter(lambda: 1, 1)\n    return {'a': next(it)}", "builtin `iter()` is not supported with a callable"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicate()}", "method .frobnicate() is not implemented by the runtime"),
         ("    d = {}\n    return {'a': d.model_dump(round_trip=True)}", ".model_dump(round_trip=) is not supported"),
         ("    xs = [3, 1]\n    return {'a': xs.frobnicated}", "attribute .frobnicated is not provided by the runtime"),

@@ -9207,7 +9207,7 @@ class FnCompiler:
         if name == "iter" and not getattr(self, "_iter_ok", False) and self.stored_iter(node):
             # `it = iter(x)`: an iterator keeping its position (next(it), then `for y in it` / list(it) take the rest)
             if len(node.args) != 1 or node.keywords:
-                raise self.err("iter(callable, sentinel) is not supported", node)
+                raise self.err("builtin `iter()` is not supported with a callable and a sentinel (iter(callable, sentinel))", node)
             return self.q(f"{RT}::methods::b_iter_stored(&{self.expr(node.args[0])})")
         if name == "next" and node.args:
             a0 = node.args[0]
