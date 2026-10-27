@@ -895,6 +895,14 @@ STEPS += [
     *[("GET", f"/jwks/decode/{c}", None) for c in ("padded", "overpadded", "junk", "junk_sig", "exp_list", "exp_inf",
                                                      "nbf_dict")],
     ("GET", "/jwks/options", None),
+    # callable instances as dependencies, HTTPBearer subclasses with their own __call__ (fixtures/langapp/depinst.py)
+    *[("GET", "/depinst/admin", None, h) for h in ({}, {"x-user": "admin"}, {"x-user": "bob"})],
+    *[("GET", "/depinst/editor", None, h) for h in ({"x-user": "editor"}, {"x-user": "bob"})],
+    *[("GET", "/depinst/token", None, h) for h in ({}, {"authorization": "Bearer t-1"}, {"authorization": "Bearer x-1"},
+                                                    {"authorization": "Bearer t-1-refresh"}, {"authorization": "Basic t-1"},
+                                                    {"authorization": "Bearer"}, {"authorization": "bearer  t-2"})],
+    *[("GET", "/depinst/optional", None, h) for h in ({}, {"authorization": "Bearer t-3"}, {"authorization": "Digest x"})],
+    ("GET", "/depinst/bare-raise", None),
     # patterns of public applications (fixtures/langapp/pubapps.py)
     ("POST", "/pub/things", {"name": "x"}), ("POST", "/pub/things", {"name": "y", "visibility": "Restricted", "enabled": None}),
     ("POST", "/pub/things", {"name": "", "visibility": "open"}),

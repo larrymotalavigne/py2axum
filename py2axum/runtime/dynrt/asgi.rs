@@ -44,6 +44,27 @@ pub struct TrustedHost {
     pub www_redirect: bool,
 }
 
+impl TrustedHost {
+    /// options known only at startup (`allowed_hosts=settings.allowed_hosts`): TrustedHostMiddleware.__init__'s
+    /// assertions on the patterns
+    pub fn from_values(hosts: &V, www_redirect: &V) -> R<TrustedHost> {
+        const WILDCARD: &str = "Domain wildcard patterns must be like '*.example.com'.";
+        let hosts = if hosts.is_none() { vec![V::str("*")] } else { ops::iter(hosts)? };
+        let mut out = Vec::with_capacity(hosts.len());
+        for h in hosts {
+            let V::Str(s) = &h else {
+                return Err(Exc::type_error(format!("py2axum: TrustedHostMiddleware(allowed_hosts=) holds a {}, not a str", h.type_name())));
+            };
+            let rest: String = s.chars().skip(1).collect();
+            if rest.contains('*') || (s.starts_with('*') && &**s != "*" && !s.starts_with("*.")) {
+                return Err(Exc::new(&ASSERTION_ERROR, vec![V::str(WILDCARD)]));
+            }
+            out.push(s.to_string());
+        }
+        Ok(TrustedHost { hosts: out, www_redirect: ops::truthy(www_redirect)? })
+    }
+}
+
 /// starlette._utils.parse_host_header: (host, port) of a valid Host header
 fn parse_host(h: Option<String>) -> Option<(String, Option<String>)> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();

@@ -939,6 +939,8 @@ class ModuleIndex:
 
     SHIMS = {"sqlalchemy.ext.hybrid.Comparator": ("_py2axum_shim_sqlalchemy_hybrid", "sqlalchemy_hybrid.py"),
              "sqlmodel.SQLModel": ("_py2axum_shim_sqlmodel", "sqlmodel_base.py"),
+             # the base of the project subclasses of HTTPBearer the binary's scheme does not cover (Frontend)
+             "_py2axum_shim_fastapi.HTTPBearer": ("_py2axum_shim_fastapi_security", "fastapi_security.py"),
              "starlette.middleware.authentication.AuthenticationMiddleware": ("_py2axum_shim_starlette_auth", "starlette_auth.py"),
              **{f"starlette.authentication.{c}": ("_py2axum_shim_starlette_auth", "starlette_auth.py")
                 for c in ("AuthenticationError", "AuthenticationBackend", "AuthCredentials", "BaseUser", "SimpleUser",

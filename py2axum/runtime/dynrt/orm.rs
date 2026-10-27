@@ -773,6 +773,21 @@ impl ObjCell {
                 }
             }
         }
+        // a many-to-many pair (back_populates): the members added or removed by the assignment, on the other side
+        if let (Some(_), Some(_)) = (rel.back, rel.secondary) {
+            let now = members(&v);
+            let before = old.as_ref().map(members).unwrap_or_default();
+            for m in &now {
+                if !before.iter().any(|y| same(y, m)) {
+                    m2m_back(self, ri, m, true);
+                }
+            }
+            for m in &before {
+                if !now.iter().any(|y| same(y, m)) {
+                    m2m_back(self, ri, m, false);
+                }
+            }
+        }
         // a collection assigned whole (`Parent(children=[...])`, `p.children = [...]`): each member's many-to-one
         // follows at once, like SQLAlchemy's backref events (an append to the list is only seen at flush)
         if let (Some(back), true, None) = (rel.back, rel.uselist, rel.secondary) {
@@ -2423,6 +2438,49 @@ pub fn sessionmaker(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
         }
     }
     Ok(V::native(Native::Maker(expire, autoflush, sync, Arc::from(Vec::new()))))
+}
+
+/// The other side of a many-to-many pair (`back_populates`) after `owner.<rel>` gained (`add`) or lost `member`: its
+/// collection, when loaded, gains or loses `owner`; a new object's unloaded collection starts with it (SQLAlchemy's
+/// backref event; a persistent object's unloaded collection is read after the flush)
+fn m2m_back(owner: &Arc<ObjCell>, ri: usize, member: &V, add: bool) {
+    let rel = &owner.desc.rels[ri];
+    let (Some(back), Some(_)) = (rel.back, rel.secondary) else { return };
+    let Some(bi) = rel.target.rel_index(back) else { return };
+    let V::Obj(x) = member else { return };
+    let me = V::Obj(owner.clone());
+    let mut xs = x.st.lock();
+    match &xs.rels[bi] {
+        Some(V::List(l)) => {
+            let mut l = l.lock();
+            if add {
+                if !l.iter().any(|y| same(y, &me)) {
+                    l.push(me);
+                }
+            } else {
+                l.retain(|y| !same(y, &me));
+            }
+        }
+        None if add && matches!(xs.status, Status::Transient | Status::Pending) => xs.rels[bi] = Some(V::list(vec![me])),
+        _ => {}
+    }
+}
+
+/// `owner.<attr>.append(x)` / `.extend(xs)` / `.remove(x)` where `<attr>` names a many-to-many pair somewhere: the list's
+/// method, then the other side kept in step when `owner` is a mapped object with that relationship
+pub async fn m2m_op(cx: &super::Cx, owner: &V, attr: &str, op: &str, arg: V) -> R {
+    let coll = super::methods::getattr(cx, owner, attr).await?;
+    let items = if op == "extend" { ops::iter(&arg)? } else { vec![arg.clone()] };
+    let given = if op == "extend" { V::list(items.clone()) } else { arg };
+    let out = Box::pin(super::methods::call_method(cx, &coll, op, vec![given], vec![])).await?;
+    if let V::Obj(o) = owner {
+        if let Some(ri) = o.desc.rel_index(attr).filter(|ri| o.desc.rels[*ri].secondary.is_some()) {
+            for x in &items {
+                m2m_back(o, ri, x, op != "remove");
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `async_scoped_session(session_factory, scopefunc)` / `scoped_session(session_factory, scopefunc)`: the registry

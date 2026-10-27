@@ -793,8 +793,8 @@ def test_config_from_project_rejected(tmp_path, capsys, prelude, config, message
     "classes, message",
     [
         ("class A:\n    pass\n\n\nclass B:\n    pass\n\n\nclass C(A, B):\n    pass\n", "only exception classes are supported"),
-        ("class A:\n    def m(self):\n        return 1\n\n\nclass C(A):\n    def m(self):\n        return super().m()\n",
-         "only `super().__init__(...)` inside a method is supported"),
+        ("class A:\n    def m(self):\n        return 1\n\n\nclass C(A):\n    def m(self):\n        return super().nope()\n",
+         "super().nope(): the base A has no method nope"),
         ("from abc import ABC\n\n\nclass A(ABC):\n    pass\n\n\nclass C(A):\n    def __init__(self):\n        super().__init__(1)\n",
          "object.__init__() takes exactly one argument"),
     ],
@@ -1222,8 +1222,8 @@ app = create_app()
 
 @pytest.mark.parametrize("stmt, msg", [
     # (a single `configure(app)` that includes routers is native: test_router_configure_function)
-    ("app.add_middleware(CORSMiddleware, allow_origins=['*'])",
-     "add_middleware(CORSMiddleware) outside the app factory is not supported"),
+    # CORSMiddleware is built there too (routing::add_mw), its options written as keywords
+    ("app.add_middleware(CORSMiddleware, ['*'])", "CORSMiddleware options must be passed by keyword"),
 ])
 def test_configure_function_registrations_rejected(tmp_path, capsys, stmt, msg):
     pkg = tmp_path / "proj"
@@ -4255,7 +4255,7 @@ from typing import Annotated, Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Response, Security
 from fastapi.responses import StreamingResponse
-from fastapi.security import HTTPBearer, SecurityScopes
+from fastapi.security import HTTPBasic, HTTPBearer, SecurityScopes
 from pydantic import AfterValidator
 
 app = FastAPI()
@@ -4277,7 +4277,8 @@ def dep(s: SecurityScopes):
 @pytest.mark.parametrize("defs, msg", [
     ("class B(HTTPBearer):\n    def make_not_authenticated_error(self):\n        return HTTPException(403, self.scheme_name)\n\n\n"
      "@app.get('/x')\ndef x(c=Depends(B())):\n    return 1", "reading `self` is not supported"),
-    ("class B(HTTPBearer):\n    realm = 'x'\n\n\n@app.get('/x')\ndef x(c=Depends(B())):\n    return 1",
+    # (a HTTPBearer subclass with more than the two hooks is translated from source: test_httpbearer_subclass_with_call)
+    ("class B(HTTPBasic):\n    realm = 'x'\n\n\n@app.get('/x')\ndef x(c=Depends(B())):\n    return 1",
      "only `def make_not_authenticated_error(self)` and `def make_authenticate_headers(self)` overrides are supported"),
     ("@app.get('/x')\ndef x(s=Security(dep, scopes=SCOPES)):\n    return 1", "Security(scopes=) must be a literal list of strings"),
     ("@app.get('/x')\ndef x(s=Depends(dep, scopes=['a'])):\n    return 1", "Depends(scopes=) is not supported"),

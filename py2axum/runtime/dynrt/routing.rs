@@ -514,6 +514,19 @@ fn building() -> R<()> {
 
 /// `app.add_middleware(RawAsgiClass, ...)` from project code: the transpiler built the instance with the
 /// slot as its `app`
+/// `app.add_middleware(CORSMiddleware | TrustedHostMiddleware | HTTPSRedirectMiddleware, ...)` in a function given
+/// the application: the layer, built now
+pub fn add_mw(app: &V, mw: Mw) -> R {
+    if !matches!(app, V::Native(n) if matches!(&**n, Native::Routing(o) if matches!(&**o, RObj::App))) {
+        return Err(Exc::attr_error(format!("'{}' object has no attribute 'add_middleware'", app.type_name())));
+    }
+    building()?;
+    if let Some(b) = BUILD.lock().as_mut() {
+        b.push(mw);
+    }
+    Ok(V::None)
+}
+
 pub fn add_asgi(app: &V, inst: V, slot: Arc<super::asgi::Slot>) -> R {
     if !matches!(app, V::Native(n) if matches!(&**n, Native::Routing(o) if matches!(&**o, RObj::App))) {
         return Err(Exc::attr_error(format!("'{}' object has no attribute 'add_middleware'", app.type_name())));

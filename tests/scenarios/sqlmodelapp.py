@@ -121,6 +121,12 @@ STEPS += [
 STEPS += [("GET", "/authx/me", None, {"x-authx": mode} if mode is not None else {})
           for mode in (None, "bad", "custom", "simple:ann", "pair:", "pair:7", "other")]
 
+# ---- fastapi-beyond-CRUD's shapes (fixtures/sqlmodelapp/bookly.py): a link-model many-to-many changed in memory,
+# methods on table classes, sqlmodel.desc, CORS and TrustedHost added by a register(app) function
+STEPS += [("POST", "/bookly/seed", None), ("GET", "/bookly/books", None), ("GET", "/bookly/tags", None),
+          ("POST", "/bookly/untag/one/rust", None), ("POST", "/bookly/tag/two/web", None), ("GET", "/bookly/tags", None),
+          ("GET", "/bookly/books", None, {"host": "evil.example"}),
+          ("GET", "/bookly/books", None, {"origin": "https://bookly.example"})]
 
 def reset(db: str) -> None:
     """the tables created once, by SQLModel itself (as the startup handler would: both servers starting together on a
@@ -137,4 +143,4 @@ def reset(db: str) -> None:
     SQLModel.metadata.create_all(main.engine)
     main.engine.dispose()
     with psycopg.connect(db, autocommit=True) as c:
-        c.execute("TRUNCATE pilot, song, sm_hero, sm_team, sm_mission, sm_gear, sm_note, sm_owner RESTART IDENTITY")
+        c.execute("TRUNCATE pilot, song, sm_hero, sm_team, sm_mission, sm_gear, sm_note, sm_owner, bk_booktag, bk_book, bk_tag RESTART IDENTITY")

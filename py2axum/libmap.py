@@ -1503,6 +1503,7 @@ CALLS = {
     "cryptography.fernet.Fernet.generate_key": lambda a, kw: f"{RT}::fernet::generate_key()",
     "cryptography.fernet.Fernet": lambda a, kw: f"{RT}::fernet::new(&{_bind('Fernet', a, kw, ['key'], {'key'})['key']})",
     # e-mail: jinja2 templates, email.mime, aiosmtplib
+    "jinja2.Template": lambda a, kw: f"{RT}::mail::template_from_string(&{_argv(a)}, &{_kwvec(kw)})",
     "jinja2.Environment": lambda a, kw: f"{RT}::mail::environment(&{_kwvec(kw)})" if not a else (_ for _ in ()).throw(ValueError("pass keyword arguments")),
     **{f"{m}.templating.Jinja2Templates": lambda a, kw: f"{RT}::mail::templates(&{_argv(a)}, &{_kwvec(kw)})" for m in ("fastapi", "starlette")},
     "jinja2.FileSystemLoader": lambda a, kw: f"{RT}::mail::fs_loader(&{_bind('FileSystemLoader', a, kw, ['searchpath'], {'searchpath'})['searchpath']})",
@@ -1707,6 +1708,13 @@ CALLS = {
     "mcp.server.mcpserver.MCPServer": lambda a, kw: _mcp_server(a, kw),
     # `Request(scope, receive)` inside a raw ASGI app (dynrt/rawasgi.rs): the request being served
     "starlette.requests.Request": lambda a, kw: _starlette_request(a, kw),
+    **{f"fastapi.security{m}.HTTPAuthorizationCredentials": lambda a, kw: f"{RT}::web::credentials_new(cx, &{_argv(a)}, &{_kwvec(kw)}).await"
+       for m in ("", ".http")},
+    # FastAPI's parameter markers evaluated as values (the default of a method FastAPI reads the signature of, such
+    # as an instance dependency's `__call__`): the translation reads them statically, the value is an opaque object
+    **{f"fastapi.{n}": (lambda n: lambda a, kw: f"{{ let _: (Vec<V>, Vec<(String, V)>) = ({_argv(a)}, {_kwvec(kw)}); "
+                                                 f"Ok::<V, Exc>(V::native({RT}::Native::Namespace(\"fastapi.params.{n}\"))) }}")(n)
+       for n in ("Depends", "Security", "Query", "Path", "Body", "Header", "Cookie", "Form", "File")},
     # `HTTPConnection(scope)`: the request being served, without its body (AuthenticationMiddleware)
     **{f"{m}.HTTPConnection": (lambda a, kw: _starlette_request(a, kw) if len(a) == 1 and not kw
                                else (_ for _ in ()).throw(ValueError("HTTPConnection(scope) only")))
@@ -2038,10 +2046,18 @@ SQLMODEL_SQLALCHEMY = frozenset({
 })
 
 
+# sqlmodel.sql.expression's typed wrappers, each returning SQLAlchemy's function of the same name on its arguments
+SQLMODEL_WRAPPERS = frozenset({"all_", "and_", "any_", "asc", "between", "case", "cast", "collate", "desc", "distinct",
+                               "extract", "funcfilter", "not_", "nulls_first", "nulls_last", "or_", "over", "tuple_",
+                               "type_coerce", "within_group"})
+
+
 def canonical(dotted: str) -> str:
     """Aliases of the same API (`sqlalchemy.sql.expression.select` -> `sqlalchemy.select`)."""
-    if dotted.startswith("sqlmodel.") and dotted[9:].split(".")[0] in SQLMODEL_SQLALCHEMY:
+    if dotted.startswith("sqlmodel.") and dotted[9:].split(".")[0] in SQLMODEL_SQLALCHEMY | SQLMODEL_WRAPPERS:
         return "sqlalchemy." + dotted[9:]
+    if dotted.startswith("sqlmodel.sql.expression.") and dotted[24:] in SQLMODEL_WRAPPERS:
+        return "sqlalchemy." + dotted[24:]
     for prefix, repl in (
         ("sqlalchemy.sql.expression.", "sqlalchemy."),
         ("sqlalchemy.sql.functions.func", "sqlalchemy.func"),

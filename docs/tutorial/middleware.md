@@ -52,12 +52,13 @@ adding a header to every response. Like every example on this site, it is compil
 - A project function given the application from the factory or the app's module (`configure(app)`) runs
   while the middleware stack is built (on the first request, when Starlette instantiates its middlewares):
   in it, `app.add_middleware(ProjectMiddleware, ...)` with a project `BaseHTTPMiddleware` subclass or raw
-  ASGI class, `@app.exception_handler(...)` on its nested functions, `app.add_exception_handler(...)`,
+  ASGI class, `CORSMiddleware`, `TrustedHostMiddleware` or `HTTPSRedirectMiddleware` (keyword options, any value), `@app.exception_handler(...)` on its nested functions, `app.add_exception_handler(...)`,
   `@app.middleware("http")`, `app.add_route(path, endpoint, methods=)` (a Starlette `Route`: GET implies
   HEAD; such routes are tried after the declared ones, as when added last), `app.routes`.
 - Starlette's `TrustedHostMiddleware(allowed_hosts=[...], www_redirect=...)` (Host header parsed like
   Starlette 1.7: `Invalid host header` 400, `www.` redirect) and `HTTPSRedirectMiddleware` (307 to the https URL,
-  port dropped when 80 or 443), with literal options. HTTP requests only: with WebSocket routes they are
+  port dropped when 80 or 443); `allowed_hosts=` may be read at startup (`allowed_hosts=settings.ALLOWED_HOSTS`,
+  Starlette's AssertionError on a bad wildcard then). HTTP requests only: with WebSocket routes they are
   refused (a WebSocket handshake does not cross the binary's middleware stack).
 
 ## What stays in Python

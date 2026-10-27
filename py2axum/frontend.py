@@ -191,8 +191,29 @@ class Frontend:
 
     # ------------------------------------------------------------------ classes
 
+    SECURITY_HOOK_NAMES = ("make_not_authenticated_error", "make_authenticate_headers")
+
+    def _rebase_security_subclasses(self) -> None:
+        """`class TokenBearer(HTTPBearer)` with a `__call__` (or any member) of its own, beyond the two hooks the
+        binary's scheme calls: its base becomes HTTPBearer translated from source (py2axum/shims/fastapi_security.py),
+        the class an ordinary project class (an instance dependency)."""
+        for m in self.index.package_modules():
+            for node in ast.walk(m.tree):
+                if not isinstance(node, ast.ClassDef) or len(node.bases) != 1:
+                    continue
+                t = self.index.resolve_expr(m.name, node.bases[0])
+                if not (isinstance(t, Ext) and t.dotted in {"fastapi.security.HTTPBearer", "fastapi.security.http.HTTPBearer"}):
+                    continue
+                if all(isinstance(st, ast.Pass) or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))
+                       or (isinstance(st, ast.FunctionDef) and st.name in self.SECURITY_HOOK_NAMES) for st in node.body):
+                    continue  # the binary's own scheme, its hooks (FnCompiler.security_subclass)
+                m.imports["__py2axum_HTTPBearer"] = ("from", "_py2axum_shim_fastapi", "HTTPBearer")
+                base = ast.Name("__py2axum_HTTPBearer", ast.Load())
+                node.bases[0] = ast.copy_location(base, node.bases[0])
+
     def _classify(self) -> None:
         """Find SQLAlchemy models and Pydantic schemas by resolving base classes."""
+        self._rebase_security_subclasses()
         classes: dict[Sym, ast.ClassDef] = {}
         bases: set[Sym] = set()
         for m in list(self.index.modules.values()):

@@ -41,7 +41,12 @@ request is over. Like every example on this site, it is compiled and compared wi
   (`Auth = Annotated[Claims, Depends(claims)]`) bound once at the factory's top level, before the endpoints that
   read it: compiled with the factory's locals, like the endpoints defined there.
 - An instance of a project class with `__call__` as a dependency (`checker = Checker("bar")`,
-  `Depends(checker)`): its parameters are those of `__call__`, sync or async.
+  `Depends(checker)`, or `Depends(Checker("bar"))` written in place, also as `admin_only = Depends(...)` listed in
+  `dependencies=`): its parameters are those of `__call__` (its own or a project base's), sync or async; the instance is
+  built once, where FastAPI builds it.
+- A project subclass of `HTTPBearer` with a `__call__` of its own (`creds = await super().__call__(request)`, then
+  checks of the token), other methods and attributes (`self.auto_error`, `self.scheme_name`): translated over
+  `HTTPBearer`'s own source (FastAPI 0.137 to 0.162: 401 `Not authenticated` with `WWW-Authenticate: Bearer`).
 - A dependency built by a factory, `Depends(make_dep(Query([], alias="id"), int))`: FastAPI reads the signature of
   the function the factory returns, whose defaults and annotations hold the factory's arguments. The factory may
   only define functions and return one of them (undecorated), or only return another factory's call

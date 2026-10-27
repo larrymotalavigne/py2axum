@@ -140,7 +140,7 @@ T = "class T(SQLModel, table=True):\n    id: int | None = Field(default=None, pr
     ("from sqlmodel import Relationship", T + "    others: list['T'] = Relationship()\n", "    return session.get(T, 1).id", "sqlmodel"),
     ("from sqlalchemy import Column, String", T + "    name: str = Field(sa_column=Column('label', String))\n", "    return session.get(T, 1).id",
      "annotate with Mapped"),
-    ("", T + "\n    def label(self):\n        return 'x'\n", "    return session.get(T, 1).id", "annotate with Mapped"),
+    ("", T + "\n    kind = 'x'\n", "    return session.get(T, 1).id", "annotate with Mapped"),
     ("", T + "    tags: list[str] = []\n", "    return session.get(T, 1).id", "annotate with Mapped"),
     # a statement given two widths (one entity, then two columns): scalars or rows cannot be told apart
     ("", T, "    statement = select(T)\n    statement = select(T.id, T.id)\n    return session.exec(statement).all()", "exec"),

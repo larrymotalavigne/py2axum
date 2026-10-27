@@ -578,6 +578,15 @@ fn http_basic(cx: &Cx, realm: Option<&str>, auto_error: bool) -> R {
     })))
 }
 
+/// `HTTPAuthorizationCredentials(scheme=..., credentials=...)` (a Pydantic model of two str fields)
+pub async fn credentials_new(cx: &Cx, args: &[V], kwargs: &[(String, V)]) -> R {
+    if !args.is_empty() {
+        return Err(Exc::type_error(format!("BaseModel.__init__() takes 1 positional argument but {} were given", args.len() + 1)));
+    }
+    let data = V::dict_from(kwargs.iter().map(|(k, v)| (V::str(k), v.clone())).collect())?;
+    pyd::construct(cx, &CREDENTIALS, data).await
+}
+
 /// A security scheme used as a dependency, as FastAPI 0.142 calls it: `Authorization` header split on
 /// the first space (`get_authorization_scheme_param`), 401 `Not authenticated` with `WWW-Authenticate:
 /// Bearer`, or None when `auto_error=False`.

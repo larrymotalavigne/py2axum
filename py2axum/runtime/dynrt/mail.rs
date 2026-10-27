@@ -106,6 +106,22 @@ fn build_env(kwargs: &[(String, V)]) -> R<minijinja::Environment<'static>> {
     Ok(env)
 }
 
+/// `jinja2.Template(source)`: a template of Jinja2's default environment (no autoescape, no loader) made from the
+/// string
+pub fn template_from_string(args: &[V], kwargs: &[(String, V)]) -> R {
+    let [src] = args else {
+        return Err(Exc::type_error("py2axum: jinja2.Template(source) takes the template source only"));
+    };
+    if !kwargs.is_empty() {
+        return Err(Exc::type_error("py2axum: jinja2.Template() options are not supported"));
+    }
+    let mut env = build_env(&[])?;
+    env.add_template_owned("<template>".to_string(), ops::str_(src)?.to_string())
+        .map_err(|e| Exc::runtime(format!("jinja2: {e}")))?;
+    let j = Arc::new(Jinja { search: None, env: parking_lot::RwLock::new(env), templates: false });
+    Ok(V::native(Native::JinjaTpl(JinjaTpl { env: j, name: "<template>".into() })))
+}
+
 /// `Jinja2Templates(directory=...)`: `Environment(loader=FileSystemLoader(directory), autoescape=select_autoescape())`
 pub fn templates(args: &[V], kwargs: &[(String, V)]) -> R {
     if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "directory") {

@@ -267,7 +267,8 @@ async def orphans(s: AsyncSession = Depends(db)):
 '''
 
 
-@pytest.mark.parametrize("extra, ok", [("", True), ("(await s.get(A, 1)).bs.append(B(id=2))", False)])
+@pytest.mark.parametrize("extra, ok", [("", True), ("(await s.get(A, 1)).bs.append(B(id=2))", True),
+                                        ("(await s.get(A, 1)).bs.insert(0, B(id=2))", False)])
 def test_many_to_many_back_populates_through_a_mapped_table(tmp_path, capsys, extra, ok):
     """`secondary="link"` naming a mapped class's table, back_populates on both sides: accepted while no code
     changes the collections in memory (SQLAlchemy would keep the other side in step)."""
@@ -952,3 +953,82 @@ def test_async_scoped_session(tmp_path):
     pkg = project(tmp_path, _SCOPED.format(args="async_sessionmaker(engine), scopefunc=ctx.get"))
     main_rs = generate(tmp_path, pkg)
     assert "scoped_session" in main_rs + (tmp_path / "out" / "src" / "gen.rs").read_text()
+
+
+def test_sqlmodel_link_model_and_methods():
+    """`Relationship(link_model=Link)` is `secondary="<link table>"`; plain methods stay on the mapped class"""
+    import ast as _ast
+
+    from py2axum.sqlmodel_rewrite import rewrite
+
+    src = '''
+from typing import List
+from sqlmodel import Field, Relationship, SQLModel
+
+
+class Link(SQLModel, table=True):
+    a_id: int = Field(default=None, foreign_key="a.id", primary_key=True)
+    b_id: int = Field(default=None, foreign_key="b.id", primary_key=True)
+
+
+class A(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    bs: List["B"] = Relationship(link_model=Link, back_populates="as_")
+
+    def __repr__(self):
+        return f"<A {self.id}>"
+
+
+class B(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    as_: List[A] = Relationship(link_model=Link, back_populates="bs")
+'''
+    out = _ast.unparse(rewrite(_ast.parse(src)))
+    assert "relationship('B', secondary='link', back_populates='as_')" in out
+    assert "def __repr__(self):" in out.split("class A(")[1].split("class A_p2a_sm_view")[0]
+
+
+_INSTANCE_DEPS = '''
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.security import HTTPBearer
+
+app = FastAPI()
+
+
+class Checker:
+    def __init__(self, allowed):
+        self.allowed = allowed
+
+    def __call__(self, request: Request):
+        if request.headers.get("x-role") not in self.allowed:
+            raise HTTPException(403)
+        return True
+
+
+only_admin = Depends(Checker(["admin"]))
+
+
+class Bearer(HTTPBearer):
+    async def __call__(self, request: Request):
+        creds = await super().__call__(request)
+        return creds.credentials
+
+
+@app.get("/a", dependencies=[only_admin])
+def a():
+    return 1
+
+
+@app.get("/b")
+def b(ok=Depends(Checker(["x"])), token=Depends(Bearer())):
+    return token
+'''
+
+
+def test_callable_instance_dependencies_and_bearer_subclass(tmp_path):
+    """`Depends(Checker([...]))` inline and through a module-level `Depends(...)`; a HTTPBearer subclass with its own
+    `__call__` (translated over HTTPBearer's source): no method left as a run-time stub"""
+    pkg = project(tmp_path, _INSTANCE_DEPS)
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "__py2axum_depcall" in gen and 'Err(Exc::runtime("py2axum: ' not in gen

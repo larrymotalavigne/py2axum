@@ -186,13 +186,15 @@ class Rewriter:
     def relationship(self, st: ast.AnnAssign) -> ast.AnnAssign:
         """`x: list["Hero"] = Relationship(back_populates="team")` as SQLModel's metaclass builds it:
         `x: Mapped[list["Hero"]] = relationship("Hero", back_populates=..., cascade="all, delete-orphan" when
-        cascade_delete=True, passive_deletes=..., **sa_relationship_kwargs)`. link_model=, sa_relationship= and
-        sa_relationship_args= are left to the translator (refused)."""
+        cascade_delete=True, passive_deletes=..., **sa_relationship_kwargs)`; `link_model=Link` (a table class of the
+        module) as `secondary="<its table name>"`. sa_relationship= and sa_relationship_args= are left to the
+        translator (refused)."""
         call = st.value
         if call.args:
             raise _Unsupported("Relationship(): positional arguments", st)
         kws = {k.arg: k.value for k in call.keywords}
-        if None in kws or not set(kws) <= {"back_populates", "cascade_delete", "passive_deletes", "sa_relationship_kwargs"}:
+        if None in kws or not set(kws) <= {"back_populates", "cascade_delete", "passive_deletes", "sa_relationship_kwargs",
+                                           "link_model"}:
             raise _Unsupported("Relationship(): " + ", ".join(sorted(str(k) for k in kws)), st)
         ann = st.annotation
         if isinstance(ann, ast.Subscript) and getattr(ann.value, "id", getattr(ann.value, "attr", "")) == "Mapped":
@@ -216,6 +218,8 @@ class Rewriter:
         if not isinstance(target, ast.Name):
             raise _Unsupported(f"Relationship(): annotation `{ast.unparse(st.annotation)}`", st)
         out_kw = []
+        if "link_model" in kws:
+            out_kw.append(ast.keyword("secondary", ast.Constant(self.link_table(kws["link_model"], st))))
         if "back_populates" in kws:
             out_kw.append(ast.keyword("back_populates", kws["back_populates"]))
         cd = kws.get("cascade_delete")
@@ -240,6 +244,21 @@ class Rewriter:
         rel = ast.Call(_attr("_p2a_sm_orm", "relationship"), [ast.Constant(target.id)], out_kw)
         out = ast.AnnAssign(target=ast.Name(id=st.target.id, ctx=ast.Store()), annotation=mapped, value=rel, simple=1)
         return ast.copy_location(out, st)
+
+    def link_table(self, link: ast.AST, st: ast.AST) -> str:
+        """the table of `link_model=Link`: its `__tablename__`, else SQLModel's default (the class name, lower case)"""
+        cls = next((n for n in self.tree.body if isinstance(n, ast.ClassDef) and isinstance(link, ast.Name)
+                    and n.name == link.id), None)
+        if cls is None or not any(k.arg == "table" and isinstance(k.value, ast.Constant) and k.value.value is True
+                                  for k in cls.keywords):
+            raise _Unsupported("Relationship(link_model=): a table class of the module", st)
+        for b in cls.body:
+            if (isinstance(b, ast.Assign) and len(b.targets) == 1 and isinstance(b.targets[0], ast.Name)
+                    and b.targets[0].id == "__tablename__"):
+                if not (isinstance(b.value, ast.Constant) and isinstance(b.value.value, str)):
+                    raise _Unsupported("Relationship(link_model=): its __tablename__ is not a literal", st)
+                return b.value.value
+        return cls.name.lower()
 
     def field_call(self, v: ast.AST | None) -> ast.Call | None:
         f = self.local("Field")
@@ -386,11 +405,14 @@ class Rewriter:
         others = [st for st in node.body if not (isinstance(st, ast.AnnAssign) or isinstance(st, ast.Pass)
                                                  or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)))]
         tablename = [st for st in others if isinstance(st, ast.Assign) and any(getattr(t, "id", "") == "__tablename__" for t in st.targets)]
-        if [st for st in others if st not in tablename]:
-            return [node]  # methods, config... on a table class: left to the translator
+        # plain methods (`__repr__`, helpers, properties): the instances are the mapped class's
+        methods = [st for st in others if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and all(
+            isinstance(d, ast.Name) and d.id in {"property", "staticmethod", "classmethod"} for d in st.decorator_list)]
+        if [st for st in others if st not in tablename and st not in methods]:
+            return [node]  # config, class attributes... on a table class: left to the translator
         sa = ast.ClassDef(name=node.name, bases=[_name(self.local("SQLModel") or "_p2a_sm_SQLModel")], keywords=[],
                           body=(tablename or [ast.Assign(targets=[ast.Name("__tablename__", ast.Store())],
-                                                         value=ast.Constant(node.name.lower()))]) + cols + rels,
+                                                         value=ast.Constant(node.name.lower()))]) + cols + rels + methods,
                           decorator_list=[], type_params=[])
         ast.copy_location(sa, node)
         ast.fix_missing_locations(sa)

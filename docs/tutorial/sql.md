@@ -101,8 +101,9 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
 - Relationships (many-to-one, one-to-many, many-to-many through `secondary=` naming a module-level `Table`, by
   its variable or its table name), `lazy=` select/selectin/joined/noload/raise, `selectinload()`
   chains, `joinedload()` (loaded like `selectinload()`: the same objects; `innerjoin=True` or `"unnested"` only on a
-  many-to-one whose foreign key column is NOT NULL, where the INNER JOIN leaves no row out, else a 500), `back_populates`/`backref` (not on a many-to-many relationship: SQLAlchemy keeps both collections in
-  step at once, which is refused), cascades (save-update, delete, delete-orphan; none on many-to-many, whose
+  many-to-one whose foreign key column is NOT NULL, where the INNER JOIN leaves no row out, else a 500), `back_populates`/`backref` (on a many-to-many relationship, `back_populates` only: the other side follows
+  `append()`, `extend()`, `remove()` and an assignment of the collection when it is loaded, or its object new, as
+  SQLAlchemy's backref events do; any other change in memory (`insert`, `pop`, `+=`, ...) is refused), cascades (save-update, delete, delete-orphan; none on many-to-many, whose
   association rows are written at flush and deleted with their owner), `passive_deletes`,
   `order_by=` (target columns, `.desc()`, or a string SQLAlchemy evaluates such as `"[Child.a, Child.b.desc()]"`),
   self-referential relationships (adjacency list: one-to-many by default, many-to-one with `remote_side=` naming

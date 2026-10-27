@@ -3041,22 +3041,45 @@ class Project:
             if not isinstance(back, str) or pair != name or "secondary" not in {k.arg for k in other.value.keywords}:
                 raise self.err(f"relationship {where}: back_populates={back!r} must name a many-to-many relationship of "
                                f"{tsym.name} whose back_populates is {name!r}", opts["back_populates"], module)
-            mutated = self._collection_mutation({name, back} if isinstance(back, str) else {name}, {info.sym, tsym})
+            mutated = self._collection_mutation({name, back} if isinstance(back, str) else {name}, {info.sym, tsym}, modelled=True)
             if mutated is not None:
                 node_, mmod = mutated
                 raise self.err(f"relationship {where}: back_populates= on a many-to-many relationship whose collection is "
                                f"changed in memory (`{ast.unparse(node_)[:50]}`, {self.src(mmod)}:{node_.lineno}) is not "
-                               "supported (both sides are not kept in step)", opts["back_populates"], module)
+                               "supported (both sides are kept in step on append(), extend(), remove() and assignment only)",
+                               opts["back_populates"], module)
         rels.append({"name": name, "target": tsym, "m2o": False, "local": li, "remote": ri, "uselist": True, "order": [],
-                     "lazy": self.LAZY[lazy], "back": None, "delete": False, "orphan": False,
+                     "lazy": self.LAZY[lazy], "back": lit("back_populates"), "delete": False, "orphan": False,
                      "passive_deletes": bool(lit("passive_deletes", False)), "secondary": (sec, left[0], right[0]),
                      "write_only": write_only, "refresh_expire": "refresh-expire" in cascade})
 
-    def _collection_mutation(self, names: set[str], classes: set[Sym]):
+    M2M_SYNCED = frozenset({"append", "extend", "remove"})
+
+    def m2m_pair_names(self) -> frozenset:
+        """The attribute names of the many-to-many relationships with back_populates (`relationship(...,
+        secondary=..., back_populates=...)` in a mapped class), read from the classes before any is compiled"""
+        got = self.__dict__.get("_m2m_pair_names")
+        if got is None:
+            names = set()
+            for node in self.fe.model_syms.values():
+                for st in node.body:
+                    v = st.value if isinstance(st, (ast.Assign, ast.AnnAssign)) else None
+                    if not (isinstance(v, ast.Call) and (dotted(v.func) or "").split(".")[-1] == "relationship"):
+                        continue
+                    kw = {k.arg: k.value for k in v.keywords}
+                    target = st.targets[0] if isinstance(st, ast.Assign) else st.target
+                    if "secondary" in kw and "back_populates" in kw and isinstance(target, ast.Name):
+                        names.add(target.id)
+            got = self.__dict__["_m2m_pair_names"] = frozenset(names)
+        return got
+
+    def _collection_mutation(self, names: set[str], classes: set[Sym], modelled: bool = False):
         """The first statement of the project that may change a collection attribute named in `names` in memory:
         `x.<name>.append/extend/insert/remove/pop/clear/add/discard/update(...)`, `x.<name> = ...`, `x.<name> += ...`,
         `del x.<name>[...]`, `x.<name>[i] = ...`, or a constructor of one of `classes` given `<name>=`. Matched by
-        attribute name whatever the receiver (an over-approximation). (node, module) or None."""
+        attribute name whatever the receiver (an over-approximation). (node, module) or None. `modelled`: the changes the
+        runtime keeps in step on a many-to-many pair are skipped (`append`/`extend`/`remove`, an assignment of the
+        attribute, a constructor keyword: orm::m2m_sync, rel_set)."""
         mut = {"append", "extend", "insert", "remove", "pop", "clear", "add", "discard", "update", "__setitem__",
                "__delitem__", "__iadd__"}
         from .frontend import _enclosing_fn
@@ -3101,15 +3124,21 @@ class Project:
                     if other_instance(n.value, m.name, _enclosing_fn(n, parents)):
                         continue
                     up = parents.get(n)
+                    if modelled and isinstance(n.ctx, ast.Store) and isinstance(up, ast.Assign) and n in up.targets:
+                        continue
                     if isinstance(n.ctx, (ast.Store, ast.Del)):
                         return n, m.name
+                    if (modelled and isinstance(up, ast.Attribute) and up.attr in self.M2M_SYNCED
+                            and isinstance(parents.get(up), ast.Call) and parents.get(up).func is up):
+                        continue
                     if isinstance(up, ast.Attribute) and up.attr in mut and isinstance(parents.get(up), ast.Call):
                         return up, m.name
                     if isinstance(up, ast.AugAssign) and up.target is n:
                         return up, m.name
                     if isinstance(up, ast.Subscript) and isinstance(up.ctx, (ast.Store, ast.Del)):
                         return up, m.name
-                if isinstance(n, ast.Call) and any(k.arg in names for k in n.keywords) and isinstance(n.func, (ast.Name, ast.Attribute)):
+                if (not modelled and isinstance(n, ast.Call) and any(k.arg in names for k in n.keywords)
+                        and isinstance(n.func, (ast.Name, ast.Attribute))):
                     if self.ix.resolve_expr(m.name, n.func) in classes:
                         return n, m.name
         return None
@@ -6318,8 +6347,19 @@ class FnCompiler:
             return f"{RT}::iadd(&{cur}, &{rhs})"
         return f"{RT}::proto::aug(&{cur}, {rs(self.AUG_SYMBOLS[op])}, &{rhs}, {RT}::ops::{op})"
 
+    def route_endpoint(self) -> bool:
+        """a function under a route decorator (`@router.get(...)`): the framework calls it, no exception being handled"""
+        n = self.node
+        return isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and self.parent is None and any(
+            isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in ROUTE_DECORATOR_ATTRS
+            for d in n.decorator_list)
+
     def raise_stmt(self, node: ast.Raise) -> None:
         if node.exc is None:
+            if not self.cur_exc and self.route_endpoint():
+                # an endpoint is called with no exception being handled: CPython's RuntimeError
+                self.emit(self.raise_code(f"{RT}::v::Exc::runtime(\"No active exception to reraise\")"))
+                return
             if not self.cur_exc:
                 raise self.err("bare `raise` outside an except block", node)
             self.emit(self.raise_code(f"{self.cur_exc[-1]}.clone()"))
@@ -8033,8 +8073,8 @@ class FnCompiler:
             raise self.err("only `object.__new__(cls)` / `super().__new__(cls)` (the class alone) is supported", node)
         return self.q(f"{RT}::pyd::object_new_of(&{self.expr(node.args[0])})")
 
-    def super_init(self, node: ast.Call) -> str | None:
-        """`super().__init__(...)` in the `__init__` of a project class."""
+    def super_init(self, node: ast.Call, awaited: bool = False) -> str | None:
+        """`super().__init__(...)` in the `__init__` of a project class; `super().m(...)` in a method of a plain class."""
         f = node.func
         if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call) and isinstance(f.value.func, ast.Name)
                 and f.value.func.id == "super"):
@@ -8063,6 +8103,9 @@ class FnCompiler:
             if any(isinstance(b, Ext) and b.dotted in ROUTE_BASES for b in bases):
                 # APIRoute.get_route_handler(): the route's own handler (request -> Response)
                 return self.q(f"{RT}::web::original_handler(cx)")
+        plain = self.super_plain_method(node, awaited)
+        if plain is not None:
+            return plain
         if f.value.args or f.attr != "__init__" or self.node is None or self.p.cur is None or "." not in self.p.cur[0].name:
             raise self.err("only `super().__init__(...)` inside a method is supported", node)
         csym = Sym(self.p.cur[0].module, self.p.cur[0].name.split(".")[0])
@@ -8109,6 +8152,35 @@ class FnCompiler:
         if node.keywords:
             raise self.err("BaseException.__init__() takes no keyword arguments", node)
         return self.q(f"{RT}::exc_set_args(&{me}, {args})")
+
+    def super_plain_method(self, node: ast.Call, awaited: bool) -> str | None:
+        """`super().m(...)` in an instance method of a plain class (single inheritance: the next class of any
+        instance's MRO is the project base): that base's `m` (its own or inherited), called with the instance. None
+        when it does not apply."""
+        f = node.func
+        if (f.value.args or f.attr == "__init__" or self.node is None or self.p.cur is None or "." not in self.p.cur[0].name
+                or not self.node.args.args or self.node.decorator_list):
+            return None
+        csym = Sym(self.p.cur[0].module, self.p.cur[0].name.split(".")[0])
+        if not isinstance(self.p.ix.definition(csym), ast.ClassDef) or not self.p.is_plain_class(csym):
+            return None
+        pb = self.p.plain_bases(csym)
+        if not pb:
+            return None
+        found = next(((prop, msym) for name, prop, msym in self.p.plain_class(pb[0]).methods if name == f.attr), None)
+        if found is None:
+            raise self.err(f"super().{f.attr}(): the base {pb[0].name} has no method {f.attr}", node)
+        prop, msym = found
+        mcls = self.p.ix.definition(Sym(msym.module, msym.name.split(".")[0]))
+        mdef = next((x for x in mcls.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and x.name == f.attr), None) \
+            if isinstance(mcls, ast.ClassDef) else None
+        if prop or mdef is None or mdef.decorator_list:
+            raise self.err(f"super().{f.attr}(): only a plain method of the base is supported", node)
+        if isinstance(mdef, ast.AsyncFunctionDef) and not awaited:
+            raise self.err(f"super().{f.attr}() of an async method is only supported awaited", node)
+        me = f"v_{ident(self.node.args.args[0].arg)}"
+        args, kwargs = self.dyn_args(node)
+        return self.q(f"{method_wrapper(self.p, msym)}(cx, {me}.clone(), {RT}::pack({args}, {kwargs})).await")
 
     DEFAULT_FACTORIES = {"int", "float", "str", "list", "dict", "set", "tuple", "bool"}
 
@@ -8376,7 +8448,7 @@ class FnCompiler:
             args, kwargs = self.dyn_args(node)
             return self.q(f"{{ let _ = ({args}, {kwargs}); Err::<V, Exc>(Exc::msg(&{RT}::v::IMPORT_ERROR, "
                           f"\"py2axum: __import__() of a module name computed at run time is not supported\")) }}")
-        sup = self.super_init(node)
+        sup = self.super_init(node, awaited)
         if sup is not None:
             return sup
         task = self.task_call(node)
@@ -8406,15 +8478,47 @@ class FnCompiler:
                 recv = self.expr(node.func.value)
                 kw = ", ".join(f"({rs(k.arg)}.to_string(), {self.expr(k.value)})" for k in node.keywords)
                 return self.q(f"{RT}::instr::{node.func.attr}(&{recv}, vec![{kw}])")
+            if (node.func.attr in self.p.M2M_SYNCED and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr in self.p.m2m_pair_names() and len(node.args) == 1
+                    and not node.keywords and not isinstance(node.args[0], ast.Starred)):
+                # `book.tags.append(tag)`: the list's method, then the other side of a many-to-many pair kept in step
+                # (whatever `book` is: orm::m2m_op checks)
+                owner = self.expr(node.func.value.value)
+                arg = self.expr(node.args[0])
+                return self.q(f"{RT}::orm::m2m_op(cx, &{owner}, {rs(node.func.value.attr)}, {rs(node.func.attr)}, {arg}).await")
             if node.func.attr == "add_middleware" and node.args:
                 # `app.add_middleware(Cls, ...)` in a function given the app: the instance is built now (the
                 # stack is being built), its `dispatch` registered
                 kind = mw_kind(self.p.fe, self.module, node)
-                if kind not in {"user", "asgi"} or any(isinstance(a, ast.Starred) for a in node.args) \
+                if kind not in {"user", "asgi", "cors", "trusted", "https"} or any(isinstance(a, ast.Starred) for a in node.args) \
                         or any(k.arg is None for k in node.keywords):
                     raise self.err(f"add_middleware({ast.unparse(node.args[0])}) outside the app factory is not supported "
-                                   "(only a project BaseHTTPMiddleware subclass or raw ASGI class, arguments written out)", node)
+                                   "(only CORSMiddleware, TrustedHostMiddleware, HTTPSRedirectMiddleware, a project "
+                                   "BaseHTTPMiddleware subclass or raw ASGI class, arguments written out)", node)
                 recv = self.expr(node.func.value)
+                if kind in {"cors", "trusted", "https"}:
+                    if len(node.args) > 1:
+                        raise self.err(f"{ast.unparse(node.args[0])} options must be passed by keyword", node)
+                    opts = {k.arg: self.expr(k.value) for k in node.keywords}
+                    if kind == "cors":
+                        major, minor = starlette_version(self.p)
+                        kw = ", ".join(f"({rs(k)}.to_string(), {v})" for k, v in opts.items())
+                        mw = f"{RT}::asgi::Mw::Cors({self.q(f'{RT}::asgi::Cors::new(vec![{kw}], ({major}, {minor}))')})"
+                    else:
+                        # HTTP only: a WebSocket handshake does not cross the stack (refused with WebSocket routes)
+                        fe_ = self.p.fe
+                        fe_.host_mws = [*fe_.__dict__.get("host_mws", []), (node, self.p.src(self.module))]
+                        if kind == "https":
+                            if opts:
+                                raise self.err("HTTPSRedirectMiddleware takes no options", node)
+                            mw = f"{RT}::asgi::Mw::HttpsRedirect"
+                        else:
+                            if set(opts) - {"allowed_hosts", "www_redirect"}:
+                                raise self.err("TrustedHostMiddleware takes allowed_hosts= and www_redirect=", node)
+                            th = (f"{RT}::asgi::TrustedHost::from_values(&{opts.get('allowed_hosts', 'V::None')}, "
+                                  f"&{opts.get('www_redirect', 'V::Bool(true)')})")
+                            mw = f"{RT}::asgi::Mw::TrustedHost({self.q(th)})"
+                    return self.q(f"{RT}::routing::add_mw(&{recv}, {mw})")
                 if kind == "asgi":
                     self.p.__dict__.setdefault("stack_classes", []).append(self.p.resolve(self.module, node.args[0]))
                     fe_ = self.p.fe
@@ -9670,7 +9774,7 @@ class RouteBuilder:
         if isinstance(value, (ast.List, ast.Tuple)):
             if any(isinstance(e, ast.Starred) for e in value.elts):
                 raise TranspileError("dependencies=[*...]: unpacking is not supported", value, file)
-            return [(e, module, file) for e in value.elts]
+            return [self.depends_element(e, module, file) for e in value.elts]
         if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add) and depth < 8:
             return (self.dependency_elements(value.left, module, file, depth + 1)
                     + self.dependency_elements(value.right, module, file, depth + 1))
@@ -9684,6 +9788,65 @@ class RouteBuilder:
         raise TranspileError(f"dependencies={ast.unparse(value)[:60]}: must be a list of Depends(...) read statically "
                              "(a literal, or a module constant bound once to one): the route would otherwise be served "
                              "without these dependencies", value, file)
+
+    def depends_element(self, e: ast.AST, module: str, file: str) -> tuple[ast.AST, str, str]:
+        """An element of `dependencies=[...]`: `admin_only` bound once at module level to `Depends(...)` is that call
+        (read in its own module)"""
+        if isinstance(e, (ast.Name, ast.Attribute)):
+            t = self.p.resolve(module, e)
+            m = self.p.ix.module(t.module) if isinstance(t, Sym) else None
+            d = m.defs.get(t.name) if m is not None else None
+            if (isinstance(d, (ast.Assign, ast.AnnAssign)) and isinstance(d.value, ast.Call)
+                    and (dotted(d.value.func) or "").split(".")[-1] in {"Depends", "Security"}
+                    and len(m.binders.get(t.name, [d])) <= 1 and not self._mutated_global(t)):
+                return d.value, t.module, str(m.path)
+        return e, module, file
+
+    def call_instance_dependency(self, call: ast.Call, module: str) -> Sym | None:
+        """`Depends(RoleChecker(["admin"]))`: the instance FastAPI builds once, where the call is (a hidden global of
+        that module bound to it), then an instance dependency (`instance_dependency`). None when the call is not of a
+        project class with a `__call__`."""
+        t = self.p.resolve(module, call.func) if isinstance(call.func, (ast.Name, ast.Attribute)) else None
+        cls = self.p.ix.definition(t) if isinstance(t, Sym) else None
+        if (not isinstance(cls, ast.ClassDef) or t in self.p.fe.schema_syms or self.inherited_call(t) is None
+                or not self.project_bases_only(t)):
+            return None
+        m = self.p.ix.module(module)
+        name = f"__py2axum_depinst_{call.lineno}_{call.col_offset}"
+        if name not in m.defs:
+            st = ast.Assign(targets=[ast.Name(name, ast.Store())], value=call)
+            ast.copy_location(st, call)
+            st.targets[0].lineno, st.targets[0].col_offset = call.lineno, call.col_offset
+            st.targets[0].end_lineno, st.targets[0].end_col_offset = call.lineno, call.col_offset
+            m.defs[name] = st
+            m.binders.setdefault(name, []).append(st)
+        return self.instance_dependency(Sym(module, name), self.p.src(module))
+
+    def inherited_call(self, cls_sym: Sym):
+        """The `__call__` of a project class, or of its project bases (single inheritance): (the function, the class
+        defining it), else None"""
+        seen = set()
+        while isinstance(cls_sym, Sym) and cls_sym not in seen:
+            seen.add(cls_sym)
+            cls = self.p.ix.definition(cls_sym)
+            if not isinstance(cls, ast.ClassDef):
+                return None
+            call = next((x for x in cls.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and x.name == "__call__"), None)
+            if call is not None:
+                return call, cls_sym
+            if len(cls.bases) != 1:
+                return None
+            cls_sym = self.p.resolve(cls_sym.module, cls.bases[0])
+        return None
+
+    def project_bases_only(self, cls_sym: Sym) -> bool:
+        """Every base, transitively, is a plain project class (a translated library class included)"""
+        cls = self.p.ix.definition(cls_sym)
+        for b in cls.bases if isinstance(cls, ast.ClassDef) else []:
+            t = self.p.resolve(cls_sym.module, b)
+            if not (isinstance(t, Sym) and isinstance(self.p.ix.definition(t), ast.ClassDef) and self.p.is_plain_class(t)):
+                return False
+        return True
 
     def _mutated_global(self, t: Sym) -> bool:
         """`NAME.append(...)`, `NAME += ...`, `NAME[i] = ...`, `mod.NAME.extend(...)` anywhere in the package."""
@@ -10051,34 +10214,44 @@ class RouteBuilder:
 
     def instance_dependency(self, sym: Sym, src: str) -> Sym | None:
         """`checker = Checker("bar")` then `Depends(checker)`: FastAPI reads the parameters of `Checker.__call__`
-        (without `self`) and calls the instance. Compiled as that function, returning `checker(**params)`.
-        None when the global is not an instance of a plain class of the same module with a `__call__`."""
-        name = f"__py2axum_depcall_{sym.name}"
-        m = self.p.ix.module(sym.module)
-        if name in m.defs:
-            return Sym(sym.module, name)
+        (without `self`) and calls the instance. Compiled as that function, returning `checker(**params)`, in the
+        module of the `__call__` (its annotations and defaults are read there; the instance is imported under another
+        name when it lives elsewhere). None when the global is not an instance of a plain project class with a
+        `__call__` (its own or inherited from project bases)."""
+        done = self.__dict__.setdefault("_instance_deps", {})
+        if sym in done:
+            return done[sym]
         st = self.p.ix.definition(sym)
         value = st.value
-        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)):
+        if not (isinstance(value, ast.Call) and isinstance(value.func, (ast.Name, ast.Attribute))):
             return None
-        cls = self.p.ix.definition(Sym(sym.module, value.func.id))
-        if not isinstance(cls, ast.ClassDef) or Sym(sym.module, cls.name) in self.p.fe.schema_syms:
+        cls_sym = self.p.resolve(sym.module, value.func)
+        cls = self.p.ix.definition(cls_sym) if isinstance(cls_sym, Sym) else None
+        if not isinstance(cls, ast.ClassDef) or cls_sym in self.p.fe.schema_syms:
             return None
-        msrc = self.p.src(sym.module)
-        call = next((x for x in cls.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and x.name == "__call__"), None)
-        if call is None:
+        msrc = self.p.src(cls_sym.module)
+        found = self.inherited_call(cls_sym)
+        if found is None:
             return None
+        call, call_sym = found
         a = call.args
-        if cls.bases or cls.keywords or cls.decorator_list:
-            raise TranspileError(f"{sym.name}: an instance dependency must be of a plain class (no base, no decorator)",
-                                 cls, msrc)
+        if cls.keywords or cls.decorator_list or not self.project_bases_only(cls_sym):
+            raise TranspileError(f"{sym.name}: an instance dependency must be of a plain class (project bases only, no "
+                                 "decorator)", cls, msrc)
+        msrc = self.p.src(call_sym.module)
         if call.decorator_list or a.vararg or a.kwarg or a.posonlyargs or not a.args or has_yield(call):
             raise TranspileError(f"{cls.name}.__call__: decorators, *args, **kwargs, positional-only parameters or "
                                  "`yield` are not supported in an instance dependency", call, msrc)
         args = ast.arguments(posonlyargs=[], args=a.args[1:], vararg=None, kwonlyargs=a.kwonlyargs,
                              kw_defaults=a.kw_defaults, kwarg=None, defaults=a.defaults)
         names = [x.arg for x in args.args + args.kwonlyargs]
-        ret = ast.Call(func=ast.Name(sym.name, ast.Load()), args=[],
+        m = self.p.ix.module(call_sym.module)
+        name = f"__py2axum_depcall_{mod_ident(sym.module)}__{sym.name}"
+        inst = sym.name
+        if sym.module != call_sym.module:
+            inst = f"__py2axum_depinst_{mod_ident(sym.module)}__{sym.name}"
+            m.imports[inst] = ("from", sym.module, sym.name)
+        ret = ast.Call(func=ast.Name(inst, ast.Load()), args=[],
                        keywords=[ast.keyword(n, ast.Name(n, ast.Load())) for n in names])
         if isinstance(call, ast.AsyncFunctionDef):
             ret = ast.Await(ret)
@@ -10090,7 +10263,8 @@ class RouteBuilder:
         fn.lineno, fn.end_lineno, fn.col_offset, fn.end_col_offset = call.lineno, call.end_lineno, 0, 0
         fn.py2axum_noframe = True
         m.defs[name] = fn
-        return Sym(sym.module, name)
+        done[sym] = Sym(call_sym.module, name)
+        return done[sym]
 
     def factory_dependency(self, call: ast.Call, module: str, scope, src: str, site: str = "") -> Sym | None:
         """`Depends(make_dep(Query([], alias="ids"), int))`: FastAPI reads the signature of the function the factory
@@ -10343,7 +10517,11 @@ class RouteBuilder:
                     continue
                 t = self.p.resolve(dmod, dep_call.args[0], dscope)
                 if isinstance(dep_call.args[0], ast.Call):
-                    t = self.factory_dependency(dep_call.args[0], dmod, dscope, src) or t
+                    t = (self.factory_dependency(dep_call.args[0], dmod, dscope, src)
+                         # a default evaluated once, when a function of the module is defined
+                         or (self.call_instance_dependency(dep_call.args[0], dmod)
+                             if dscope is None or self.p.ix.module(dmod).defs.get(getattr(dscope, "name", None)) is dscope
+                             else None) or t)
                 elif isinstance(dep_call.args[0], ast.Lambda):
                     t = self.lambda_dependency(dep_call.args[0], dmod, dscope, src)
                 elif t is None and isinstance(dep_call.args[0], ast.Name):
@@ -10973,7 +11151,7 @@ class RouteBuilder:
                     raise TranspileError("dependencies=[...] must contain Depends(function)", e, file)
                 t = self.p.resolve(mod, e.args[0])
                 if isinstance(e.args[0], ast.Call):
-                    t = self.factory_dependency(e.args[0], mod, None, file) or t
+                    t = self.factory_dependency(e.args[0], mod, None, file) or self.call_instance_dependency(e.args[0], mod) or t
                 elif isinstance(e.args[0], ast.Lambda):
                     t = self.lambda_dependency(e.args[0], mod, None, file)
                 elif t is None and isinstance(e.args[0], ast.Name):
@@ -11254,7 +11432,7 @@ class RouteBuilder:
                     raise TranspileError("dependencies=[...] must contain Depends(function)", e, file)
                 t = self.p.resolve(mod, e.args[0])
                 if isinstance(e.args[0], ast.Call):
-                    t = self.factory_dependency(e.args[0], mod, None, file) or t
+                    t = self.factory_dependency(e.args[0], mod, None, file) or self.call_instance_dependency(e.args[0], mod) or t
                 elif isinstance(e.args[0], ast.Lambda):
                     t = self.lambda_dependency(e.args[0], mod, None, file)
                 elif t is None and isinstance(e.args[0], ast.Name):
@@ -14321,8 +14499,19 @@ def build_stack(p: "Project", fe: Frontend) -> str:
                 if len(call.args) > 1:
                     raise TranspileError("TrustedHostMiddleware options must be passed by keyword", call, p.src(module))
                 hosts, www = ["*"], True
-                for kw in call.keywords:
-                    v = p.const(kw.value, module)
+                try:
+                    consts = [p.const(kw.value, module) for kw in call.keywords]
+                except TranspileError:
+                    # read when the stack is built (`allowed_hosts=get_settings().allowed_hosts`), Starlette's
+                    # assertions then
+                    opts = {k.arg: fc.expr(k.value) for k in call.keywords}
+                    if set(opts) - {"allowed_hosts", "www_redirect"}:
+                        raise TranspileError(f"TrustedHostMiddleware({next(iter(set(opts) - {'allowed_hosts', 'www_redirect'}))}=) "
+                                             "is not an option", call, p.src(module))
+                    fc.emit(f"__st.{add}({RT}::asgi::Mw::TrustedHost({RT}::asgi::TrustedHost::from_values("
+                            f"&{opts.get('allowed_hosts', 'V::None')}, &{opts.get('www_redirect', 'V::Bool(true)')})?));")
+                    return
+                for kw, v in zip(call.keywords, consts):
                     if kw.arg == "allowed_hosts" and (v is None or (isinstance(v, (list, tuple)) and all(isinstance(h, str) for h in v))):
                         hosts = ["*"] if v is None else list(v)
                     elif kw.arg == "www_redirect" and isinstance(v, bool):
