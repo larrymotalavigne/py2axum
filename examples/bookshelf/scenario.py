@@ -13,7 +13,8 @@ import jwt
 import psycopg
 
 SECRET = "change-me-in-production-0123456789"
-SETTLE = 0.05  # FastAPI commits the session after sending the response: let it land before the next request
+SETTLE = 0.25  # FastAPI commits the session after sending the response: let it land before the next request (0.05 s
+# was not always enough on a loaded CI runner)
 
 
 def token(sub, exp=datetime(2100, 1, 1, tzinfo=UTC), key=SECRET, **claims) -> str:
