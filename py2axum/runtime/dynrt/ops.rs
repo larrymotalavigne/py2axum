@@ -987,6 +987,7 @@ pub fn is(a: &V, b: &V) -> bool {
         (V::Dict(x), V::Dict(y)) => Arc::ptr_eq(x, y),
         (V::Obj(x), V::Obj(y)) => Arc::ptr_eq(x, y),
         (V::Inst(x), V::Inst(y)) => Arc::ptr_eq(x, y),
+        (V::Session(x), V::Session(y)) => x.same(y),
         // `e.orig is e.__cause__`, `exc is caught`
         (V::Exc(x), V::Exc(y)) => Arc::ptr_eq(&x.0, &y.0),
         (V::Class(x), V::Class(y)) => std::ptr::eq(*x, *y),

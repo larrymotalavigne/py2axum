@@ -281,6 +281,9 @@ pub enum Native {
     /// `async_sessionmaker(...)`/`sessionmaker(...)` built at run time: (expire_on_commit, autoflush, sync: `sessionmaker` rather than `async_sessionmaker`)
     /// (expire_on_commit, autoflush, sync, the session parameters its engine's `connect_args` sets)
     Maker(bool, bool, bool, std::sync::Arc<[(String, String)]>),
+    /// `async_scoped_session(factory, scopefunc)` / `scoped_session(...)`: a session per value of scopefunc() (see
+    /// `orm::Scoped`)
+    ScopedSession(Arc<orm::Scoped>),
     /// `session.query(...)`: the session and the `select()` it runs
     Query(super::orm::Session, V),
     /// a `redis.asyncio` client (see `rds`), a `Retry` policy (its number of retries)
@@ -571,6 +574,7 @@ impl V {
                 Native::AsyncItems(_) => "async_generator",
                 Native::Maker(_, _, false, _) => "async_sessionmaker",
                 Native::Maker(_, _, true, _) => "sessionmaker",
+                Native::ScopedSession(s) => if s.sync { "scoped_session" } else { "async_scoped_session" },
                 Native::Query(..) => "Query",
                 Native::TLock(l) => if l.reentrant { "RLock" } else { "lock" },
                 Native::TEvent(_) | Native::AEvent(_) => "Event",

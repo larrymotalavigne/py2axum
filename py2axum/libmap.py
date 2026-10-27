@@ -1732,6 +1732,9 @@ CALLS = {
     "sqlalchemy.orm.Session": lambda a, kw: _session(a, kw, True),
     "sqlalchemy.ext.asyncio.AsyncSession": lambda a, kw: _session(a, kw, False),
     "sqlalchemy.orm.sessionmaker": lambda a, kw: f"{RT}::orm::sessionmaker(&{_argv(a)}, &{_kwvec(kw)}, true)",
+    "sqlalchemy.ext.asyncio.async_scoped_session": lambda a, kw: f"{RT}::orm::scoped_session(&{_argv(a)}, &{_kwvec(kw)}, false)",
+    "sqlalchemy.ext.asyncio.scoping.async_scoped_session": lambda a, kw: f"{RT}::orm::scoped_session(&{_argv(a)}, &{_kwvec(kw)}, false)",
+    "sqlalchemy.orm.scoped_session": lambda a, kw: f"{RT}::orm::scoped_session(&{_argv(a)}, &{_kwvec(kw)}, true)",
     "sqlalchemy.create_engine": lambda a, kw: _engine(a, kw, True),
     "sqlalchemy.ext.asyncio.create_async_engine": lambda a, kw: _engine(a, kw, False),
     # inspect(x, raiseerr=False) only: with raiseerr=True a non-mapped value raises NoInspectionAvailable

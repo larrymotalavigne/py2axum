@@ -87,6 +87,7 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   are detached, then the transaction is rolled back; the session stays usable), `obj in session`,
   `Session(engine)` / `AsyncSession(engine)` in an endpoint (`bind=`, `expire_on_commit=`, `autoflush=`; its
   `with` block closes it),
+  `async_scoped_session(session_factory=maker, scopefunc=f)` (and `scoped_session` with a `scopefunc`): a module proxy whose methods are those of the session of the current `scopefunc()` value (a `ContextVar` a middleware sets per request, typically), made by the factory on first use; `session()` is that session, `await session.remove()` closes and forgets it (`obj in session` on the proxy itself is not supported: `obj in session()`),
   `expunge`/`expunge_all` (the objects are detached: reading what they have not loaded raises
   `DetachedInstanceError`), `expire_all`, `expire(obj)` (with the `refresh-expire` cascade of `cascade="all"`) and
   `expire(obj, ["col", "rel"])` (only those attributes; their changes not flushed are lost),

@@ -921,3 +921,34 @@ def test_starlette_authentication_middleware_with_websockets_refused(tmp_path, c
     pkg = project(tmp_path, _AUTH_APP.format(ws_import=", WebSocket", ws=ws))
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     assert "WebSocket routes" in capsys.readouterr().err
+
+
+_SCOPED = '''
+from contextvars import ContextVar
+
+from fastapi import FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_scoped_session, async_sessionmaker, create_async_engine
+
+from .models import Team
+
+ctx: ContextVar[str] = ContextVar("ctx")
+engine = create_async_engine("postgresql+psycopg://x/y")
+session = async_scoped_session({args})
+app = FastAPI()
+
+
+@app.get("/teams")
+async def teams():
+    ctx.set("one")
+    rows = (await session.scalars(select(Team))).all()
+    await session.remove()
+    return [t.name for t in rows]
+'''
+
+
+def test_async_scoped_session(tmp_path):
+    """`async_scoped_session(factory, scopefunc=ctx.get)`: the proxy's calls go to the current scope's session"""
+    pkg = project(tmp_path, _SCOPED.format(args="async_sessionmaker(engine), scopefunc=ctx.get"))
+    main_rs = generate(tmp_path, pkg)
+    assert "scoped_session" in main_rs + (tmp_path / "out" / "src" / "gen.rs").read_text()

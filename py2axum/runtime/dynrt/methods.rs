@@ -1726,6 +1726,10 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 Box::pin(call_value(cx, &f, args, kwargs)).await
             }
         },
+        V::Native(n) if matches!(&**n, Native::ScopedSession(_)) => {
+            let Native::ScopedSession(sc) = &**n else { unreachable!() };
+            orm::scoped_method(cx, sc, name, args, kwargs).await
+        }
         V::Session(s) => {
             // positional/keyword arguments beyond the supported ones are refused, never ignored
             let (max_pos, kws): (usize, &[&str]) = match name {
@@ -2031,6 +2035,13 @@ pub async fn call_value(cx: &Cx, f: &V, args: Vec<V>, kwargs: Vec<(String, V)>) 
                 return Err(Exc::type_error("decorator() got an unexpected keyword argument"));
             }
             return super::ctools::decorate(c, &args);
+        }
+        // `scoped()`: the session of the current scope
+        if let Native::ScopedSession(sc) = &**n {
+            if !args.is_empty() || !kwargs.is_empty() {
+                return Err(Exc::type_error("py2axum: calling a scoped session with arguments is not supported"));
+            }
+            return Box::pin(orm::scoped_current(cx, sc)).await;
         }
         // `async_sessionmaker(...)()`: a new session on the process pool
         if let Native::Maker(expire, autoflush, sync, params) = &**n {
@@ -3192,7 +3203,7 @@ pub fn b_callable(args: &[V]) -> R {
     let [v] = args else { return Err(Exc::type_error(format!("callable() takes exactly one argument ({} given)", args.len()))) };
     Ok(V::Bool(match v {
         V::Class(_) => true,
-        V::Native(n) => matches!(&**n, Native::RequestReceive | Native::Bound(..) | Native::Unbound(..) | Native::PyFn(_) | Native::Builtin(..) | Native::Type(_) | Native::Maker(..) | Native::CallNext(_) | Native::AsgiApp(_)),
+        V::Native(n) => matches!(&**n, Native::RequestReceive | Native::Bound(..) | Native::Unbound(..) | Native::PyFn(_) | Native::Builtin(..) | Native::Type(_) | Native::Maker(..) | Native::ScopedSession(_) | Native::CallNext(_) | Native::AsgiApp(_)),
         V::Inst(i) => find_method(i.desc.methods, "__call__").is_some(),
         V::Obj(o) => find_method(o.desc.methods, "__call__").is_some(),
         _ => false,

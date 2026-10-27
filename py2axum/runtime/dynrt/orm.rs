@@ -2425,6 +2425,78 @@ pub fn sessionmaker(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
     Ok(V::native(Native::Maker(expire, autoflush, sync, Arc::from(Vec::new()))))
 }
 
+/// `async_scoped_session(session_factory, scopefunc)` / `scoped_session(session_factory, scopefunc)`: the registry
+/// of sessions by the value scopefunc() returns (a ContextVar set per request, typically), each made by the factory on
+/// first use; the proxy's methods are the current session's, `remove()` closes it and forgets it.
+pub struct Scoped {
+    pub factory: V,
+    pub scopefunc: V,
+    pub sync: bool,
+    pub registry: Mutex<Vec<(V, V)>>,
+}
+
+pub fn scoped_session(args: &[V], kwargs: &[(String, V)], sync: bool) -> R {
+    let what = if sync { "scoped_session" } else { "async_scoped_session" };
+    let arg = |i: usize, name: &str| args.get(i).cloned().or_else(|| kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()));
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "session_factory" && k != "scopefunc") {
+        return Err(Exc::type_error(format!("{what}() got an unexpected keyword argument '{k}'")));
+    }
+    let factory = arg(0, "session_factory").ok_or_else(|| Exc::type_error(format!("{what}() missing 1 required positional argument: 'session_factory'")))?;
+    let scopefunc = match arg(1, "scopefunc") {
+        Some(f) if !f.is_none() => f,
+        // scoped_session's thread-local registry: a request is served by any thread here
+        _ => return Err(Exc::type_error(format!("py2axum: {what}() needs a scopefunc= (a thread-local registry is not supported)"))),
+    };
+    if !matches!(&factory, V::Native(n) if matches!(&**n, Native::Maker(..))) {
+        return Err(Exc::type_error(format!("py2axum: {what}(session_factory=) must be a sessionmaker")));
+    }
+    Ok(V::native(Native::ScopedSession(Arc::new(Scoped { factory, scopefunc, sync, registry: Mutex::new(Vec::new()) }))))
+}
+
+async fn scoped_key(cx: &super::Cx, sc: &Scoped) -> R {
+    Box::pin(super::methods::call_value(cx, &sc.scopefunc, vec![], vec![])).await
+}
+
+fn scoped_find(sc: &Scoped, key: &V) -> R<Option<usize>> {
+    let reg = sc.registry.lock();
+    for (i, (k, _)) in reg.iter().enumerate() {
+        if ops::truthy(&ops::eq(k, key)?)? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// `scoped()`: the session of the current scope, made by the factory when there is none
+pub async fn scoped_current(cx: &super::Cx, sc: &Scoped) -> R {
+    let key = scoped_key(cx, sc).await?;
+    if let Some(i) = scoped_find(sc, &key)? {
+        return Ok(sc.registry.lock()[i].1.clone());
+    }
+    let s = Box::pin(super::methods::call_value(cx, &sc.factory, vec![], vec![])).await?;
+    sc.registry.lock().push((key, s.clone()));
+    Ok(s)
+}
+
+/// a method of the proxy: `remove()` (the current session closed, then forgotten), else the current session's
+pub async fn scoped_method(cx: &super::Cx, sc: &Scoped, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) -> R {
+    if name == "remove" {
+        if !args.is_empty() || !kwargs.is_empty() {
+            return Err(Exc::type_error("remove() takes 1 positional argument"));
+        }
+        let key = scoped_key(cx, sc).await?;
+        if let Some(i) = scoped_find(sc, &key)? {
+            let (_, s) = sc.registry.lock().remove(i);
+            if let V::Session(s) = &s {
+                s.close().await?;
+            }
+        }
+        return Ok(V::None);
+    }
+    let s = scoped_current(cx, sc).await?;
+    Box::pin(super::methods::call_method(cx, &s, name, args, kwargs)).await
+}
+
 /// `insert(Model)`; `pg`: the postgresql dialect's (on_conflict_do_update/nothing)
 pub fn insert(m: &V, pg: bool) -> R {
     Ok(sql(Sql::Insert(Box::new(Ins { m: model_of(m)?, rows: vec![], conflict: None, returning: vec![], pg, render_nulls: false, fixed: false }))))
@@ -5346,6 +5418,13 @@ pub async fn create_all_engine(cx: &super::Cx, engine: &V, ddl: &'static Ddl) ->
 /// `AsyncSession`: one per request (FastAPI dependency cache), cheap to clone.
 #[derive(Clone)]
 pub struct Session(Arc<tokio::sync::Mutex<SessInner>>);
+
+impl Session {
+    /// `a is b`: the same session object
+    pub fn same(&self, other: &Session) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 fn ident(m: &'static ModelDesc, pk: &V) -> R<(usize, Key)> {
     // inheritance: one identity per row of the hierarchy (`get(Employee, 1)` finds the Manager)

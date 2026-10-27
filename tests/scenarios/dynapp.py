@@ -707,6 +707,7 @@ def reset_tables(db: str) -> None:
 
     import fixtures.dynapp.inherit  # noqa: F401  (its tables are on the same Base)
     import fixtures.dynapp.streamx  # noqa: F401
+    import fixtures.dynapp.scoped  # noqa: F401
     from fixtures.dynapp.models import Base
 
     engine = create_engine(db.replace("postgresql://", "postgresql+psycopg://", 1))
@@ -844,6 +845,10 @@ STEPS += [
 STEPS += [("POST", "/streamx/seed", None), ("GET", "/streamx/notes", None), ("GET", "/streamx/notes/2", None),
           ("GET", "/streamx/notes/9", None), ("GET", "/streamx/byids", None), ("GET", "/streamx/byids?ids=2", None),
           ("GET", "/streamx/books", None), ("GET", "/streamx/rows", None), ("GET", "/streamx/scalars", None)]
+
+# ---- async_scoped_session scoped by a ContextVar a raw middleware sets per request (fixtures/dynapp/scoped.py)
+STEPS += [("POST", "/scoped/items/a", None), ("POST", "/scoped/items/b", None), ("GET", "/scoped/items", None),
+          ("POST", "/scoped/dirty/1", None), ("GET", "/scoped/items/1", None), ("POST", "/scoped/dirty/9", None)]
 
 # ---- obj.__dict__ around an INSERT (fixtures/dynapp/idict.py): columns never set, defaults, foreign keys and
 # back-populated relationships, then a later read, SELECT, get, refresh, UPDATE, collection removal
