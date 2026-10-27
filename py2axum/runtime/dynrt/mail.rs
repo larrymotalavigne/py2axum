@@ -330,10 +330,18 @@ pub struct Mime {
     headers: Mutex<Vec<(String, String)>>,
     parts: Mutex<Vec<V>>,
     payload: Mutex<Option<V>>,
+    /// `msg.preamble`: written between the headers and the first boundary
+    pub preamble: Mutex<Option<String>>,
 }
 
-fn mime(kind: MimeKind, headers: Vec<(String, String)>) -> V {
-    V::native(Native::Mime(Arc::new(Mime { kind, headers: Mutex::new(headers), parts: Mutex::new(Vec::new()), payload: Mutex::new(None) })))
+pub(super) fn mime(kind: MimeKind, headers: Vec<(String, String)>) -> V {
+    V::native(Native::Mime(Arc::new(Mime {
+        kind,
+        headers: Mutex::new(headers),
+        parts: Mutex::new(Vec::new()),
+        payload: Mutex::new(None),
+        preamble: Mutex::new(None),
+    })))
 }
 
 fn kw<'a>(kwargs: &'a [(String, V)], name: &str) -> Option<&'a V> {
@@ -472,9 +480,9 @@ fn header_encode_lines(s: &str, first: i64, next: i64) -> Vec<Option<String>> {
 /// utf-8 encoded words, cut to the line (the first one after `name: `), continuation lines indented by one space
 /// (email.header._ValueFormatter). Lines joined by "\n": the SMTP flattening turns every "\n" into CRLF. `maxlen`:
 /// 78 when sent (the SMTP policy), 1 000 000 for `as_string()` (`maxheaderlen=0`: no folding)
-fn fold_header(name: &str, v: &str, maxlen: i64) -> String {
+pub(super) fn fold_header(name: &str, v: &str, maxlen: i64) -> String {
     if v.is_ascii() {
-        return v.to_string();
+        return if maxlen >= 1_000_000 { v.to_string() } else { ascii_fold(name.len() + 2, v, maxlen as usize) };
     }
     let mut lines: Vec<String> = Vec::new();
     // the current line: its text and the columns already taken (the header's name on the first)
@@ -509,6 +517,181 @@ fn fold_header(name: &str, v: &str, maxlen: i64) -> String {
         lines.push(cur);
     }
     lines.join("\n")
+}
+
+/// email.header._Accumulator: the (folding white space, text) chunks of the line being built, after `initial`
+/// columns (the header's name on the first line)
+struct Acc {
+    parts: Vec<(String, String)>,
+    initial: usize,
+}
+
+impl Acc {
+    fn len(&self) -> usize {
+        self.initial + self.parts.iter().map(|(f, p)| f.len() + p.len()).sum::<usize>()
+    }
+    fn text(&self) -> String {
+        self.parts.iter().map(|(f, p)| format!("{f}{p}")).collect()
+    }
+    fn pop(&mut self) -> (String, String) {
+        self.parts.pop().unwrap_or_default()
+    }
+    fn is_onlyws(&self) -> bool {
+        let t = self.text();
+        self.initial == 0 && (self.parts.is_empty() || (!t.is_empty() && t.chars().all(|c| c.is_whitespace())))
+    }
+    fn reset(&mut self, start: Vec<(String, String)>) {
+        self.parts = start;
+        self.initial = 0;
+    }
+}
+
+/// email.header._ValueFormatter for a us-ascii chunk: lines broken at the "highest level syntactic break" that
+/// fits, `;` then `,` then a space then a tab (Header.encode's default splitchars), continuation lines keeping the
+/// folding white space they were split at
+struct Formatter {
+    maxlen: usize,
+    lines: Vec<String>,
+    cur: Acc,
+}
+
+impl Formatter {
+    fn newline(&mut self) {
+        let end = self.cur.pop();
+        if end != (" ".to_string(), String::new()) {
+            self.cur.parts.push(end);
+        }
+        if self.cur.len() > 0 {
+            if self.cur.is_onlyws() && !self.lines.is_empty() {
+                let t = self.cur.text();
+                *self.lines.last_mut().unwrap() += &t;
+            } else {
+                self.lines.push(self.cur.text());
+            }
+        }
+        self.cur.reset(Vec::new());
+    }
+
+    /// `_ascii_split`: `fws + string` cut into (white space run, word) pairs
+    fn ascii_split(&mut self, fws: &str, string: &str) {
+        let all = format!("{fws}{string}");
+        let mut parts: Vec<String> = Vec::new();
+        let mut word = String::new();
+        let mut ws = String::new();
+        for c in all.chars() {
+            if c == ' ' || c == '\t' {
+                if ws.is_empty() {
+                    parts.push(std::mem::take(&mut word));
+                }
+                ws.push(c);
+            } else {
+                if !ws.is_empty() {
+                    parts.push(std::mem::take(&mut ws));
+                }
+                word.push(c);
+            }
+        }
+        if !ws.is_empty() {
+            parts.push(ws);
+        }
+        parts.push(word);
+        // re.split("([ \t]+)", s): [word, ws, word, ...]; a leading '' is dropped, else '' put in front
+        if parts[0].is_empty() {
+            parts.remove(0);
+        } else {
+            parts.insert(0, String::new());
+        }
+        let mut it = parts.into_iter();
+        while let (Some(f), Some(p)) = (it.next(), it.next()) {
+            self.append_chunk(f, p);
+        }
+    }
+
+    fn append_chunk(&mut self, fws: String, string: String) {
+        self.cur.parts.push((fws, string));
+        if self.cur.len() <= self.maxlen {
+            return;
+        }
+        // the best split point, working backward from the end; none on a long first word
+        let n = self.cur.parts.len();
+        let mut at = None;
+        'outer: for ch in [';', ',', ' ', '\t'] {
+            for i in (1..n).rev() {
+                if ch == ' ' || ch == '\t' {
+                    if self.cur.parts[i].0.starts_with(ch) {
+                        at = Some(i);
+                        break 'outer;
+                    }
+                }
+                if self.cur.parts[i - 1].1.ends_with(ch) {
+                    at = Some(i);
+                    break 'outer;
+                }
+            }
+        }
+        match at {
+            None => {
+                let (mut fws, part) = self.cur.pop();
+                if self.cur.initial > 0 {
+                    // there will be a header: leave it on a line by itself
+                    self.newline();
+                    if fws.is_empty() {
+                        fws = " ".into();
+                    }
+                }
+                self.cur.parts.push((fws, part));
+            }
+            Some(i) => {
+                let rest = self.cur.parts.split_off(i);
+                self.lines.push(self.cur.text());
+                self.cur.reset(rest);
+            }
+        }
+    }
+}
+
+/// compat32's `Header(value, header_name=name).encode(maxlinelen=maxlen)` for an ASCII value (`headerlen`: the
+/// columns of `name: `); lines joined by "\n", as `fold_header`
+fn ascii_fold(headerlen: usize, v: &str, maxlen: usize) -> String {
+    let mut f = Formatter { maxlen, lines: Vec::new(), cur: Acc { parts: Vec::new(), initial: headerlen } };
+    // str.splitlines() of an ASCII string
+    let lines: Vec<&str> = {
+        let mut out = Vec::new();
+        let b = v.as_bytes();
+        let (mut start, mut i) = (0, 0);
+        while i < b.len() {
+            match b[i] {
+                b'\r' if b.get(i + 1) == Some(&b'\n') => {
+                    out.push(&v[start..i]);
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+                b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e => {
+                    out.push(&v[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if start < b.len() {
+            out.push(&v[start..]);
+        }
+        out
+    };
+    f.ascii_split("", lines.first().copied().unwrap_or(""));
+    for line in lines.iter().skip(1) {
+        f.newline();
+        let sline = line.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+        f.ascii_split(&line[..line.len() - sline.len()], sline);
+    }
+    if lines.len() > 1 {
+        f.newline();
+    }
+    f.cur.parts.push((" ".into(), String::new()));
+    f.newline();
+    f.lines.join("\n")
 }
 
 /// header params: `name="value"`, or RFC 2231 for non-ASCII values
@@ -617,27 +800,7 @@ fn compat32_lines(k: &str, v: &str) -> R<Option<String>> {
     Ok(Some(joined))
 }
 
-/// compat32 folding of a header line longer than 78 characters, at its "; " parameter separators
-fn fold(line: String) -> String {
-    if line.len() <= 78 || !line.contains("; ") {
-        return line;
-    }
-    let mut out = String::new();
-    let mut cur = String::new();
-    for (i, piece) in line.split("; ").enumerate() {
-        let add = if i == 0 { piece.to_string() } else { format!("; {piece}") };
-        if !cur.is_empty() && cur.len() + add.len() > 78 {
-            out += &cur;
-            out += ";\n";
-            cur = format!(" {}", add.trim_start_matches("; "));
-        } else {
-            cur += &add;
-        }
-    }
-    out + &cur
-}
-
-fn render_with(m: &Arc<Mime>, folded: bool) -> R<String> {
+pub(super) fn render_with(m: &Arc<Mime>, folded: bool) -> R<String> {
     let boundary = match &m.kind {
         MimeKind::Multipart(_) => Some(format!("==============={:019}==", rand_u64() % 10_000_000_000_000_000_000)),
         _ => None,
@@ -649,13 +812,21 @@ fn render_with(m: &Arc<Mime>, folded: bool) -> R<String> {
         let v = lines.as_deref().unwrap_or(v);
         let v = match (&boundary, k.eq_ignore_ascii_case("content-type")) {
             (Some(b), true) => format!("{v}; boundary=\"{b}\""),
-            _ => fold_header(k, v, if folded { 78 } else { 1_000_000 }),
+            _ => v.to_string(),
         };
-        let line = format!("{k}: {v}");
-        out += &if folded { fold(line) } else { line };
-        out += "\n";
+        out += &format!("{k}: {}\n", fold_header(k, &v, if folded { 78 } else { 1_000_000 }));
     }
     out += "\n";
+    // email.generator._write_lines(preamble), then a line end
+    if let Some(p) = &*m.preamble.lock() {
+        let lines: Vec<&str> = p.split("\r\n").flat_map(|l| l.split(['\r', '\n'])).collect();
+        for l in &lines[..lines.len() - 1] {
+            out += l;
+            out += "\n";
+        }
+        out += lines[lines.len() - 1];
+        out += "\n";
+    }
     match &m.kind {
         MimeKind::Multipart(_) => {
             // email.generator: "--b\n" part, then "\n--b\n" part..., then "\n--b--\n"
