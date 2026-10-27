@@ -30,6 +30,19 @@ pub struct Jwk {
     pub key: KeyMaterial,
 }
 
+static PYJWT_MINOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(15);
+
+/// The PyJWT 2.x minor the project locks (13, 14 or 15; main() sets it): what changed in 2.14 (the refresh
+/// cooldown, redirects refused) and 2.15 (key errors as InvalidKeyError, members that are not objects skipped,
+/// the payload checked before it is cached)
+pub fn set_pyjwt(minor: u32) {
+    PYJWT_MINOR.store(minor, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn minor() -> u32 {
+    PYJWT_MINOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn exc(class: &'static Class, msg: impl AsRef<str>) -> Exc {
     Exc::msg(class, msg)
 }
@@ -126,7 +139,17 @@ pub fn jwk_new(data: &V, algorithm: Option<&V>) -> R<Arc<Jwk>> {
     if !KNOWN.contains(&alg.as_str()) {
         return Err(exc(&PYJWK_ERROR, format!("Unable to find an algorithm for key: {}", repr(data))));
     }
-    let construct = |msg: String| exc(&PYJWT_INVALID_KEY, format!("Unable to construct key from JWK: {msg}"));
+    // PyJWK wraps the ValueError of Algorithm.from_jwk from 2.14, its TypeError from 2.15; else it propagates
+    let construct = |msg: String| {
+        let type_error = msg == "Expected a string value";
+        if minor() >= 15 || (minor() == 14 && !type_error) {
+            exc(&PYJWT_INVALID_KEY, format!("Unable to construct key from JWK: {msg}"))
+        } else if type_error {
+            Exc::type_error(msg)
+        } else {
+            Exc::value_error(msg)
+        }
+    };
     let key = match alg.as_str() {
         "RS256" | "RS384" | "RS512" | "PS256" | "PS384" | "PS512" => {
             // RSAAlgorithm.from_jwk
@@ -198,6 +221,10 @@ pub fn set_new(keys: &V) -> R<Arc<Vec<Arc<Jwk>>>> {
     let mut out = Vec::new();
     for k in l.lock().clone() {
         if !matches!(k, V::Dict(_)) {
+            if minor() < 15 {
+                // PyJWK(key) reads `key.get("kty")`
+                return Err(Exc::attr_error(format!("'{}' object has no attribute 'get'", k.type_name())));
+            }
             continue;
         }
         match jwk_new(&k, None) {
@@ -321,6 +348,8 @@ pub struct Client {
 #[derive(Default)]
 struct State {
     set: Option<(Arc<Vec<Arc<Jwk>>>, Instant)>,
+    /// before 2.15 the JWK Set cache holds the payload as received, parsed again by each read
+    raw: Option<(V, Instant)>,
     last_fetch: Option<Instant>,
     /// lru_cache of get_signing_key: (kid, key), most recent last
     lru: Vec<(V, Arc<Jwk>)>,
@@ -342,17 +371,20 @@ fn fmt_num(v: &V) -> String {
 /// `PyJWKClient(uri, cache_keys=False, max_cached_keys=16, cache_jwk_set=True, lifespan=300, headers=None,
 /// timeout=30, ssl_context=None, cooldown_duration=30)`
 pub fn client_new(args: &[V], kwargs: &[(String, V)]) -> R {
-    const NAMES: &[&str] = &["uri", "cache_keys", "max_cached_keys", "cache_jwk_set", "lifespan", "headers", "timeout",
-                             "ssl_context", "cooldown_duration"];
-    if args.len() > NAMES.len() {
-        return Err(Exc::type_error(format!("PyJWKClient.__init__() takes from 2 to 10 positional arguments but {} were given", args.len() + 1)));
+    const ALL: &[&str] = &["uri", "cache_keys", "max_cached_keys", "cache_jwk_set", "lifespan", "headers", "timeout",
+                           "ssl_context", "cooldown_duration"];
+    // `cooldown_duration` appeared in 2.14
+    let names = if minor() >= 14 { ALL } else { &ALL[..8] };
+    if args.len() > names.len() {
+        return Err(Exc::type_error(format!("PyJWKClient.__init__() takes from 2 to {} positional arguments but {} were given",
+                                           names.len() + 1, args.len() + 1)));
     }
-    let mut vals: Vec<Option<V>> = vec![None; NAMES.len()];
+    let mut vals: Vec<Option<V>> = vec![None; ALL.len()];
     for (i, a) in args.iter().enumerate() {
         vals[i] = Some(a.clone());
     }
     for (k, v) in kwargs {
-        let Some(i) = NAMES.iter().position(|n| n == k) else {
+        let Some(i) = names.iter().position(|n| n == k) else {
             return Err(Exc::type_error(format!("PyJWKClient.__init__() got an unexpected keyword argument '{k}'")));
         };
         if vals[i].is_some() {
@@ -426,7 +458,8 @@ fn reason(code: u16) -> &'static str {
 async fn fetch_data(c: &Client, st: &mut State) -> R<V> {
     let conn = |m: String| exc(&PYJWK_CLIENT_CONNECTION_ERROR, format!("Fail to fetch data from the url, err: \"{m}\""));
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+        // 2.13's urlopen follows redirects (HTTPRedirectHandler: at most 10); 2.14 refuses them
+        .redirect(if minor() < 14 { reqwest::redirect::Policy::limited(10) } else { reqwest::redirect::Policy::none() })
         .timeout(Duration::from_secs_f64(c.timeout.max(0.0)))
         .build()
         .map_err(|e| conn(e.to_string()))?;
@@ -446,6 +479,14 @@ async fn fetch_data(c: &Client, st: &mut State) -> R<V> {
         if e.is_timeout() { conn("timed out".into()) } else { conn(format!("<urlopen error {e}>")) }
     })?;
     let data = super::libs::json_loads(&V::Bytes(Arc::from(&body[..])))?;
+    if minor() < 15 {
+        // the payload cached as it is (checked and parsed by get_jwk_set)
+        if c.lifespan.is_some() {
+            st.raw = Some((data.clone(), Instant::now()));
+        }
+        st.last_fetch = Some(Instant::now());
+        return Ok(data);
+    }
     if !matches!(data, V::Dict(_)) {
         return Err(exc(&PYJWK_CLIENT_ERROR, "The JWKS endpoint did not return a JSON object"));
     }
@@ -460,6 +501,20 @@ async fn fetch_data(c: &Client, st: &mut State) -> R<V> {
 
 /// `get_jwk_set(refresh=False)`
 async fn get_jwk_set(c: &Client, st: &mut State, refresh: bool) -> R<Arc<Vec<Arc<Jwk>>>> {
+    if minor() < 15 {
+        let cached = match (c.lifespan, refresh, &st.raw) {
+            (Some(life), false, Some((raw, at))) if at.elapsed().as_secs_f64() <= life => Some(raw.clone()),
+            _ => None,
+        };
+        let data = match cached {
+            Some(d) => d,
+            None => fetch_data(c, st).await?,
+        };
+        if !matches!(data, V::Dict(_)) {
+            return Err(exc(&PYJWK_CLIENT_ERROR, "The JWKS endpoint did not return a JSON object"));
+        }
+        return set_from_dict(&data);
+    }
     if let (Some(life), false) = (c.lifespan, refresh) {
         // JWKSetCache.get: None once expired (`monotonic() > timestamp + lifespan`)
         if let Some((set, at)) = &st.set {
@@ -529,7 +584,8 @@ async fn signing_key_uncached(c: &Client, st: &mut State, kid: &V) -> R<Arc<Jwk>
     if let Some(k) = match_kid(&keys, kid)? {
         return Ok(k);
     }
-    let cooling = c.lifespan.is_some() && st.last_fetch.is_some_and(|t| t.elapsed().as_secs_f64() < c.cooldown);
+    // the refresh cooldown appeared in 2.14
+    let cooling = minor() >= 14 && c.lifespan.is_some() && st.last_fetch.is_some_and(|t| t.elapsed().as_secs_f64() < c.cooldown);
     if !cooling {
         let set = get_jwk_set(c, st, true).await?;
         let keys = signing_keys_of(&set)?;

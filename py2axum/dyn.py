@@ -12149,6 +12149,7 @@ async fn serve() {{
     dynrt::set_python_features(&[{pyfeatures}]);
     dynrt::orm::set_sqlalchemy({sa_major}, {sa_minor});
     dynrt::set_fastapi({fa_ver});
+    dynrt::jwks::set_pyjwt({pyjwt_minor});
     dynrt::logging::init_clock();
     dynrt::logging::set_source_root({source_root});
     // uvicorn's Config.configure_logging(): its LOGGING_CONFIG and options, before the import
@@ -14904,7 +14905,8 @@ def generate_project(fe: Frontend, out_dir: Path, source: str, crate_name: str, 
                                                           mount_fallback=", ".join(rs(x) for x in sorted(set(fe.__dict__.get("mount_fallback", [])))),
                                                           source_root=rs(str(Path(fe.index.root).resolve())),
                                                           loguru_init=loguru_init(proj),
-                                                          sa_major=sa_ver[0], sa_minor=sa_ver[1], fa_ver=", ".join(map(str, fa_ver))))
+                                                          sa_major=sa_ver[0], sa_minor=sa_ver[1], fa_ver=", ".join(map(str, fa_ver)),
+                                                          pyjwt_minor=libmap.pyjwt_minor()))
     (out_dir / "src" / "gen.rs").write_text("\n".join(gen) + "\n")
     if shutil.which("rustfmt"):
         subprocess.run(["rustfmt", "--edition", "2021", str(out_dir / "src" / "gen.rs"), str(out_dir / "src" / "main.rs")], check=False,

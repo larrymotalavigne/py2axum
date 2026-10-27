@@ -65,11 +65,18 @@ def rs_(s: str) -> str:
 
 
 def _pyjwt_215(what: str) -> str:
-    """PyJWT's JWK classes are ported from 2.15 (2.13 and 2.14 differ: no refresh cooldown, no scheme check)."""
+    """PyJWT's JWK classes are ported from 2.13, 2.14 and 2.15 (dynrt::jwks::set_pyjwt: their differences)."""
     v = LIB_VERSIONS.get("pyjwt")
-    if v is not None and not v.startswith("2.15."):
-        raise ValueError(f"jwt.{what} is ported from PyJWT 2.15 (the project locks {v})")
+    if v is not None and not v.startswith(("2.13.", "2.14.", "2.15.")):
+        raise ValueError(f"jwt.{what} is ported from PyJWT 2.13 to 2.15 (the project locks {v})")
     return ""
+
+
+def pyjwt_minor() -> int:
+    """the PyJWT 2.x minor the JWK classes follow (main() passes it to dynrt::jwks::set_pyjwt)"""
+    v = LIB_VERSIONS.get("pyjwt") or "2.15"
+    m = re.match(r"2\.(\d+)", v)
+    return int(m.group(1)) if m and 13 <= int(m.group(1)) <= 15 else 15
 
 
 def _pyjwk(a, kw) -> str:

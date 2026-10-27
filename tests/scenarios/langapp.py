@@ -883,6 +883,12 @@ STEPS += [
     ("POST", "/fa156/nullembed", {"item": {"name": "i"}, "k": "3"}),
     ("POST", "/fa156/nullembed", [1]),
     ("GET", "/fa156/nan", None),
+    # PyJWT's PyJWKClient against the reference server's JWKS endpoint (fixtures/langapp/jwksx.py)
+    *[("GET", f"/jwks/verify/{ks}/{t}", None) for ks, t in [
+        ("ok", "valid"), ("ok", "ps"), ("ok", "k2"), ("ok", "unknown"), ("ok", "badsig"), ("ok", "expired"), ("ok", "aud"),
+        ("ok", "garbage"), ("one", "k2"), ("one", "valid"), ("junk", "valid"), ("badnum", "valid"), ("empty", "valid"),
+        ("list", "valid"), ("list", "valid")]],
+    *[("GET", f"/jwks/set/{n}", None) for n in ("ok", "junk", "badnum", "empty", "list")],
     # patterns of public applications (fixtures/langapp/pubapps.py)
     ("POST", "/pub/things", {"name": "x"}), ("POST", "/pub/things", {"name": "y", "visibility": "Restricted", "enabled": None}),
     ("POST", "/pub/things", {"name": "", "visibility": "open"}),
