@@ -2571,7 +2571,8 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
         }
         // `selectinload(A.b).load_only(B.x)` ...: a column option continuing the chain
         let raiseload = kwargs.iter().find(|(k, _)| k == "raiseload").map_or(V::Bool(false), |(_, v)| v.clone());
-        if kwargs.iter().any(|(k, _)| k != "raiseload") || (name == "undefer" && !kwargs.is_empty()) {
+        let chained_inner = name == "joinedload" && matches!(&kwargs[..], [(k, _)] if k == "innerjoin");
+        if (kwargs.iter().any(|(k, _)| k != "raiseload") && !chained_inner) || (name == "undefer" && !kwargs.is_empty()) {
             return Err(Exc::type_error(format!("py2axum: {name}() keyword arguments are not supported here")));
         }
         match name {

@@ -388,6 +388,7 @@ STEPS += [
 # silently wrong values made exact or refused (fixtures/langapp/silent.py): frozenset, TypeAdapter titles, model_type,
 # decode/encode errors=, what a Request offers
 STEPS += [
+    *[("GET", f"/silent/nan/{c}", None) for c in ("default", "indent", "compact", "strict", "finite")],
     ("GET", "/silent/frozen/type", None),
     ("GET", "/silent/frozen/isinstance", None),
     ("GET", "/silent/frozen/repr", None),
@@ -889,6 +890,11 @@ STEPS += [
         ("ok", "garbage"), ("one", "k2"), ("one", "valid"), ("junk", "valid"), ("badnum", "valid"), ("empty", "valid"),
         ("list", "valid"), ("list", "valid")]],
     *[("GET", f"/jwks/set/{n}", None) for n in ("ok", "junk", "badnum", "empty", "list")],
+    *[("GET", f"/jwks/pyjwk/{c}", None) for c in ("even_n", "small_n", "even_e", "big_e", "junk_n", "hmac", "hmac_junk",
+                                                    "hmac_empty", "hmac_int")],
+    *[("GET", f"/jwks/decode/{c}", None) for c in ("padded", "overpadded", "junk", "junk_sig", "exp_list", "exp_inf",
+                                                     "nbf_dict")],
+    ("GET", "/jwks/options", None),
     # patterns of public applications (fixtures/langapp/pubapps.py)
     ("POST", "/pub/things", {"name": "x"}), ("POST", "/pub/things", {"name": "y", "visibility": "Restricted", "enabled": None}),
     ("POST", "/pub/things", {"name": "", "visibility": "open"}),

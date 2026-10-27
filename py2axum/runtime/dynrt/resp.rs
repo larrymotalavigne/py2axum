@@ -180,7 +180,7 @@ pub fn new(kind: &str, args: &[V], kwargs: &[(String, V)]) -> R {
                 (c, true) if kind == "ORJSONResponse" => super::orj::dumps_bytes(c.as_ref().unwrap_or(&V::None),
                     super::orj::OPT_NON_STR_KEYS | super::orj::OPT_SERIALIZE_NUMPY)?,
                 // Starlette: json.dumps(content, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                (c, true) => super::pyd::to_json(c.as_ref().unwrap_or(&V::None), &super::pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false }, false)?.into_bytes(),
+                (c, true) => super::pyd::to_json(c.as_ref().unwrap_or(&V::None), &super::pyd::JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false, nan_literal: false }, false)?.into_bytes(),
                 (Some(V::Bytes(b)), _) => b.to_vec(),
                 (Some(V::Str(s)), _) => s.as_bytes().to_vec(),
                 // Starlette's `render`: `content.encode(self.charset)`

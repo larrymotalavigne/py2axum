@@ -651,7 +651,7 @@ async fn send(cx: &Cx, method: &str, url: &str, mut headers: Vec<(String, String
 }
 
 fn json(v: &V) -> R<String> {
-    super::pyd::to_json(v, &super::pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false }, false)
+    super::pyd::to_json(v, &super::pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false, nan_literal: false }, false)
 }
 
 // ---------------------------------------------------------------- the request (_APIRequestor.request)

@@ -181,7 +181,7 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
     let mut sort_keys = false;
     let mut indent: Option<String> = None;
     let seps_given = kwargs.iter().any(|(k, _)| k == "separators");
-    let mut style = pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false };
+    let mut style = pyd::JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false, nan_literal: true };
     for (k, v) in kwargs {
         match k.as_str() {
             "default" => {
@@ -193,6 +193,7 @@ pub fn json_dumps(obj: &V, kwargs: &[(String, V)]) -> R {
                 default_str = true
             }
             "ensure_ascii" => style.ensure_ascii = ops::truthy(v)?,
+            "allow_nan" => style.nan_literal = ops::truthy(v)?,
             "sort_keys" => sort_keys = ops::truthy(v)?,
             "indent" => {
                 indent = match v {

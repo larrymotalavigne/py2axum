@@ -531,3 +531,21 @@ async def req_query_str(request: Request):
         return {"ok": [dict(q), list(q), len(q), bool(q), q.get("a"), q["a"], "a" in q, list(q.items())]}
     except Exception as e:  # noqa: BLE001
         return fail(e)
+
+
+@router.get("/nan/{case}")
+def nan_dumps(case: str):
+    """json.dumps writes NaN/Infinity/-Infinity by default (allow_nan=True), raises ValueError with allow_nan=False"""
+    values = [float("inf"), float("-inf"), float("nan"), 1.5]
+    try:
+        if case == "default":
+            return {"ok": json.dumps(values)}
+        if case == "indent":
+            return {"ok": json.dumps({"a": float("nan"), "b": [float("-inf")]}, indent=2)}
+        if case == "compact":
+            return {"ok": json.dumps({"x": float("inf")}, separators=(",", ":"), allow_nan=True)}
+        if case == "strict":
+            return {"ok": json.dumps([1.0, float("-inf")], allow_nan=False)}
+        return {"ok": json.dumps([1.0, 2.0], allow_nan=False)}
+    except ValueError as e:
+        return fail(e)

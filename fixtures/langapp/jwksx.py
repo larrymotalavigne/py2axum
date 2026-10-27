@@ -69,3 +69,67 @@ def keyset(name: str):
         return {"error": type(e).__name__, "msg": str(e)}
     except (ValueError, TypeError, AttributeError) as e:
         return {"error": type(e).__name__, "msg": str(e)}
+
+
+# PyJWK(...) of key material each release reads its own way (base64url_decode skips characters outside the
+# alphabet; cryptography's checks of the public numbers; an empty HMAC key refused from 2.14)
+PYJWKS = {
+    "even_n": {"kty": "RSA", "n": "Cg", "e": "Aw", "alg": "RS256"},
+    "small_n": {"kty": "RSA", "n": "Ag", "e": "AQAB", "alg": "RS256"},
+    "even_e": {**JWK1, "e": "BA"},
+    "big_e": {**JWK1, "e": JWK1["n"]},
+    "junk_n": {**JWK1, "n": "!!" + JWK1["n"][2:]},
+    "hmac": {"kty": "oct", "k": "c2VjcmV0", "alg": "HS256"},
+    "hmac_junk": {"kty": "oct", "k": "c2V!jcmV0", "alg": "HS256"},
+    "hmac_empty": {"kty": "oct", "k": "", "alg": "HS256"},
+    "hmac_int": {"kty": "oct", "k": 123, "alg": "HS256"},
+}
+
+
+def outcome(f):
+    try:
+        return {"ok": f()}
+    except jwt.PyJWTError as e:
+        return {"error": type(e).__name__, "msg": str(e)}
+    except (ValueError, TypeError, AttributeError, OverflowError) as e:
+        return {"error": type(e).__name__, "msg": str(e)}
+
+
+@router.get("/pyjwk/{case}")
+def pyjwk(case: str):
+    def make():
+        k = jwt.PyJWK(PYJWKS[case])
+        signed = jwt.encode({"sub": "ann"}, "secret", algorithm="HS256")
+        if case.startswith("hmac"):
+            return [k.algorithm_name, jwt.decode(signed, k, algorithms=["HS256"])]
+        return [k.algorithm_name, k.key_type]
+    return outcome(make)
+
+
+def _tok(claims: dict) -> list[str]:
+    return jwt.encode(claims, "secret", algorithm="HS256").split(".")
+
+
+@router.get("/decode/{case}")
+def decode_case(case: str):
+    """token segments each release decodes its own way, claims int() fails on, options a release changes"""
+    h, p, s = _tok({"sub": "ann"})
+    pad = "=" * (-len(p) % 4)
+    tokens = {
+        "padded": f"{h}.{p}{pad}.{s}",
+        "overpadded": f"{h}.{p}{pad}====.{s}",
+        "junk": f"{h[:4]}!!{h[4:]}.{p}.{s}",
+        "junk_sig": f"{h}.{p}.{s[:3]}*{s[3:]}",
+        "exp_list": ".".join(_tok({"sub": "ann", "exp": [1]})),
+        "exp_inf": ".".join(_tok({"sub": "ann", "exp": float("inf")})),
+        "nbf_dict": ".".join(_tok({"sub": "ann", "nbf": {}})),
+    }
+    return outcome(lambda: jwt.decode(tokens[case], "secret", algorithms=["HS256"]))
+
+
+@router.get("/options")
+def options_dict():
+    """2.13 writes the verify_* defaults into the caller's options when verify_signature is False"""
+    opts = {"verify_signature": False, "verify_aud": True}
+    claims = jwt.decode(".".join(_tok({"sub": "ann", "aud": "x"})), options=opts, algorithms=["HS256"], audience="x")
+    return {"claims": claims, "options": opts}

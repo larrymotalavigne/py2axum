@@ -39,7 +39,8 @@ pub fn set_pyjwt(minor: u32) {
     PYJWT_MINOR.store(minor, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn minor() -> u32 {
+/// the locked PyJWT's minor version (2.13 to 2.15)
+pub fn minor() -> u32 {
     PYJWT_MINOR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -63,15 +64,31 @@ fn get_str(d: &V, name: &str) -> Option<String> {
 
 /// `jwt.utils.from_base64url_uint`: base64url (padding added), big-endian
 fn b64url_uint(v: &V) -> R<rsa::BigUint> {
-    let s = match v {
-        V::Str(s) => s.to_string(),
-        V::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
-        _ => return Err(Exc::type_error("Expected a string value")),
+    let raw = match v {
+        V::Str(s) => base64url_decode(s.as_bytes())?,
+        V::Bytes(b) => base64url_decode(b)?,
+        _ => return Err(force_bytes_error()),
     };
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s.trim_end_matches('=').as_bytes())
-        .map_err(|_| Exc::value_error("Incorrect padding"))?;
     Ok(rsa::BigUint::from_bytes_be(&raw))
+}
+
+/// `jwt.utils.force_bytes` given neither str nor bytes
+fn force_bytes_error() -> Exc {
+    Exc::type_error(if minor() >= 15 { "Expected a string or bytes value" } else { "Expected a string value" })
+}
+
+/// `jwt.utils.base64url_decode`: `=` added up to a multiple of 4, then `base64.urlsafe_b64decode` (characters
+/// outside the alphabet skipped, binascii.Error for bad padding)
+pub fn base64url_decode(s: &[u8]) -> R<Vec<u8>> {
+    let mut data: Vec<u8> = s.iter().map(|c| match c {
+        b'-' => b'+',
+        b'_' => b'/',
+        c => *c,
+    }).collect();
+    if data.len() % 4 > 0 {
+        data.extend(std::iter::repeat_n(b'=', 4 - data.len() % 4));
+    }
+    super::stdlib::b64dec_padded(&data, false, super::python() < (3, 15))
 }
 
 fn same(a: &V, b: &V) -> R<bool> {
@@ -139,15 +156,14 @@ pub fn jwk_new(data: &V, algorithm: Option<&V>) -> R<Arc<Jwk>> {
     if !KNOWN.contains(&alg.as_str()) {
         return Err(exc(&PYJWK_ERROR, format!("Unable to find an algorithm for key: {}", repr(data))));
     }
-    // PyJWK wraps the ValueError of Algorithm.from_jwk from 2.14, its TypeError from 2.15; else it propagates
-    let construct = |msg: String| {
-        let type_error = msg == "Expected a string value";
-        if minor() >= 15 || (minor() == 14 && !type_error) {
-            exc(&PYJWT_INVALID_KEY, format!("Unable to construct key from JWK: {msg}"))
-        } else if type_error {
-            Exc::type_error(msg)
+    // PyJWK wraps the ValueError of Algorithm.from_jwk from 2.14 (binascii.Error is one), its TypeError from 2.15;
+    // else it propagates
+    let construct = |err: Exc| {
+        let wrap = if err.isinstance(&TYPE_ERROR) { minor() >= 15 } else { err.isinstance(&VALUE_ERROR) && minor() >= 14 };
+        if wrap {
+            exc(&PYJWT_INVALID_KEY, format!("Unable to construct key from JWK: {}", err.message()))
         } else {
-            Exc::value_error(msg)
+            err
         }
     };
     let key = match alg.as_str() {
@@ -167,23 +183,26 @@ pub fn jwk_new(data: &V, algorithm: Option<&V>) -> R<Arc<Jwk>> {
                 }
                 KeyMaterial::Other("an RSA private key")
             } else if let (Some(n), Some(e)) = (n, e) {
-                let (n, e) = match (b64url_uint(&n), b64url_uint(&e)) {
-                    (Ok(n), Ok(e)) => (n, e),
-                    (Err(err), _) | (_, Err(err)) => {
-                        if err.isinstance(&TYPE_ERROR) || err.isinstance(&VALUE_ERROR) {
-                            return Err(construct(err.message()));
-                        }
-                        return Err(err);
-                    }
-                };
-                // cryptography's RSAPublicNumbers.public_key() checks: 3 <= e < n, e odd, n odd
+                // from_base64url_uint(e) is read first (RSAPublicNumbers(e=..., n=...))
+                let e = b64url_uint(&e).map_err(construct)?;
+                let n = b64url_uint(&n).map_err(construct)?;
+                // cryptography's RSAPublicNumbers.public_key() checks, in its order (an even modulus is accepted)
                 let three = rsa::BigUint::from(3u32);
-                if e < three || e >= n || e.is_even() || n.is_even() {
-                    return Err(construct("Invalid public numbers".into()));
+                if n < three {
+                    return Err(construct(Exc::value_error("n must be >= 3.")));
                 }
+                if e < three || e >= n {
+                    return Err(construct(Exc::value_error("e must be >= 3 and < n.")));
+                }
+                if e.is_even() {
+                    return Err(construct(Exc::value_error("e must be odd.")));
+                }
+                let even = n.is_even();
                 match rsa::RsaPublicKey::new_with_max_size(n, e, 16384) {
                     Ok(k) => KeyMaterial::Rsa(Arc::new(k)),
-                    Err(err) => return Err(construct(err.to_string())),
+                    // cryptography loads it (verifying with it is not ported)
+                    Err(_) if even => KeyMaterial::Other("an RSA key with an even modulus"),
+                    Err(err) => return Err(construct(Exc::value_error(err.to_string()))),
                 }
             } else {
                 return Err(exc(&PYJWT_INVALID_KEY, "Not a public or private key"));
@@ -195,13 +214,15 @@ pub fn jwk_new(data: &V, algorithm: Option<&V>) -> R<Arc<Jwk>> {
                 return Err(exc(&PYJWT_INVALID_KEY, "Not an HMAC key"));
             }
             let k = get(data, "k").ok_or_else(|| Exc::new(&KEY_ERROR, vec![V::str("k")]))?;
-            let s = match &k {
-                V::Str(s) => s.to_string(),
-                _ => return Err(construct("Expected a string value".into())),
-            };
-            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(s.trim_end_matches('=').as_bytes())
-                .map_err(|_| construct("Incorrect padding".into()))?;
+            let raw = match &k {
+                V::Str(s) => base64url_decode(s.as_bytes()),
+                V::Bytes(b) => base64url_decode(b),
+                _ => Err(force_bytes_error()),
+            }
+            .map_err(construct)?;
+            if raw.is_empty() && minor() >= 14 {
+                return Err(exc(&PYJWT_INVALID_KEY, "HMAC key must not be empty."));
+            }
             KeyMaterial::Hmac(raw)
         }
         "none" => KeyMaterial::Other("the 'none' algorithm"),

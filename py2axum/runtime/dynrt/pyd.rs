@@ -4409,14 +4409,16 @@ pub struct JsonStyle {
     pub key_sep: &'static str,
     /// pydantic's `dump_json`: NaN and infinities are `null` (ser_json_inf_nan="null"), not an error
     pub nan_null: bool,
+    /// `json.dumps(allow_nan=True)` (its default): `NaN`, `Infinity`, `-Infinity`
+    pub nan_literal: bool,
 }
 
 /// FastAPI's JSONResponse: `json.dumps(ensure_ascii=False, separators=(",", ":"))`
-pub const RESPONSE: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false };
+pub const RESPONSE: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: false, nan_literal: false };
 /// plain `json.dumps(x)`
 /// A response_model's JSON (FastAPI 0.130+: `TypeAdapter.dump_json`, compact, non-ASCII kept)
-pub const DUMP_JSON: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: true };
-pub const DUMPS: JsonStyle = JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false };
+pub const DUMP_JSON: JsonStyle = JsonStyle { ensure_ascii: false, item_sep: ",", key_sep: ":", nan_null: true, nan_literal: false };
+pub const DUMPS: JsonStyle = JsonStyle { ensure_ascii: true, item_sep: ", ", key_sep: ": ", nan_null: false, nan_literal: false };
 
 fn write_str(out: &mut String, s: &str, st: &JsonStyle) {
     out.push('"');
@@ -4467,6 +4469,10 @@ fn write(out: &mut String, v: &V, st: &JsonStyle, default_str: bool) -> R<()> {
             if !f.is_finite() {
                 if st.nan_null {
                     out.push_str("null");
+                    return Ok(());
+                }
+                if st.nan_literal {
+                    out.push_str(if f.is_nan() { "NaN" } else if *f > 0.0 { "Infinity" } else { "-Infinity" });
                     return Ok(());
                 }
                 return Err(Exc::value_error(format!("Out of range float values are not JSON compliant: {}", ops::float_repr(*f))));

@@ -163,7 +163,7 @@ fn hmac_key(key: &V) -> R<Vec<u8>> {
     let k: Vec<u8> = match key {
         V::Str(s) => s.as_bytes().to_vec(),
         V::Bytes(b) => b.to_vec(),
-        _ => return Err(Exc::type_error("Expected a string or bytes value")),
+        _ => return Err(Exc::type_error(if super::jwks::minor() >= 15 { "Expected a string or bytes value" } else { "Expected a string value" })),
     };
     if k.is_empty() {
         return Err(exc(&PYJWT_INVALID_KEY, "HMAC key must not be empty."));
@@ -174,6 +174,24 @@ fn hmac_key(key: &V) -> R<Vec<u8>> {
             &PYJWT_INVALID_KEY,
             "The specified key is an asymmetric key or x509 certificate and should not be used as an HMAC secret.",
         ));
+    }
+    if super::jwks::minor() < 14 {
+        // 2.13: no DER check; a JWK only as a JSON object with a "kty" member at its top
+        let stripped = k.iter().position(|c| !b" \t\n\r\x0b\x0c".contains(c)).map_or(&k[..0], |i| &k[i..]);
+        if stripped.starts_with(b"{") {
+            let jwk = match libs::json_loads(&V::Bytes(Arc::from(k.as_slice()))) {
+                Ok(v) => v,
+                Err(e) if e.isinstance(&OVERFLOW_ERROR) => {
+                    return Err(Exc::runtime("py2axum: an HMAC key that is JSON with integers beyond 64 bits is not supported"))
+                }
+                Err(e) if e.isinstance(&VALUE_ERROR) => V::None,
+                Err(e) => return Err(e),
+            };
+            if matches!(jwk, V::Dict(_)) && has(&jwk, "kty") {
+                return Err(exc(&PYJWT_INVALID_KEY, JWK_MSG));
+            }
+        }
+        return Ok(k);
     }
     if der_shaped(&k) {
         return Err(Exc::runtime("py2axum: an HMAC key shaped like a DER structure is not supported (PyJWT tries it as a public key)"));
@@ -381,10 +399,15 @@ pub fn encode(payload: &V, key: &V, algorithm: Option<&V>, headers: &V, sort_hea
     Ok(V::str(format!("{h64}.{middle}.{}", b64(&sig))))
 }
 
-/// `PyJWS._decode_base64url_segment`
+/// `PyJWS._decode_base64url_segment` (2.14: no `=` accepted; 2.13: `base64url_decode`, lenient, whose
+/// binascii.Error is the DecodeError)
 fn segment(seg: &[u8], name: &str) -> R<Vec<u8>> {
     let bad = || exc(&PYJWT_DECODE_ERROR, format!("Invalid {name} padding"));
-    let stripped = {
+    let minor = super::jwks::minor();
+    if minor < 14 {
+        return super::jwks::base64url_decode(seg).map_err(|e| if e.isinstance(&BINASCII_ERROR) { bad() } else { e });
+    }
+    let stripped = if minor < 15 { seg } else {
         let mut s = seg;
         let mut padding = 0;
         while let Some(r) = s.strip_suffix(b"=") {
@@ -409,10 +432,12 @@ fn segment(seg: &[u8], name: &str) -> R<Vec<u8>> {
     Ok(decoded)
 }
 
-/// `json.loads(bytes)` wrapped as PyJWT does (`Invalid {what} string: {e}`), a json object required
+/// `json.loads(bytes)` wrapped as PyJWT does (`Invalid {what} string: {e}`), a json object required; a
+/// RecursionError is wrapped from 2.14 (header) or 2.15 (payload)
 fn json_object(bytes: &[u8], what: &str) -> R<V> {
+    let recursion = super::jwks::minor() >= if what == "header" { 14 } else { 15 };
     let v = libs::json_loads(&V::Bytes(Arc::from(bytes))).map_err(|e| {
-        if e.isinstance(&VALUE_ERROR) || e.isinstance(&RECURSION_ERROR) {
+        if e.isinstance(&VALUE_ERROR) || (recursion && e.isinstance(&RECURSION_ERROR)) {
             exc(&PYJWT_DECODE_ERROR, format!("Invalid {what} string: {}", e.message()))
         } else {
             e
@@ -471,9 +496,19 @@ fn merge_options(options: &V) -> R<Vec<(String, V)>> {
         if options.is_none() {
             return Ok(opts);
         }
+        if super::jwks::minor() < 14 {
+            return Err(Exc::attr_error(format!("'{}' object has no attribute 'get'", options.type_name())));
+        }
         // dict(options)
         return Err(Exc::type_error(format!("'{}' object is not iterable", options.type_name())));
     };
+    // 2.13 sets the defaults of the verify_* options in the caller's own dict
+    if super::jwks::minor() < 14 && !dict_get(options, "verify_signature")?.map(|v| ops::truthy(&v)).transpose()?.unwrap_or(true) {
+        for k in ["verify_exp", "verify_nbf", "verify_iat", "verify_aud", "verify_iss", "verify_sub", "verify_jti"] {
+            let cur = dict_get(options, k)?;
+            ops::setitem(options, &V::str(k), cur.unwrap_or(V::Bool(false)))?;
+        }
+    }
     let mut given: Vec<(String, V)> = Vec::new();
     for (k, v) in d.lock().values() {
         let V::Str(k) = k else { continue };
@@ -595,7 +630,8 @@ fn verify_with(a: &Alg, key: &super::jwks::KeyMaterial, signing_input: &[u8], si
             Ok(super::jwks::rsa_verify(name, k, signing_input, signature))
         }
         (Alg::Hmac(name), KeyMaterial::Hmac(k)) => {
-            let k = hmac_key(&V::Bytes(Arc::from(k.as_slice())))?;
+            // a PyJWK's key goes through prepare_key from 2.14
+            let k = if super::jwks::minor() >= 14 { hmac_key(&V::Bytes(Arc::from(k.as_slice())))? } else { k.clone() };
             Ok(bool::from(subtle::ConstantTimeEq::ct_eq(signature, hmac_sign(name, &k, signing_input).as_slice())))
         }
         (_, KeyMaterial::Other(what)) => Err(Exc::runtime(format!("py2axum: verifying with {what} is not supported"))),
@@ -612,12 +648,14 @@ pub fn decode(token: &V, key: &V, algorithms: &V, options: &V, audience: &V, iss
     Ok(get(&d, "payload").unwrap_or(V::None))
 }
 
-/// `int(x)` as the claim checks call it: ValueError, TypeError and OverflowError become `err`
+/// `int(x)` as the claim checks call it: ValueError, TypeError and OverflowError become `err` (before 2.15, only a
+/// ValueError)
 fn claim_int(v: &V, err: Exc) -> R<f64> {
+    let all = super::jwks::minor() >= 15;
     match super::methods::b_int(std::slice::from_ref(v)) {
         Ok(V::Int(i)) => Ok(i as f64),
         Ok(_) => Err(Exc::runtime("py2axum: int() beyond 64 bits in a JWT claim")),
-        Err(e) if e.isinstance(&VALUE_ERROR) || e.isinstance(&TYPE_ERROR) || e.isinstance(&OVERFLOW_ERROR) => Err(err),
+        Err(e) if e.isinstance(&VALUE_ERROR) || (all && (e.isinstance(&TYPE_ERROR) || e.isinstance(&OVERFLOW_ERROR))) => Err(err),
         Err(e) => Err(e),
     }
 }

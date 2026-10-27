@@ -786,8 +786,9 @@ def _sa_inspect(a, kw):
 
 def _json_dumps(a, kw):
     for k in kw:
-        if k not in ("default", "ensure_ascii", "separators", "sort_keys", "indent"):
-            raise ValueError(f"json.dumps({k}=) is not supported (default=str, ensure_ascii, separators, sort_keys, indent)")
+        if k not in ("default", "ensure_ascii", "separators", "sort_keys", "indent", "allow_nan"):
+            raise ValueError(f"json.dumps({k}=) is not supported (default=str, ensure_ascii, separators, sort_keys, indent, "
+                             "allow_nan)")
     return f"{RT}::libs::json_dumps(&{a[0]}, &{_kwvec(kw)})"
 
 
