@@ -37,6 +37,7 @@ adding a header to every response. Like every example on this site, it is compil
   response starts reaches the outer middlewares, then `ServerErrorMiddleware`; after it started, the
   response is kept and the exception logged. ContextVars set around `await self.app(...)` are seen by the
   endpoint and back. `app.state` is a process-wide `State` (`add_middleware(Cls, state=app.state)`).
+- Starlette's `AuthenticationMiddleware(backend=..., on_error=...)`, also through a project subclass, with a project `AuthenticationBackend`: run as the raw ASGI class it is (translated from Starlette 1.x's source, as are `AuthCredentials`, `BaseUser`, `SimpleUser`, `UnauthenticatedUser` and `AuthenticationError`). The backend's result goes to `request.user` / `request.auth` as returned (a `(bool, user)` pair too); None gives `UnauthenticatedUser()`; an `AuthenticationError` answers with `on_error` (default: 400, the error's text). `request.user` without the middleware raises its AssertionError. Refused in an application with WebSocket routes (Starlette authenticates the connection, the binary does not run raw middlewares for them); `requires()` is not supported.
 - `starlette_context` 0.5's `RawContextMiddleware(plugins=(RequestIdPlugin(), CorrelationIdPlugin()))`
   (plugin options `force_new_uuid`, `validate`, `version=4` as literals): the id read from its header or a new
   `uuid4().hex`, validated like `uuid.UUID(value)` (400 with an empty body otherwise), appended to the

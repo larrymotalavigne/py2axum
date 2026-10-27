@@ -645,6 +645,15 @@ pub async fn getattr(cx: &Cx, v: &V, name: &str) -> R {
                 "path_params" => V::dict_from(r.path_params.lock().iter().map(|(k, x)| (V::str(k), V::str(x))).collect())?,
                 "app" => super::routing::app(),
                 "scope" => super::routing::scope(cx)?,
+                // what AuthenticationMiddleware put in the scope (HTTPConnection.user / .auth)
+                "user" | "auth" => match super::routing::scope(cx)? {
+                    V::Dict(d) => match d.lock().get(&Key::Str(Arc::from(name))) {
+                        Some((_, x)) => x.clone(),
+                        None => return Err(Exc::new(&ASSERTION_ERROR, vec![V::str(format!(
+                            "AuthenticationMiddleware must be installed to access request.{name}"))])),
+                    },
+                    _ => return Err(no_attr(v, name)),
+                },
                 // a bound method in Starlette, only handed to `Request(scope, receive)` here
                 "receive" => V::native(Native::RequestReceive),
                 _ => return Err(no_attr(v, name)),

@@ -938,7 +938,11 @@ class ModuleIndex:
         return False
 
     SHIMS = {"sqlalchemy.ext.hybrid.Comparator": ("_py2axum_shim_sqlalchemy_hybrid", "sqlalchemy_hybrid.py"),
-             "sqlmodel.SQLModel": ("_py2axum_shim_sqlmodel", "sqlmodel_base.py")}
+             "sqlmodel.SQLModel": ("_py2axum_shim_sqlmodel", "sqlmodel_base.py"),
+             "starlette.middleware.authentication.AuthenticationMiddleware": ("_py2axum_shim_starlette_auth", "starlette_auth.py"),
+             **{f"starlette.authentication.{c}": ("_py2axum_shim_starlette_auth", "starlette_auth.py")
+                for c in ("AuthenticationError", "AuthenticationBackend", "AuthCredentials", "BaseUser", "SimpleUser",
+                          "UnauthenticatedUser")}}
 
     def load_shim(self, dotted: str) -> Sym | None:
         """A library class py2axum translates from Python source of its own (`py2axum/shims/`): the class as a

@@ -7366,10 +7366,10 @@ class FnCompiler:
                            "instance)", node)
 
     # what the runtime offers of Starlette's Request (dynrt/methods.rs, `Native::Request`): the rest of the class
-    # (session, user, auth, close, stream, url_for, send_push_promise, the Mapping of the scope, free attributes)
+    # (session, close, stream, url_for, send_push_promise, the Mapping of the scope, free attributes)
     # is refused where the variable is a parameter annotated `Request`
     REQUEST_ATTRS = frozenset({"headers", "state", "url", "base_url", "method", "query_params", "cookies", "client",
-                               "path_params", "app", "scope", "receive", "body", "json", "is_disconnected",
+                               "path_params", "app", "scope", "receive", "body", "json", "is_disconnected", "user", "auth",
                                # Starlette's cache of body(): per Request object (the route's, a middleware's...)
                                "_body"})
 

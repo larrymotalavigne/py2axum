@@ -117,6 +117,10 @@ STEPS += [
     ("DELETE", f"{T}/owners/nobody@example.com/notes", None),
 ]
 
+# ---- Starlette's AuthenticationMiddleware with a project backend (fixtures/sqlmodelapp/authx.py)
+STEPS += [("GET", "/authx/me", None, {"x-authx": mode} if mode is not None else {})
+          for mode in (None, "bad", "custom", "simple:ann", "pair:", "pair:7", "other")]
+
 
 def reset(db: str) -> None:
     """the tables created once, by SQLModel itself (as the startup handler would: both servers starting together on a

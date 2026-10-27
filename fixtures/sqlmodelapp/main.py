@@ -189,3 +189,8 @@ app.include_router(gear.router)
 from . import tmpl  # noqa: E402
 
 app.include_router(tmpl.router)
+
+from . import authx  # noqa: E402
+
+app.add_middleware(authx.AuthMiddleware, backend=authx.Backend(), on_error=authx.on_error)
+app.include_router(authx.router)

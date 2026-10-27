@@ -1707,6 +1707,10 @@ CALLS = {
     "mcp.server.mcpserver.MCPServer": lambda a, kw: _mcp_server(a, kw),
     # `Request(scope, receive)` inside a raw ASGI app (dynrt/rawasgi.rs): the request being served
     "starlette.requests.Request": lambda a, kw: _starlette_request(a, kw),
+    # `HTTPConnection(scope)`: the request being served, without its body (AuthenticationMiddleware)
+    **{f"{m}.HTTPConnection": (lambda a, kw: _starlette_request(a, kw) if len(a) == 1 and not kw
+                               else (_ for _ in ()).throw(ValueError("HTTPConnection(scope) only")))
+       for m in ("starlette.requests", "fastapi.requests")},
     "fastapi.Request": lambda a, kw: f"{{ let _ = {a[1]}; {RT}::rawasgi::request_from_scope(cx, &{a[0]}) }}",
     "mcp.server.transport_security.TransportSecuritySettings": lambda a, kw: _mcp_security(a, kw),
     "contextvars.ContextVar": lambda a, kw: f"{RT}::agen::context_var(&{_argv(a)}, &{_kwvec(kw)})",

@@ -883,3 +883,41 @@ def test_include_router_prefix_from_settings_in_the_app_factory(tmp_path, capsys
     assert rc == (0 if ok else 1), err
     if not ok:
         assert "prefix=<non-literal>" in err
+
+
+_AUTH_APP = '''
+from fastapi import FastAPI, Request{ws_import}
+from starlette.authentication import AuthCredentials, AuthenticationBackend, SimpleUser
+from starlette.middleware.authentication import AuthenticationMiddleware
+
+
+class Backend(AuthenticationBackend):
+    async def authenticate(self, conn):
+        token = conn.headers.get("x-user")
+        return (AuthCredentials(["read"]), SimpleUser(token)) if token else None
+
+
+app = FastAPI()
+app.add_middleware(AuthenticationMiddleware, backend=Backend())
+
+
+@app.get("/me")
+async def me(request: Request):
+    return {{"name": request.user.display_name, "scopes": request.auth.scopes}}
+{ws}'''
+
+
+def test_starlette_authentication_middleware(tmp_path):
+    """Starlette's AuthenticationMiddleware: a raw ASGI class translated from Starlette's source (shim), the
+    backend's user and credentials read through request.user / request.auth"""
+    pkg = project(tmp_path, _AUTH_APP.format(ws_import="", ws=""))
+    generate(tmp_path, pkg)
+    gen = (tmp_path / "out" / "src" / "gen.rs").read_text()
+    assert "_py2axum_shim_starlette_auth" in gen or "AuthenticationMiddleware" in gen
+
+
+def test_starlette_authentication_middleware_with_websockets_refused(tmp_path, capsys):
+    ws = '\n\n@app.websocket("/ws")\nasync def ws(websocket: WebSocket):\n    await websocket.accept()\n'
+    pkg = project(tmp_path, _AUTH_APP.format(ws_import=", WebSocket", ws=ws))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "WebSocket routes" in capsys.readouterr().err

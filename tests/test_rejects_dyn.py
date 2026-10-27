@@ -4591,8 +4591,6 @@ async def x(request: Request):
 
 @pytest.mark.parametrize("body, msg", [
     ("request.session", "attribute .session of a Request is not supported"),
-    ("request.user", "attribute .user of a Request is not supported"),
-    ("request.auth", "attribute .auth of a Request is not supported"),
     ("await request.close()", "attribute .close of a Request is not supported"),
     ("request.keys()", "attribute .keys of a Request is not supported"),
     ("request.nope", "attribute .nope of a Request is not supported"),
