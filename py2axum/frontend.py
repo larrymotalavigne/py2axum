@@ -108,6 +108,23 @@ def _under_if(node: ast.AST, parents: dict, decide=None) -> bool | None:
     return False
 
 
+def _reads_globals_only(call: ast.Call, scope) -> bool:
+    """`include_router(r, prefix=settings.API_PREFIX)` inside a function: its prefix reads no parameter or local
+    of the function (a function at module level), so it means at startup what it meant when the function ran"""
+    kw = next((k for k in call.keywords if k.arg == "prefix"), None)
+    if kw is None or scope is None:
+        return False
+    local = {a.arg for a in [*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs, scope.args.vararg,
+                             scope.args.kwarg] if a}
+    local |= {n.id for n in ast.walk(scope) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    local |= {n.name for n in ast.walk(scope) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              and n is not scope}
+    names = [n for n in ast.walk(kw.value) if isinstance(n, ast.Name)]
+    if any(isinstance(n, (ast.Lambda, ast.NamedExpr, ast.comprehension)) for n in ast.walk(kw.value)):
+        return False
+    return bool(names) and not any(n.id in local for n in names)
+
+
 def _enclosing_fn(node: ast.AST, parents: dict) -> ast.AST | None:
     cur = parents.get(node)
     while cur is not None:
@@ -768,6 +785,9 @@ class Frontend:
                         if owner not in self.routers:
                             continue
                     top = scope is None or (("configure", scope, site[1]) if site is not None else False)
+                    if top is False and owner == "app" and _enclosing_fn(scope, parents) is None \
+                            and _reads_globals_only(node, scope):
+                        top = True  # in the app factory, a prefix read from module globals: as at module level
                     edges.append((owner, child, node, file, cond, m.name, top, (key[0], key[1] + sub)))
         self.include_edges = edges
         memo: dict[object, list[Mount]] = {"app": [Mount("", deps=list(self.__dict__.get("app_deps", [])))]}

@@ -765,3 +765,121 @@ def test_humps_alias_generator(name, alias):
 
     assert pydstatic.LIBRARY["humps.main.camelize"](name) == alias
     assert pydstatic.LIBRARY["humps.camelize"] is pydstatic.LIBRARY["humps.main.camelize"]
+
+
+_MW_MODULE = '''
+from fastapi import FastAPI
+from fastapi.middleware import Middleware
+from fastapi.middleware.cors import CORSMiddleware
+
+middleware = [
+    Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"]),
+]
+{extra}
+
+def create_app() -> FastAPI:
+    app = FastAPI(middleware=middleware)
+
+    @app.get("/x")
+    async def x():
+        return {{"ok": True}}
+
+    return app
+
+
+app = create_app()
+'''
+
+
+def test_middleware_list_of_the_module_in_a_factory(tmp_path):
+    """`middleware = [...]` at module level, `FastAPI(middleware=middleware)` in the app factory (grillazz)"""
+    pkg = project(tmp_path, _MW_MODULE.format(extra=""))
+    generate(tmp_path, pkg)
+    assert "Cors::new" in (tmp_path / "out" / "src" / "gen.rs").read_text() + (tmp_path / "out" / "src" / "main.rs").read_text()
+
+
+@pytest.mark.parametrize("extra", ["def g():\n    middleware.append(None)\n", "middleware = []", "def f(middleware):\n    return middleware\n"])
+def test_middleware_list_of_the_module_changed_refused(tmp_path, capsys, extra):
+    pkg = project(tmp_path, _MW_MODULE.format(extra=extra))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "middleware=" in capsys.readouterr().err
+
+
+_SHARED_CONFIG = '''
+from fastapi import FastAPI
+from pydantic import BaseModel, ConfigDict
+
+config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+{extra}
+
+class A(BaseModel):
+    model_config = config
+    name: str
+
+
+app = FastAPI()
+
+
+@app.post("/a")
+async def a(x: A) -> A:
+    return x
+'''
+
+
+def test_model_config_shared_by_name(tmp_path):
+    """`config = ConfigDict(...)` then `model_config = config` in several models (grillazz)"""
+    pkg = project(tmp_path, _SHARED_CONFIG.format(extra=""))
+    generate(tmp_path, pkg)
+
+
+@pytest.mark.parametrize("extra", ['config["extra"] = "allow"', "config.update(frozen=True)", "config = ConfigDict()"])
+def test_model_config_shared_but_changed_refused(tmp_path, capsys, extra):
+    pkg = project(tmp_path, _SHARED_CONFIG.format(extra=extra))
+    assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
+    assert "model_config" in capsys.readouterr().err
+
+
+_FACTORY_PREFIX = '''
+from fastapi import APIRouter, FastAPI
+
+from .settings import settings
+
+router = APIRouter()
+
+
+@router.get("/x")
+async def x():
+    return {{"ok": True}}
+
+
+def create_app({param}) -> FastAPI:
+    app = FastAPI()
+    app.include_router(router, prefix={prefix})
+    return app
+
+
+app = create_app({arg})
+'''
+
+
+@pytest.mark.parametrize("param, prefix, arg, ok", [
+    ("", "settings.API_PREFIX", "", True),
+    ("", "settings.API_PREFIX + '/v1'", "", True),
+    # a parameter, a local: what they hold is known only when the factory runs
+    ("prefix: str", "prefix", "settings.API_PREFIX", False),
+    ("", "p", "", False),
+])
+def test_include_router_prefix_from_settings_in_the_app_factory(tmp_path, capsys, param, prefix, arg, ok):
+    """`include_router(r, prefix=settings.API_PREFIX)` in the app factory, `settings` a module global: read when the
+    application starts, as at module level (FastAPI-Backend-Template, the realworld example app)"""
+    src = _FACTORY_PREFIX.format(param=param, prefix=prefix, arg=arg)
+    if prefix == "p":
+        src = src.replace("    app = FastAPI()\n", "    app = FastAPI()\n    p = settings.API_PREFIX\n")
+    pkg = project(tmp_path, src)
+    (pkg / "settings.py").write_text("from pydantic_settings import BaseSettings\n\n\nclass Settings(BaseSettings):\n"
+                                     "    API_PREFIX: str = '/api'\n\n\nsettings = Settings()\n")
+    rc = main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")])
+    err = capsys.readouterr().err
+    assert rc == (0 if ok else 1), err
+    if not ok:
+        assert "prefix=<non-literal>" in err

@@ -1594,6 +1594,34 @@ pub fn loader(kind: &str, attr: &V) -> R {
     loader_chain(vec![], kind, attr)
 }
 
+/// `joinedload(A.b, innerjoin=...)`: loaded like selectin, which an INNER JOIN does not change only when every row
+/// has its related object: a many-to-one whose foreign key is NOT NULL (the constraint guarantees the row)
+pub fn joinedload_inner(attr: &V, inner: &V) -> R {
+    innerjoin_check(attr, inner)?;
+    loader("joinedload", attr)
+}
+
+fn innerjoin_check(attr: &V, inner: &V) -> R<()> {
+    let on = match inner {
+        V::Str(s) if &**s == "unnested" => true,
+        V::Str(_) => return Err(Exc::value_error(format!("py2axum: joinedload(innerjoin={}) is not supported", ops::repr(inner)?))),
+        other => ops::truthy(other)?,
+    };
+    if !on {
+        return Ok(());
+    }
+    if let V::Sql(x) = attr {
+        if let Sql::Rel(m, ri) = &**x {
+            let r = &m.rels[*ri];
+            if r.m2o && r.secondary.is_none() && !m.cols[r.local].nullable {
+                return Ok(());
+            }
+        }
+    }
+    Err(Exc::type_error("py2axum: joinedload(..., innerjoin=True) is supported on a many-to-one relationship whose \
+                         foreign key column is NOT NULL only (an INNER JOIN leaves no row out there)"))
+}
+
 /// `sub` is `base` or one of its mapped subclasses
 fn is_subclass(sub: &'static ModelDesc, base: &'static ModelDesc) -> bool {
     let mut m = Some(sub);
@@ -2553,10 +2581,17 @@ pub fn sql_method(recv: &V, name: &str, args: Vec<V>, kwargs: Vec<(String, V)>) 
             "undefer_group" if args.len() == 1 => return chain_options(c.clone(), &[undefer_group(&args[0])?]),
             _ => {}
         }
-        if !kwargs.is_empty() || args.len() != 1 {
+        let inner = match &kwargs[..] {
+            [(k, v)] if name == "joinedload" && k == "innerjoin" => Some(v),
+            _ => None,
+        };
+        if (!kwargs.is_empty() && inner.is_none()) || args.len() != 1 {
             return Err(Exc::type_error(format!("{name}() takes one argument")));
         }
         let a = args.first().cloned().ok_or_else(|| Exc::type_error(format!("{name}() takes one argument")))?;
+        if let Some(inner) = inner {
+            innerjoin_check(&a, inner)?;
+        }
         return loader_chain(c.clone(), name, &a);
     }
     #[allow(clippy::single_match)]

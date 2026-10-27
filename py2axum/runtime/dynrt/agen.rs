@@ -223,6 +223,11 @@ pub async fn anext(it: &V) -> R {
 pub async fn aiter(cx: &Cx, it: &V) -> R {
     match it {
         V::Native(n) if matches!(&**n, Native::Gen(_) | Native::WsIter(..) | Native::AsyncItems(_) | Native::AmqpIter(_) | Native::RPubSubListen(_)) => Ok(it.clone()),
+        V::Native(n) if matches!(&**n, Native::AsyncResult(_)) => {
+            let Native::AsyncResult(r) = &**n else { unreachable!() };
+            let rows = r.lock().take_rows()?;
+            Ok(V::native(Native::AsyncItems(parking_lot::Mutex::new(Some(rows)))))
+        }
         V::Inst(_) => super::methods::call_method(cx, it, "__aiter__", vec![], vec![]).await,
         o => Err(Exc::type_error(format!("'async for' requires an object with __aiter__ method, got {}", o.type_name()))),
     }

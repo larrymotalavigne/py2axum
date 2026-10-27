@@ -1341,6 +1341,21 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
             let Native::RPubSub(p) = &**n else { unreachable!() };
             super::rps::method(p, name, args, kwargs).await
         }
+        V::Native(n) if matches!(&**n, Native::AsyncResult(_)) => {
+            let Native::AsyncResult(r) = &**n else { unreachable!() };
+            if !args.is_empty() || !kwargs.is_empty() {
+                return Err(Exc::type_error(format!("py2axum: {}.{name}() with arguments is not supported", recv.type_name())));
+            }
+            // the sync result's methods (awaited, they give their value); a result they make stays asynchronous
+            match name {
+                "all" | "fetchall" | "first" | "fetchone" | "one" | "one_or_none" | "scalar" | "scalar_one"
+                | "scalar_one_or_none" | "scalars" | "mappings" | "unique" => match orm::result_method(r, name)? {
+                    V::Result(x) => Ok(V::native(Native::AsyncResult(x))),
+                    other => Ok(other),
+                },
+                _ => Err(Exc::attr_error(format!("'{}' object has no attribute '{name}'", recv.type_name()))),
+            }
+        }
         V::Native(n) if matches!(&**n, Native::Sem(_)) => {
             let Native::Sem(s) = &**n else { unreachable!() };
             super::aio::sem_method(s, name).await
@@ -1708,7 +1723,7 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 "get" => (2, &["options"]),
                 "refresh" => (2, &["attribute_names"]),
                 "expire" => (2, &["attribute_names"]),
-                "execute" | "scalar" | "scalars" => (2, &["params", "execution_options"]),
+                "execute" | "scalar" | "scalars" | "stream" | "stream_scalars" => (2, &["params", "execution_options"]),
                 "add" | "add_all" | "delete" | "expunge" => (1, &[]),
                 "query" => (usize::MAX, &[]),
                 _ => (0, &[]),
@@ -1735,7 +1750,8 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 Some(o) => s.get_with(&args[0], &args[1], orm::load_chains(&o)?).await,
                 None => s.get(&args[0], &args[1]).await,
             },
-            "execute" | "scalar" | "scalars" => {
+            "stream" | "stream_scalars" if s.is_sync() => Err(Exc::attr_error(format!("'Session' object has no attribute '{name}'"))),
+            "execute" | "scalar" | "scalars" | "stream" | "stream_scalars" => {
                 // execution_options={...}: as the statement's own .execution_options(...)
                 let stmt = match kw("execution_options") {
                     Some(V::Dict(d)) => {
@@ -1749,7 +1765,12 @@ pub async fn call_method(cx: &Cx, recv: &V, name: &str, args: Vec<V>, kwargs: Ve
                 match name {
                     "execute" => s.execute_params(&stmt, params.as_ref()).await,
                     "scalar" => s.scalar_params(&stmt, params.as_ref()).await,
-                    _ => s.scalars_params(&stmt, params.as_ref()).await,
+                    "scalars" => s.scalars_params(&stmt, params.as_ref()).await,
+                    // read at once: what the rows are does not depend on when they are fetched
+                    _ => match if name == "stream" { s.execute_params(&stmt, params.as_ref()).await? } else { s.scalars_params(&stmt, params.as_ref()).await? } {
+                        V::Result(r) => Ok(V::native(Native::AsyncResult(r))),
+                        other => Ok(other),
+                    },
                 }
             }
             "commit" => s.commit().await.map(|_| V::None),

@@ -1282,7 +1282,8 @@ async def x():
 
 def create_app() -> FastAPI:
     app = FastAPI()
-    app.include_router(router, prefix=os.environ.get("PREFIX", "/api"))
+    prefix = os.environ.get("PREFIX", "/api")  # a local: `prefix=os.environ.get(...)` itself is read at startup
+    app.include_router(router, prefix=prefix)
     return app
 
 
@@ -1291,7 +1292,7 @@ app = create_app()
     assert main([str(pkg), "--root", str(tmp_path), "-o", str(tmp_path / "out")]) == 1
     err = capsys.readouterr().err
     assert "include_router(prefix=<non-literal>) inside a function (app factory) is not supported" in err
-    assert "main.py:16" in err
+    assert "main.py:17" in err
 
 
 ROUTER_GUARD = """

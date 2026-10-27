@@ -5204,10 +5204,36 @@ class Project:
                                            f"'{k.arg}'", kw, module)
                         seen.add(k.arg)
                 groups += got
+        elif isinstance(value, ast.Name) and (shared := self.shared_config(value, module)) is not None:
+            # `config = ConfigDict(...)` of the module (or imported), shared by several models
+            return self.model_config(info, *shared)
         else:
             raise self.err("model_config must be ConfigDict(...) or a dict literal", value, module)
         for items, m in groups:
             self.config_items(info, items, m)
+
+    def shared_config(self, name: ast.Name, module: str) -> tuple[ast.AST, str] | None:
+        """`model_config = config`: the ConfigDict(...) or dict literal of a module-level `config = ...` bound once in
+        its module and never changed there (no item assignment, no augmented assignment, no method call on it)."""
+        t = self.resolve(module, name)
+        if not isinstance(t, Sym):
+            return None
+        d = self.ix.definition(t)
+        if not (isinstance(d, (ast.Assign, ast.AnnAssign)) and isinstance(d.value, (ast.Call, ast.Dict))):
+            return None
+        tree = self.ix.module(t.module).tree
+        binds = 0
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name) and n.id == t.name and isinstance(n.ctx, ast.Store):
+                binds += 1
+            elif isinstance(n, (ast.Subscript, ast.Attribute)) and isinstance(n.value, ast.Name) and n.value.id == t.name \
+                    and (isinstance(n.ctx, (ast.Store, ast.Del)) or isinstance(n, ast.Attribute)):
+                return None
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == t.name:
+                return None
+            elif isinstance(n, ast.Global) and t.name in n.names:
+                return None
+        return (d.value, t.module) if binds == 1 else None
 
     def config_source(self, node: ast.AST, module: str):
         """`X.model_config` (or `X.model_config or {}`) for a project model `X`: its SchemaInfo; None for pydantic's
@@ -13022,12 +13048,35 @@ def _single_list_binding(fe: Frontend, module: str, call: ast.Call, name: ast.Na
             (stores if isinstance(n.ctx, ast.Store) else loads).append(n)
         elif isinstance(n, (ast.Global, ast.Nonlocal)) and name.id in n.names:
             return None
+    if not stores and scope is not None:
+        # inside an app factory, a list of the module (`middleware = [...]` at module level): the same conditions over
+        # the whole module (any other binding or read of the name, a `global` of it, and the list is not taken)
+        return _single_list_binding_module(fe, module, call, name)
     if len(stores) != 1 or loads != [name]:
         return None
     st = parents.get(stores[0])
     if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and st.targets[0] is stores[0]
             and isinstance(st.value, (ast.List, ast.Tuple)) and st.lineno < call.lineno
             and frontend_enclosing_fn(st, parents) is scope):
+        return None
+    return st.value
+
+
+def _single_list_binding_module(fe: Frontend, module: str, call: ast.Call, name: ast.Name) -> ast.List | ast.Tuple | None:
+    tree = fe.index.module(module).tree
+    stores, loads = [], []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == name.id:
+            (stores if isinstance(n.ctx, ast.Store) else loads).append(n)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name.id in n.names:
+            return None
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and name.id in {
+                a.arg for a in [*n.args.posonlyargs, *n.args.args, *n.args.kwonlyargs, n.args.vararg, n.args.kwarg] if a}:
+            return None
+    if len(stores) != 1 or loads != [name]:
+        return None
+    st = next((s for s in tree.body if isinstance(s, ast.Assign) and len(s.targets) == 1 and s.targets[0] is stores[0]), None)
+    if st is None or not isinstance(st.value, (ast.List, ast.Tuple)) or st.lineno > call.lineno:
         return None
     return st.value
 

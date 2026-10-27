@@ -99,7 +99,8 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   the SQL `onupdate=` values with the UPDATE (other `__mapper_args__` keys are refused).
 - Relationships (many-to-one, one-to-many, many-to-many through `secondary=` naming a module-level `Table`, by
   its variable or its table name), `lazy=` select/selectin/joined/noload/raise, `selectinload()`
-  chains, `back_populates`/`backref` (not on a many-to-many relationship: SQLAlchemy keeps both collections in
+  chains, `joinedload()` (loaded like `selectinload()`: the same objects; `innerjoin=True` or `"unnested"` only on a
+  many-to-one whose foreign key column is NOT NULL, where the INNER JOIN leaves no row out, else a 500), `back_populates`/`backref` (not on a many-to-many relationship: SQLAlchemy keeps both collections in
   step at once, which is refused), cascades (save-update, delete, delete-orphan; none on many-to-many, whose
   association rows are written at flush and deleted with their owner), `passive_deletes`,
   `order_by=` (target columns, `.desc()`, or a string SQLAlchemy evaluates such as `"[Child.a, Child.b.desc()]"`),
@@ -166,7 +167,10 @@ dependency and the engine are in `docs_src/db.py`; the tables are created by the
   (a plain table: the same alias), `aliased(Model, select(Model)....subquery())` or `aliased(Model, cte)` (the entity read
   from the subquery, which must select that entity alone, or a union of such selects),
   `execution_options(populate_existing=, autoflush=, yield_per=)` on a SELECT (also given to
-  `session.execute(stmt, execution_options={...})`),
+  `session.execute(stmt, execution_options={...})`), `await session.stream(stmt)` / `stream_scalars(stmt)` (the rows
+  read at once: an `AsyncResult` / `AsyncScalarResult` for `async for`, with `all()`, `first()`, `one()`,
+  `one_or_none()`, `scalar()`, `scalar_one()`, `scalar_one_or_none()`, `scalars()`, `mappings()` and `unique()`
+  awaited),
   ORM bulk INSERT (`session.execute(insert(Model), [dicts])`, `scalars(insert(Model).returning(Model), [dicts])`:
   one statement per dict in order, `None` values left out unless `execution_options(render_nulls=True)`,
   `returning(..., sort_by_parameter_order=True)`) and bulk UPDATE by primary key (`execute(update(Model),

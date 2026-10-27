@@ -293,6 +293,9 @@ pub enum Native {
     /// `r.pubsub()` and its `listen()` (see `rps`)
     RPubSub(Arc<super::rps::RPubSub>),
     RPubSubListen(Arc<super::rps::RPubSub>),
+    /// `await session.stream(...)` / `stream_scalars(...)`: the rows read at once, iterated by `async for`, its
+    /// methods awaited (an AsyncResult / AsyncScalarResult over a buffered result)
+    AsyncResult(Arc<Mutex<orm::QResult>>),
     /// the items of an async iterator produced by the runtime (`scan_iter`), read by `async for`
     AsyncItems(Mutex<Option<Vec<V>>>),
     /// `yarl.URL`
@@ -563,6 +566,7 @@ impl V {
                 Native::RPool(_) => "ConnectionPool",
                 Native::RPipe(_) => "Pipeline",
                 Native::RPubSub(_) => "PubSub",
+                Native::AsyncResult(r) => if r.lock().scalars { "AsyncScalarResult" } else { "AsyncResult" },
                 Native::RPubSubListen(_) => "async_generator",
                 Native::AsyncItems(_) => "async_generator",
                 Native::Maker(_, _, false, _) => "async_sessionmaker",

@@ -42,7 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette_context import plugins
 from starlette_context.middleware import RawContextMiddleware
 
-from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, makerwrap, mounted, reqbody, sessforms, smsess, sqlmore, syncsess, wsock
+from . import aio, apiv, asgimw, composite, ddl, enumcols, expire, greenlet, idict, inherit, lazyimp, leaks, life, makerwrap, mounted, reqbody, sessforms, smsess, sqlmore, streamx, syncsess, wsock
 from .db import DbDep
 from .enums import Channel, Level, Priority, Status
 from .models import Archive, Asset, Owner, Project, Secret, Task
@@ -69,6 +69,7 @@ app.add_middleware(asgimw.HeaderStamp, name="outer")
 app.include_router(ddl.router)
 app.include_router(makerwrap.router)
 app.include_router(inherit.router)
+app.include_router(streamx.router)
 app.include_router(enumcols.router)
 app.include_router(composite.router)
 app.include_router(reqbody.router)

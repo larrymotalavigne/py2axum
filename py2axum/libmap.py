@@ -1772,7 +1772,12 @@ CALLS = {
     "sqlalchemy.delete": lambda a, kw: f"{RT}::orm::delete(&{a[0]})",
     "sqlalchemy.exists": lambda a, kw: f"{RT}::orm::exists(&{_argv(a)})",
     **{f"sqlalchemy.orm.{n}": (lambda n: lambda a, kw: f"{RT}::orm::loader(\"{n}\", &{_one(n)(a, kw)})")(n)
-       for n in ("selectinload", "joinedload", "subqueryload", "immediateload", "noload", "lazyload", "defaultload")},
+       for n in ("selectinload", "subqueryload", "immediateload", "noload", "lazyload", "defaultload")},
+    # innerjoin=: checked at run time (orm::joinedload_inner)
+    "sqlalchemy.orm.joinedload": lambda a, kw: (
+        f"{RT}::orm::loader(\"joinedload\", &{_one('joinedload')(a, kw)})" if not kw
+        else f"{RT}::orm::joinedload_inner(&{a[0]}, &{kw['innerjoin']})" if len(a) == 1 and set(kw) == {"innerjoin"}
+        else (_ for _ in ()).throw(ValueError("joinedload(attribute, innerjoin=) only"))),
     "sqlalchemy.orm.selectin_polymorphic": lambda a, kw: (
         f"{RT}::orm::selectin_polymorphic(&{a[0]}, &{a[1]})" if len(a) == 2 and not kw
         else (_ for _ in ()).throw(ValueError("selectin_polymorphic(Base, [Sub, ...]) only"))),

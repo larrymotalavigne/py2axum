@@ -21,7 +21,7 @@ adding a header to every response. Like every example on this site, it is compil
   [its own page](cors.md).
 - Raw ASGI middleware: a project class with `__init__(self, app, ...)` and `async def __call__(self, scope,
   receive, send)`, registered with `app.add_middleware(Cls, ...)` or `FastAPI(middleware=[Middleware(Cls,
-  ...)])` (those entries stay inside every `add_middleware`, in list order, as in Starlette). The instance is
+  ...)])` (the list also as a variable bound once, in the function or at module level, or a function returning it) (those entries stay inside every `add_middleware`, in list order, as in Starlette). The instance is
   built with the rest of the stack as its `app`. One `scope` dict per request, shared by every layer (and
   by `request.scope` below them); `receive()` returns the whole body in one `http.request` message, then
   `http.disconnect` once the response is complete (uvicorn); `send()` takes `http.response.start` /

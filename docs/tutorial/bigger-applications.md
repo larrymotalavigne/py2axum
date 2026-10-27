@@ -120,7 +120,9 @@ Routes added by a `configure(app)` function are described in [Middleware](middle
 - `include_router` under an `if` that is off at startup: its routes are not served, but `app.routes` still
   lists them.
 - `include_router`: a runtime prefix containing a path parameter (`{...}`) stops the binary; a non-literal
-  prefix inside a function (app factory) is refused at compile time, except in a function given the app (above); `--python-side` cannot name a route under
+  prefix inside a function (app factory) is refused at compile time when it reads a parameter or a local of the
+  function (`prefix=settings.API_PREFIX` with `settings` a module global is read at startup, as at module level),
+  except in a function given the app (above); `--python-side` cannot name a route under
   a runtime prefix (it is compiled).
 - Raw ASGI routes: `allow` of a 405 lists the methods in declaration order (Starlette iterates a set, so its
   order varies between processes); mutations of `dependency_overrides` are lost.
